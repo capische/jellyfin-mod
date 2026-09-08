@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>JellyfinMod</title></head>
+<body>
+<div id="JellyfinModConfigPage" data-role="page" class="page type-interior pluginConfigurationPage">
+  <div data-role="content">
+    <div class="content-primary">
+      <form id="JellyfinModConfigForm">
+
+        <h2 class="sectionTitle">Discovery</h2>
+        <div class="inputContainer">
+          <input is="emby-input" type="text" id="TmdbApiKey" label="TMDB API key" />
+          <div class="fieldDescription">Used to search TMDB. The key stays on the server.</div>
+        </div>
+
+        <h2 class="sectionTitle verticalSection">Retention</h2>
+        <label class="checkboxContainer">
+          <input is="emby-checkbox" type="checkbox" id="RetentionEnabled" />
+          <span>Delete media files after they are watched</span>
+        </label>
+        <div class="inputContainer">
+          <input is="emby-input" type="number" id="ReclaimAfterDays" min="1" max="3650"
+                 label="Days to keep a file after it is finished" />
+          <div class="fieldDescription">
+            The entry, its artwork and its watch history always stay. Only the media file goes.
+          </div>
+        </div>
+        <label class="checkboxContainer">
+          <input is="emby-checkbox" type="checkbox" id="ExemptFavourites" />
+          <span>Never reclaim favourites</span>
+        </label>
+
+        <div>
+          <button is="emby-button" type="submit" class="raised button-submit block">
+            <span>Save</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script type="text/javascript">
+    (function () {
+      var pluginId = '6f1a2b3c-4d5e-4f60-9a71-8b2c3d4e5f60';
+
+      document.querySelector('#JellyfinModConfigPage')
+        .addEventListener('pageshow', function () {
+          Dashboard.showLoadingMsg();
+          ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+            document.querySelector('#TmdbApiKey').value = config.TmdbApiKey || '';
+            document.querySelector('#RetentionEnabled').checked = !!config.RetentionEnabled;
+            document.querySelector('#ReclaimAfterDays').value = config.ReclaimAfterDays;
+            document.querySelector('#ExemptFavourites').checked = !!config.ExemptFavourites;
+            Dashboard.hideLoadingMsg();
+          });
+        });
+
+      document.querySelector('#JellyfinModConfigForm')
+        .addEventListener('submit', function (e) {
+          e.preventDefault();
+          Dashboard.showLoadingMsg();
+          ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+            config.TmdbApiKey = document.querySelector('#TmdbApiKey').value;
+            config.RetentionEnabled = document.querySelector('#RetentionEnabled').checked;
+            config.ReclaimAfterDays = parseInt(document.querySelector('#ReclaimAfterDays').value, 10);
+            config.ExemptFavourites = document.querySelector('#ExemptFavourites').checked;
+            ApiClient.updatePluginConfiguration(pluginId, config)
+              .then(Dashboard.processPluginConfigurationUpdateResult);
+          });
+          return false;
+        });
+    })();
+  </script>
+</div>
+</body>
+</html>

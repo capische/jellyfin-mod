@@ -1,0 +1,20 @@
+---
+name: "JellyfinMod"
+guid: "6f1a2b3c-4d5e-4f60-9a71-8b2c3d4e5f60"
+version: "0.1.0.0"
+targetAbi: "10.11.0.0"
+framework: "net9.0"
+overview: "Track what you want to watch, get it, and reclaim the disk when you are done."
+description: >
+  One entry per title, with or without a media file. Entries live in this plugin's own database
+  and appear inside your existing Movies and TV libraries: a wishlist for what you do not have,
+  acquisition for getting it, and retention for reclaiming the disk once you are finished —
+  while the entry, its artwork and its watch history stay.
+category: "General"
+owner: "kxalex"
+artifacts:
+# Jellyfin 10.11 provides EF Core 9 and SQLite (managed and native) at runtime.
+# Do not bundle a second database stack or the Jellyfin host assemblies.
+- "JellyfinMod.dll"
+changelog: >
+  0.1.0.0 - Phase 0: plugin loads, health endpoint, configuration page.
