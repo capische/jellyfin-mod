@@ -59,20 +59,31 @@ convention is a convention, not a requirement, and `Jellyfin.Plugin.JellyfinMod`
 dotnet build -c Release JellyfinMod/JellyfinMod.csproj
 ```
 
-For a release package, use JPRM (`jprm plugin build .`), which reads `build.yaml` and emits the
-zip plus its `meta.json`. To test by hand, copy `JellyfinMod.dll` into a folder under the server's
-`plugins/` directory and restart Jellyfin. The assembly version matches `build.yaml` (`0.1.0.0`).
+Package the compiled assembly and plugin-card logo with the JPRM-based helper:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r scripts/requirements.txt
+.venv/bin/python scripts/package_plugin.py JellyfinMod/bin/Release/net9.0 artifacts/package
+```
+
+Copy all three generated files (`JellyfinMod.dll`, `logo.png`, `meta.json`) from `artifacts/package`
+into the plugin's own folder under the server's persistent `plugins/` directory, then restart
+Jellyfin. The helper reads `build.yaml` and adds the `imagePath` field required by Jellyfin 10.11;
+copying only the DLL leaves the installed plugin card without its logo.
+The assembly version matches `build.yaml` (`0.1.0.0`).
 Jellyfin 10.11 already supplies EF Core 9 and SQLite, including the native SQLite library; do
 not copy the host assemblies or a second database stack into the plugin directory.
 
 For plugin-only deployment from the sibling web checkout:
 
 ```bash
-./jellyfin-sync --local --plugin
+JELLYFIN_PLUGIN_PYTHON=../plugin/.venv/bin/python ./jellyfin-sync --local --plugin
 ```
 
 See `jellyfin-sync.env.example` for project, destination and SDK path overrides. This leaves
-the web bundle untouched. `--no-build` ships the existing Release DLL; `--no-restart` only copies it.
+the web bundle untouched. `--no-build` packages the existing Release DLL; `--no-restart` only
+copies the package. Existing enable/disable and automatic-update choices are preserved.
 
 ## Database and local validation
 

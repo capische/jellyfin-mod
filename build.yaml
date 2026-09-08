@@ -12,6 +12,7 @@ description: >
   while the entry, its artwork and its watch history stay.
 category: "General"
 owner: "kxalex"
+image: "JellyfinMod/Assets/logo.png"
 artifacts:
 # Jellyfin 10.11 provides EF Core 9 and SQLite (managed and native) at runtime.
 # Do not bundle a second database stack or the Jellyfin host assemblies.
