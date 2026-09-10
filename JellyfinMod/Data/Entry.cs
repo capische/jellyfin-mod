@@ -57,6 +57,9 @@ public class Entry
     [MaxLength(256)]
     public string? PosterPath { get; set; }
 
+    /// <summary>Gets or sets the durable TMDB metadata snapshot, including regional ratings.</summary>
+    public string? MetadataJson { get; set; }
+
     /// <summary>Gets or sets the current file state.</summary>
     public FileState State { get; set; } = FileState.None;
 

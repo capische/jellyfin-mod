@@ -1,8 +1,10 @@
 using JellyfinMod.Data;
+using JellyfinMod.Services;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace JellyfinMod;
 
@@ -20,6 +22,10 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
     {
         services.AddTransient(_ =>
             new ModDbContext(Path.Combine(Plugin.Instance!.DataPath, "jellyfinmod.db")));
+        services.AddTransient<LibraryAccess>();
+        services.AddTransient<CatalogSortName>();
+        services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
+            () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>()));
         services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<DatabaseInitializer>());
     }

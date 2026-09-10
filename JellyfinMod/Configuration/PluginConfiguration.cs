@@ -7,6 +7,9 @@ namespace JellyfinMod;
 /// </summary>
 public class PluginConfiguration : BasePluginConfiguration
 {
+    /// <summary>Gets or sets the TMDB API Read Access Token used for discovery. Stays server-side.</summary>
+    public string TmdbReadAccessToken { get; set; } = string.Empty;
+
     /// <summary>Gets or sets the TMDB API key used for discovery. Stays server-side.</summary>
     public string TmdbApiKey { get; set; } = string.Empty;
 

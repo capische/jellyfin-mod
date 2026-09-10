@@ -4,3 +4,4 @@ obj/
 artifacts/
 .venv/
 __pycache__/
+.env

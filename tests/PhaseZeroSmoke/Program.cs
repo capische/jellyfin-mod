@@ -24,7 +24,7 @@ try
     var id = Guid.NewGuid();
     await using (var database = new ModDbContext(path))
     {
-        Assert((await database.Database.GetAppliedMigrationsAsync()).Count() == 1, "Initial migration applied once");
+        Assert((await database.Database.GetAppliedMigrationsAsync()).Count() == database.Database.GetMigrations().Count(), "Initial migration applied once");
         database.Entries.Add(new Entry { Id = id, TmdbId = 123, Title = "Persistence probe" });
         database.History.Add(new HistoryRecord { EntryId = id, EventType = "added", Summary = "Persistence probe" });
         await database.SaveChangesAsync();
@@ -38,7 +38,7 @@ try
         Assert(restarted.IsReady, "Restart initialization succeeds");
         Assert(await database.Entries.CountAsync() == 1 && await database.History.CountAsync() == 1,
             "Entries and history survive restart");
-        Assert((await database.Database.GetAppliedMigrationsAsync()).Count() == 1, "Restart does not reapply migration");
+        Assert((await database.Database.GetAppliedMigrationsAsync()).Count() == database.Database.GetMigrations().Count(), "Restart does not reapply migration");
     }
 
     using var brokenProvider = new ServiceCollection()
@@ -50,12 +50,12 @@ try
     Assert(HealthStatus(broken) == 503, "Failed migration reports unavailable without crashing the host");
 
     var serializer = new XmlSerializer(typeof(PluginConfiguration));
-    var config = new PluginConfiguration { ReclaimAfterDays = 21, ExemptFavourites = false };
+    var config = new PluginConfiguration { TmdbReadAccessToken = "test-read-token", ReclaimAfterDays = 21, ExemptFavourites = false };
     using var serialized = new StringWriter();
     serializer.Serialize(serialized, config);
     using var reader = new StringReader(serialized.ToString());
     var restored = (PluginConfiguration)serializer.Deserialize(reader)!;
-    Assert(restored.ReclaimAfterDays == 21 && !restored.ExemptFavourites && !restored.RetentionEnabled,
+    Assert(restored.TmdbReadAccessToken == "test-read-token" && restored.ReclaimAfterDays == 21 && !restored.ExemptFavourites && !restored.RetentionEnabled,
         "Configuration survives XML round trip with retention disabled");
     Console.WriteLine("PASS: migrations, restart persistence, health readiness/failure, configuration XML");
 }

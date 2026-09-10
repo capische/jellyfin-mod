@@ -21,6 +21,10 @@ public sealed class DatabaseInitializer(
             using var scope = scopeFactory.CreateScope();
             var database = scope.ServiceProvider.GetRequiredService<ModDbContext>();
             await database.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
+            var quarantined = await database.Entries.CountAsync(entry => entry.TargetLibraryId == null ||
+                (entry.MetadataJson == null && entry.JellyfinItemId == null), cancellationToken).ConfigureAwait(false);
+            if (quarantined > 0)
+                logger.LogWarning("JellyfinMod preserved {Count} legacy entries without library scope or metadata. They are quarantined from browsing; an administrator must repair these records before they can be shown. No destination library was guessed.", quarantined);
             IsReady = true;
             logger.LogInformation("JellyfinMod database migrations applied");
         }

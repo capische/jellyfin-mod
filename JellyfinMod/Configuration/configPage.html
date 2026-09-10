@@ -9,8 +9,13 @@
 
         <h2 class="sectionTitle">Discovery</h2>
         <div class="inputContainer">
-          <input is="emby-input" type="text" id="TmdbApiKey" label="TMDB API key" />
-          <div class="fieldDescription">Used to search TMDB. The key stays on the server.</div>
+          <input is="emby-input" type="password" id="TmdbReadAccessToken" autocomplete="off"
+                 label="TMDB API Read Access Token" />
+          <div class="fieldDescription">Recommended. Used to search TMDB and kept on the server.</div>
+        </div>
+        <div class="inputContainer">
+          <input is="emby-input" type="password" id="TmdbApiKey" autocomplete="off" label="TMDB API key" />
+          <div class="fieldDescription">Optional v3 API key for existing configurations.</div>
         </div>
 
         <h2 class="sectionTitle verticalSection">Retention</h2>
@@ -47,6 +52,7 @@
         .addEventListener('pageshow', function () {
           Dashboard.showLoadingMsg();
           ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+            document.querySelector('#TmdbReadAccessToken').value = config.TmdbReadAccessToken || '';
             document.querySelector('#TmdbApiKey').value = config.TmdbApiKey || '';
             document.querySelector('#RetentionEnabled').checked = !!config.RetentionEnabled;
             document.querySelector('#ReclaimAfterDays').value = config.ReclaimAfterDays;
@@ -60,6 +66,7 @@
           e.preventDefault();
           Dashboard.showLoadingMsg();
           ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+            config.TmdbReadAccessToken = document.querySelector('#TmdbReadAccessToken').value;
             config.TmdbApiKey = document.querySelector('#TmdbApiKey').value;
             config.RetentionEnabled = document.querySelector('#RetentionEnabled').checked;
             config.ReclaimAfterDays = parseInt(document.querySelector('#ReclaimAfterDays').value, 10);
