@@ -25,7 +25,10 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<LibraryAccess>();
         services.AddTransient<CatalogSortName>();
         services.AddSingleton<ReconciliationLibraryLock>();
+        services.AddSingleton<ReconciliationRunGate>();
         services.AddTransient<ReconciliationService>();
+        services.AddTransient<JellyfinNativeTitleSource>();
+        services.AddTransient<CatalogBackfillRunner>();
         services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
             () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>()));
         services.AddSingleton<DatabaseInitializer>();

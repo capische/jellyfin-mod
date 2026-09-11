@@ -23,6 +23,7 @@
           <input is="emby-checkbox" type="checkbox" id="RetentionEnabled" />
           <span>Delete media files after they are watched</span>
         </label>
+
         <div class="inputContainer">
           <input is="emby-input" type="number" id="ReclaimAfterDays" min="1" max="3650"
                  label="Days to keep a file after it is finished" />
@@ -34,6 +35,10 @@
           <input is="emby-checkbox" type="checkbox" id="ExemptFavourites" />
           <span>Never reclaim favourites</span>
         </label>
+
+        <h2 class="sectionTitle verticalSection">Library reconciliation</h2>
+        <p>Run <strong>Reconcile JellyfinMod catalog</strong> from Dashboard → Scheduled Tasks to backfill or repair bindings.</p>
+        <div id="ReconciliationSummary" class="fieldDescription">No reconciliation run has been recorded.</div>
 
         <div>
           <button is="emby-button" type="submit" class="raised button-submit block">
@@ -59,6 +64,18 @@
             document.querySelector('#ExemptFavourites').checked = !!config.ExemptFavourites;
             Dashboard.hideLoadingMsg();
           });
+          ApiClient.ajax({
+            type: 'GET',
+            url: ApiClient.getUrl('JellyfinMod/Reconciliation/Latest'),
+            dataType: 'json'
+          }).then(function (run) {
+            var completed = run.completedAt ? new Date(run.completedAt).toLocaleString() : 'in progress';
+            document.querySelector('#ReconciliationSummary').textContent =
+              run.status + ' · ' + completed + ' · scanned ' + run.scannedItems + '/' + run.totalItems +
+              ' · created ' + run.createdEntries + ' · updated ' + run.updatedBindings +
+              ' · unchanged ' + run.unchangedItems + ' · unmatched ' + run.unmatchedItems +
+              ' · conflicts ' + run.conflictedItems + ' · failed ' + run.failedItems;
+          }, function () {});
         });
 
       document.querySelector('#JellyfinModConfigForm')

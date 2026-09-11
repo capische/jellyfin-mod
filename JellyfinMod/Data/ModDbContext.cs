@@ -26,6 +26,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets the durable native episode representations.</summary>
     public DbSet<EpisodeBinding> EpisodeBindings => Set<EpisodeBinding>();
 
+    /// <summary>Gets full reconciliation run summaries.</summary>
+    public DbSet<ReconciliationRun> ReconciliationRuns => Set<ReconciliationRun>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -57,6 +60,12 @@ public class ModDbContext : DbContext
         {
             e.HasIndex(x => x.JellyfinItemId).IsUnique();
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<ReconciliationRun>(e =>
+        {
+            e.Property(x => x.Status).HasMaxLength(16);
+            e.HasIndex(x => x.StartedAt);
         });
 
         b.Entity<HistoryRecord>(e => e.HasIndex(x => x.EntryId));
