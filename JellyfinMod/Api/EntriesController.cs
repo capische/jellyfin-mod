@@ -81,6 +81,18 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
                 database.ChangeTracker.Clear();
                 existing = await FindExisting(request, cancellationToken);
                 if (existing is null) throw;
+                if (!existing.Monitored)
+                {
+                    existing.Monitored = true;
+                    database.History.Add(new HistoryRecord
+                    {
+                        EntryId = existing.Id,
+                        EventType = "monitoring_enabled",
+                        Summary = "Enabled monitoring when added by user"
+                    });
+                    await database.SaveChangesAsync(cancellationToken);
+                }
+
                 return access.CanRead(user, existing) ? new CreateEntryResult(new EntryDto(existing), false) : NotFound();
             }
 

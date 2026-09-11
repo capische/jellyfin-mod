@@ -24,6 +24,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
             new ModDbContext(Path.Combine(Plugin.Instance!.DataPath, "jellyfinmod.db")));
         services.AddTransient<LibraryAccess>();
         services.AddTransient<CatalogSortName>();
+        services.AddSingleton<ReconciliationLibraryLock>();
+        services.AddTransient<ReconciliationService>();
         services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
             () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>()));
         services.AddSingleton<DatabaseInitializer>();

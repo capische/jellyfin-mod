@@ -20,6 +20,12 @@ public class ModDbContext : DbContext
     /// <summary>Gets the individually tracked series episodes.</summary>
     public DbSet<Episode> Episodes => Set<Episode>();
 
+    /// <summary>Gets the durable native title representations.</summary>
+    public DbSet<EntryBinding> EntryBindings => Set<EntryBinding>();
+
+    /// <summary>Gets the durable native episode representations.</summary>
+    public DbSet<EpisodeBinding> EpisodeBindings => Set<EpisodeBinding>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -36,9 +42,21 @@ public class ModDbContext : DbContext
 
         b.Entity<Episode>(e =>
         {
-            e.HasIndex(x => new { x.EntryId, x.SeasonNumber, x.EpisodeNumber }).IsUnique();
+            e.HasIndex(x => new { x.EntryId, x.SeasonNumber, x.EpisodeNumber });
             e.HasIndex(x => new { x.EntryId, x.TmdbId }).IsUnique();
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<EntryBinding>(e =>
+        {
+            e.HasIndex(x => x.JellyfinItemId).IsUnique();
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<EpisodeBinding>(e =>
+        {
+            e.HasIndex(x => x.JellyfinItemId).IsUnique();
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
         });
 
         b.Entity<HistoryRecord>(e => e.HasIndex(x => x.EntryId));
