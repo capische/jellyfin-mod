@@ -38,6 +38,12 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
         return observations;
     }
 
+    /// <summary>Re-reads current native state and finds the complete title observation containing one item.</summary>
+    public NativeCatalogObservation? GetObservation(Guid itemId, CancellationToken cancellationToken) =>
+        GetObservations(cancellationToken).FirstOrDefault(observation => observation.NativeItemId == itemId ||
+            observation.Snapshot is { } snapshot && (snapshot.Representations.Any(item => item.JellyfinItemId == itemId) ||
+                snapshot.Episodes.Any(episode => episode.JellyfinItemId == itemId)));
+
     private static IEnumerable<NativeCatalogObservation> GetMovies(
         CollectionFolder folder,
         Guid libraryId,
