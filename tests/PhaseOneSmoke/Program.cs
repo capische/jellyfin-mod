@@ -62,7 +62,7 @@ try
     await using (var restarted = new ModDbContext(dbPath))
     {
         await restarted.Database.MigrateAsync();
-        Assert(await restarted.Entries.CountAsync() == 2 && (await restarted.Database.GetAppliedMigrationsAsync()).Count() == 3, "Restart preserves rows and migrations");
+        Assert(await restarted.Entries.CountAsync() == 2 && (await restarted.Database.GetAppliedMigrationsAsync()).Count() == 4, "Restart preserves rows and migrations");
     }
 
     await ApiSmoke.RunAsync(folder);

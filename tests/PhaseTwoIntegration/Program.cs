@@ -167,6 +167,7 @@ try
             "Reconciled identities, every observed copy and exact transition history persist after a real SQLite restart");
     }
 
+    await BackfillIntegration.RunAsync(folder);
     Console.WriteLine("PASS: deterministic Phase 2 reconciliation persists across real SQLite transactions and restart");
 }
 finally

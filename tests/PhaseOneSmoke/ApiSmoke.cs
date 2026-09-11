@@ -185,6 +185,18 @@ internal static class ApiSmoke
                 "An already-existing duplicate add preserves the administrator's monitoring preference and history");
         }
 
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.ReconciliationRuns.Add(new ReconciliationRun
+            {
+                Status = "completed", TotalItems = 3, ScannedItems = 3, CreatedEntries = 1,
+                UpdatedBindings = 1, UnchangedItems = 1
+            });
+            await database.SaveChangesAsync();
+        }
+
+        Assert((await client.GetAsync("/JellyfinMod/Reconciliation/Latest")).StatusCode == HttpStatusCode.Forbidden,
+            "Ordinary users cannot read item-level reconciliation diagnostics");
         Assert((await client.DeleteAsync($"/JellyfinMod/Entries/{entryId}")).StatusCode == HttpStatusCode.Forbidden, "Ordinary deletion denied by middleware");
         Assert((await client.PatchAsJsonAsync($"/JellyfinMod/Entries/{entryId}", new { monitored = false })).StatusCode == HttpStatusCode.Forbidden, "Ordinary settings denied by middleware");
         using var filtered = await client.GetAsync($"/JellyfinMod/Entries?targetLibraryId={libraryFolder.Id}&state=onDisk&state=reclaimed");
@@ -197,6 +209,13 @@ internal static class ApiSmoke
         client.DefaultRequestHeaders.Remove("X-Smoke-User");
         client.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
         client.DefaultRequestHeaders.Add("X-Smoke-Role", "admin");
+        using var reconciliationSummary = await client.GetAsync("/JellyfinMod/Reconciliation/Latest");
+        using var reconciliationJson = JsonDocument.Parse(await reconciliationSummary.Content.ReadAsStringAsync());
+        Assert(reconciliationSummary.StatusCode == HttpStatusCode.OK &&
+            reconciliationJson.RootElement.GetProperty("status").GetString() == "completed" &&
+            reconciliationJson.RootElement.GetProperty("scannedItems").GetInt32() == 3 &&
+            reconciliationJson.RootElement.GetProperty("diagnostics").GetArrayLength() == 0,
+            "Administrators receive the exact durable reconciliation summary through authenticated HTTP");
         Assert((await client.PostAsJsonAsync("/JellyfinMod/Entries", new { mediaType = "bogus", tmdbId = -1, targetLibraryId = libraryFolder.Id })).StatusCode == HttpStatusCode.BadRequest, "Invalid create fields rejected");
         Assert((await client.PatchAsJsonAsync($"/JellyfinMod/Entries/{entryId}", new { qualityProfileId = 1 })).StatusCode == HttpStatusCode.BadRequest, "Unknown patch field rejected");
         Assert((await client.PatchAsJsonAsync($"/JellyfinMod/Entries/{entryId}", new { monitored = false })).StatusCode == HttpStatusCode.OK, "Admin monitoring update works");
