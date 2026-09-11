@@ -50,4 +50,10 @@ Everything under `/JellyfinMod`, `[Authorize]`, admin-only where it changes serv
 
 ## Commits
 
-Conventional Commits, lower case, imperative, no trailing full stop — same as the web fork.
+Commit validated slices regularly. Use Conventional Commits with the phase/task ID in the
+scope: `feat(P2.R1): reconcile native library bindings` or `fix(P1.P6): correct tmdb requests`.
+Use task IDs from the plan; use a lower-case imperative description without a trailing full stop.
+For existing combined commits, list their tasks, such as `P1.P5,P1.P6`; prefer separate task
+commits for new work. Never add a Codex/GPT co-author or commit secrets. Rewrite published
+history only when explicitly authorized, using a verified remote tip and explicit
+force-with-lease, then verify the pushed commit.
