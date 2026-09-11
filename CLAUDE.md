@@ -1,61 +1,44 @@
-# JellyfinMod
+# JellyfinMod plugin rules
 
-Server half of JellyfinMod. The web half is the `jellyfin-web` fork beside this repo; read
-`../jellyfin-web/docs/jellyfinmod/README.md` (architecture, data model, roadmap) and
-`../jellyfin-web/docs/jellyfinmod/UX.md` (the interface this has to serve) before any work here.
-Both carry dated decision logs — several questions are settled and should not be reopened without
-new evidence.
+## Scope and planning
 
-Tasks live in `../jellyfin-web/docs/jellyfinmod/PLAN.md`; plugin tasks are prefixed **P**. Start
-there rather than inventing a task order.
+- Read workspace rules and `../jellyfin-web/docs/jellyfinmod/{PLAN,README,UX}.md`, plus the current phase refinement.
+- Follow the plan's task order and accepted decisions. Preserve other agents' edits.
+- Store library-scoped catalog entries in plugin SQLite, never as synthetic Jellyfin `BaseItem`s.
+- Use existing Movies/TV views; do not introduce a separate catalog section.
 
-## The one idea
+## Target and packaging
 
-**A title is one entry that may or may not have a media file behind it.** Entries live in this
-plugin's SQLite database and are never Jellyfin `BaseItem`s. There is no separate "catalog" — the
-web fork shows these entries inside the existing Movies and TV libraries.
+- Target `net9.0`, Jellyfin Controller/Model `10.11.11`, and `targetAbi: 10.11.0.0`.
+- Do not change these pins to bypass build errors. A move to Jellyfin 12/.NET 10 is separate work.
+- Keep the project at the repository root, shared settings in `Directory.Build.props`, and manifest in `build.yaml`.
+- Generate `meta.json` through JPRM; never hand-write it.
 
-## Target, pinned
+## Implementation
 
-`net9.0` · `Jellyfin.Controller`/`Jellyfin.Model` `10.11.11` · `targetAbi` `10.11.0.0`, matching the
-server on the Pi. There is no Jellyfin 11.x. Moving to 12.0 / net10 is a deliberate later step.
-
-## Layout
-
-Mirrors the official `jellyfin-plugin-template`: project folder at the repo root (no `src/`),
-`Directory.Build.props` for shared settings, and **`build.yaml` as the manifest** — `meta.json` is
-generated from it by JPRM, never hand-written.
-
-## Rules
-
-- **Plugin config is XML** (`XmlSerializer`), so no `Dictionary<,>` in `PluginConfiguration`.
-  Anything structured goes in the database.
-- **Never trust `BasePlugin.DataFolderPath`** for the database — it can gain a `_<Version>` suffix
-  across upgrades and orphan the data. Use `Plugin.Instance.DataPath`.
-- `IServerEntryPoint` was removed in 10.9. Use `IScheduledTask` for periodic work and
-  `IHostedService` for long-lived loops.
-- Some host services are scoped, not singleton — do not capture them in a singleton.
+- Keep plugin configuration XML-serializable; do not put `Dictionary<,>` in `PluginConfiguration`. Store structured data in SQLite.
+- Use `Plugin.Instance.DataPath` for the DB; never rely on the version-dependent `BasePlugin.DataFolderPath`.
+- Use `IScheduledTask` for periodic tasks and `IHostedService` for long-running work; never use removed `IServerEntryPoint`.
+- Resolve scoped services within scopes; never capture them in singletons.
 - Use `IHttpClientFactory.CreateClient(NamedClient.Default)`.
-- **Never delete a file the torrent client is still seeding** under its ratio or time goal, and
-  never count a hardlinked file as reclaimed space without checking the link count.
-- Imports **hardlink**; a copy doubles every file while it seeds. Download dir and library must
-  share a filesystem.
-- **Licensing: Jellyfin is GPL-2.0-only, Sonarr/Radarr are GPL-3.0 — incompatible.** Do not port
-  their parsers. MIT references only, or regexes written against their *test cases*.
+- Put APIs under `/JellyfinMod`; require `[Authorize]` and `Policies.RequiresElevation` for admin-only writes. Do not use nonexistent `Policies.DefaultAuthorization`.
+- Enforce accepted permissions: users may add accessible titles; only admins remove entries or change settings.
+- Preserve seed ratio/time goals. Check hardlink counts before claiming reclaimed disk space.
+- Import with hardlinks; require download and library paths on the same filesystem.
+- Do not port GPL-3.0 Sonarr/Radarr parsers into this GPL-2.0-only project. Use MIT references or independently written parsers.
 
-## API shape
+## Testing and deployment
 
-Everything under `/JellyfinMod`, `[Authorize]`, admin-only where it changes server config
-(`[Authorize(Policy = Policies.RequiresElevation)]`). There is no `Policies.DefaultAuthorization`.
+- Use real HTTP/auth/serializer/SQLite integration and browser E2E; do not add unit tests.
+- Require E2E acceptance; a successful build alone is insufficient.
+- Deploy mod work only to the isolated test instance defined in workspace rules. Never modify production.
+- Load test credentials from ignored `.env`; commit only `.env.sample`. Never print or commit secrets.
 
 ## Commits
 
-Commit validated slices regularly. Use Conventional Commits with a lowercase component and
-phase/task separated by a comma: `feat(catalog,p2.r1): reconcile native library bindings` or
-`fix(tmdb,p1.p6): correct tmdb requests`. Do not put spaces around the comma.
-Use lowercase task IDs from the plan and an imperative description without a trailing full stop.
-For combined commits, use ranges for consecutive tasks in the same phase and task series,
-such as `catalog,p1.p5-6`. List nonconsecutive tasks or different phases separately; prefer separate task
-commits for new work. Never add a Codex/GPT co-author or commit secrets. Rewrite published
-history only when explicitly authorized, using a verified remote tip and explicit
-force-with-lease, then verify the pushed commit.
+- Commit validated slices regularly; stage explicit files and preserve unrelated work.
+- Use lowercase `type(component,phase.task): description`, for example `feat(catalog,p2.r1): reconcile native bindings`.
+- Use task IDs from the plan, no spaces around commas, and an imperative description without a trailing full stop.
+- Abbreviate consecutive same-phase/task-series ranges: `catalog,p1.p5-6`. List other tasks separately; prefer separate task commits.
+- Never add a Codex/GPT co-author or commit secrets.
+- Rewrite published history only when explicitly authorized; verify remote tips, use explicit force-with-lease, then verify pushed commits.
