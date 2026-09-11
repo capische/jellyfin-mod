@@ -50,10 +50,11 @@ Everything under `/JellyfinMod`, `[Authorize]`, admin-only where it changes serv
 
 ## Commits
 
-Commit validated slices regularly. Use Conventional Commits with the phase/task ID in the
-scope: `feat(P2.R1): reconcile native library bindings` or `fix(P1.P6): correct tmdb requests`.
-Use task IDs from the plan; use a lower-case imperative description without a trailing full stop.
-For existing combined commits, list their tasks, such as `P1.P5,P1.P6`; prefer separate task
+Commit validated slices regularly. Use Conventional Commits with a lowercase component and
+phase/task separated by a comma: `feat(catalog,p2.r1): reconcile native library bindings` or
+`fix(tmdb,p1.p6): correct tmdb requests`. Do not put spaces around the comma.
+Use lowercase task IDs from the plan and an imperative description without a trailing full stop.
+For existing combined commits, list their tasks after the component, such as `catalog,p1.p5,p1.p6`; prefer separate task
 commits for new work. Never add a Codex/GPT co-author or commit secrets. Rewrite published
 history only when explicitly authorized, using a verified remote tip and explicit
 force-with-lease, then verify the pushed commit.
