@@ -8,6 +8,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Querying;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 
 internal static class BackfillIntegration
@@ -64,13 +65,27 @@ internal static class BackfillIntegration
                 Name = "TV", ItemId = tvLibraryId.ToString(), CollectionType = CollectionTypeOptions.tvshows
             }
         };
-        var library = Stub<ILibraryManager>.Create((method, arguments) => method.Name switch
+        EventHandler<ItemChangeEventArgs>? itemAdded = null;
+        EventHandler<ItemChangeEventArgs>? itemUpdated = null;
+        EventHandler<ItemChangeEventArgs>? itemRemoved = null;
+        object? LibraryCall(MethodInfo method, object?[]? arguments)
         {
-            "GetVirtualFolders" => virtualFolders,
-            "GetItemById" when (Guid)arguments![0]! == movieLibraryId => movieLibrary,
-            "GetItemById" when (Guid)arguments![0]! == tvLibraryId => tvLibrary,
-            _ => throw new NotSupportedException(method.ToString())
-        });
+            switch (method.Name)
+            {
+                case "GetVirtualFolders": return virtualFolders;
+                case "GetItemById" when (Guid)arguments![0]! == movieLibraryId: return movieLibrary;
+                case "GetItemById" when (Guid)arguments![0]! == tvLibraryId: return tvLibrary;
+                case "add_ItemAdded": itemAdded += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
+                case "remove_ItemAdded": itemAdded -= (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
+                case "add_ItemUpdated": itemUpdated += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
+                case "remove_ItemUpdated": itemUpdated -= (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
+                case "add_ItemRemoved": itemRemoved += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
+                case "remove_ItemRemoved": itemRemoved -= (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
+                default: throw new NotSupportedException(method.ToString());
+            }
+        }
+
+        var library = Stub<ILibraryManager>.Create(LibraryCall);
 
         await using var database = new ModDbContext(dbPath);
         await database.Database.MigrateAsync();
@@ -118,6 +133,131 @@ internal static class BackfillIntegration
         Assert(await restarted.ReconciliationRuns.CountAsync() == 3 &&
             (await restarted.ReconciliationRuns.OrderBy(run => run.StartedAt).LastAsync()).Status == "cancelled",
             "Backfill summaries persist across a real SQLite restart");
+
+        void Raise(string eventName, ItemChangeEventArgs eventArgs)
+        {
+            var handler = eventName switch
+            {
+                "added" => itemAdded,
+                "updated" => itemUpdated,
+                "removed" => itemRemoved,
+                _ => throw new ArgumentOutOfRangeException(nameof(eventName))
+            };
+            handler!(null, eventArgs);
+        }
+
+        await RunEventIntegrationAsync(folder, library, movieLibrary, movies, Raise);
+    }
+
+    private static async Task RunEventIntegrationAsync(
+        string folder,
+        ILibraryManager library,
+        TestLibrary movieLibrary,
+        List<BaseItem> movies,
+        Action<string, ItemChangeEventArgs> raise)
+    {
+        var dbPath = Path.Combine(folder, "events.db");
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton(library);
+        services.AddTransient(_ => new ModDbContext(dbPath));
+        services.AddSingleton<ReconciliationLibraryLock>();
+        services.AddSingleton<ReconciliationRunGate>();
+        services.AddTransient<ReconciliationService>();
+        services.AddTransient<JellyfinNativeTitleSource>();
+        services.AddTransient<JellyfinItemReconciliationRunner>();
+        services.AddTransient<CatalogBackfillRunner>();
+        services.AddTransient<CatalogPostScanTask>();
+        services.AddSingleton<LibraryEventListener>();
+        await using var provider = services.BuildServiceProvider();
+        await using (var setup = new ModDbContext(dbPath)) await setup.Database.MigrateAsync();
+        var listener = provider.GetRequiredService<LibraryEventListener>();
+        await listener.StartAsync(default);
+        try
+        {
+            var added = Movie(8200, movieLibrary.Id);
+            movies.Add(added);
+            movieLibrary.Items = movies;
+            raise("added", new ItemChangeEventArgs { Item = added, Parent = movieLibrary });
+            var entryId = await WaitForEntryAsync(dbPath, 8200);
+
+            var replacement = Movie(8200, movieLibrary.Id);
+            movies.Remove(added);
+            movies.Add(replacement);
+            movieLibrary.Items = movies;
+            raise("removed", new ItemChangeEventArgs { Item = added, Parent = movieLibrary });
+            raise("added", new ItemChangeEventArgs { Item = replacement, Parent = movieLibrary });
+            await WaitForAsync(async database => (await database.Entries.SingleAsync(entry => entry.Id == entryId)).JellyfinItemId == replacement.Id,
+                dbPath, "Replacement event did not converge");
+            await using (var replaced = new ModDbContext(dbPath))
+            {
+                Assert(await replaced.EntryBindings.CountAsync(binding => binding.EntryId == entryId) == 2 &&
+                    await replaced.History.CountAsync(history => history.EntryId == entryId) == 2,
+                    "Replacement native IDs preserve entry identity and one meaningful transition history event");
+            }
+
+            for (var repeat = 0; repeat < 20; repeat++)
+                raise("updated", new ItemChangeEventArgs { Item = replacement, Parent = movieLibrary });
+
+            var corrected = new Movie { Id = Guid.NewGuid(), Name = "Provider correction", Path = "/media/corrected.mkv" };
+            movies.Add(corrected);
+            movieLibrary.Items = movies;
+            raise("added", new ItemChangeEventArgs { Item = corrected, Parent = movieLibrary });
+            corrected.ProviderIds["Tmdb"] = "8201";
+            raise("updated", new ItemChangeEventArgs { Item = corrected, Parent = movieLibrary });
+            await WaitForEntryAsync(dbPath, 8201);
+
+            var missed = Movie(8202, movieLibrary.Id);
+            movies.Add(missed);
+            movieLibrary.Items = movies;
+            await provider.GetRequiredService<CatalogPostScanTask>().Run(new InlineProgress(_ => { }), default);
+            await using (var repaired = new ModDbContext(dbPath))
+                Assert(await repaired.Entries.AnyAsync(entry => entry.TmdbId == 8202),
+                    "Successful post-scan repair picks up a title whose event was missed");
+
+            movies.Remove(replacement);
+            var sentinel = Movie(8203, movieLibrary.Id);
+            movies.Add(sentinel);
+            movieLibrary.Items = movies;
+            raise("removed", new ItemChangeEventArgs { Item = replacement, Parent = movieLibrary });
+            raise("added", new ItemChangeEventArgs { Item = sentinel, Parent = movieLibrary });
+            await WaitForEntryAsync(dbPath, 8203);
+            await using var afterRemoval = new ModDbContext(dbPath);
+            var preserved = await afterRemoval.Entries.SingleAsync(entry => entry.Id == entryId);
+            Assert(preserved.State == FileState.OnDisk && preserved.JellyfinItemId == replacement.Id,
+                "A removal notification alone does not clear a binding before successful absence evidence");
+            Assert(await afterRemoval.History.CountAsync(history => history.EntryId == entryId) == 2,
+                "Coalesced repeated update notifications do not duplicate transition history");
+        }
+        finally
+        {
+            await listener.StopAsync(default);
+        }
+    }
+
+    private static async Task<Guid> WaitForEntryAsync(string dbPath, int tmdbId)
+    {
+        Guid result = Guid.Empty;
+        await WaitForAsync(async database =>
+        {
+            result = await database.Entries.Where(entry => entry.TmdbId == tmdbId).Select(entry => entry.Id)
+                .FirstOrDefaultAsync();
+            return result != Guid.Empty;
+        }, dbPath, $"Timed out waiting for TMDB {tmdbId}");
+        return result;
+    }
+
+    private static async Task WaitForAsync(Func<ModDbContext, Task<bool>> condition, string dbPath, string message)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!timeout.IsCancellationRequested)
+        {
+            await using var database = new ModDbContext(dbPath);
+            if (await condition(database)) return;
+            await Task.Delay(20, timeout.Token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        }
+
+        throw new InvalidOperationException(message);
     }
 
     private static Movie Movie(int tmdbId, Guid libraryId)
