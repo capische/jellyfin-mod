@@ -21,19 +21,36 @@ try
 {
     var dbPath = Path.Combine(folder, "upgrade.db");
     var firstId = Guid.NewGuid();
+    var firstNativeId = Guid.NewGuid();
     var libraryId = Guid.NewGuid();
     await using (var database = new ModDbContext(dbPath))
     {
         await database.GetService<IMigrator>().MigrateAsync("20260906021220_InitialCreate");
-        await database.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO Entries (Id, MediaType, TmdbId, Title, State, Monitored, AddedAt, TargetLibraryId) VALUES ({firstId}, 'movie', 123, 'Existing title', 0, 1, {DateTime.UtcNow}, {libraryId})");
-        await database.Database.MigrateAsync();
+        await database.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO Entries (Id, MediaType, TmdbId, Title, State, Monitored, AddedAt, TargetLibraryId, JellyfinItemId) VALUES ({firstId}, 'movie', 123, 'Existing title', 4, 1, {DateTime.UtcNow}, {libraryId}, {firstNativeId})");
+        await database.GetService<IMigrator>().MigrateAsync("20260908011536_PhaseOneEntries");
         Assert((await database.Entries.SingleAsync()).Id == firstId, "Upgrade preserves entries");
         database.Entries.Add(new Entry { MediaType = "movie", TmdbId = 123, TargetLibraryId = Guid.NewGuid(), Title = "Second library" });
-        var show = new Entry { MediaType = "series", TmdbId = 123, TargetLibraryId = libraryId, Title = "Series" };
+        var seriesNativeId = Guid.NewGuid();
+        var show = new Entry
+        {
+            MediaType = "series", TmdbId = 123, TargetLibraryId = libraryId, Title = "Series",
+            JellyfinItemId = seriesNativeId, State = FileState.OnDisk
+        };
         database.Entries.Add(show);
-        database.Episodes.Add(new Episode { EntryId = show.Id, TmdbId = 999, SeasonNumber = 1, EpisodeNumber = 1, Title = "Pilot" });
+        var episodeNativeId = Guid.NewGuid();
+        database.Episodes.Add(new Episode
+        {
+            EntryId = show.Id, TmdbId = 999, SeasonNumber = 1, EpisodeNumber = 1, Title = "Pilot",
+            JellyfinItemId = episodeNativeId, State = FileState.OnDisk
+        });
         await database.SaveChangesAsync();
+        await database.Database.MigrateAsync();
         Assert(await database.Entries.CountAsync() == 3, "Identity includes media type and library");
+        Assert((await database.EntryBindings.SingleAsync(binding => binding.EntryId == firstId)).JellyfinItemId == firstNativeId &&
+            (await database.EpisodeBindings.SingleAsync()).JellyfinItemId == episodeNativeId &&
+            (await database.EpisodeBindings.SingleAsync()).SeriesItemId == seriesNativeId &&
+            (await database.EpisodeBindings.SingleAsync()).TargetLibraryId == libraryId,
+            "Phase 2 migration preserves canonical title and episode bindings");
         database.Entries.Add(new Entry { MediaType = "movie", TmdbId = 123, TargetLibraryId = libraryId });
         await Throws<DbUpdateException>(() => database.SaveChangesAsync());
         database.ChangeTracker.Clear();
@@ -45,7 +62,7 @@ try
     await using (var restarted = new ModDbContext(dbPath))
     {
         await restarted.Database.MigrateAsync();
-        Assert(await restarted.Entries.CountAsync() == 2 && (await restarted.Database.GetAppliedMigrationsAsync()).Count() == 2, "Restart preserves rows and migrations");
+        Assert(await restarted.Entries.CountAsync() == 2 && (await restarted.Database.GetAppliedMigrationsAsync()).Count() == 3, "Restart preserves rows and migrations");
     }
 
     await ApiSmoke.RunAsync(folder);
@@ -71,6 +88,7 @@ internal sealed class BoundaryHttpFactory : IHttpClientFactory
     public HttpStatusCode Status { get; set; } = HttpStatusCode.OK;
     public Uri BaseAddress { get; set; } = null!;
     public Func<Uri, HttpResponseMessage>? Response { get; set; }
+    public Func<Uri, Task>? BeforeResponse { get; set; }
     public string? LastAuthorization { get; set; }
     public string? LastApiKey { get; set; }
     public HttpClient CreateClient(string name) => new(new BoundaryRedirect(BaseAddress));

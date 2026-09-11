@@ -36,8 +36,9 @@ internal static class ApiSmoke
         var otherUser = new User("restricted", "auth", "reset") { Id = Guid.NewGuid() };
         var libraryFolder = new EmptyMovieLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.movies };
         var secondLibrary = new EmptyMovieLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.movies };
+        var raceLibrary = new EmptyMovieLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.movies };
         var tvLibrary = new EmptyMovieLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.tvshows };
-        var root = new TestRoot(user.Id, [libraryFolder, secondLibrary, tvLibrary]);
+        var root = new TestRoot(user.Id, [libraryFolder, secondLibrary, raceLibrary, tvLibrary]);
         var nativeById = new Dictionary<Guid, BaseItem>();
         var library = Stub<ILibraryManager>.Create((method, args) => method.Name switch
         {
@@ -92,6 +93,7 @@ internal static class ApiSmoke
                 return;
             }
             var uri = new Uri("https://api.themoviedb.org" + context.Request.Path + context.Request.QueryString);
+            if (http.BeforeResponse is not null) await http.BeforeResponse(uri);
             using var fixture = http.Response?.Invoke(uri) ?? new HttpResponseMessage(http.Status) { Content = new StringContent(http.Body) };
             context.Response.StatusCode = (int)fixture.StatusCode;
             context.Response.ContentType = "application/json";
@@ -125,9 +127,67 @@ internal static class ApiSmoke
         Assert(!duplicateJson.RootElement.GetProperty("created").GetBoolean(), "Duplicate add is idempotent");
         await using (var database = new ModDbContext(dbPath))
             Assert(await database.Entries.CountAsync() == 1 && await database.History.CountAsync() == 1, "Exactly one entry and added event");
+
+        var raceNative = new MediaBrowser.Controller.Entities.Movies.Movie { Id = Guid.NewGuid(), Name = "Race winner" };
+        raceNative.ProviderIds["Tmdb"] = "124";
+        raceLibrary.Items = [raceNative];
+        nativeById[raceNative.Id] = raceNative;
+        var metadataReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseMetadata = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        http.Body = """{"id":124,"title":"Race winner"}""";
+        http.BeforeResponse = async uri =>
+        {
+            if (!uri.AbsolutePath.EndsWith("/124", StringComparison.Ordinal)) return;
+            metadataReached.TrySetResult();
+            await releaseMetadata.Task;
+        };
+        var raceRequest = new { mediaType = "movie", tmdbId = 124, targetLibraryId = raceLibrary.Id };
+        var addDuringBackfill = client.PostAsJsonAsync("/JellyfinMod/Entries", raceRequest);
+        await metadataReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await using (var reconciliationDatabase = new ModDbContext(dbPath))
+        {
+            var reconciliation = new ReconciliationService(reconciliationDatabase, new ReconciliationLibraryLock());
+            Assert((await reconciliation.ReconcileAsync(new NativeTitleSnapshot("movie", 124, raceLibrary.Id,
+                "Race winner", 2026, null, null, null, null,
+                [new(raceNative.Id, raceLibrary.Id, true)], []), default)).Outcome == ReconciliationOutcome.Created,
+                "Backfill wins the deliberately overlapped create race");
+        }
+
+        releaseMetadata.TrySetResult();
+        using var concurrentAdd = await addDuringBackfill;
+        Assert(concurrentAdd.IsSuccessStatusCode, "Concurrent user add converges after backfill: " +
+            await concurrentAdd.Content.ReadAsStringAsync());
+        http.BeforeResponse = null;
+        http.Body = """{"id":123,"title":"Movie"}""";
+        Guid raceEntryId;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var raceEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 124 &&
+                entry.TargetLibraryId == raceLibrary.Id);
+            raceEntryId = raceEntry.Id;
+            var creationEvents = await database.History.CountAsync(history => history.EntryId == raceEntry.Id &&
+                (history.EventType == "added" || history.EventType == "backfilled"));
+            Assert(raceEntry.Monitored && raceEntry.State == FileState.OnDisk && creationEvents == 1 &&
+                await database.History.CountAsync(history => history.EntryId == raceEntry.Id &&
+                    history.EventType == "monitoring_enabled") == 1,
+                "Concurrent add preserves user monitoring intent with one creation event and one meaningful update");
+            raceEntry.Monitored = false;
+            await database.SaveChangesAsync();
+        }
+
+        using var preExistingAdd = await client.PostAsJsonAsync("/JellyfinMod/Entries", raceRequest);
+        using var preExistingJson = JsonDocument.Parse(await preExistingAdd.Content.ReadAsStringAsync());
+        await using (var database = new ModDbContext(dbPath))
+        {
+            Assert(!preExistingJson.RootElement.GetProperty("created").GetBoolean() &&
+                !(await database.Entries.SingleAsync(entry => entry.Id == raceEntryId)).Monitored &&
+                await database.History.CountAsync(history => history.EntryId == raceEntryId) == 2,
+                "An already-existing duplicate add preserves the administrator's monitoring preference and history");
+        }
+
         Assert((await client.DeleteAsync($"/JellyfinMod/Entries/{entryId}")).StatusCode == HttpStatusCode.Forbidden, "Ordinary deletion denied by middleware");
         Assert((await client.PatchAsJsonAsync($"/JellyfinMod/Entries/{entryId}", new { monitored = false })).StatusCode == HttpStatusCode.Forbidden, "Ordinary settings denied by middleware");
-        using var filtered = await client.GetAsync("/JellyfinMod/Entries?state=onDisk&state=reclaimed");
+        using var filtered = await client.GetAsync($"/JellyfinMod/Entries?targetLibraryId={libraryFolder.Id}&state=onDisk&state=reclaimed");
         using var filterJson = JsonDocument.Parse(await filtered.Content.ReadAsStringAsync());
         Assert(filterJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 0, "Repeated state keys bind and filter");
         client.DefaultRequestHeaders.Remove("X-Smoke-User");
