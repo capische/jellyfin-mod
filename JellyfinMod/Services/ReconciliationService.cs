@@ -16,6 +16,9 @@ public sealed class ReconciliationService(ModDbContext database, ReconciliationL
         return await ReconcileAsync(snapshot, true, cancellationToken).ConfigureAwait(false);
     }
 
+    internal Task<ReconciliationResult> ReconcileUnderLeaseAsync(NativeTitleSnapshot snapshot,
+        CancellationToken cancellationToken) => ReconcileAsync(snapshot, true, cancellationToken);
+
     private async Task<ReconciliationResult> ReconcileAsync(
         NativeTitleSnapshot snapshot,
         bool retryUniqueConflict,

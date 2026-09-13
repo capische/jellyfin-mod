@@ -1,4 +1,5 @@
 using System.Reflection;
+using JellyfinMod;
 using JellyfinMod.Data;
 using JellyfinMod.Services;
 using MediaBrowser.Controller.Entities;
@@ -18,8 +19,8 @@ internal static class BackfillIntegration
         var dbPath = Path.Combine(folder, "backfill.db");
         var movieLibraryId = Guid.NewGuid();
         var tvLibraryId = Guid.NewGuid();
-        var movieLibrary = new TestLibrary { Id = movieLibraryId };
-        var tvLibrary = new TestLibrary { Id = tvLibraryId };
+        var movieLibrary = new CollectionFolder { Id = movieLibraryId, CollectionType = Jellyfin.Data.Enums.CollectionType.movies };
+        var tvLibrary = new CollectionFolder { Id = tvLibraryId, CollectionType = Jellyfin.Data.Enums.CollectionType.tvshows };
         var movies = Enumerable.Range(1, 51).Select(number => Movie(number, movieLibraryId)).Cast<BaseItem>().ToList();
         movies.Add(new Movie { Id = Guid.NewGuid(), Name = "Unmatched", Path = "/media/unmatched.mkv" });
         var primary = Movie(8000, movieLibraryId);
@@ -32,27 +33,24 @@ internal static class BackfillIntegration
         conflictingAlternate.PrimaryVersionId = conflictingPrimary.Id.ToString("N");
         movies.Add(conflictingPrimary);
         movies.Add(conflictingAlternate);
-        movieLibrary.Items = movies;
 
-        var goodSeries = new TestSeries
-        {
-            Id = Guid.NewGuid(),
-            Name = "Backfilled series",
-            Path = "/media/series",
-            Episodes =
-            [
-                Episode(9001, 1, 1, "/media/series/s01e01.mkv"),
-                Episode(9002, 0, 1, "/media/series/s00e01.mkv")
-            ]
-        };
+        var goodSeries = new Series { Id = Guid.NewGuid(), Name = "Backfilled series", Path = "/media/series" };
         goodSeries.ProviderIds["Tmdb"] = "7000";
-        var badSeries = new TestSeries
-        {
-            Id = Guid.NewGuid(), Name = "Bad episode metadata", Path = "/media/bad",
-            Episodes = [new MediaBrowser.Controller.Entities.TV.Episode { Id = Guid.NewGuid(), Name = "Unknown" }]
-        };
+        var badSeries = new Series { Id = Guid.NewGuid(), Name = "Bad episode metadata", Path = "/media/bad" };
         badSeries.ProviderIds["Tmdb"] = "7001";
-        tvLibrary.Items = [goodSeries, badSeries];
+        var groupedCopy = new Series { Id = Guid.NewGuid(), Name = "Backfilled series copy", Path = "/media/series-copy" };
+        groupedCopy.ProviderIds["Tmdb"] = "7000";
+        goodSeries.PresentationUniqueKey = groupedCopy.PresentationUniqueKey = "grouped-series";
+        var unidentifiedSeries = new Series { Id = Guid.NewGuid(), Name = "Unidentified series", Path = "/media/unidentified" };
+        BaseItem[] tvItems = [goodSeries, groupedCopy, badSeries, unidentifiedSeries];
+        var goodPilot = Episode(9001, 1, 1, "/media/series/s01e01.mkv");
+        var goodSpecial = Episode(9002, 0, 1, "/media/series/s00e01.mkv");
+        goodPilot.SeriesId = goodSpecial.SeriesId = goodSeries.Id;
+        var alternatePilot = Episode(9001, 1, 1, "/media/series-copy/s01e01.mkv");
+        alternatePilot.SeriesId = groupedCopy.Id;
+        BaseItem[] nativeEpisodes = [goodPilot, goodSpecial, alternatePilot,
+            new MediaBrowser.Controller.Entities.TV.Episode { Id = Guid.NewGuid(), SeriesId = badSeries.Id, Name = "Unknown" },
+            new MediaBrowser.Controller.Entities.TV.Episode { Id = Guid.NewGuid(), SeriesId = unidentifiedSeries.Id, Name = "No numbering" }];
 
         var virtualFolders = new List<VirtualFolderInfo>
         {
@@ -68,13 +66,45 @@ internal static class BackfillIntegration
         EventHandler<ItemChangeEventArgs>? itemAdded = null;
         EventHandler<ItemChangeEventArgs>? itemUpdated = null;
         EventHandler<ItemChangeEventArgs>? itemRemoved = null;
+        IEnumerable<BaseItem> AllItems() => movies.Concat(tvItems).Concat(nativeEpisodes);
+        int? failedProvider = null;
+        var pagedReads = new List<(Guid ParentId, int StartIndex, int? Limit)>();
+        IReadOnlyList<BaseItem> Query(InternalItemsQuery query)
+        {
+            if (query.HasAnyProviderId?.GetValueOrDefault("Tmdb") == failedProvider?.ToString() && failedProvider.HasValue)
+                throw new InvalidOperationException("Isolated native metadata failure");
+            if (query.Limit.HasValue) pagedReads.Add((query.ParentId, query.StartIndex ?? 0, query.Limit));
+            IEnumerable<BaseItem> items = query.ParentId == movieLibraryId ? movies :
+                query.ParentId == tvLibraryId ? tvItems : AllItems();
+            if (query.AncestorIds.Length > 0)
+                items = items.OfType<MediaBrowser.Controller.Entities.TV.Episode>()
+                    .Where(episode => query.AncestorIds.Contains(episode.SeriesId));
+            if (query.ItemIds.Length > 0) items = items.Where(item => query.ItemIds.Contains(item.Id));
+            if (query.HasAnyProviderId is { } providers)
+                items = items.Where(item => providers.Any(provider => item.ProviderIds.GetValueOrDefault(provider.Key) == provider.Value));
+            if (query.PresentationUniqueKey is { } group)
+                items = items.OfType<Movie>().Where(movie => (movie.PrimaryVersionId ?? movie.Id.ToString("N")) == group);
+            if (query.IncludeItemTypes.Length > 0)
+                items = items.Where(item => query.IncludeItemTypes.Contains(item.GetBaseItemKind()));
+            return items.OrderBy(item => item.Name, StringComparer.Ordinal).ThenBy(item => item.Id)
+                .Skip(query.StartIndex ?? 0).Take(query.Limit ?? int.MaxValue).ToArray();
+        }
+
+        var virtualFolderReads = 0;
         object? LibraryCall(MethodInfo method, object?[]? arguments)
         {
             switch (method.Name)
             {
-                case "GetVirtualFolders": return virtualFolders;
+                case "GetVirtualFolders": virtualFolderReads++; return virtualFolders;
+                case "GetItemList": return Query((InternalItemsQuery)arguments![0]!);
+                case "GetCount": return Query((InternalItemsQuery)arguments![0]!).Count;
+                case "GetCollectionFolders": return new List<Folder>
+                {
+                    movies.Any(item => item.Id == ((BaseItem)arguments![0]!).Id) ? movieLibrary : tvLibrary
+                };
                 case "GetItemById" when (Guid)arguments![0]! == movieLibraryId: return movieLibrary;
                 case "GetItemById" when (Guid)arguments![0]! == tvLibraryId: return tvLibrary;
+                case "GetItemById": return AllItems().FirstOrDefault(item => item.Id == (Guid)arguments![0]!);
                 case "add_ItemAdded": itemAdded += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
                 case "remove_ItemAdded": itemAdded -= (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
                 case "add_ItemUpdated": itemUpdated += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
@@ -89,20 +119,25 @@ internal static class BackfillIntegration
 
         await using var database = new ModDbContext(dbPath);
         await database.Database.MigrateAsync();
-        var libraryLock = new ReconciliationLibraryLock();
-        var gate = new ReconciliationRunGate();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton(library);
+        new PluginServiceRegistrator().RegisterServices(services, null!);
+        services.AddTransient(_ => new ModDbContext(dbPath));
+        await using var provider = services.BuildServiceProvider();
+        var gate = provider.GetRequiredService<ReconciliationRunGate>();
         CatalogBackfillRunner Runner(ModDbContext context) => new(context,
-            new ReconciliationService(context, libraryLock), new JellyfinNativeTitleSource(library), gate,
+            provider.GetRequiredService<IServiceScopeFactory>(), new JellyfinNativeTitleSource(library), gate,
             NullLogger<CatalogBackfillRunner>.Instance);
 
         var first = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
-        Assert(first.Status == "completed" && first.TotalItems == 56 && first.ScannedItems == 56 &&
-            first.CreatedEntries == 53 && first.UnmatchedItems == 1 && first.FailedItems == 1 &&
+        Assert(first.Status == "completed" && first.TotalItems == 57 && first.ScannedItems == 57 &&
+            first.CreatedEntries == 53 && first.UnmatchedItems == 2 && first.FailedItems == 1 &&
             first.ConflictedItems == 1 && first.UpdatedBindings == 0 && first.UnchangedItems == 0,
             "Backfill reports exact bounded outcome counts while one bad title does not stop later work");
         var seriesEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 7000);
         Assert(await database.Episodes.CountAsync(episode => episode.EntryId == seriesEntry.Id) == 2 &&
-            await database.EpisodeBindings.CountAsync(binding => binding.TargetLibraryId == tvLibraryId) == 2,
+            await database.EpisodeBindings.CountAsync(binding => binding.TargetLibraryId == tvLibraryId) == 3,
             "Fresh series backfill creates individual episodes through the production native snapshot source");
         Assert(await database.EntryBindings.CountAsync(binding => binding.EntryId ==
             database.Entries.Single(entry => entry.TmdbId == 8000).Id) == 2,
@@ -111,26 +146,39 @@ internal static class BackfillIntegration
         database.ChangeTracker.Clear();
         var rerun = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
         Assert(rerun.CreatedEntries == 0 && rerun.UpdatedBindings == 0 && rerun.UnchangedItems == 53 &&
-            rerun.UnmatchedItems == 1 && rerun.FailedItems == 1 && rerun.ConflictedItems == 1 &&
+            rerun.UnmatchedItems == 2 && rerun.FailedItems == 1 && rerun.ConflictedItems == 1 &&
             await database.History.CountAsync() == 53,
             "A complete rerun is idempotent and creates no duplicate entries or transition history");
+
+        failedProvider = 5;
+        var failedItemRun = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
+        Assert(failedItemRun.ScannedItems == 57 && failedItemRun.TotalItems == 57 &&
+            failedItemRun.UnchangedItems == 52 && failedItemRun.FailedItems == 2 &&
+            failedItemRun.UnmatchedItems == 2 && failedItemRun.ConflictedItems == 1,
+            "Production transient registrations retain every preceding outcome after a mid-run item failure");
+        failedProvider = null;
+        Assert(pagedReads.All(read => read.Limit <= 50) && pagedReads.Any(read => read.StartIndex == 50),
+            "Full runs page native queries instead of loading the complete library");
 
         await using (var held = await gate.TryAcquireAsync(default))
             await AssertThrowsAsync<InvalidOperationException>(() => Runner(database).RunAsync(new InlineProgress(_ => { }), default),
                 "Overlapping full runs must be rejected");
 
         database.ChangeTracker.Clear();
+        pagedReads.Clear();
         using var cancellation = new CancellationTokenSource();
         await AssertThrowsAsync<OperationCanceledException>(() => Runner(database).RunAsync(
             new InlineProgress(value => { if (value > 0) cancellation.Cancel(); }), cancellation.Token),
             "Cancellation must stop between items");
         database.ChangeTracker.Clear();
         var cancelled = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt).FirstAsync();
-        Assert(cancelled.Status == "cancelled" && cancelled.CompletedAt.HasValue && cancelled.ScannedItems < cancelled.TotalItems,
+        Assert(!pagedReads.Any(read => read.StartIndex == 50), "Cancellation is observed before the next native page is loaded");
+        Assert(cancelled.Status == "cancelled" && cancelled.CompletedAt.HasValue && cancelled.ScannedItems == 1 &&
+            cancelled.UnchangedItems == 1 && cancelled.ScannedItems < cancelled.TotalItems,
             "Cancellation persists an interrupted summary that is safe to resume by rerunning");
 
         await using var restarted = new ModDbContext(dbPath);
-        Assert(await restarted.ReconciliationRuns.CountAsync() == 3 &&
+        Assert(await restarted.ReconciliationRuns.CountAsync() == 4 &&
             (await restarted.ReconciliationRuns.OrderBy(run => run.StartedAt).LastAsync()).Status == "cancelled",
             "Backfill summaries persist across a real SQLite restart");
 
@@ -146,15 +194,16 @@ internal static class BackfillIntegration
             handler!(null, eventArgs);
         }
 
-        await RunEventIntegrationAsync(folder, library, movieLibrary, movies, Raise);
+        await RunEventIntegrationAsync(folder, library, movieLibrary, movies, Raise, () => virtualFolderReads);
     }
 
     private static async Task RunEventIntegrationAsync(
         string folder,
         ILibraryManager library,
-        TestLibrary movieLibrary,
+        CollectionFolder movieLibrary,
         List<BaseItem> movies,
-        Action<string, ItemChangeEventArgs> raise)
+        Action<string, ItemChangeEventArgs> raise,
+        Func<int> getEnumerationCount)
     {
         var dbPath = Path.Combine(folder, "events.db");
         var services = new ServiceCollection();
@@ -175,16 +224,15 @@ internal static class BackfillIntegration
         await listener.StartAsync(default);
         try
         {
+            var initialEnumerations = getEnumerationCount();
             var added = Movie(8200, movieLibrary.Id);
             movies.Add(added);
-            movieLibrary.Items = movies;
             raise("added", new ItemChangeEventArgs { Item = added, Parent = movieLibrary });
             var entryId = await WaitForEntryAsync(dbPath, 8200);
 
             var replacement = Movie(8200, movieLibrary.Id);
             movies.Remove(added);
             movies.Add(replacement);
-            movieLibrary.Items = movies;
             raise("removed", new ItemChangeEventArgs { Item = added, Parent = movieLibrary });
             raise("added", new ItemChangeEventArgs { Item = replacement, Parent = movieLibrary });
             await WaitForAsync(async database => (await database.Entries.SingleAsync(entry => entry.Id == entryId)).JellyfinItemId == replacement.Id,
@@ -196,12 +244,30 @@ internal static class BackfillIntegration
                     "Replacement native IDs preserve entry identity and one meaningful transition history event");
             }
 
+            Assert(getEnumerationCount() == initialEnumerations,
+                "Item events query their own library/title without enumerating every server library");
+            // Enumerate the work identity before a newer event commits its replacement.
+            var staleWork = provider.GetRequiredService<JellyfinNativeTitleSource>().GetWorkItems(default)
+                .Single(work => work.TmdbId == 8200);
+            var newest = Movie(8200, movieLibrary.Id);
+            movies.Remove(replacement);
+            movies.Add(newest);
+            raise("added", new ItemChangeEventArgs { Item = newest, Parent = movieLibrary });
+            await WaitForAsync(async database => (await database.Entries.SingleAsync(entry => entry.Id == entryId)).JellyfinItemId == newest.Id,
+                dbPath, "Newer event did not converge before queued repair work");
+            using (var scope = provider.CreateScope())
+                await scope.ServiceProvider.GetRequiredService<JellyfinItemReconciliationRunner>().ReconcileAsync(staleWork, default);
+            await using (var afterQueuedWork = new ModDbContext(dbPath))
+                Assert((await afterQueuedWork.Entries.SingleAsync(entry => entry.Id == entryId)).JellyfinItemId == newest.Id &&
+                    await afterQueuedWork.History.CountAsync(history => history.EntryId == entryId) == 3,
+                    "Queued repair work re-reads native state and cannot overwrite a newer event with the old item ID");
+            replacement = newest;
+
             for (var repeat = 0; repeat < 20; repeat++)
                 raise("updated", new ItemChangeEventArgs { Item = replacement, Parent = movieLibrary });
 
             var corrected = new Movie { Id = Guid.NewGuid(), Name = "Provider correction", Path = "/media/corrected.mkv" };
             movies.Add(corrected);
-            movieLibrary.Items = movies;
             raise("added", new ItemChangeEventArgs { Item = corrected, Parent = movieLibrary });
             corrected.ProviderIds["Tmdb"] = "8201";
             raise("updated", new ItemChangeEventArgs { Item = corrected, Parent = movieLibrary });
@@ -209,7 +275,6 @@ internal static class BackfillIntegration
 
             var missed = Movie(8202, movieLibrary.Id);
             movies.Add(missed);
-            movieLibrary.Items = movies;
             await provider.GetRequiredService<CatalogPostScanTask>().Run(new InlineProgress(_ => { }), default);
             await using (var repaired = new ModDbContext(dbPath))
                 Assert(await repaired.Entries.AnyAsync(entry => entry.TmdbId == 8202),
@@ -218,7 +283,6 @@ internal static class BackfillIntegration
             movies.Remove(replacement);
             var sentinel = Movie(8203, movieLibrary.Id);
             movies.Add(sentinel);
-            movieLibrary.Items = movies;
             raise("removed", new ItemChangeEventArgs { Item = replacement, Parent = movieLibrary });
             raise("added", new ItemChangeEventArgs { Item = sentinel, Parent = movieLibrary });
             await WaitForEntryAsync(dbPath, 8203);
@@ -226,7 +290,7 @@ internal static class BackfillIntegration
             var preserved = await afterRemoval.Entries.SingleAsync(entry => entry.Id == entryId);
             Assert(preserved.State == FileState.OnDisk && preserved.JellyfinItemId == replacement.Id,
                 "A removal notification alone does not clear a binding before successful absence evidence");
-            Assert(await afterRemoval.History.CountAsync(history => history.EntryId == entryId) == 2,
+            Assert(await afterRemoval.History.CountAsync(history => history.EntryId == entryId) == 3,
                 "Coalesced repeated update notifications do not duplicate transition history");
         }
         finally
@@ -309,20 +373,6 @@ internal static class BackfillIntegration
     private sealed class InlineProgress(Action<double> report) : IProgress<double>
     {
         public void Report(double value) => report(value);
-    }
-
-    private sealed class TestLibrary : CollectionFolder
-    {
-        public IReadOnlyList<BaseItem> Items { get; set; } = [];
-        protected override QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query) =>
-            new() { Items = Items, TotalRecordCount = Items.Count };
-    }
-
-    private sealed class TestSeries : Series
-    {
-        public IReadOnlyList<BaseItem> Episodes { get; init; } = [];
-        protected override QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query) =>
-            new() { Items = Episodes, TotalRecordCount = Episodes.Count };
     }
 
     private class Stub<T> : DispatchProxy where T : class
