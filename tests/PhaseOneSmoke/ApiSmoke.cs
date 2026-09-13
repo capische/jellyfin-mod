@@ -344,6 +344,27 @@ internal static class ApiSmoke
             !refreshedPilot.GetProperty("monitored").GetBoolean() && refreshedPilot.GetProperty("state").GetString() == "onDisk" &&
             refreshedEpisodes.Length == 4 && refreshedJson.RootElement.GetProperty("history").GetArrayLength() == 1,
             "Complete HTTP metadata refresh preserves local IDs, monitoring, native binding and history while adding episodes");
+        var completeSnapshot = http.Response;
+        http.Response = uri => uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
+            ? Json("""{"season_number":1,"episodes":[{"id":9001,"season_number":1,"episode_number":2,"name":"Pilot renumbered"},{"id":9002,"season_number":1,"episode_number":1,"name":"Second episode renumbered"},{"id":9003,"season_number":1,"episode_number":3,"name":"New episode"}]}""")
+            : completeSnapshot(uri);
+        using var renumbered = await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null);
+        Assert(renumbered.IsSuccessStatusCode, "HTTP refresh accepts an episode-number swap without a unique-index conflict");
+        using var renumberedJson = JsonDocument.Parse(await renumbered.Content.ReadAsStringAsync());
+        var renumberedEpisodes = renumberedJson.RootElement.GetProperty("episodes").EnumerateArray().ToArray();
+        Assert(renumberedEpisodes.Length == refreshedEpisodes.Length && renumberedEpisodes.All(episode =>
+                episode.GetProperty("id").GetString() == refreshedEpisodes.Single(previous => previous.GetProperty("tmdbId").GetInt32() == episode.GetProperty("tmdbId").GetInt32()).GetProperty("id").GetString()) &&
+            renumberedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9001).GetProperty("episodeNumber").GetInt32() == 2 &&
+            renumberedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9002).GetProperty("episodeNumber").GetInt32() == 1 &&
+            !renumberedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9001).GetProperty("monitored").GetBoolean() &&
+            renumberedJson.RootElement.GetProperty("history").GetRawText() == refreshedJson.RootElement.GetProperty("history").GetRawText(),
+            "Renumbering preserves every durable episode ID, monitoring choice and history in the HTTP response");
+        await using (var database = new ModDbContext(dbPath))
+            Assert((await database.Episodes.SingleAsync(episode => episode.Id == Guid.Parse(episodeId))).EpisodeNumber == 2 &&
+                !await database.Episodes.AnyAsync(episode => episode.SeasonNumber < 0), "Only final episode positions persist in SQLite after refresh");
+        http.Response = completeSnapshot;
+        Assert((await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null)).IsSuccessStatusCode,
+            "The reverse episode-number swap also succeeds through HTTP");
         http.Response = uri => uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
             ? Json("{\"season_number\":1,\"episodes\":[{\"id\":9001,\"season_number\":1,\"episode_number\":1,\"name\":\"Partial\"}]}")
             : uri.AbsolutePath.Contains("/season/0", StringComparison.Ordinal)

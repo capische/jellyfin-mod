@@ -118,8 +118,21 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
             // Both remote snapshots are fully validated before any tracked entity is changed.
             var metadata = await tmdb.GetDetailsAsync(entry.MediaType, entry.TmdbId, timeout.Token);
             var snapshot = await tmdb.GetEpisodesAsync(metadata, timeout.Token);
+            await using var transaction = await database.Database.BeginTransactionAsync(timeout.Token);
             var existing = await database.Episodes.Where(episode => episode.EntryId == entry.Id).ToListAsync(timeout.Token);
             var byTmdbId = existing.ToDictionary(episode => episode.TmdbId);
+            if (snapshot.Any(remote => byTmdbId.TryGetValue(remote.TmdbId, out var local) &&
+                (local.SeasonNumber != remote.SeasonNumber || local.EpisodeNumber != remote.EpisodeNumber)))
+            {
+                // Free the unique display positions before applying swaps. Negative seasons
+                // cannot come from TMDB, and the transaction hides these temporary positions.
+                for (var index = 0; index < existing.Count; index++)
+                {
+                    existing[index].SeasonNumber = -1;
+                    existing[index].EpisodeNumber = index + 1;
+                }
+                await database.SaveChangesAsync(timeout.Token);
+            }
             foreach (var remote in snapshot)
             {
                 if (byTmdbId.Remove(remote.TmdbId, out var local))
@@ -154,6 +167,7 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
             access.BindEpisodes(user, owned, existing.Where(episode => !byTmdbId.ContainsKey(episode.TmdbId))
                 .Concat(snapshot.Where(remote => !existing.Any(local => local.TmdbId == remote.TmdbId))).ToArray());
             await database.SaveChangesAsync(timeout.Token);
+            await transaction.CommitAsync(timeout.Token);
             return await BuildDetail(entry, cancellationToken);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
