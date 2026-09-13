@@ -313,6 +313,28 @@ internal static class ApiSmoke
         using var seriesAdd = await client.PostAsJsonAsync("/JellyfinMod/Entries", new { mediaType = "series", tmdbId = 123, targetLibraryId = tvLibrary.Id });
         using var seriesJson = JsonDocument.Parse(await seriesAdd.Content.ReadAsStringAsync());
         var seriesId = seriesJson.RootElement.GetProperty("entry").GetProperty("id").GetString()!;
+        var nativeLookup = $"/JellyfinMod/Entries?jellyfinItemId={nativeSeries.Id}&limit=1";
+        using var nativeEntries = await client.GetAsync(nativeLookup);
+        using var nativeEntriesJson = JsonDocument.Parse(await nativeEntries.Content.ReadAsStringAsync());
+        Assert(nativeEntries.IsSuccessStatusCode && nativeEntriesJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 1 &&
+            nativeEntriesJson.RootElement.GetProperty("items")[0].GetProperty("id").GetString() == seriesId,
+            "Native item lookup returns only the accessible canonical bound entry before paging");
+        foreach (var missingLookup in new[] { $"/JellyfinMod/Entries?jellyfinItemId={Guid.NewGuid()}", nativeLookup + "&mediaType=movie" })
+        {
+            using var missingEntries = await client.GetAsync(missingLookup);
+            using var missingEntriesJson = JsonDocument.Parse(await missingEntries.Content.ReadAsStringAsync());
+            Assert(missingEntries.IsSuccessStatusCode && missingEntriesJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 0 &&
+                missingEntriesJson.RootElement.GetProperty("items").GetArrayLength() == 0, "Native lookup composes with existing filters and never falls back to unrelated entries");
+        }
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        Assert((await client.GetAsync(nativeLookup)).StatusCode == HttpStatusCode.Unauthorized, "Native entry lookup requires authentication");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", otherUser.Id.ToString());
+        using var inaccessibleEntries = await client.GetAsync(nativeLookup);
+        using var inaccessibleEntriesJson = JsonDocument.Parse(await inaccessibleEntries.Content.ReadAsStringAsync());
+        Assert(inaccessibleEntries.IsSuccessStatusCode && inaccessibleEntriesJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 0 &&
+            inaccessibleEntriesJson.RootElement.GetProperty("items").GetArrayLength() == 0, "Native entry lookup does not expose another user's inaccessible library");
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
         using var detail = await client.GetAsync($"/JellyfinMod/Entries/{seriesId}");
         using var detailJson = JsonDocument.Parse(await detail.Content.ReadAsStringAsync());
         var episodeRows = detailJson.RootElement.GetProperty("episodes").EnumerateArray().ToArray();
