@@ -67,6 +67,7 @@ internal static class ApiSmoke
         builder.Services.AddAuthorization(options => options.AddPolicy(Policies.RequiresElevation, policy => policy.RequireRole("admin")));
         builder.Services.AddTransient(_ => new ModDbContext(dbPath));
         builder.Services.AddSingleton<DatabaseInitializer>();
+        builder.Services.AddSingleton<ReconciliationLibraryLock>();
         builder.Services.AddTransient(_ => new LibraryAccess(users, library, localization));
         var configuration = Stub<IServerConfigurationManager>.Create((method, args) => method.Name == "get_Configuration"
             ? new ServerConfiguration { SortRemoveWords = ["the", "a"], SortRemoveCharacters = [], SortReplaceCharacters = [] } : null);
@@ -184,6 +185,64 @@ internal static class ApiSmoke
                 await database.History.CountAsync(history => history.EntryId == raceEntryId) == 2,
                 "An already-existing duplicate add preserves the administrator's monitoring preference and history");
         }
+
+        var seriesRaceNativeEpisode = new MediaBrowser.Controller.Entities.TV.Episode
+        {
+            Id = Guid.NewGuid(), Name = "Race pilot", ParentIndexNumber = 1, IndexNumber = 1
+        };
+        seriesRaceNativeEpisode.ProviderIds["Tmdb"] = "9101";
+        var seriesRaceNative = new TestSeries { Id = Guid.NewGuid(), Name = "Series race", Episodes = [seriesRaceNativeEpisode] };
+        seriesRaceNative.ProviderIds["Tmdb"] = "125";
+        tvLibrary.Items = [seriesRaceNative];
+        nativeById[seriesRaceNative.Id] = seriesRaceNative;
+        var seriesMetadataReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSeriesMetadata = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        http.Response = uri => uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
+            ? Json("""{"season_number":1,"episodes":[{"id":9101,"season_number":1,"episode_number":1,"name":"Pilot"},{"id":9102,"season_number":1,"episode_number":2,"name":"Missing"}]}""")
+            : Json("""{"id":125,"name":"Series race","seasons":[{"season_number":1,"episode_count":2}]}""");
+        http.BeforeResponse = async uri =>
+        {
+            if (!uri.AbsolutePath.EndsWith("/125", StringComparison.Ordinal)) return;
+            seriesMetadataReached.TrySetResult();
+            await releaseSeriesMetadata.Task;
+        };
+        var seriesAddDuringBackfill = client.PostAsJsonAsync("/JellyfinMod/Entries",
+            new { mediaType = "series", tmdbId = 125, targetLibraryId = tvLibrary.Id });
+        await seriesMetadataReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Guid backfilledEpisodeId;
+        Guid seriesRaceEntryId;
+        await using (var reconciliationDatabase = new ModDbContext(dbPath))
+        {
+            var result = await new ReconciliationService(reconciliationDatabase,
+                app.Services.GetRequiredService<ReconciliationLibraryLock>()).ReconcileAsync(new NativeTitleSnapshot(
+                "series", 125, tvLibrary.Id, "Series race", 2026, null, null, null, null,
+                [new(seriesRaceNative.Id, tvLibrary.Id, true)],
+                [new(seriesRaceNativeEpisode.Id, seriesRaceNative.Id, 9101, 1, 1, true)]), default);
+            seriesRaceEntryId = result.EntryId!.Value;
+            backfilledEpisodeId = await reconciliationDatabase.Episodes.Where(episode => episode.EntryId == seriesRaceEntryId)
+                .Select(episode => episode.Id).SingleAsync();
+        }
+
+        releaseSeriesMetadata.TrySetResult();
+        using var seriesConcurrentAdd = await seriesAddDuringBackfill;
+        Assert(seriesConcurrentAdd.IsSuccessStatusCode, "Concurrent series add succeeds: " + await seriesConcurrentAdd.Content.ReadAsStringAsync());
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var episodesAfterRace = await database.Episodes.Where(episode => episode.EntryId == seriesRaceEntryId).ToListAsync();
+            Assert(episodesAfterRace.Count == 2 && episodesAfterRace.All(episode => episode.Monitored) &&
+                episodesAfterRace.Single(episode => episode.TmdbId == 9101).Id == backfilledEpisodeId &&
+                episodesAfterRace.Single(episode => episode.TmdbId == 9101).JellyfinItemId == seriesRaceNativeEpisode.Id &&
+                episodesAfterRace.Single(episode => episode.TmdbId == 9102).State == FileState.None &&
+                await database.History.CountAsync(history => history.EntryId == seriesRaceEntryId) == 2,
+                "Concurrent series add retains its complete monitored episode set and the backfilled native/local identity");
+            database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == seriesRaceEntryId));
+            database.History.RemoveRange(database.History.Where(history => history.EntryId == seriesRaceEntryId));
+            await database.SaveChangesAsync();
+        }
+
+        tvLibrary.Items = [];
+        http.BeforeResponse = null;
+        http.Response = null;
 
         await using (var database = new ModDbContext(dbPath))
         {

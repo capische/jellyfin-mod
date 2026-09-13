@@ -12,7 +12,7 @@ namespace JellyfinMod.Api;
 
 /// <summary>Authorized durable entries; no Phase 1 operation deletes media.</summary>
 [ApiController, Authorize, Route("JellyfinMod/Entries")]
-public sealed class EntriesController(ModDbContext database, DatabaseInitializer readiness, LibraryAccess access, TmdbClient tmdb) : ControllerBase
+public sealed class EntriesController(ModDbContext database, DatabaseInitializer readiness, LibraryAccess access, TmdbClient tmdb, ReconciliationLibraryLock libraryLock) : ControllerBase
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
@@ -56,9 +56,13 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
         try
         {
             var metadata = await tmdb.GetDetailsAsync(request.MediaType, request.TmdbId, timeout.Token);
+            var episodes = await tmdb.GetEpisodesAsync(metadata, timeout.Token);
+            await using var lease = await libraryLock.AcquireAsync(request.TargetLibraryId, timeout.Token);
             var owned = access.FindOwned(user, metadata, request.TargetLibraryId);
             if (owned is null && !access.CanReadMetadata(user, metadata)) return NotFound();
-            var episodes = await tmdb.GetEpisodesAsync(metadata, timeout.Token);
+            existing = await FindExisting(request, timeout.Token);
+            if (existing is not null)
+                return await CompleteConcurrentAdd(existing, episodes, user, timeout.Token);
             var entry = new Entry
             {
                 MediaType = request.MediaType, TmdbId = request.TmdbId, TargetLibraryId = request.TargetLibraryId,
@@ -81,19 +85,7 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
                 database.ChangeTracker.Clear();
                 existing = await FindExisting(request, cancellationToken);
                 if (existing is null) throw;
-                if (!existing.Monitored)
-                {
-                    existing.Monitored = true;
-                    database.History.Add(new HistoryRecord
-                    {
-                        EntryId = existing.Id,
-                        EventType = "monitoring_enabled",
-                        Summary = "Enabled monitoring when added by user"
-                    });
-                    await database.SaveChangesAsync(cancellationToken);
-                }
-
-                return access.CanRead(user, existing) ? new CreateEntryResult(new EntryDto(existing), false) : NotFound();
+                return await CompleteConcurrentAdd(existing, episodes, user, cancellationToken);
             }
 
             return new CreateEntryResult(new EntryDto(entry), true);
@@ -232,6 +224,43 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
         database.History.RemoveRange(database.History.Where(h => h.EntryId == id));
         await database.SaveChangesAsync(cancellationToken);
         return NoContent();
+    }
+
+    private async Task<ActionResult<CreateEntryResult>> CompleteConcurrentAdd(Entry existing,
+        IReadOnlyList<Episode> snapshot, Jellyfin.Database.Implementations.Entities.User user,
+        CancellationToken cancellationToken)
+    {
+        if (!access.CanRead(user, existing)) return NotFound();
+        var episodes = await database.Episodes.Where(episode => episode.EntryId == existing.Id)
+            .ToDictionaryAsync(episode => episode.TmdbId, cancellationToken);
+        // Only the request which observed no entry initially completes its requested episode set.
+        // A later duplicate request still returns early without changing administrator settings.
+        foreach (var remote in snapshot)
+        {
+            if (episodes.TryGetValue(remote.TmdbId, out var local))
+            {
+                local.Monitored = true;
+            }
+            else
+            {
+                remote.EntryId = existing.Id;
+                database.Episodes.Add(remote);
+            }
+        }
+
+        if (!existing.Monitored)
+        {
+            existing.Monitored = true;
+            database.History.Add(new HistoryRecord
+            {
+                EntryId = existing.Id,
+                EventType = "monitoring_enabled",
+                Summary = "Enabled monitoring when added by user"
+            });
+        }
+
+        await database.SaveChangesAsync(cancellationToken);
+        return new CreateEntryResult(new EntryDto(existing), false);
     }
 
     private Task<Entry?> FindExisting(CreateEntryRequest request, CancellationToken cancellationToken) => database.Entries.SingleOrDefaultAsync(entry =>
