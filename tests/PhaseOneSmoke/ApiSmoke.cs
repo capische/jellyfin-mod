@@ -38,7 +38,8 @@ internal static class ApiSmoke
         var secondLibrary = new EmptyMovieLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.movies };
         var raceLibrary = new EmptyMovieLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.movies };
         var tvLibrary = new EmptyMovieLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.tvshows };
-        var root = new TestRoot(user.Id, [libraryFolder, secondLibrary, raceLibrary, tvLibrary]);
+        var secondTvLibrary = new EmptyMovieLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.tvshows };
+        var root = new TestRoot(user.Id, [libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary]);
         var nativeById = new Dictionary<Guid, BaseItem>();
         var library = Stub<ILibraryManager>.Create((method, args) => method.Name switch
         {
@@ -305,6 +306,33 @@ internal static class ApiSmoke
         tvLibrary.Items = [nativeSeries];
         nativeById[nativeSeries.Id] = nativeSeries;
         nativeById[nativeEpisode.Id] = nativeEpisode;
+        http.Response = uri => uri.AbsolutePath.Contains("/search/", StringComparison.Ordinal)
+            ? Json("""{"results":[{"id":123,"name":"Owned show"},{"id":124,"name":"Eligible show"}],"total_pages":1}""")
+            : uri.AbsolutePath.EndsWith("/123", StringComparison.Ordinal)
+                ? Json("""{"id":123,"name":"Owned show","external_ids":{"tvdb_id":777},"seasons":[]}""")
+                : Json("""{"id":124,"name":"Eligible show","external_ids":{"tvdb_id":778},"seasons":[]}""");
+        foreach (var scope in new[] { string.Empty, $"&targetLibraryId={tvLibrary.Id}" })
+        {
+            using var ownedDiscovery = await client.GetAsync("/JellyfinMod/Discover/Search?q=show&type=series" + scope);
+            using var ownedDiscoveryJson = JsonDocument.Parse(await ownedDiscovery.Content.ReadAsStringAsync());
+            Assert(ownedDiscovery.IsSuccessStatusCode && ownedDiscoveryJson.RootElement.GetProperty("items").GetArrayLength() == 1 &&
+                ownedDiscoveryJson.RootElement.GetProperty("items")[0].GetProperty("tmdbId").GetInt32() == 124,
+                "Discovery excludes a TVDB-only owned series before any plugin entry exists, globally and in its library");
+        }
+        using var otherLibraryDiscovery = await client.GetAsync($"/JellyfinMod/Discover/Search?q=show&type=series&targetLibraryId={secondTvLibrary.Id}");
+        using var otherLibraryDiscoveryJson = JsonDocument.Parse(await otherLibraryDiscovery.Content.ReadAsStringAsync());
+        Assert(otherLibraryDiscovery.IsSuccessStatusCode && otherLibraryDiscoveryJson.RootElement.GetProperty("items").GetArrayLength() == 2,
+            "A TVDB match in a different library does not suppress scoped discovery");
+        root.OtherUserLibraries = [secondTvLibrary];
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", otherUser.Id.ToString());
+        using var restrictedDiscovery = await client.GetAsync("/JellyfinMod/Discover/Search?q=show&type=series");
+        using var restrictedDiscoveryJson = JsonDocument.Parse(await restrictedDiscovery.Content.ReadAsStringAsync());
+        Assert(restrictedDiscovery.IsSuccessStatusCode && restrictedDiscoveryJson.RootElement.GetProperty("items").GetArrayLength() == 2,
+            "A TVDB match in an inaccessible library does not suppress global discovery");
+        root.OtherUserLibraries = [];
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
         http.Response = uri => uri.AbsolutePath.Contains("/season/0", StringComparison.Ordinal)
             ? Json("{\"season_number\":0,\"episodes\":[{\"id\":9099,\"season_number\":0,\"episode_number\":1,\"name\":\"Future special\",\"air_date\":\"2099-01-02\"}]}")
             : uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
@@ -515,7 +543,8 @@ internal static class ApiSmoke
     private static void Assert(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); }
     private sealed class TestRoot(Guid userId, CollectionFolder[] libraries) : Folder
     {
-        public override IReadOnlyList<BaseItem> GetChildren(User user, bool includeLinkedChildren, InternalItemsQuery? query = null) => user.Id == userId ? libraries : [];
+        public IReadOnlyList<BaseItem> OtherUserLibraries { get; set; } = [];
+        public override IReadOnlyList<BaseItem> GetChildren(User user, bool includeLinkedChildren, InternalItemsQuery? query = null) => user.Id == userId ? libraries : OtherUserLibraries;
     }
     private sealed class EmptyMovieLibrary : CollectionFolder
     {
