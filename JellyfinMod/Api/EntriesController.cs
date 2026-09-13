@@ -16,7 +16,7 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
-    public async Task<ActionResult<EntriesResult>> List([FromQuery] string? mediaType, [FromQuery] Guid? targetLibraryId,
+    public async Task<ActionResult<EntriesResult>> List([FromQuery] string? mediaType, [FromQuery] Guid? targetLibraryId, [FromQuery] Guid? jellyfinItemId,
         [FromQuery] string? query, [FromQuery] string[]? state, [FromQuery] int startIndex = 0, [FromQuery] int limit = 100,
         [FromQuery] string sortBy = "SortName", [FromQuery] string sortOrder = "Ascending", CancellationToken cancellationToken = default)
     {
@@ -32,6 +32,7 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
         var candidates = database.Entries.AsNoTracking().AsQueryable();
         if (mediaType is not null) candidates = candidates.Where(entry => entry.MediaType == mediaType);
         if (targetLibraryId.HasValue) candidates = candidates.Where(entry => entry.TargetLibraryId == targetLibraryId);
+        if (jellyfinItemId.HasValue) candidates = candidates.Where(entry => entry.JellyfinItemId == jellyfinItemId);
         var visible = (await candidates.ToListAsync(cancellationToken)).Where(entry => access.CanRead(user, entry));
         if (!string.IsNullOrWhiteSpace(query)) visible = visible.Where(entry => entry.Title.Contains(query, StringComparison.OrdinalIgnoreCase));
         if (state?.Length > 0) visible = visible.Where(entry => state.Contains(FileStates.ToWire(entry.State)));
