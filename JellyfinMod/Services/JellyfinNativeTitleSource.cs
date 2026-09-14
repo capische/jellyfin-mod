@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
@@ -15,8 +16,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
 {
     private const int PageSize = 50;
     private const string PrimaryVersionIdPropertyName = "PrimaryVersionId";
-    private static readonly PropertyInfo PrimaryVersionIdProperty = typeof(Video).GetProperty(PrimaryVersionIdPropertyName)
-        ?? throw new MissingMemberException(typeof(Video).FullName, PrimaryVersionIdPropertyName);
+    private static readonly ConcurrentDictionary<Type, Func<Video, Guid?>> PrimaryVersionIdReaders = new();
 
     /// <summary>Counts native title representations for scheduled-task progress without loading their metadata.</summary>
     public int GetNativeTitleCount(CancellationToken cancellationToken)
@@ -220,15 +220,25 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
         return primaryId.HasValue && movieIds.Contains(primaryId.Value) ? primaryId.Value : movie.Id;
     }
 
-    private static Guid? PrimaryVersionId(Video video)
+    private static Guid? PrimaryVersionId(Video video) =>
+        PrimaryVersionIdReaders.GetOrAdd(video.GetType(), CreatePrimaryVersionIdReader)(video);
+
+    private static Func<Video, Guid?> CreatePrimaryVersionIdReader(Type videoType)
     {
-        var value = PrimaryVersionIdProperty.GetValue(video);
-        if (value is Guid id)
+        for (var type = videoType; type is not null; type = type.BaseType)
         {
-            return id == Guid.Empty ? null : id;
+            var property = type.GetProperty(PrimaryVersionIdPropertyName,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly);
+            if (property is null) continue;
+            if (property.PropertyType == typeof(string))
+                return video => Guid.TryParse(property.GetValue(video) as string, out var id) && id != Guid.Empty ? id : null;
+            if (property.PropertyType == typeof(Guid) || property.PropertyType == typeof(Guid?))
+                return video => property.GetValue(video) is Guid id && id != Guid.Empty ? id : null;
+            throw new NotSupportedException(
+                $"Unsupported Jellyfin {PrimaryVersionIdPropertyName} type {property.PropertyType.FullName}.");
         }
 
-        return value is string text && Guid.TryParse(text, out id) && id != Guid.Empty ? id : null;
+        throw new MissingMemberException(videoType.FullName, PrimaryVersionIdPropertyName);
     }
 
     private static bool IsPlayable(BaseItem item) => !string.IsNullOrWhiteSpace(item.Path);

@@ -28,11 +28,24 @@ internal static class BackfillIntegration
         alternate.PrimaryVersionId = primary.Id.ToString("N");
         movies.Add(primary);
         movies.Add(alternate);
-        var conflictingPrimary = Movie(8100, movieLibraryId);
-        var conflictingAlternate = Movie(8101, movieLibraryId);
-        conflictingAlternate.PrimaryVersionId = conflictingPrimary.Id.ToString("N");
+        var jellyfin12Primary = Movie12(8050, movieLibraryId);
+        var jellyfin12Alternate = Movie12(8050, movieLibraryId);
+        jellyfin12Primary.Id = Guid.Parse("30000000-0000-0000-0000-000000000050");
+        jellyfin12Alternate.Id = Guid.Parse("40000000-0000-0000-0000-000000000050");
+        jellyfin12Alternate.PrimaryVersionId = jellyfin12Primary.Id;
+        movies.Add(jellyfin12Primary);
+        movies.Add(jellyfin12Alternate);
+        var conflictingPrimary = Movie12(8100, movieLibraryId);
+        var conflictingAlternate = Movie12(8101, movieLibraryId);
+        conflictingAlternate.PrimaryVersionId = conflictingPrimary.Id;
         movies.Add(conflictingPrimary);
         movies.Add(conflictingAlternate);
+        var movieVersionGroups = new Dictionary<Guid, Guid>
+        {
+            [alternate.Id] = primary.Id,
+            [jellyfin12Alternate.Id] = jellyfin12Primary.Id,
+            [conflictingAlternate.Id] = conflictingPrimary.Id
+        };
 
         var goodSeries = new Series { Id = Guid.NewGuid(), Name = "Backfilled series", Path = "/media/series" };
         goodSeries.ProviderIds["Tmdb"] = "7000";
@@ -83,9 +96,12 @@ internal static class BackfillIntegration
             if (query.HasAnyProviderId is { } providers)
                 items = items.Where(item => providers.Any(provider => item.ProviderIds.GetValueOrDefault(provider.Key) == provider.Value));
             if (query.PresentationUniqueKey is { } group)
-                items = items.OfType<Movie>().Where(movie => (movie.PrimaryVersionId ?? movie.Id.ToString("N")) == group);
+                items = items.OfType<Movie>().Where(movie =>
+                    movieVersionGroups.GetValueOrDefault(movie.Id, movie.Id).ToString("N") == group);
             if (query.IncludeItemTypes.Length > 0)
-                items = items.Where(item => query.IncludeItemTypes.Contains(item.GetBaseItemKind()));
+                items = items.Where(item => query.IncludeItemTypes.Contains(item is Movie
+                    ? Jellyfin.Data.Enums.BaseItemKind.Movie
+                    : item.GetBaseItemKind()));
             return items.OrderBy(item => item.Name, StringComparer.Ordinal).ThenBy(item => item.Id)
                 .Skip(query.StartIndex ?? 0).Take(query.Limit ?? int.MaxValue).ToArray();
         }
@@ -131,8 +147,8 @@ internal static class BackfillIntegration
             NullLogger<CatalogBackfillRunner>.Instance);
 
         var first = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
-        Assert(first.Status == "completed" && first.TotalItems == 57 && first.ScannedItems == 57 &&
-            first.CreatedEntries == 53 && first.UnmatchedItems == 2 && first.FailedItems == 1 &&
+        Assert(first.Status == "completed" && first.TotalItems == 58 && first.ScannedItems == 58 &&
+            first.CreatedEntries == 54 && first.UnmatchedItems == 2 && first.FailedItems == 1 &&
             first.ConflictedItems == 1 && first.UpdatedBindings == 0 && first.UnchangedItems == 0,
             "Backfill reports exact bounded outcome counts while one bad title does not stop later work");
         var seriesEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 7000);
@@ -142,18 +158,23 @@ internal static class BackfillIntegration
         Assert(await database.EntryBindings.CountAsync(binding => binding.EntryId ==
             database.Entries.Single(entry => entry.TmdbId == 8000).Id) == 2,
             "Native primary and alternate movie versions converge to one entry with two durable bindings");
+        var jellyfin12Entry = await database.Entries.SingleAsync(entry => entry.TmdbId == 8050);
+        Assert(jellyfin12Entry.JellyfinItemId == new[] { jellyfin12Primary.Id, jellyfin12Alternate.Id }.Min() &&
+            await database.EntryBindings.CountAsync(binding => binding.EntryId == jellyfin12Entry.Id &&
+                binding.VersionGroupId == jellyfin12Primary.Id) == 2,
+            "Jellyfin 12 nullable Guid version identities preserve deterministic grouping through reconciliation");
 
         database.ChangeTracker.Clear();
         var rerun = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
-        Assert(rerun.CreatedEntries == 0 && rerun.UpdatedBindings == 0 && rerun.UnchangedItems == 53 &&
+        Assert(rerun.CreatedEntries == 0 && rerun.UpdatedBindings == 0 && rerun.UnchangedItems == 54 &&
             rerun.UnmatchedItems == 2 && rerun.FailedItems == 1 && rerun.ConflictedItems == 1 &&
-            await database.History.CountAsync() == 53,
+            await database.History.CountAsync() == 54,
             "A complete rerun is idempotent and creates no duplicate entries or transition history");
 
         failedProvider = 5;
         var failedItemRun = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
-        Assert(failedItemRun.ScannedItems == 57 && failedItemRun.TotalItems == 57 &&
-            failedItemRun.UnchangedItems == 52 && failedItemRun.FailedItems == 2 &&
+        Assert(failedItemRun.ScannedItems == 58 && failedItemRun.TotalItems == 58 &&
+            failedItemRun.UnchangedItems == 53 && failedItemRun.FailedItems == 2 &&
             failedItemRun.UnmatchedItems == 2 && failedItemRun.ConflictedItems == 1,
             "Production transient registrations retain every preceding outcome after a mid-run item failure");
         failedProvider = null;
@@ -335,6 +356,17 @@ internal static class BackfillIntegration
         return movie;
     }
 
+    private static Jellyfin12Movie Movie12(int tmdbId, Guid libraryId)
+    {
+        var movie = new Jellyfin12Movie
+        {
+            Id = Guid.NewGuid(), Name = "Movie " + tmdbId, Path = $"/media/{libraryId}/{tmdbId}.mkv",
+            ProductionYear = 2026
+        };
+        movie.ProviderIds["Tmdb"] = tmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return movie;
+    }
+
     private static MediaBrowser.Controller.Entities.TV.Episode Episode(
         int tmdbId,
         int seasonNumber,
@@ -373,6 +405,11 @@ internal static class BackfillIntegration
     private sealed class InlineProgress(Action<double> report) : IProgress<double>
     {
         public void Report(double value) => report(value);
+    }
+
+    private sealed class Jellyfin12Movie : Movie
+    {
+        public new Guid? PrimaryVersionId { get; set; }
     }
 
     private class Stub<T> : DispatchProxy where T : class
