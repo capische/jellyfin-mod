@@ -78,7 +78,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         cancellationToken.ThrowIfCancellationRequested();
         var item = library.GetItemById(itemId);
         if (item is Episode episode)
-            item = library.GetItemById(episode.SeriesId);
+            item = episode.Series;
         if (item is not (Movie or Series)) yield break;
         var mediaType = item is Movie ? "movie" : "series";
         foreach (var folder in library.GetCollectionFolders(item).OfType<CollectionFolder>())

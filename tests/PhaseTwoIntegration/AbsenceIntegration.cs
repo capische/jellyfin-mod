@@ -123,6 +123,13 @@ internal static class AbsenceIntegration
         await using var provider = services.BuildServiceProvider();
         await using (var setup = new ModDbContext(dbPath)) await setup.Database.MigrateAsync();
         var task = provider.GetRequiredService<CatalogPostScanTask>();
+        var partialEpisode = Episode(9499, Guid.Empty, "Partially scanned episode", tvPath, 3);
+        episodes.Add(partialEpisode);
+        Assert(!provider.GetRequiredService<JellyfinNativeTitleSource>()
+                .GetItemWorkItems(partialEpisode.Id, default).Any(),
+            "An episode event observed before Jellyfin assigns its series is deferred without querying an empty identity");
+        episodes.Remove(partialEpisode);
+        File.Delete(partialEpisode.Path);
 
         await task.Run(new InlineProgress(), default);
         await using var database = new ModDbContext(dbPath);
