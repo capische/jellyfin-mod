@@ -11,7 +11,9 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace JellyfinMod.Data.Migrations
 {
     [DbContext(typeof(ModDbContext))]
-    [Migration("20260911042407_PhaseTwoBindings")]
+    // Keep the identifier first deployed to the isolated host. Changing a migration ID after a
+    // database has applied it makes EF run the same schema change twice on the next restart.
+    [Migration("20260910233343_PhaseTwoBindings")]
     partial class PhaseTwoBindings
     {
         /// <inheritdoc />

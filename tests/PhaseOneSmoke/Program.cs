@@ -62,7 +62,10 @@ try
     await using (var restarted = new ModDbContext(dbPath))
     {
         await restarted.Database.MigrateAsync();
-        Assert(await restarted.Entries.CountAsync() == 2 && (await restarted.Database.GetAppliedMigrationsAsync()).Count() == 4, "Restart preserves rows and migrations");
+        var appliedMigrations = (await restarted.Database.GetAppliedMigrationsAsync()).ToArray();
+        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length == 4, "Restart preserves rows and migrations");
+        Assert(appliedMigrations.Contains("20260910233343_PhaseTwoBindings"),
+            "Published Phase 2 migration identity remains compatible with deployed databases");
     }
 
     await ApiSmoke.RunAsync(folder);
