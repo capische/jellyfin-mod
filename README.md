@@ -2,8 +2,10 @@
 
 ![JellyfinMod](JellyfinMod/Assets/logo.png)
 
-Phase 0 foundation: plugin loading, authenticated health, configuration and persistent SQLite
-storage are implemented. Catalog/search, acquisition and retention are planned work.
+Plugin loading, authenticated health, configuration, persistent SQLite and the Phase 1 catalog
+APIs are implemented. Phase 2 positive reconciliation has local integration coverage and has
+passed its initial native-host backfill/idempotency checkpoint. Disappearance handling and the
+remaining browser acceptance are still incomplete. Acquisition and retention are planned work.
 
 The server half of **JellyfinMod**. The other half is the
 [`jellyfin-web`](https://github.com/capische/jellyfin-web) fork.
@@ -100,6 +102,65 @@ dotnet run -c Release --project tests/PhaseZeroSmoke/PhaseZeroSmoke.csproj
 The smoke test creates a temporary SQLite database, checks migration and row persistence after
 initialization runs twice, checks failure health, and round-trips XML configuration. It does not
 replace installation, authentication and Dashboard checks against a running Jellyfin server.
+
+## Phase 2 validation checkpoint
+
+R1–R3 reconciliation reads native titles in pages of at most 50, re-reads a title while holding
+its library lease, and commits each title in a separate service scope. Episode observations use
+physical ancestry and the episode's own `SeriesId`; they do not use the grouped recursive
+`Series.GetItemList` query. A concurrent user add completes its fetched episode set after a
+backfill wins the entry race. These operations only record positive observations.
+
+The local suites passed at the 2026-09-13 review checkpoint:
+
+```bash
+dotnet run --project tests/PhaseOneSmoke/PhaseOneSmoke.csproj
+dotnet run --project tests/PhaseTwoIntegration/PhaseTwoIntegration.csproj
+```
+
+- The first backfill fixture processes 57 logical titles: 53 created, two unmatched, one
+  conflicted and one failed. Its rerun has 53 unchanged titles and creates no new history.
+- An injected item failure preserves all counters: 52 unchanged, two unmatched, one conflicted
+  and two failed. Cancellation persists the first completed item before another page is read.
+- Grouped series copies preserve three native episode bindings across two durable episodes.
+  An unidentified series with incomplete episode numbering does not abort the run.
+- Queued work does not overwrite a newer event's replacement binding. Item notifications do
+  not enumerate all virtual folders. Repeated events do not duplicate transition history.
+- The HTTP series-add race retains the complete monitored episode set, the backfilled pilot's
+  local/native IDs, and one creation event plus one monitoring event.
+
+The HTTP suite runs real Kestrel, authentication/authorization middleware, serialization, a TMDB
+HTTP boundary and SQLite migrations/transactions. Its users and native library are controlled
+fixtures. The Phase 2 suite uses the production DI registrations and pinned native entity types,
+but `ILibraryManager` is still a fixture. Neither suite proves behavior inside a running Jellyfin
+server or replaces the required browser and native-host acceptance.
+
+Uncommitted R4 preparation remains outside the validated commit set. The validation source copy
+excluded its changes to `ReconciliationRun.cs`, `ReconciliationContracts.cs`, `configPage.html`,
+and the storage-observation helpers in `JellyfinNativeTitleSource.cs`. The prepared model fields
+have no migration yet, so running EF migrations with those dirty files reports pending model
+changes; no warning was suppressed and no R4 migration was invented.
+
+The isolated `jellyfinmod-test` host completed the first native-library run on 2026-09-14. Jellyfin
+12 exposes video version identities as GUIDs and the deployed Phase 2 binding migration predated
+its provenance columns. Compatibility readers and a forward-only provenance migration were added,
+then validated against a copy of the deployed SQLite database before redeploying to the test host.
+
+The successful backfill scanned all 159 native title observations in 7.3 seconds: 157 entries were
+created, one item without a usable TMDB identity was unmatched, and one series with conflicting
+episode provenance failed independently. The immediate rerun scanned the same 159 observations:
+157 were unchanged, zero entries or bindings were created or updated, and the same two bounded
+diagnostics remained. The durable database then contained 160 entries, 157 entry bindings and 160
+history records, with no duplicate library-scoped entries or bindings. Startup and migration logs
+contained neither the previous missing-method failure nor a missing-column failure.
+
+These results prove positive backfill and idempotency on the isolated native host. Before Phase 2
+acceptance, still exercise real grouped copies, provider corrections, replacement events overlapping
+repair, cancellation/rerun, and ordinary-user adds during backfill. Verify exact persisted
+counts/history, library access, native playback and stable entry bookmarks. R4 still requires
+proven successful scan completion and available storage before any missing-media transition. R5
+still requires two-user state/access checks and desktop/mobile/TV browser acceptance. No
+disappearance handling, production deployment or production data changes are claimed here.
 
 ## Phase 0 — done when
 
