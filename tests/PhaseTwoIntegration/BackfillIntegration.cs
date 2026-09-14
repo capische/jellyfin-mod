@@ -144,6 +144,7 @@ internal static class BackfillIntegration
         var gate = provider.GetRequiredService<ReconciliationRunGate>();
         CatalogBackfillRunner Runner(ModDbContext context) => new(context,
             provider.GetRequiredService<IServiceScopeFactory>(), new JellyfinNativeTitleSource(library), gate,
+            provider.GetRequiredService<ReconciliationLibraryLock>(),
             NullLogger<CatalogBackfillRunner>.Instance);
 
         var first = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);

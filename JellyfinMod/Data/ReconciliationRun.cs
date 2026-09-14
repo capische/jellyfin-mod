@@ -27,6 +27,10 @@ public sealed class ReconciliationRun
     public int ConflictedItems { get; set; }
     /// <summary>Gets or sets the number of observations that failed independently.</summary>
     public int FailedItems { get; set; }
+    /// <summary>Gets or sets the number of catalog titles or episodes confirmed to have lost playable media.</summary>
+    public int MissingItems { get; set; }
+    /// <summary>Gets or sets the number of libraries whose absence check remained uncertain.</summary>
+    public int IncompleteLibraries { get; set; }
     /// <summary>Gets or sets bounded administrator diagnostics as JSON.</summary>
     public string? DiagnosticsJson { get; set; }
 }

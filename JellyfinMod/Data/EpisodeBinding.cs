@@ -13,4 +13,8 @@ public sealed class EpisodeBinding
     public Guid SeriesItemId { get; set; }
     /// <summary>Gets or sets the library that owned the native episode when it was observed.</summary>
     public Guid TargetLibraryId { get; set; }
+    /// <summary>Gets or sets the native media path observed for this episode representation.</summary>
+    public string? MediaPath { get; set; }
+    /// <summary>Gets or sets the Linux mount identity observed for the media path.</summary>
+    public string? StorageIdentity { get; set; }
 }

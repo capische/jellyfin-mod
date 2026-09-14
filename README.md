@@ -105,11 +105,17 @@ replace installation, authentication and Dashboard checks against a running Jell
 
 ## Phase 2 validation checkpoint
 
-R1–R3 reconciliation reads native titles in pages of at most 50, re-reads a title while holding
+R1–R4 reconciliation reads native titles in pages of at most 50, re-reads a title while holding
 its library lease, and commits each title in a separate service scope. Episode observations use
 physical ancestry and the episode's own `SeriesId`; they do not use the grouped recursive
 `Series.GetItemList` query. A concurrent user add completes its fetched episode set after a
-backfill wins the entry race. These operations only record positive observations.
+backfill wins the entry race.
+
+Only the post-scan task confirms absence. It requires two identical complete observations while
+holding the library lease. Each positive title and episode binding records its native media path
+and Linux mount identity. An absent binding is cleared only when that same mount still contains
+the configured readable library root; bindings without this provenance remain intact until a
+positive reconciliation records it. Manual and scheduled repair runs remain positive-only.
 
 The local suites passed at the 2026-09-13 review checkpoint:
 
@@ -128,18 +134,15 @@ dotnet run --project tests/PhaseTwoIntegration/PhaseTwoIntegration.csproj
   not enumerate all virtual folders. Repeated events do not duplicate transition history.
 - The HTTP series-add race retains the complete monitored episode set, the backfilled pilot's
   local/native IDs, and one creation event plus one monitoring event.
+- The absence fixture covers a changing collection larger than one page, a disappeared nested
+  mount with a stale nonempty directory, surviving copies, episode-only removal and return,
+  stable catalog IDs, transition history and idempotent reruns.
 
 The HTTP suite runs real Kestrel, authentication/authorization middleware, serialization, a TMDB
 HTTP boundary and SQLite migrations/transactions. Its users and native library are controlled
 fixtures. The Phase 2 suite uses the production DI registrations and pinned native entity types,
 but `ILibraryManager` is still a fixture. Neither suite proves behavior inside a running Jellyfin
 server or replaces the required browser and native-host acceptance.
-
-Uncommitted R4 preparation remains outside the validated commit set. The validation source copy
-excluded its changes to `ReconciliationRun.cs`, `ReconciliationContracts.cs`, `configPage.html`,
-and the storage-observation helpers in `JellyfinNativeTitleSource.cs`. The prepared model fields
-have no migration yet, so running EF migrations with those dirty files reports pending model
-changes; no warning was suppressed and no R4 migration was invented.
 
 The isolated `jellyfinmod-test` host completed the first native-library run on 2026-09-14. Jellyfin
 12 exposes video version identities as GUIDs and the deployed Phase 2 binding migration predated
@@ -154,13 +157,15 @@ diagnostics remained. The durable database then contained 160 entries, 157 entry
 history records, with no duplicate library-scoped entries or bindings. Startup and migration logs
 contained neither the previous missing-method failure nor a missing-column failure.
 
-These results prove positive backfill and idempotency on the isolated native host. Before Phase 2
+These results prove positive backfill and idempotency on the isolated native host. The R4 migration
+also preserves all entry, binding, episode and history counts when applied to a copy of that
+database and passes SQLite integrity checking. Before Phase 2
 acceptance, still exercise real grouped copies, provider corrections, replacement events overlapping
 repair, cancellation/rerun, and ordinary-user adds during backfill. Verify exact persisted
-counts/history, library access, native playback and stable entry bookmarks. R4 still requires
-proven successful scan completion and available storage before any missing-media transition. R5
+counts/history, library access, native playback and stable entry bookmarks. R4 still requires a
+successful isolated native scan/removal/return run before any completion claim. R5
 still requires two-user state/access checks and desktop/mobile/TV browser acceptance. No
-disappearance handling, production deployment or production data changes are claimed here.
+production deployment or production data changes are claimed here.
 
 ## Phase 0 — done when
 

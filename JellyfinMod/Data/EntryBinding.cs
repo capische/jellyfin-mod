@@ -13,4 +13,8 @@ public sealed class EntryBinding
     public Guid TargetLibraryId { get; set; }
     /// <summary>Gets or sets Jellyfin's primary version identity, or this item's identity when it is not an alternate.</summary>
     public Guid VersionGroupId { get; set; }
+    /// <summary>Gets or sets the native media path observed for this representation.</summary>
+    public string? MediaPath { get; set; }
+    /// <summary>Gets or sets the Linux mount identity observed for the media path.</summary>
+    public string? StorageIdentity { get; set; }
 }

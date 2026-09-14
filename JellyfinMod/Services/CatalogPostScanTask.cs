@@ -16,7 +16,7 @@ public sealed class CatalogPostScanTask(
         {
             using var scope = scopeFactory.CreateScope();
             await scope.ServiceProvider.GetRequiredService<CatalogBackfillRunner>()
-                .RunAsync(progress, cancellationToken).ConfigureAwait(false);
+                .RunAsync(progress, cancellationToken, confirmAbsence: true).ConfigureAwait(false);
         }
         catch (InvalidOperationException error) when (error.Message.Contains("already active", StringComparison.Ordinal))
         {

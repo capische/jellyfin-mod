@@ -18,6 +18,8 @@ public sealed record ReconciliationRunDto(
     [property: JsonPropertyName("unmatchedItems")] int UnmatchedItems,
     [property: JsonPropertyName("conflictedItems")] int ConflictedItems,
     [property: JsonPropertyName("failedItems")] int FailedItems,
+    [property: JsonPropertyName("missingItems")] int MissingItems,
+    [property: JsonPropertyName("incompleteLibraries")] int IncompleteLibraries,
     [property: JsonPropertyName("diagnostics")] IReadOnlyList<ReconciliationDiagnostic> Diagnostics)
 {
     /// <summary>Creates a wire-safe summary from its durable row.</summary>
@@ -25,7 +27,8 @@ public sealed record ReconciliationRunDto(
         : this(run.Id, DateTime.SpecifyKind(run.StartedAt, DateTimeKind.Utc),
             run.CompletedAt.HasValue ? DateTime.SpecifyKind(run.CompletedAt.Value, DateTimeKind.Utc) : null,
             run.Status, run.TotalItems, run.ScannedItems, run.CreatedEntries, run.UpdatedBindings,
-            run.UnchangedItems, run.UnmatchedItems, run.ConflictedItems, run.FailedItems, diagnostics)
+            run.UnchangedItems, run.UnmatchedItems, run.ConflictedItems, run.FailedItems, run.MissingItems,
+            run.IncompleteLibraries, diagnostics)
     {
     }
 }

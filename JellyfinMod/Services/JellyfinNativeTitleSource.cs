@@ -12,11 +12,12 @@ using MediaBrowser.Model.Entities;
 namespace JellyfinMod.Services;
 
 /// <summary>Builds current library-scoped observations using bounded native queries.</summary>
-public sealed class JellyfinNativeTitleSource(ILibraryManager library)
+public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStorageIdentity? mediaStorage = null)
 {
     private const int PageSize = 50;
     private const string PrimaryVersionIdPropertyName = "PrimaryVersionId";
     private static readonly ConcurrentDictionary<Type, Func<Video, Guid?>> PrimaryVersionIdReaders = new();
+    private readonly MediaStorageIdentity _mediaStorage = mediaStorage ?? new();
 
     /// <summary>Counts native title representations for scheduled-task progress without loading their metadata.</summary>
     public int GetNativeTitleCount(CancellationToken cancellationToken)
@@ -36,11 +37,20 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
     }
 
     /// <summary>Enumerates title identities without retaining server-wide episode snapshots.</summary>
-    public IEnumerable<NativeTitleWorkItem> GetWorkItems(CancellationToken cancellationToken)
+    public IEnumerable<NativeTitleWorkItem> GetWorkItems(CancellationToken cancellationToken) =>
+        GetWorkItems(null, cancellationToken);
+
+    /// <summary>Re-enumerates one library while its reconciliation lease is held.</summary>
+    internal IEnumerable<NativeTitleWorkItem> GetLibraryWorkItems(Guid libraryId, CancellationToken cancellationToken) =>
+        GetWorkItems(libraryId, cancellationToken);
+
+    private IEnumerable<NativeTitleWorkItem> GetWorkItems(Guid? requiredLibraryId, CancellationToken cancellationToken)
     {
         foreach (var folderInfo in library.GetVirtualFolders()
                      .Where(folder => folder.CollectionType is MediaBrowser.Model.Entities.CollectionTypeOptions.movies or
                          MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows)
+                     .Where(folder => !requiredLibraryId.HasValue ||
+                         Guid.TryParse(folder.ItemId, out var id) && id == requiredLibraryId.Value)
                      .OrderBy(folder => folder.Name, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -163,7 +173,23 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
         }
     }
 
-    private static NativeTitleSnapshot Snapshot(
+    /// <summary>Gets configured movie and series libraries with the paths needed to prove storage availability.</summary>
+    internal IReadOnlyList<NativeLibraryStorage> GetLibraryStorage(CancellationToken cancellationToken)
+    {
+        var result = new List<NativeLibraryStorage>();
+        foreach (var folder in library.GetVirtualFolders().Where(folder => folder.CollectionType is
+                     MediaBrowser.Model.Entities.CollectionTypeOptions.movies or
+                     MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Guid.TryParse(folder.ItemId, out var id))
+                result.Add(new(id, folder.Name, folder.Locations ?? []));
+        }
+
+        return result;
+    }
+
+    private NativeTitleSnapshot Snapshot(
         string mediaType,
         int? tmdbId,
         Guid libraryId,
@@ -178,7 +204,8 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
         return new(mediaType, tmdbId, libraryId, representative.Name, representative.ProductionYear,
             metadata.ImdbId, representative.Overview, null, JsonSerializer.Serialize(metadata),
             copies.Select(copy => new NativeRepresentation(copy.Id, libraryId, IsPlayable(copy),
-                mediaType == "movie" ? VersionGroup((Movie)copy, movieIds!) : copy.Id)).ToArray(), episodes);
+                mediaType == "movie" ? VersionGroup((Movie)copy, movieIds!) : copy.Id, copy.Path,
+                _mediaStorage.Capture(copy.Path))).ToArray(), episodes);
     }
 
     private NativeEpisodeSnapshot[] GetEpisodes(
@@ -206,7 +233,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
                     throw new InvalidOperationException($"Native episode {episode.Id} has no season/episode identity.");
                 episodes.Add(new(episode.Id, episode.SeriesId, ProviderTmdbId(episode), episode.ParentIndexNumber.Value,
                     episode.IndexNumber.Value, IsPlayable(episode), episode.Name, episode.Overview, null,
-                    episode.PremiereDate, RuntimeMinutes(episode)));
+                    episode.PremiereDate, RuntimeMinutes(episode), episode.Path, _mediaStorage.Capture(episode.Path)));
             }
         }
 
@@ -261,6 +288,9 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
 /// <summary>One native title work item or a bounded diagnostic produced while inspecting it.</summary>
 public sealed record NativeCatalogObservation(Guid NativeItemId, Guid TargetLibraryId, string Title,
     NativeTitleSnapshot? Snapshot, bool IsConflict, string? Detail);
+
+/// <summary>A native media library and its configured storage locations.</summary>
+internal sealed record NativeLibraryStorage(Guid LibraryId, string Name, IReadOnlyList<string> Locations);
 
 /// <summary>A lightweight identity to re-read immediately before reconciliation.</summary>
 public sealed record NativeTitleWorkItem(Guid NativeItemId, Guid TargetLibraryId, string MediaType, int? TmdbId, string Title);

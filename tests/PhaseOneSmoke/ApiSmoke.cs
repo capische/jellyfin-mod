@@ -274,6 +274,8 @@ internal static class ApiSmoke
         Assert(reconciliationSummary.StatusCode == HttpStatusCode.OK &&
             reconciliationJson.RootElement.GetProperty("status").GetString() == "completed" &&
             reconciliationJson.RootElement.GetProperty("scannedItems").GetInt32() == 3 &&
+            reconciliationJson.RootElement.GetProperty("missingItems").GetInt32() == 0 &&
+            reconciliationJson.RootElement.GetProperty("incompleteLibraries").GetInt32() == 0 &&
             reconciliationJson.RootElement.GetProperty("diagnostics").GetArrayLength() == 0,
             "Administrators receive the exact durable reconciliation summary through authenticated HTTP");
         Assert((await client.PostAsJsonAsync("/JellyfinMod/Entries", new { mediaType = "bogus", tmdbId = -1, targetLibraryId = libraryFolder.Id })).StatusCode == HttpStatusCode.BadRequest, "Invalid create fields rejected");

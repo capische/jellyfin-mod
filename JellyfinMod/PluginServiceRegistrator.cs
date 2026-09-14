@@ -26,6 +26,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<CatalogSortName>();
         services.AddSingleton<ReconciliationLibraryLock>();
         services.AddSingleton<ReconciliationRunGate>();
+        services.AddSingleton<MediaStorageIdentity>();
         services.AddTransient<ReconciliationService>();
         services.AddTransient<JellyfinNativeTitleSource>();
         services.AddTransient<CatalogBackfillRunner>();

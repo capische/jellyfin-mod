@@ -7,8 +7,12 @@ using Microsoft.EntityFrameworkCore;
 namespace JellyfinMod.Services;
 
 /// <summary>Reconciles verified native observations into the durable catalog.</summary>
-public sealed class ReconciliationService(ModDbContext database, ReconciliationLibraryLock libraryLock)
+public sealed class ReconciliationService(
+    ModDbContext database,
+    ReconciliationLibraryLock libraryLock,
+    MediaStorageIdentity? mediaStorage = null)
 {
+    private readonly MediaStorageIdentity _mediaStorage = mediaStorage ?? new();
     /// <summary>Reconciles one library-scoped native title observation.</summary>
     public async Task<ReconciliationResult> ReconcileAsync(NativeTitleSnapshot snapshot, CancellationToken cancellationToken)
     {
@@ -18,6 +22,105 @@ public sealed class ReconciliationService(ModDbContext database, ReconciliationL
 
     internal Task<ReconciliationResult> ReconcileUnderLeaseAsync(NativeTitleSnapshot snapshot,
         CancellationToken cancellationToken) => ReconcileAsync(snapshot, true, cancellationToken);
+
+    /// <summary>Clears bindings absent from a complete observation while the caller holds the library lease.</summary>
+    internal async Task<AbsenceConfirmationResult> ConfirmAbsenceUnderLeaseAsync(
+        ConfirmedLibrarySnapshot observation,
+        CancellationToken cancellationToken)
+    {
+        var entries = await database.Entries.Where(entry => entry.TargetLibraryId == observation.LibraryId)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var entryIds = entries.Select(entry => entry.Id).ToHashSet();
+        var bindings = await database.EntryBindings.Where(binding => entryIds.Contains(binding.EntryId))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var episodes = await database.Episodes.Where(episode => entryIds.Contains(episode.EntryId))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var episodeIds = episodes.Select(episode => episode.Id).ToHashSet();
+        var episodeBindings = await database.EpisodeBindings.Where(binding => episodeIds.Contains(binding.EpisodeId))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var absentBindings = bindings.Where(binding =>
+            !observation.TitleIds.Contains(binding.JellyfinItemId)).ToArray();
+        var absentEpisodeBindings = episodeBindings.Where(binding =>
+            !observation.EpisodeIds.Contains(binding.JellyfinItemId)).ToArray();
+        foreach (var binding in absentBindings)
+        {
+            if (!_mediaStorage.IsCurrent(binding.MediaPath, binding.StorageIdentity, observation.LibraryLocations,
+                    out var detail))
+                return new(0, false, detail);
+        }
+
+        foreach (var binding in absentEpisodeBindings)
+        {
+            if (!_mediaStorage.IsCurrent(binding.MediaPath, binding.StorageIdentity, observation.LibraryLocations,
+                    out var detail))
+                return new(0, false, detail);
+        }
+
+        database.EntryBindings.RemoveRange(absentBindings);
+        database.EpisodeBindings.RemoveRange(absentEpisodeBindings);
+
+        var missingItems = 0;
+        foreach (var entry in entries)
+        {
+            var playableBindings = bindings.Where(binding => binding.EntryId == entry.Id &&
+                    observation.PlayableTitleIds.Contains(binding.JellyfinItemId))
+                .OrderBy(binding => binding.JellyfinItemId == binding.VersionGroupId ? 0 : 1)
+                .ThenBy(binding => binding.VersionGroupId).ThenBy(binding => binding.JellyfinItemId).ToArray();
+            var selected = playableBindings.FirstOrDefault(binding => binding.JellyfinItemId == entry.JellyfinItemId) ??
+                playableBindings.FirstOrDefault();
+            if (selected is not null)
+            {
+                entry.JellyfinItemId = selected.JellyfinItemId;
+                entry.State = FileState.OnDisk;
+            }
+            else
+            {
+                var becameMissing = entry.State == FileState.OnDisk || entry.JellyfinItemId.HasValue;
+                entry.JellyfinItemId = null;
+                if (entry.State == FileState.OnDisk) entry.State = FileState.None;
+                if (becameMissing)
+                {
+                    missingItems++;
+                    database.History.Add(new HistoryRecord
+                    {
+                        EntryId = entry.Id,
+                        EventType = "media_missing",
+                        Summary = "Playable media is no longer present in Jellyfin"
+                    });
+                }
+            }
+
+            foreach (var episode in episodes.Where(episode => episode.EntryId == entry.Id))
+            {
+                var playableEpisodeBindings = episodeBindings.Where(binding => binding.EpisodeId == episode.Id &&
+                        observation.PlayableEpisodeIds.Contains(binding.JellyfinItemId))
+                    .OrderBy(binding => binding.JellyfinItemId).ToArray();
+                var selectedEpisode = playableEpisodeBindings
+                    .FirstOrDefault(binding => binding.JellyfinItemId == episode.JellyfinItemId) ??
+                    playableEpisodeBindings.FirstOrDefault();
+                var becameMissing = selectedEpisode is null &&
+                    (episode.State == FileState.OnDisk || episode.JellyfinItemId.HasValue);
+                episode.JellyfinItemId = selectedEpisode?.JellyfinItemId;
+                if (selectedEpisode is not null) episode.State = FileState.OnDisk;
+                else if (episode.State == FileState.OnDisk) episode.State = FileState.None;
+                if (becameMissing)
+                {
+                    missingItems++;
+                    database.History.Add(new HistoryRecord
+                    {
+                        EntryId = entry.Id,
+                        EventType = "episode_media_missing",
+                        Summary = $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00} is no longer present in Jellyfin",
+                        Data = JsonSerializer.Serialize(new { episodeId = episode.Id, tmdbId = episode.TmdbId,
+                            episode.SeasonNumber, episode.EpisodeNumber })
+                    });
+                }
+            }
+        }
+
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return new(missingItems, true, null);
+    }
 
     private async Task<ReconciliationResult> ReconcileAsync(
         NativeTitleSnapshot snapshot,
@@ -119,11 +222,16 @@ public sealed class ReconciliationService(ModDbContext database, ReconciliationL
             if (knownRepresentations.TryGetValue(representation.JellyfinItemId, out var binding))
             {
                 var versionGroupId = representation.VersionGroupId ?? representation.JellyfinItemId;
-                if (binding.VersionGroupId != versionGroupId || binding.TargetLibraryId != representation.TargetLibraryId)
+                var structuralChange = binding.VersionGroupId != versionGroupId ||
+                    binding.TargetLibraryId != representation.TargetLibraryId;
+                if (structuralChange || binding.MediaPath != representation.MediaPath ||
+                    binding.StorageIdentity != representation.StorageIdentity)
                 {
                     binding.VersionGroupId = versionGroupId;
                     binding.TargetLibraryId = representation.TargetLibraryId;
-                    entryBindingChanges++;
+                    binding.MediaPath = representation.MediaPath;
+                    binding.StorageIdentity = representation.StorageIdentity;
+                    if (structuralChange) entryBindingChanges++;
                 }
 
                 continue;
@@ -134,7 +242,9 @@ public sealed class ReconciliationService(ModDbContext database, ReconciliationL
                 EntryId = entry.Id,
                 JellyfinItemId = representation.JellyfinItemId,
                 TargetLibraryId = representation.TargetLibraryId,
-                VersionGroupId = representation.VersionGroupId ?? representation.JellyfinItemId
+                VersionGroupId = representation.VersionGroupId ?? representation.JellyfinItemId,
+                MediaPath = representation.MediaPath,
+                StorageIdentity = representation.StorageIdentity
             });
             entryBindingChanges++;
         }
@@ -309,7 +419,7 @@ public sealed class ReconciliationService(ModDbContext database, ReconciliationL
         bool backfilled)
     {
         var changedEpisodeIds = new HashSet<Guid>();
-        var knownNativeIds = episodeBindings.Select(binding => binding.JellyfinItemId).ToHashSet();
+        var knownBindings = episodeBindings.ToDictionary(binding => binding.JellyfinItemId);
         foreach (var episode in episodes)
         {
             var allCandidates = observations.Where(observation => observation.TmdbId == episode.TmdbId).ToArray();
@@ -319,16 +429,37 @@ public sealed class ReconciliationService(ModDbContext database, ReconciliationL
                     observation.SeasonNumber == episode.SeasonNumber && observation.EpisodeNumber == episode.EpisodeNumber).ToArray();
             }
 
-            foreach (var candidate in allCandidates.Where(candidate => !knownNativeIds.Contains(candidate.JellyfinItemId)))
+            foreach (var candidate in allCandidates)
             {
-                database.EpisodeBindings.Add(new EpisodeBinding
+                if (knownBindings.TryGetValue(candidate.JellyfinItemId, out var existingBinding))
+                {
+                    var structuralChange = existingBinding.SeriesItemId != candidate.SeriesItemId ||
+                        existingBinding.TargetLibraryId != targetLibraryId;
+                    if (structuralChange ||
+                        existingBinding.MediaPath != candidate.MediaPath ||
+                        existingBinding.StorageIdentity != candidate.StorageIdentity)
+                    {
+                        existingBinding.SeriesItemId = candidate.SeriesItemId;
+                        existingBinding.TargetLibraryId = targetLibraryId;
+                        existingBinding.MediaPath = candidate.MediaPath;
+                        existingBinding.StorageIdentity = candidate.StorageIdentity;
+                        if (structuralChange) changedEpisodeIds.Add(episode.Id);
+                    }
+
+                    continue;
+                }
+
+                var newBinding = new EpisodeBinding
                 {
                     EpisodeId = episode.Id,
                     JellyfinItemId = candidate.JellyfinItemId,
                     SeriesItemId = candidate.SeriesItemId,
-                    TargetLibraryId = targetLibraryId
-                });
-                knownNativeIds.Add(candidate.JellyfinItemId);
+                    TargetLibraryId = targetLibraryId,
+                    MediaPath = candidate.MediaPath,
+                    StorageIdentity = candidate.StorageIdentity
+                };
+                database.EpisodeBindings.Add(newBinding);
+                knownBindings.Add(candidate.JellyfinItemId, newBinding);
                 changedEpisodeIds.Add(episode.Id);
             }
 
@@ -337,11 +468,24 @@ public sealed class ReconciliationService(ModDbContext database, ReconciliationL
             {
                 var selected = candidates.FirstOrDefault(candidate => candidate.JellyfinItemId == episode.JellyfinItemId) ??
                     candidates.OrderBy(candidate => candidate.JellyfinItemId).First();
+                var becameAvailable = episode.State != FileState.OnDisk || !episode.JellyfinItemId.HasValue;
                 if (episode.JellyfinItemId != selected.JellyfinItemId || episode.State != FileState.OnDisk)
                 {
                     episode.JellyfinItemId = selected.JellyfinItemId;
                     episode.State = FileState.OnDisk;
                     changedEpisodeIds.Add(episode.Id);
+                    if (!backfilled && becameAvailable)
+                    {
+                        database.History.Add(new HistoryRecord
+                        {
+                            EntryId = entryId,
+                            EventType = "episode_media_available",
+                            Summary = $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00} matched playable media in Jellyfin",
+                            Data = JsonSerializer.Serialize(new { episodeId = episode.Id, tmdbId = episode.TmdbId,
+                                episode.SeasonNumber, episode.EpisodeNumber,
+                                jellyfinItemId = selected.JellyfinItemId })
+                        });
+                    }
                 }
             }
 
@@ -376,14 +520,17 @@ public sealed class ReconciliationService(ModDbContext database, ReconciliationL
             database.Episodes.Add(newEpisode);
             foreach (var observation in providerGroup)
             {
-                database.EpisodeBindings.Add(new EpisodeBinding
+                var binding = new EpisodeBinding
                 {
                     EpisodeId = newEpisode.Id,
                     JellyfinItemId = observation.JellyfinItemId,
                     SeriesItemId = observation.SeriesItemId,
-                    TargetLibraryId = targetLibraryId
-                });
-                knownNativeIds.Add(observation.JellyfinItemId);
+                    TargetLibraryId = targetLibraryId,
+                    MediaPath = observation.MediaPath,
+                    StorageIdentity = observation.StorageIdentity
+                };
+                database.EpisodeBindings.Add(binding);
+                knownBindings.Add(observation.JellyfinItemId, binding);
             }
 
             changedEpisodeIds.Add(newEpisode.Id);
@@ -440,12 +587,21 @@ public sealed record NativeTitleSnapshot(string MediaType, int? TmdbId, Guid Tar
     IReadOnlyList<NativeRepresentation> Representations, IReadOnlyList<NativeEpisodeSnapshot> Episodes);
 
 /// <summary>One native movie or series representation.</summary>
-public sealed record NativeRepresentation(Guid JellyfinItemId, Guid TargetLibraryId, bool IsPlayable, Guid? VersionGroupId = null);
+public sealed record NativeRepresentation(Guid JellyfinItemId, Guid TargetLibraryId, bool IsPlayable,
+    Guid? VersionGroupId = null, string? MediaPath = null, string? StorageIdentity = null);
 
 /// <summary>One playable or unavailable native episode observation.</summary>
 public sealed record NativeEpisodeSnapshot(Guid JellyfinItemId, Guid SeriesItemId, int? TmdbId,
     int SeasonNumber, int EpisodeNumber, bool IsPlayable, string? Title = null, string? Overview = null,
-    string? StillPath = null, DateTime? AirDate = null, int? RuntimeMinutes = null);
+    string? StillPath = null, DateTime? AirDate = null, int? RuntimeMinutes = null,
+    string? MediaPath = null, string? StorageIdentity = null);
+
+/// <summary>A complete successful observation used to remove stale native bindings for one available library.</summary>
+internal sealed record ConfirmedLibrarySnapshot(Guid LibraryId, IReadOnlyList<string> LibraryLocations,
+    IReadOnlySet<Guid> TitleIds, IReadOnlySet<Guid> PlayableTitleIds, IReadOnlySet<Guid> EpisodeIds,
+    IReadOnlySet<Guid> PlayableEpisodeIds);
+
+internal sealed record AbsenceConfirmationResult(int MissingItems, bool IsComplete, string? Detail);
 
 /// <summary>The durable effect of one reconciliation operation.</summary>
 public sealed record ReconciliationResult(ReconciliationOutcome Outcome, Guid? EntryId, int ChangedEpisodes, string? Detail);

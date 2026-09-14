@@ -63,11 +63,13 @@ try
     {
         await restarted.Database.MigrateAsync();
         var appliedMigrations = (await restarted.Database.GetAppliedMigrationsAsync()).ToArray();
-        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length == 5, "Restart preserves rows and migrations");
+        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length == 6, "Restart preserves rows and migrations");
         Assert(appliedMigrations.Contains("20260910233343_PhaseTwoBindings"),
             "Published Phase 2 migration identity remains compatible with deployed databases");
         Assert(appliedMigrations.Contains("20260914125924_PhaseTwoBindingProvenance"),
             "Forward migration repairs binding provenance for already deployed databases");
+        Assert(appliedMigrations.Contains("20260914224459_PhaseTwoAbsenceSummary"),
+            "Phase 2 summaries receive missing-media and incomplete-library counters");
     }
 
     await ApiSmoke.RunAsync(folder);
