@@ -11,10 +11,8 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace JellyfinMod.Data.Migrations
 {
     [DbContext(typeof(ModDbContext))]
-    // Keep the identifier first deployed to the isolated host. Changing a migration ID after a
-    // database has applied it makes EF run the same schema change twice on the next restart.
-    [Migration("20260910233343_PhaseTwoBindings")]
-    partial class PhaseTwoBindings
+    [Migration("20260914125924_PhaseTwoBindingProvenance")]
+    partial class PhaseTwoBindingProvenance
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
@@ -109,7 +107,10 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<Guid>("JellyfinItemId")
                         .HasColumnType("TEXT");
 
-                    b.Property<Guid?>("VersionGroupId")
+                    b.Property<Guid>("TargetLibraryId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<Guid>("VersionGroupId")
                         .HasColumnType("TEXT");
 
                     b.HasKey("Id");
@@ -187,6 +188,12 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<Guid>("JellyfinItemId")
                         .HasColumnType("TEXT");
 
+                    b.Property<Guid>("SeriesItemId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<Guid>("TargetLibraryId")
+                        .HasColumnType("TEXT");
+
                     b.HasKey("Id");
 
                     b.HasIndex("EpisodeId");
@@ -227,6 +234,57 @@ namespace JellyfinMod.Data.Migrations
                     b.HasIndex("EntryId");
 
                     b.ToTable("History");
+                });
+
+            modelBuilder.Entity("JellyfinMod.Data.ReconciliationRun", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("CompletedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("ConflictedItems")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("CreatedEntries")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("DiagnosticsJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("FailedItems")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("ScannedItems")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("StartedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("TotalItems")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("UnchangedItems")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("UnmatchedItems")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("UpdatedBindings")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("StartedAt");
+
+                    b.ToTable("ReconciliationRuns");
                 });
 
             modelBuilder.Entity("JellyfinMod.Data.EntryBinding", b =>

@@ -22,8 +22,7 @@ namespace JellyfinMod.Data.Migrations
                     Id = table.Column<Guid>(type: "TEXT", nullable: false),
                     EntryId = table.Column<Guid>(type: "TEXT", nullable: false),
                     JellyfinItemId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    TargetLibraryId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    VersionGroupId = table.Column<Guid>(type: "TEXT", nullable: false)
+                    VersionGroupId = table.Column<Guid>(type: "TEXT", nullable: true)
                 },
                 constraints: table =>
                 {
@@ -42,9 +41,7 @@ namespace JellyfinMod.Data.Migrations
                 {
                     Id = table.Column<Guid>(type: "TEXT", nullable: false),
                     EpisodeId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    JellyfinItemId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    SeriesItemId = table.Column<Guid>(type: "TEXT", nullable: false),
-                    TargetLibraryId = table.Column<Guid>(type: "TEXT", nullable: false)
+                    JellyfinItemId = table.Column<Guid>(type: "TEXT", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -85,15 +82,12 @@ namespace JellyfinMod.Data.Migrations
                 unique: true);
 
             migrationBuilder.Sql(
-                "INSERT INTO EntryBindings (Id, EntryId, JellyfinItemId, TargetLibraryId, VersionGroupId) " +
-                "SELECT JellyfinItemId, Id, JellyfinItemId, TargetLibraryId, JellyfinItemId FROM Entries " +
-                "WHERE JellyfinItemId IS NOT NULL AND TargetLibraryId IS NOT NULL;");
+                "INSERT INTO EntryBindings (Id, EntryId, JellyfinItemId, VersionGroupId) " +
+                "SELECT JellyfinItemId, Id, JellyfinItemId, JellyfinItemId FROM Entries " +
+                "WHERE JellyfinItemId IS NOT NULL;");
             migrationBuilder.Sql(
-                "INSERT INTO EpisodeBindings (Id, EpisodeId, JellyfinItemId, SeriesItemId, TargetLibraryId) " +
-                "SELECT episode.JellyfinItemId, episode.Id, episode.JellyfinItemId, owner.JellyfinItemId, owner.TargetLibraryId " +
-                "FROM Episodes episode JOIN Entries owner ON owner.Id = episode.EntryId " +
-                "WHERE episode.JellyfinItemId IS NOT NULL AND owner.JellyfinItemId IS NOT NULL " +
-                "AND owner.TargetLibraryId IS NOT NULL;");
+                "INSERT INTO EpisodeBindings (Id, EpisodeId, JellyfinItemId) " +
+                "SELECT JellyfinItemId, Id, JellyfinItemId FROM Episodes WHERE JellyfinItemId IS NOT NULL;");
         }
 
         /// <inheritdoc />
