@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Reflection;
 using System.Text.Json;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Entities;
@@ -13,6 +14,9 @@ namespace JellyfinMod.Services;
 public sealed class JellyfinNativeTitleSource(ILibraryManager library)
 {
     private const int PageSize = 50;
+    private const string PrimaryVersionIdPropertyName = "PrimaryVersionId";
+    private static readonly PropertyInfo PrimaryVersionIdProperty = typeof(Video).GetProperty(PrimaryVersionIdPropertyName)
+        ?? throw new MissingMemberException(typeof(Video).FullName, PrimaryVersionIdPropertyName);
 
     /// <summary>Counts native title representations for scheduled-task progress without loading their metadata.</summary>
     public int GetNativeTitleCount(CancellationToken cancellationToken)
@@ -103,7 +107,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
         {
             foreach (var movie in copies.Cast<Movie>())
             {
-                var groupId = Guid.TryParse(movie.PrimaryVersionId, out var primaryId) ? primaryId : movie.Id;
+                var groupId = PrimaryVersionId(movie) ?? movie.Id;
                 var versionsQuery = TitleQuery(folder, "movie");
                 versionsQuery.PresentationUniqueKey = groupId.ToString("N");
                 var versions = ReadPages(versionsQuery, cancellationToken).OfType<Movie>().ToList();
@@ -210,8 +214,22 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library)
             .ThenBy(episode => episode.EpisodeNumber).ThenBy(episode => episode.JellyfinItemId).ToArray();
     }
 
-    private static Guid VersionGroup(Movie movie, IReadOnlySet<Guid> movieIds) =>
-        Guid.TryParse(movie.PrimaryVersionId, out var primaryId) && movieIds.Contains(primaryId) ? primaryId : movie.Id;
+    private static Guid VersionGroup(Movie movie, IReadOnlySet<Guid> movieIds)
+    {
+        var primaryId = PrimaryVersionId(movie);
+        return primaryId.HasValue && movieIds.Contains(primaryId.Value) ? primaryId.Value : movie.Id;
+    }
+
+    private static Guid? PrimaryVersionId(Video video)
+    {
+        var value = PrimaryVersionIdProperty.GetValue(video);
+        if (value is Guid id)
+        {
+            return id == Guid.Empty ? null : id;
+        }
+
+        return value is string text && Guid.TryParse(text, out id) && id != Guid.Empty ? id : null;
+    }
 
     private static bool IsPlayable(BaseItem item) => !string.IsNullOrWhiteSpace(item.Path);
 
