@@ -3,6 +3,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 
 namespace JellyfinMod.Services;
 
@@ -12,16 +13,25 @@ public sealed class RetentionCompletionService(
     IUserManager users,
     ILibraryManager library,
     IUserDataManager userData,
-    TimeProvider clock)
+    TimeProvider clock,
+    ILogger<RetentionCompletionService> logger)
 {
     /// <summary>Refreshes one native movie or episode for one user.</summary>
     public async Task RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason, CancellationToken cancellationToken)
     {
         var user = users.GetUserById(userId);
-        if (user is null) return;
+        if (user is null)
+        {
+            logger.LogDebug("Retention evidence skipped unknown user {UserId}", userId);
+            return;
+        }
 
         var target = await ResolveTargetAsync(jellyfinItemId, cancellationToken).ConfigureAwait(false);
-        if (target is null) return;
+        if (target is null)
+        {
+            logger.LogDebug("Retention evidence skipped unbound native item {ItemId}", jellyfinItemId);
+            return;
+        }
 
         var now = clock.GetUtcNow().UtcDateTime;
         var observation = await database.CompletionObservations.SingleOrDefaultAsync(
@@ -77,6 +87,8 @@ public sealed class RetentionCompletionService(
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
         var userIds = users.GetUsers().Select(user => user.Id).ToArray();
         var total = itemIds.Length * userIds.Length;
+        logger.LogInformation("Refreshing retention evidence for {ItemCount} bound items and {UserCount} users",
+            itemIds.Length, userIds.Length);
         var completed = 0;
         foreach (var itemId in itemIds)
         {
