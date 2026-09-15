@@ -73,6 +73,12 @@
         selectedUser.disabled = !visible;
       }
 
+      function watchedUserModeValue(value) {
+        if (value === 1 || value === 'SelectedUser') return '1';
+        if (value === 2 || value === 'AnyUser') return '2';
+        return '0';
+      }
+
       watchedUserMode.addEventListener('change', updateSelectedUserVisibility);
 
       document.querySelector('#JellyfinModConfigPage')
@@ -83,7 +89,7 @@
             document.querySelector('#TmdbApiKey').value = config.TmdbApiKey || '';
             document.querySelector('#RetentionEnabled').checked = !!config.RetentionEnabled;
             document.querySelector('#ReclaimAfterDays').value = config.ReclaimAfterDays;
-            watchedUserMode.value = String(config.RetentionWatchedUserMode == null ? 0 : config.RetentionWatchedUserMode);
+            watchedUserMode.value = watchedUserModeValue(config.RetentionWatchedUserMode);
             document.querySelector('#ExemptFavourites').checked = !!config.ExemptFavourites;
             return ApiClient.getUsers().then(function (users) {
               var configuredUserId = (config.RetentionSelectedUserId || '').replace(/-/g, '').toLowerCase();
