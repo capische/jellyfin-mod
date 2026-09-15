@@ -3,10 +3,10 @@
 ![JellyfinMod](JellyfinMod/Assets/logo.png)
 
 Plugin loading, authenticated health, configuration, persistent SQLite and the Phase 1 catalog
-APIs are implemented. Phase 2 reconciliation has integration coverage and has passed native-host
-backfill, idempotency, disappearance/return and browser acceptance checkpoints on the isolated test
-instance. The remaining native-host concurrency cases are listed below. Acquisition and retention
-are planned work.
+APIs are implemented. Phase 2 reconciliation has passed its integration, native-host and browser
+acceptance checkpoints. Phase 3 T1 policy, completion evidence and access-aware deadline evaluation
+are implemented and accepted on the isolated test instance. Retention preview, protection checks and
+reclamation remain planned work; no automatic file deletion exists yet.
 
 The server half of **JellyfinMod**. The other half is the
 [`jellyfin-web`](https://github.com/capische/jellyfin-web) fork.
@@ -194,6 +194,29 @@ All disposable media, entries and the temporary user were removed. The database 
 entries and 160 bindings; the TMDB 550 fixture retained one binding to its original C copy. The
 four expected test users remained. Phase 2 native and browser acceptance is complete on
 `jellyfinmod-test`. No production deployment or production data changes are claimed.
+
+## Phase 3 T1 validation checkpoint
+
+T1 persists the disabled-by-default All/Selected/Any policy, per-user movie and episode completion
+evidence, and access-aware deadline evaluations. Native user-data and user-policy callbacks enqueue
+work and re-read authoritative Jellyfin state outside the callback. The scheduled evidence repair
+recovers missed events. Evaluations retain the policy revision, a non-identifying access-set hash,
+completion basis, full-grace start and deadline. They never delete files.
+
+The integration suite covers duplicate and out-of-order notifications, replay/resume, unwatched,
+favorites, missing evidence, Keep, per-entry days, restart persistence, re-enable baseline grace,
+deadline non-shortening and access membership changes for All, Selected and Any user modes. All
+Phase 0–3 integration suites pass, and the eighth migration preserved the isolated database copy's
+163 entries, 160 bindings, 22 episodes and 224 completion observations with SQLite integrity and
+foreign-key checks clean.
+
+The isolated native-host check then produced 224 observations for 56 bound movie/episode targets
+and four users. Real watched, unwatched and favorite events updated only the affected user/target
+row. The browser configuration page persisted all three modes and the selected-user picker across
+reloads. Selected and Any scheduled the disposable R4 movie after `oleksii` watched it; All waited
+for the other accessible users. The movie finished unwatched and unfavorited, retention was restored
+to disabled/All users, and all 56 evaluations returned to `retention_disabled`. Production was not
+deployed or modified.
 
 ## Phase 0 — done when
 
