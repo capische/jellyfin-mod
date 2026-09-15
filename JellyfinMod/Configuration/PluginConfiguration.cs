@@ -2,6 +2,19 @@ using MediaBrowser.Model.Plugins;
 
 namespace JellyfinMod;
 
+/// <summary>Whose completed playback starts a retention window.</summary>
+public enum WatchedUserMode
+{
+    /// <summary>Every user with access to the library must finish the media.</summary>
+    AllUsers = 0,
+
+    /// <summary>One administrator-selected user must finish the media.</summary>
+    SelectedUser = 1,
+
+    /// <summary>The first user with access to finish the media starts the window.</summary>
+    AnyUser = 2
+}
+
 /// <summary>
 /// Plugin settings. Serialized as XML by the host, so no Dictionary&lt;,&gt; members.
 /// </summary>
@@ -18,6 +31,12 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Gets or sets how many days after finishing a title its file is reclaimed.</summary>
     public int ReclaimAfterDays { get; set; } = 14;
+
+    /// <summary>Gets or sets whose watched state starts the retention window.</summary>
+    public WatchedUserMode RetentionWatchedUserMode { get; set; } = WatchedUserMode.AllUsers;
+
+    /// <summary>Gets or sets the selected Jellyfin user when SelectedUser mode is active.</summary>
+    public Guid? RetentionSelectedUserId { get; set; }
 
     /// <summary>Gets or sets a value indicating whether favourites are exempt from retention.</summary>
     public bool ExemptFavourites { get; set; } = true;

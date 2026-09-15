@@ -31,11 +31,16 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<JellyfinNativeTitleSource>();
         services.AddTransient<CatalogBackfillRunner>();
         services.AddTransient<JellyfinItemReconciliationRunner>();
+        services.AddTransient<RetentionPolicyService>();
+        services.AddTransient<RetentionCompletionService>();
+        services.AddSingleton(TimeProvider.System);
         services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
             () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>()));
         services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<DatabaseInitializer>());
         services.AddSingleton<LibraryEventListener>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<LibraryEventListener>());
+        services.AddSingleton<RetentionEventListener>();
+        services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<RetentionEventListener>());
     }
 }

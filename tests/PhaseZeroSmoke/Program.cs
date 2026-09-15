@@ -50,12 +50,22 @@ try
     Assert(HealthStatus(broken) == 503, "Failed migration reports unavailable without crashing the host");
 
     var serializer = new XmlSerializer(typeof(PluginConfiguration));
-    var config = new PluginConfiguration { TmdbReadAccessToken = "test-read-token", ReclaimAfterDays = 21, ExemptFavourites = false };
+    var selectedUserId = Guid.NewGuid();
+    var config = new PluginConfiguration
+    {
+        TmdbReadAccessToken = "test-read-token",
+        ReclaimAfterDays = 21,
+        RetentionWatchedUserMode = WatchedUserMode.SelectedUser,
+        RetentionSelectedUserId = selectedUserId,
+        ExemptFavourites = false
+    };
     using var serialized = new StringWriter();
     serializer.Serialize(serialized, config);
     using var reader = new StringReader(serialized.ToString());
     var restored = (PluginConfiguration)serializer.Deserialize(reader)!;
-    Assert(restored.TmdbReadAccessToken == "test-read-token" && restored.ReclaimAfterDays == 21 && !restored.ExemptFavourites && !restored.RetentionEnabled,
+    Assert(restored.TmdbReadAccessToken == "test-read-token" && restored.ReclaimAfterDays == 21 &&
+        restored.RetentionWatchedUserMode == WatchedUserMode.SelectedUser && restored.RetentionSelectedUserId == selectedUserId &&
+        !restored.ExemptFavourites && !restored.RetentionEnabled,
         "Configuration survives XML round trip with retention disabled");
     Console.WriteLine("PASS: migrations, restart persistence, health readiness/failure, configuration XML");
 }

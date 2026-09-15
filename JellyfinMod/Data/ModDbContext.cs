@@ -29,6 +29,12 @@ public class ModDbContext : DbContext
     /// <summary>Gets full reconciliation run summaries.</summary>
     public DbSet<ReconciliationRun> ReconciliationRuns => Set<ReconciliationRun>();
 
+    /// <summary>Gets durable per-user completion and protection evidence.</summary>
+    public DbSet<CompletionObservation> CompletionObservations => Set<CompletionObservation>();
+
+    /// <summary>Gets persisted retention policy revisions.</summary>
+    public DbSet<RetentionPolicySnapshot> RetentionPolicySnapshots => Set<RetentionPolicySnapshot>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -67,6 +73,15 @@ public class ModDbContext : DbContext
             e.Property(x => x.Status).HasMaxLength(16);
             e.HasIndex(x => x.StartedAt);
         });
+
+        b.Entity<CompletionObservation>(e =>
+        {
+            e.HasIndex(x => new { x.TargetId, x.UserId }).IsUnique();
+            e.HasIndex(x => x.JellyfinItemId);
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<RetentionPolicySnapshot>(e => e.HasKey(x => x.Id));
 
         b.Entity<HistoryRecord>(e => e.HasIndex(x => x.EntryId));
     }

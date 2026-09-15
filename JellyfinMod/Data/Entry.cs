@@ -24,6 +24,19 @@ public enum FileState
     Reclaimed = 5
 }
 
+/// <summary>An entry's explicit override of the global retention duration.</summary>
+public enum RetentionPolicy
+{
+    /// <summary>Use the global retention duration.</summary>
+    Inherit = 0,
+
+    /// <summary>Use the positive duration stored on this entry.</summary>
+    Days = 1,
+
+    /// <summary>Keep this entry indefinitely.</summary>
+    Never = 2
+}
+
 /// <summary>
 /// One entry per title. May or may not have a media file behind it — that is the whole point.
 /// </summary>
@@ -89,4 +102,7 @@ public class Entry
 
     /// <summary>Gets or sets a per-entry override of the global retention window.</summary>
     public int? ReclaimAfterDays { get; set; }
+
+    /// <summary>Gets or sets how this entry overrides the global retention policy.</summary>
+    public RetentionPolicy RetentionPolicy { get; set; }
 }

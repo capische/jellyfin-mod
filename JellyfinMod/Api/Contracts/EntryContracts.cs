@@ -60,10 +60,26 @@ public sealed class EntryDto(Entry entry)
     /// <summary>Gets reclaimAfterDays.</summary>
     [JsonPropertyName("reclaimAfterDays")]
     public int? ReclaimAfterDays { get; } = entry.ReclaimAfterDays;
+    /// <summary>Gets retentionPolicy.</summary>
+    [JsonPropertyName("retentionPolicy")]
+    public string RetentionPolicy { get; } = RetentionPolicies.ToWire(entry.RetentionPolicy);
     /// <summary>Gets metadata.</summary>
     [JsonPropertyName("metadata")]
     public TmdbMetadata? Metadata { get; } = entry.MetadataJson is { } json ? JsonSerializer.Deserialize<TmdbMetadata>(json) : null;
     private static DateTime? Utc(DateTime? value) => value.HasValue ? DateTime.SpecifyKind(value.Value, DateTimeKind.Utc) : null;
+}
+
+/// <summary>Explicit stable retention-policy names.</summary>
+public static class RetentionPolicies
+{
+    /// <summary>Converts an internal retention policy into the public contract.</summary>
+    public static string ToWire(RetentionPolicy policy) => policy switch
+    {
+        RetentionPolicy.Inherit => "inherit",
+        RetentionPolicy.Days => "days",
+        RetentionPolicy.Never => "never",
+        _ => throw new ArgumentOutOfRangeException(nameof(policy))
+    };
 }
 
 /// <summary>One durable history event.</summary>

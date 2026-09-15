@@ -28,22 +28,16 @@ try
         await database.GetService<IMigrator>().MigrateAsync("20260906021220_InitialCreate");
         await database.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO Entries (Id, MediaType, TmdbId, Title, State, Monitored, AddedAt, TargetLibraryId, JellyfinItemId) VALUES ({firstId}, 'movie', 123, 'Existing title', 4, 1, {DateTime.UtcNow}, {libraryId}, {firstNativeId})");
         await database.GetService<IMigrator>().MigrateAsync("20260908011536_PhaseOneEntries");
-        Assert((await database.Entries.SingleAsync()).Id == firstId, "Upgrade preserves entries");
-        database.Entries.Add(new Entry { MediaType = "movie", TmdbId = 123, TargetLibraryId = Guid.NewGuid(), Title = "Second library" });
+        Assert(await database.Entries.Select(entry => entry.Id).SingleAsync() == firstId, "Upgrade preserves entries");
+        var secondEntryId = Guid.NewGuid();
+        var secondLibraryId = Guid.NewGuid();
+        await database.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO Entries (Id, MediaType, TmdbId, Title, State, Monitored, AddedAt, TargetLibraryId) VALUES ({secondEntryId}, 'movie', 123, 'Second library', 0, 1, {DateTime.UtcNow}, {secondLibraryId})");
         var seriesNativeId = Guid.NewGuid();
-        var show = new Entry
-        {
-            MediaType = "series", TmdbId = 123, TargetLibraryId = libraryId, Title = "Series",
-            JellyfinItemId = seriesNativeId, State = FileState.OnDisk
-        };
-        database.Entries.Add(show);
+        var showId = Guid.NewGuid();
+        await database.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO Entries (Id, MediaType, TmdbId, Title, State, Monitored, AddedAt, TargetLibraryId, JellyfinItemId) VALUES ({showId}, 'series', 123, 'Series', 4, 1, {DateTime.UtcNow}, {libraryId}, {seriesNativeId})");
         var episodeNativeId = Guid.NewGuid();
-        database.Episodes.Add(new Episode
-        {
-            EntryId = show.Id, TmdbId = 999, SeasonNumber = 1, EpisodeNumber = 1, Title = "Pilot",
-            JellyfinItemId = episodeNativeId, State = FileState.OnDisk
-        });
-        await database.SaveChangesAsync();
+        var episodeId = Guid.NewGuid();
+        await database.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO Episodes (Id, EntryId, TmdbId, SeasonNumber, EpisodeNumber, Title, Monitored, State, JellyfinItemId) VALUES ({episodeId}, {showId}, 999, 1, 1, 'Pilot', 1, 4, {episodeNativeId})");
         await database.Database.MigrateAsync();
         Assert(await database.Entries.CountAsync() == 3, "Identity includes media type and library");
         Assert((await database.EntryBindings.SingleAsync(binding => binding.EntryId == firstId)).JellyfinItemId == firstNativeId &&
@@ -55,7 +49,7 @@ try
         await Throws<DbUpdateException>(() => database.SaveChangesAsync());
         database.ChangeTracker.Clear();
         Assert(await database.Entries.CountAsync() == 3, "Same-library duplicate rejected");
-        database.Entries.Remove(await database.Entries.SingleAsync(e => e.Id == show.Id));
+        database.Entries.Remove(await database.Entries.SingleAsync(e => e.Id == showId));
         await database.SaveChangesAsync();
         Assert(await database.Episodes.CountAsync() == 0, "Entry removal cascades episodes");
     }
@@ -63,13 +57,15 @@ try
     {
         await restarted.Database.MigrateAsync();
         var appliedMigrations = (await restarted.Database.GetAppliedMigrationsAsync()).ToArray();
-        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length == 6, "Restart preserves rows and migrations");
+        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length == 7, "Restart preserves rows and migrations");
         Assert(appliedMigrations.Contains("20260910233343_PhaseTwoBindings"),
             "Published Phase 2 migration identity remains compatible with deployed databases");
         Assert(appliedMigrations.Contains("20260914125924_PhaseTwoBindingProvenance"),
             "Forward migration repairs binding provenance for already deployed databases");
         Assert(appliedMigrations.Contains("20260914224459_PhaseTwoAbsenceSummary"),
             "Phase 2 summaries receive missing-media and incomplete-library counters");
+        Assert(appliedMigrations.Contains("20260915140337_PhaseThreeRetentionEvidence"),
+            "Phase 3 adds durable retention policy and completion evidence");
     }
 
     await ApiSmoke.RunAsync(folder);
