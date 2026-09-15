@@ -174,11 +174,26 @@ layouts, TV D-pad navigation and Poster/List views. A temporary non-admin user s
 movie library but not the restricted TV library; changing that user's played state did not change
 the admin user's state. The temporary account was removed after the check.
 
-Before declaring every Phase 2 live scenario complete, still exercise real grouped copies,
-provider corrections, replacement events overlapping repair, cancellation/rerun, and an
-ordinary-user add during backfill on the isolated native host. The integration suite covers these
-contracts, but this checkpoint does not claim they have all been reproduced against Jellyfin's
-running native event pipeline. No production deployment or production data changes are claimed.
+The remaining native-host scenarios passed on the isolated server on 2026-09-15:
+
+- Two physical copies with TMDB 550 produced one durable catalog entry with two bindings. Removing
+  one copy retained the card, rebound it to the survivor and did not emit `media_missing`.
+- Overlapping `RefreshLibrary` and `JellyfinModCatalogReconciliation` tasks converged to the restored
+  native item with no duplicate entry or binding. The repair summary scanned 161 observations, had
+  160 unchanged and one unmatched item, and reported zero failures or conflicts.
+- Cancelling reconciliation after three committed observations persisted a bounded partial run.
+  Its immediate rerun scanned all 161 observations and again reported 160 unchanged, one unmatched,
+  and zero created, updated, conflicted or failed rows.
+- A non-admin add for TMDB 552 raced a full reconciliation. Backfill won the insert, the request
+  returned the same single entry with monitoring enabled, and history contained one backfill plus
+  one monitoring transition.
+- A native movie without a provider ID remained unmatched. After its native metadata was corrected
+  to TMDB 553, the next scan created one bound `onDisk` entry without title-based guessing.
+
+All disposable media, entries and the temporary user were removed. The database returned to 163
+entries and 160 bindings; the TMDB 550 fixture retained one binding to its original C copy. The
+four expected test users remained. Phase 2 native and browser acceptance is complete on
+`jellyfinmod-test`. No production deployment or production data changes are claimed.
 
 ## Phase 0 — done when
 
