@@ -35,6 +35,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets persisted retention policy revisions.</summary>
     public DbSet<RetentionPolicySnapshot> RetentionPolicySnapshots => Set<RetentionPolicySnapshot>();
 
+    /// <summary>Gets durable access-aware completion policy results.</summary>
+    public DbSet<RetentionEvaluation> RetentionEvaluations => Set<RetentionEvaluation>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -82,6 +85,14 @@ public class ModDbContext : DbContext
         });
 
         b.Entity<RetentionPolicySnapshot>(e => e.HasKey(x => x.Id));
+
+        b.Entity<RetentionEvaluation>(e =>
+        {
+            e.HasIndex(x => x.TargetId).IsUnique();
+            e.HasIndex(x => x.Deadline);
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+        });
 
         b.Entity<HistoryRecord>(e => e.HasIndex(x => x.EntryId));
     }

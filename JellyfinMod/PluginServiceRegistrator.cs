@@ -33,6 +33,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<JellyfinItemReconciliationRunner>();
         services.AddTransient<RetentionPolicyService>();
         services.AddTransient<RetentionCompletionService>();
+        services.AddTransient<RetentionEvaluator>();
         services.AddSingleton(TimeProvider.System);
         services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
             () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>()));

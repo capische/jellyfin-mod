@@ -1,4 +1,6 @@
 using System.Reflection;
+using Jellyfin.Data.Enums;
+using Jellyfin.Data.Events;
 using Jellyfin.Database.Implementations.Entities;
 using JellyfinMod;
 using JellyfinMod.Data;
@@ -8,6 +10,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Globalization;
 using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Serialization;
 using Microsoft.EntityFrameworkCore;
@@ -56,7 +59,15 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     var path = Path.Combine(folder, "events.db");
     var firstUser = new User("first", "auth", "reset") { Id = Guid.NewGuid() };
     var secondUser = new User("second", "auth", "reset") { Id = Guid.NewGuid() };
-    User[] allUsers = [firstUser, secondUser];
+    List<User> allUsers = [firstUser, secondUser];
+    var movieLibrary = new EmptyLibrary { Id = Guid.NewGuid(), CollectionType = CollectionType.movies };
+    var tvLibrary = new EmptyLibrary { Id = Guid.NewGuid(), CollectionType = CollectionType.tvshows };
+    var accessibleLibraries = new Dictionary<Guid, IReadOnlyList<BaseItem>>
+    {
+        [firstUser.Id] = [movieLibrary, tvLibrary],
+        [secondUser.Id] = [movieLibrary, tvLibrary]
+    };
+    var root = new TestRoot(user => accessibleLibraries.GetValueOrDefault(user.Id, []));
     var movie = new Movie { Id = Guid.NewGuid(), Name = "Movie", Path = "/fixture/movie.mkv" };
     var nativeEpisode = new MediaBrowser.Controller.Entities.TV.Episode
     {
@@ -65,6 +76,7 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     var items = new Dictionary<Guid, BaseItem> { [movie.Id] = movie, [nativeEpisode.Id] = nativeEpisode };
     var states = new Dictionary<(Guid UserId, Guid ItemId), UserItemData>();
     EventHandler<UserDataSaveEventArgs>? userDataSaved = null;
+    EventHandler<GenericEventArgs<User>>? userUpdated = null;
     var userData = Stub<IUserDataManager>.Create((method, arguments) => method.Name switch
     {
         "add_UserDataSaved" => AddHandler(arguments),
@@ -74,13 +86,19 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     });
     var users = Stub<IUserManager>.Create((method, arguments) => method.Name switch
     {
+        "add_OnUserUpdated" => AddUserUpdatedHandler(arguments),
+        "remove_OnUserUpdated" => RemoveUserUpdatedHandler(arguments),
         "GetUserById" when arguments?[0] is Guid id => allUsers.SingleOrDefault(user => user.Id == id),
-        "GetUsers" => allUsers,
+        "GetUsers" => allUsers.ToArray(),
         _ => null
     });
-    var library = Stub<ILibraryManager>.Create((method, arguments) => method.Name == "GetItemById" && arguments?[0] is Guid id
-        ? items.GetValueOrDefault(id)
-        : null);
+    var library = Stub<ILibraryManager>.Create((method, arguments) => method.Name switch
+    {
+        "GetUserRootFolder" => root,
+        "GetItemById" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
+        _ => null
+    });
+    var localization = Stub<ILocalizationManager>.Create((_, _) => null);
     var applicationPaths = Stub<IApplicationPaths>.Create((method, _) => method.Name switch
     {
         "get_DataPath" => folder,
@@ -97,26 +115,37 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     });
     var plugin = new Plugin(applicationPaths, serializer);
     var clock = new MutableTimeProvider(new DateTimeOffset(2026, 9, 16, 0, 0, 0, TimeSpan.Zero));
+    var movieEntryId = Guid.NewGuid();
+    var seriesEntryId = Guid.NewGuid();
+    var episodeRecordId = Guid.NewGuid();
 
     await using (var setup = new ModDbContext(path))
     {
         await setup.Database.MigrateAsync();
-        var movieEntry = new Entry { Id = Guid.NewGuid(), MediaType = "movie", TmdbId = 10, Title = "Movie", State = FileState.OnDisk };
-        var seriesEntry = new Entry { Id = Guid.NewGuid(), MediaType = "series", TmdbId = 20, Title = "Series", State = FileState.OnDisk };
+        var movieEntry = new Entry
+        {
+            Id = movieEntryId, MediaType = "movie", TmdbId = 10, Title = "Movie", State = FileState.OnDisk,
+            TargetLibraryId = movieLibrary.Id
+        };
+        var seriesEntry = new Entry
+        {
+            Id = seriesEntryId, MediaType = "series", TmdbId = 20, Title = "Series", State = FileState.OnDisk,
+            TargetLibraryId = tvLibrary.Id
+        };
         var episode = new Episode
         {
-            Id = Guid.NewGuid(), EntryId = seriesEntry.Id, TmdbId = 21, SeasonNumber = 1, EpisodeNumber = 1,
+            Id = episodeRecordId, EntryId = seriesEntry.Id, TmdbId = 21, SeasonNumber = 1, EpisodeNumber = 1,
             Title = "Episode", State = FileState.OnDisk, JellyfinItemId = nativeEpisode.Id
         };
         setup.Entries.AddRange(movieEntry, seriesEntry);
         setup.Episodes.Add(episode);
         setup.EntryBindings.Add(new EntryBinding
         {
-            EntryId = movieEntry.Id, JellyfinItemId = movie.Id, TargetLibraryId = Guid.NewGuid(), VersionGroupId = movie.Id
+            EntryId = movieEntry.Id, JellyfinItemId = movie.Id, TargetLibraryId = movieLibrary.Id, VersionGroupId = movie.Id
         });
         setup.EpisodeBindings.Add(new EpisodeBinding
         {
-            EpisodeId = episode.Id, JellyfinItemId = nativeEpisode.Id, SeriesItemId = Guid.NewGuid(), TargetLibraryId = Guid.NewGuid()
+            EpisodeId = episode.Id, JellyfinItemId = nativeEpisode.Id, SeriesItemId = Guid.NewGuid(), TargetLibraryId = tvLibrary.Id
         });
         await setup.SaveChangesAsync();
     }
@@ -127,9 +156,11 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     services.AddSingleton(users);
     services.AddSingleton(library);
     services.AddSingleton(userData);
+    services.AddTransient(_ => new LibraryAccess(users, library, localization));
     services.AddSingleton<TimeProvider>(clock);
     services.AddTransient<RetentionPolicyService>();
     services.AddTransient<RetentionCompletionService>();
+    services.AddTransient<RetentionEvaluator>();
     services.AddSingleton<RetentionEventListener>();
     await using var provider = services.BuildServiceProvider();
     var listener = provider.GetRequiredService<RetentionEventListener>();
@@ -138,11 +169,15 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     {
         await WaitForAsync(path, async database => await database.RetentionPolicySnapshots.CountAsync() == 1,
             "Startup did not persist the disabled default All users policy");
+        await WaitForAsync(path, async database => await database.RetentionEvaluations.CountAsync() == 2,
+            "Startup did not evaluate the bound movie and episode");
         await using (var initial = new ModDbContext(path))
         {
             var policy = await initial.RetentionPolicySnapshots.SingleAsync();
             Assert(policy.Version == 1 && !policy.Enabled && policy.WatchedUserMode == WatchedUserMode.AllUsers &&
                 policy.EnabledAt is null, "Default retention policy is disabled and uses All users");
+            Assert(await initial.RetentionEvaluations.AllAsync(evaluation => evaluation.State == "disabled" && evaluation.Deadline == null),
+                "Disabled retention clears every completion deadline");
         }
 
         plugin.UpdateConfiguration(new PluginConfiguration
@@ -155,6 +190,9 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         });
         await WaitForAsync(path, async database => (await database.RetentionPolicySnapshots.SingleAsync()).Version == 2,
             "Configuration event did not advance the durable policy revision");
+        await WaitForAsync(path, async database => await database.RetentionEvaluations.AllAsync(evaluation =>
+                evaluation.PolicyVersion == 2 && evaluation.State == "blocked"),
+            "Enabled policy did not block targets with missing completion evidence");
         await using (var configured = new ModDbContext(path))
         {
             var policy = await configured.RetentionPolicySnapshots.SingleAsync();
@@ -207,9 +245,147 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
 
         var repairProgress = 0d;
         using (var scope = provider.CreateScope())
+        {
             await scope.ServiceProvider.GetRequiredService<RetentionCompletionService>()
                 .RefreshAllAsync(new InlineProgress(value => repairProgress = value), default);
+            await scope.ServiceProvider.GetRequiredService<RetentionEvaluator>().EvaluateAllAsync(default);
+        }
         Assert(repairProgress == 100, "Repair re-reads every bound target for every user");
+
+        clock.Advance(TimeSpan.FromHours(1));
+        var selectedCompletion = clock.GetUtcNow().UtcDateTime;
+        states[(secondUser.Id, movie.Id)] = State(true, 0, selectedCompletion);
+        Raise(secondUser.Id, movie, UserDataSaveReason.TogglePlayed);
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "scheduled" &&
+            evaluation.CompletionBasisAt == selectedCompletion && evaluation.EligibleAt == selectedCompletion &&
+            evaluation.Deadline == selectedCompletion.AddDays(21),
+            "Selected user did not create its own full retention window");
+        DateTime selectedDeadline;
+        await using (var selected = new ModDbContext(path))
+            selectedDeadline = (await selected.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == movieEntryId)).Deadline!.Value;
+
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            RetentionEnabled = true,
+            RetentionWatchedUserMode = WatchedUserMode.AnyUser,
+            ReclaimAfterDays = 7,
+            ExemptFavourites = false
+        });
+        await WaitForAsync(path, async database => (await database.RetentionPolicySnapshots.SingleAsync()).Version == 3,
+            "Any user policy did not advance the revision");
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "scheduled" &&
+            evaluation.CompletionBasisAt == replayCompletion && evaluation.Deadline == selectedDeadline,
+            "Any user did not use the first completion while preserving an existing longer grace period");
+
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            RetentionEnabled = true,
+            RetentionWatchedUserMode = WatchedUserMode.AnyUser,
+            ReclaimAfterDays = 7,
+            ExemptFavourites = true
+        });
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "blocked" && evaluation.Reason == "favorite",
+            "An accessible user's favourite did not block the completion deadline");
+
+        await using (var keep = new ModDbContext(path))
+        {
+            var entry = await keep.Entries.SingleAsync(candidate => candidate.Id == movieEntryId);
+            entry.RetentionPolicy = RetentionPolicy.Never;
+            await keep.SaveChangesAsync();
+        }
+        using (var scope = provider.CreateScope())
+            await scope.ServiceProvider.GetRequiredService<RetentionEvaluator>().EvaluateNativeItemAsync(movie.Id, default);
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "blocked" && evaluation.Reason == "kept",
+            "A Never entry override did not block retention before user-state evaluation");
+        await using (var inherit = new ModDbContext(path))
+        {
+            var entry = await inherit.Entries.SingleAsync(candidate => candidate.Id == movieEntryId);
+            entry.RetentionPolicy = RetentionPolicy.Inherit;
+            await inherit.SaveChangesAsync();
+        }
+
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            RetentionEnabled = true,
+            RetentionWatchedUserMode = WatchedUserMode.AllUsers,
+            ReclaimAfterDays = 7,
+            ExemptFavourites = false
+        });
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "scheduled" &&
+            evaluation.CompletionBasisAt == selectedCompletion,
+            "All users did not wait for the last accessible completion");
+
+        clock.Advance(TimeSpan.FromHours(1));
+        states[(secondUser.Id, movie.Id)] = State(false, 0, null);
+        Raise(secondUser.Id, movie, UserDataSaveReason.TogglePlayed);
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "waiting" && evaluation.Deadline == null,
+            "Marking one accessible user unwatched did not cancel All users eligibility");
+
+        accessibleLibraries[secondUser.Id] = [];
+        RaiseUserUpdated(secondUser);
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "scheduled" &&
+            evaluation.EligibleAt == clock.GetUtcNow().UtcDateTime && evaluation.Deadline == clock.GetUtcNow().UtcDateTime.AddDays(7),
+            "Removing an unfinished user's access did not start a fresh full grace period");
+
+        accessibleLibraries[secondUser.Id] = [movieLibrary, tvLibrary];
+        RaiseUserUpdated(secondUser);
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "waiting" && evaluation.Deadline == null,
+            "Adding an unfinished user back did not block All users eligibility");
+
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            RetentionEnabled = true,
+            RetentionWatchedUserMode = WatchedUserMode.SelectedUser,
+            RetentionSelectedUserId = secondUser.Id,
+            ReclaimAfterDays = 7,
+            ExemptFavourites = false
+        });
+        accessibleLibraries[secondUser.Id] = [];
+        RaiseUserUpdated(secondUser);
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "blocked" &&
+            evaluation.Reason == "selected_user_inaccessible" && evaluation.Deadline == null,
+            "An inaccessible selected user did not block retention");
+
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            RetentionEnabled = false,
+            RetentionWatchedUserMode = WatchedUserMode.AllUsers,
+            ReclaimAfterDays = 14,
+            ExemptFavourites = true
+        });
+        await WaitForAsync(path, async database => await database.RetentionEvaluations.AllAsync(evaluation =>
+                evaluation.State == "disabled" && evaluation.Deadline == null),
+            "Disabling retention did not clear every active countdown");
+
+        clock.Advance(TimeSpan.FromDays(1));
+        accessibleLibraries[secondUser.Id] = [];
+        await using (var duration = new ModDbContext(path))
+        {
+            var entry = await duration.Entries.SingleAsync(candidate => candidate.Id == movieEntryId);
+            entry.RetentionPolicy = RetentionPolicy.Days;
+            entry.ReclaimAfterDays = 3;
+            await duration.SaveChangesAsync();
+        }
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            RetentionEnabled = true,
+            RetentionWatchedUserMode = WatchedUserMode.AnyUser,
+            ReclaimAfterDays = 14,
+            ExemptFavourites = false
+        });
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "scheduled" &&
+            evaluation.EligibleAt == clock.GetUtcNow().UtcDateTime && evaluation.Deadline == clock.GetUtcNow().UtcDateTime.AddDays(3),
+            "Re-enable did not start a fresh full per-entry grace period");
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            RetentionEnabled = false,
+            RetentionWatchedUserMode = WatchedUserMode.AllUsers,
+            ReclaimAfterDays = 14,
+            ExemptFavourites = true
+        });
+        await WaitForAsync(path, async database => await database.RetentionEvaluations.AllAsync(evaluation =>
+                evaluation.State == "disabled" && evaluation.Deadline == null),
+            "Final disable did not clear re-enabled countdowns");
     }
     finally
     {
@@ -218,8 +394,9 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
 
     await using var restarted = new ModDbContext(path);
     Assert(await restarted.CompletionObservations.CountAsync() == 4 &&
-        await restarted.RetentionPolicySnapshots.CountAsync() == 1,
-        "Per-user evidence and policy revision survive a real SQLite restart");
+        await restarted.RetentionPolicySnapshots.CountAsync() == 1 &&
+        await restarted.RetentionEvaluations.CountAsync() == 2,
+        "Per-user evidence, policy and access-aware evaluations survive a real SQLite restart");
 
     object? AddHandler(object?[]? arguments)
     {
@@ -230,6 +407,18 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     object? RemoveHandler(object?[]? arguments)
     {
         userDataSaved -= (EventHandler<UserDataSaveEventArgs>)arguments![0]!;
+        return null;
+    }
+
+    object? AddUserUpdatedHandler(object?[]? arguments)
+    {
+        userUpdated += (EventHandler<GenericEventArgs<User>>)arguments![0]!;
+        return null;
+    }
+
+    object? RemoveUserUpdatedHandler(object?[]? arguments)
+    {
+        userUpdated -= (EventHandler<GenericEventArgs<User>>)arguments![0]!;
         return null;
     }
 
@@ -247,6 +436,8 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         SaveReason = reason,
         Keys = []
     });
+
+    void RaiseUserUpdated(User user) => userUpdated!(null, new GenericEventArgs<User>(user));
 }
 
 static UserItemData State(bool played, long position, DateTime? lastPlayedAt, bool favorite = false) => new()
@@ -265,6 +456,13 @@ static Task WaitForObservationAsync(string path, Guid userId, Guid jellyfinItemI
         candidate.UserId == userId && candidate.JellyfinItemId == jellyfinItemId);
     return observation is not null && condition(observation);
 }, "Timed out waiting for completion evidence");
+
+static Task WaitForEvaluationAsync(string path, Guid targetId,
+    Func<RetentionEvaluation, bool> condition, string message) => WaitForAsync(path, async database =>
+{
+    var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(candidate => candidate.TargetId == targetId);
+    return evaluation is not null && condition(evaluation);
+}, message);
 
 static async Task WaitForAsync(string path, Func<ModDbContext, Task<bool>> condition, string message)
 {
@@ -294,6 +492,18 @@ sealed class MutableTimeProvider(DateTimeOffset now) : TimeProvider
 sealed class InlineProgress(Action<double> report) : IProgress<double>
 {
     public void Report(double value) => report(value);
+}
+
+sealed class TestRoot(Func<User, IReadOnlyList<BaseItem>> children) : Folder
+{
+    public override IReadOnlyList<BaseItem> GetChildren(User user, bool includeLinkedChildren, InternalItemsQuery? query = null) =>
+        children(user);
+}
+
+sealed class EmptyLibrary : CollectionFolder
+{
+    protected override MediaBrowser.Model.Querying.QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query) =>
+        new() { Items = [], TotalRecordCount = 0 };
 }
 
 class Stub<T> : DispatchProxy where T : class

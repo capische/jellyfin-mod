@@ -36,5 +36,7 @@ public sealed class RetentionEvidenceRepairTask(IServiceScopeFactory scopeFactor
         using var scope = scopeFactory.CreateScope();
         await scope.ServiceProvider.GetRequiredService<RetentionCompletionService>()
             .RefreshAllAsync(progress, cancellationToken).ConfigureAwait(false);
+        await scope.ServiceProvider.GetRequiredService<RetentionEvaluator>()
+            .EvaluateAllAsync(cancellationToken).ConfigureAwait(false);
     }
 }
