@@ -3,9 +3,10 @@
 ![JellyfinMod](JellyfinMod/Assets/logo.png)
 
 Plugin loading, authenticated health, configuration, persistent SQLite and the Phase 1 catalog
-APIs are implemented. Phase 2 positive reconciliation has local integration coverage and has
-passed its initial native-host backfill/idempotency checkpoint. Disappearance handling and the
-remaining browser acceptance are still incomplete. Acquisition and retention are planned work.
+APIs are implemented. Phase 2 reconciliation has integration coverage and has passed native-host
+backfill, idempotency, disappearance/return and browser acceptance checkpoints on the isolated test
+instance. The remaining native-host concurrency cases are listed below. Acquisition and retention
+are planned work.
 
 The server half of **JellyfinMod**. The other half is the
 [`jellyfin-web`](https://github.com/capische/jellyfin-web) fork.
@@ -159,13 +160,25 @@ contained neither the previous missing-method failure nor a missing-column failu
 
 These results prove positive backfill and idempotency on the isolated native host. The R4 migration
 also preserves all entry, binding, episode and history counts when applied to a copy of that
-database and passes SQLite integrity checking. Before Phase 2
-acceptance, still exercise real grouped copies, provider corrections, replacement events overlapping
-repair, cancellation/rerun, and ordinary-user adds during backfill. Verify exact persisted
-counts/history, library access, native playback and stable entry bookmarks. R4 still requires a
-successful isolated native scan/removal/return run before any completion claim. R5
-still requires two-user state/access checks and desktop/mobile/TV browser acceptance. No
-production deployment or production data changes are claimed here.
+database and passes SQLite integrity checking.
+
+The isolated R4 movie fixture completed a native scan/removal/return run on 2026-09-15. Entry
+`efe27ec9dffe405d8c97a6c23e324cab` changed from `onDisk` to `none` and back to `onDisk`, retained
+its durable identity/history, and rebound to native item `ba9815a6b64dfb9820639f36f8271a1a`.
+The TV library card refreshed in both directions after scan completion without reloading or losing
+focus.
+
+R5 then passed isolated browser acceptance using web commit `4c465f8f37`: one reconciled global
+search result, stable `entryId` bookmark redirection, native playback target, desktop/mobile/TV
+layouts, TV D-pad navigation and Poster/List views. A temporary non-admin user saw its permitted
+movie library but not the restricted TV library; changing that user's played state did not change
+the admin user's state. The temporary account was removed after the check.
+
+Before declaring every Phase 2 live scenario complete, still exercise real grouped copies,
+provider corrections, replacement events overlapping repair, cancellation/rerun, and an
+ordinary-user add during backfill on the isolated native host. The integration suite covers these
+contracts, but this checkpoint does not claim they have all been reproduced against Jellyfin's
+running native event pipeline. No production deployment or production data changes are claimed.
 
 ## Phase 0 — done when
 
