@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using JellyfinMod.Data;
 
 namespace JellyfinMod.Api.Contracts;
@@ -12,14 +13,14 @@ namespace JellyfinMod.Api.Contracts;
 /// <param name="Disabled">Number of representations excluded by disabled retention policy.</param>
 /// <param name="Items">Per-representation diagnostics, including admin-only paths.</param>
 public sealed record RetentionPreviewDto(
-    DateTime GeneratedAt,
-    int Inspected,
-    int Due,
-    int Blocked,
-    int Scheduled,
-    int Waiting,
-    int Disabled,
-    IReadOnlyList<RetentionRepresentationDto> Items);
+    [property: JsonPropertyName("generatedAt")] DateTime GeneratedAt,
+    [property: JsonPropertyName("inspected")] int Inspected,
+    [property: JsonPropertyName("due")] int Due,
+    [property: JsonPropertyName("blocked")] int Blocked,
+    [property: JsonPropertyName("scheduled")] int Scheduled,
+    [property: JsonPropertyName("waiting")] int Waiting,
+    [property: JsonPropertyName("disabled")] int Disabled,
+    [property: JsonPropertyName("items")] IReadOnlyList<RetentionRepresentationDto> Items);
 
 /// <summary>One physical media representation in an admin retention preview.</summary>
 /// <param name="BindingId">The durable binding identity.</param>
@@ -39,39 +40,39 @@ public sealed record RetentionPreviewDto(
 /// <param name="RatioGoal">The highest matched torrent ratio goal.</param>
 /// <param name="SecondsSeeding">The lowest matched torrent cumulative seeding time.</param>
 public sealed record RetentionRepresentationDto(
-    Guid BindingId,
-    Guid EntryId,
-    Guid? EpisodeId,
-    Guid JellyfinItemId,
-    Guid TargetLibraryId,
-    string? Path,
-    string? CanonicalPath,
-    string State,
-    string Reason,
-    DateTime? Deadline,
-    ulong? LogicalBytes,
-    uint? HardlinkCount,
-    bool? TorrentManaged,
-    double? UploadRatio,
-    double? RatioGoal,
-    long? SecondsSeeding);
+    [property: JsonPropertyName("bindingId")] Guid BindingId,
+    [property: JsonPropertyName("entryId")] Guid EntryId,
+    [property: JsonPropertyName("episodeId")] Guid? EpisodeId,
+    [property: JsonPropertyName("jellyfinItemId")] Guid JellyfinItemId,
+    [property: JsonPropertyName("targetLibraryId")] Guid TargetLibraryId,
+    [property: JsonPropertyName("path")] string? Path,
+    [property: JsonPropertyName("canonicalPath")] string? CanonicalPath,
+    [property: JsonPropertyName("state")] string State,
+    [property: JsonPropertyName("reason")] string Reason,
+    [property: JsonPropertyName("deadline")] DateTime? Deadline,
+    [property: JsonPropertyName("logicalBytes")] ulong? LogicalBytes,
+    [property: JsonPropertyName("hardlinkCount")] uint? HardlinkCount,
+    [property: JsonPropertyName("torrentManaged")] bool? TorrentManaged,
+    [property: JsonPropertyName("uploadRatio")] double? UploadRatio,
+    [property: JsonPropertyName("ratioGoal")] double? RatioGoal,
+    [property: JsonPropertyName("secondsSeeding")] long? SecondsSeeding);
 
 /// <summary>One durable automatic or administrator-triggered retention run.</summary>
 public sealed record RetentionRunDto(
-    Guid Id,
-    DateTime StartedAt,
-    DateTime? CompletedAt,
-    string Status,
-    int Inspected,
-    int Eligible,
-    int Blocked,
-    int Reclaimed,
-    int Failed,
-    int Interrupted,
-    long LogicalBytesUnlinked,
-    long PhysicalBytesReleased,
-    int PhysicalBytesUnknown,
-    string? Detail)
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("startedAt")] DateTime StartedAt,
+    [property: JsonPropertyName("completedAt")] DateTime? CompletedAt,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("inspected")] int Inspected,
+    [property: JsonPropertyName("eligible")] int Eligible,
+    [property: JsonPropertyName("blocked")] int Blocked,
+    [property: JsonPropertyName("reclaimed")] int Reclaimed,
+    [property: JsonPropertyName("failed")] int Failed,
+    [property: JsonPropertyName("interrupted")] int Interrupted,
+    [property: JsonPropertyName("logicalBytesUnlinked")] long LogicalBytesUnlinked,
+    [property: JsonPropertyName("physicalBytesReleased")] long PhysicalBytesReleased,
+    [property: JsonPropertyName("physicalBytesUnknown")] int PhysicalBytesUnknown,
+    [property: JsonPropertyName("detail")] string? Detail)
 {
     /// <summary>Creates the public administrator contract from a durable run.</summary>
     public RetentionRunDto(RetentionRun run)
@@ -85,8 +86,8 @@ public sealed record RetentionRunDto(
 
 /// <summary>Privacy-safe retention state shown with an entry or episode.</summary>
 public sealed record RetentionSummaryDto(
-    bool Enabled,
-    string Policy,
-    string State,
-    string Reason,
-    DateTime? Deadline);
+    [property: JsonPropertyName("enabled")] bool Enabled,
+    [property: JsonPropertyName("policy")] string Policy,
+    [property: JsonPropertyName("state")] string State,
+    [property: JsonPropertyName("reason")] string Reason,
+    [property: JsonPropertyName("deadline")] DateTime? Deadline);
