@@ -239,6 +239,7 @@ static async Task VerifyPreviewHttpAsync(
         "GetUserRootFolder" => root,
         "GetVirtualFolders" => virtualFolders,
         "GetItemById" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
+        "DeleteItem" when arguments?[0] is BaseItem item => items.Remove(item.Id),
         _ => null
     });
     var users = Stub<IUserManager>.Create((method, arguments) => method.Name switch
@@ -279,6 +280,8 @@ static async Task VerifyPreviewHttpAsync(
     apiBuilder.Services.AddSingleton<TimeProvider>(clock);
     apiBuilder.Services.AddSingleton<MediaStorageIdentity>();
     apiBuilder.Services.AddSingleton<UnixFileInspector>();
+    apiBuilder.Services.AddSingleton<ReconciliationLibraryLock>();
+    apiBuilder.Services.AddSingleton<RetentionExecutionGate>();
     apiBuilder.Services.AddSingleton<IHttpClientFactory, PlainHttpClientFactory>();
     apiBuilder.Services.AddTransient<LibraryAccess>();
     apiBuilder.Services.AddTransient<RetentionEvaluator>();
@@ -286,6 +289,7 @@ static async Task VerifyPreviewHttpAsync(
         provider.GetRequiredService<IHttpClientFactory>(), () => settings,
         provider.GetRequiredService<UnixFileInspector>(), NullLogger<TransmissionSeedClient>.Instance));
     apiBuilder.Services.AddTransient<RetentionPreviewService>();
+    apiBuilder.Services.AddTransient<RetentionExecutor>();
     await using var api = apiBuilder.Build();
     api.UseAuthentication();
     api.UseAuthorization();
@@ -501,6 +505,9 @@ static async Task VerifyPreviewHttpAsync(
             sharedPath.RootElement.GetProperty("waiting").GetInt32() +
             sharedPath.RootElement.GetProperty("disabled").GetInt32(),
             "Preview summary accounts for every representation state");
+
+        await VerifyReclamationAsync(api.Services, databasePath, libraryPath, storage, clock, settings,
+            entry, movie, secondVersion, user.Id, libraryFolder.Id, items);
     }
     finally
     {
@@ -513,9 +520,182 @@ static JsonElement FindRow(JsonElement preview, Guid jellyfinItemId) =>
         .Single(item => Guid.Parse(item.GetProperty("jellyfinItemId").GetString()!) == jellyfinItemId)
         .Clone();
 
+static async Task VerifyReclamationAsync(
+    IServiceProvider services,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    PluginConfiguration settings,
+    Entry entry,
+    Movie primaryMovie,
+    Movie secondVersion,
+    Guid userId,
+    Guid libraryId,
+    IDictionary<Guid, BaseItem> nativeItems)
+{
+    settings.TransmissionRpcUrl = settings.TransmissionRpcUrl.Replace("/unreachable", "/transmission/rpc",
+        StringComparison.Ordinal);
+    Guid secondBindingId;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var binding = await database.EntryBindings.SingleAsync(candidate =>
+            candidate.JellyfinItemId == secondVersion.Id);
+        binding.StorageIdentity = storage.Capture(secondVersion.Path);
+        secondBindingId = binding.Id;
+        await database.SaveChangesAsync();
+    }
+
+    var secondSidecar = Path.ChangeExtension(secondVersion.Path, ".srt");
+    await File.WriteAllTextAsync(secondSidecar, "sidecar survives");
+    var executor = services.GetRequiredService<RetentionExecutor>();
+    var reclaimed = await executor.ReclaimAsync(secondBindingId, default);
+    var source = Path.Combine(Path.GetDirectoryName(libraryPath)!, "downloads", "version2.mkv");
+    Assert(reclaimed.State == "completed" && reclaimed.Reason == "reclaimed" &&
+        reclaimed.LogicalBytesUnlinked == 2048 && reclaimed.PhysicalBytesReleased == 0 &&
+        !File.Exists(secondVersion.Path) && File.Exists(source) && File.Exists(secondSidecar),
+        "Exact-file reclamation preserves its source hardlink and sidecar and claims zero physical bytes");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var saved = await database.Entries.SingleAsync(candidate => candidate.Id == entry.Id);
+        Assert(saved.State == FileState.OnDisk && saved.JellyfinItemId == primaryMovie.Id &&
+            await database.EntryBindings.CountAsync(candidate => candidate.EntryId == entry.Id) == 2 &&
+            await database.History.CountAsync(history => history.Id == reclaimed.OperationId) == 1 &&
+            (await database.RetentionOperations.SingleAsync(operation => operation.Id == reclaimed.OperationId)).State ==
+                "completed",
+            "A reclaimed alternate version leaves surviving bindings playable and records one durable history event");
+    }
+
+    var before = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900101, "before-unlink", RetentionOperationStatesForTest.Prepared, keep: false);
+    var beforeResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == before.OperationId);
+    Assert(beforeResult.State == "completed" && !File.Exists(before.MediaPath) && File.Exists(before.SidecarPath),
+        "Restart recovery revalidates and completes an operation interrupted before unlink");
+
+    var after = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900102, "after-unlink", RetentionOperationStatesForTest.Unlinked, keep: false);
+    File.Delete(after.MediaPath);
+    var afterResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == after.OperationId);
+    Assert(afterResult.State == "completed" && File.Exists(after.SidecarPath),
+        "Restart recovery completes catalog state when the exact file was already unlinked");
+
+    Assert((await executor.RecoverAsync(default)).Count == 0,
+        "Completed recovery is idempotent and leaves no interrupted operation");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        Assert(await database.History.CountAsync(history =>
+                history.Id == before.OperationId || history.Id == after.OperationId) == 2,
+            "Repeated recovery writes exactly one reclaimed history event per operation");
+    }
+
+    var replaced = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900103, "replaced", RetentionOperationStatesForTest.Prepared, keep: false);
+    var replacement = replaced.MediaPath + ".replacement";
+    await File.WriteAllBytesAsync(replacement, new byte[1536]);
+    File.Delete(replaced.MediaPath);
+    File.Move(replacement, replaced.MediaPath);
+    var replacedResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == replaced.OperationId);
+    Assert(replacedResult.State == "failed" && replacedResult.Reason == "media_identity_changed" &&
+        File.Exists(replaced.MediaPath),
+        "Recovery never unlinks a path whose inode changed after intent was persisted");
+
+    var kept = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900104, "kept", RetentionOperationStatesForTest.Prepared, keep: true);
+    var keptResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == kept.OperationId);
+    Assert(keptResult.State == "blocked" && keptResult.Reason == "kept" && File.Exists(kept.MediaPath),
+        "Keep received before unlink wins during recovery revalidation");
+
+    var disabled = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900105, "disabled", RetentionOperationStatesForTest.Prepared, keep: false);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var policy = await database.RetentionPolicySnapshots.SingleAsync(candidate =>
+            candidate.Id == RetentionPolicyService.PolicyId);
+        policy.Enabled = false;
+        policy.EnabledAt = null;
+        policy.Version++;
+        policy.UpdatedAt = clock.GetUtcNow().UtcDateTime;
+        await database.SaveChangesAsync();
+    }
+
+    var disabledResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == disabled.OperationId);
+    Assert(disabledResult.State == "blocked" && disabledResult.Reason == "retention_disabled" &&
+        File.Exists(disabled.MediaPath), "Disabling retention before unlink wins during recovery revalidation");
+    Console.WriteLine("PASS: recoverable exact-file reclamation, history and physical-space accounting");
+}
+
+static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    IDictionary<Guid, BaseItem> nativeItems,
+    Guid userId,
+    Guid libraryId,
+    int tmdbId,
+    string name,
+    string state,
+    bool keep)
+{
+    var mediaPath = Path.Combine(libraryPath, name + ".mkv");
+    var sidecarPath = Path.Combine(libraryPath, name + ".nfo");
+    await File.WriteAllBytesAsync(mediaPath, new byte[1536]);
+    await File.WriteAllTextAsync(sidecarPath, "sidecar survives");
+    var inspector = new UnixFileInspector();
+    Assert(inspector.TryInspect(mediaPath, out var observed), "Recovery fixture has Linux inode evidence");
+    var movie = new Movie { Id = Guid.NewGuid(), Name = name, Path = mediaPath };
+    nativeItems[movie.Id] = movie;
+    var entry = new Entry
+    {
+        Id = Guid.NewGuid(), MediaType = "movie", TmdbId = tmdbId, Title = name,
+        State = FileState.OnDisk, TargetLibraryId = libraryId,
+        JellyfinItemId = movie.Id, RetentionPolicy = keep ? RetentionPolicy.Never : RetentionPolicy.Inherit
+    };
+    var binding = new EntryBinding
+    {
+        Id = Guid.NewGuid(), EntryId = entry.Id, JellyfinItemId = movie.Id,
+        TargetLibraryId = entry.TargetLibraryId!.Value, VersionGroupId = movie.Id, MediaPath = mediaPath,
+        StorageIdentity = storage.Capture(mediaPath)
+    };
+    var operation = new RetentionOperation
+    {
+        Id = Guid.NewGuid(), BindingId = binding.Id, EntryId = entry.Id, JellyfinItemId = movie.Id,
+        TargetLibraryId = binding.TargetLibraryId, PolicyVersion = 1, MediaPath = observed.CanonicalPath,
+        StorageIdentity = binding.StorageIdentity!, PhysicalIdentity = observed.PhysicalIdentity,
+        LogicalBytes = checked((long)observed.LogicalBytes), HardlinkCountBefore = observed.HardlinkCount,
+        State = state, Reason = state == RetentionOperationStatesForTest.Unlinked ? "unlinked" : "eligible",
+        PreparedAt = clock.GetUtcNow().UtcDateTime.AddMinutes(-1),
+        UnlinkedAt = state == RetentionOperationStatesForTest.Unlinked
+            ? clock.GetUtcNow().UtcDateTime.AddSeconds(-1)
+            : null
+    };
+    await using var database = new ModDbContext(databasePath);
+    database.Entries.Add(entry);
+    database.EntryBindings.Add(binding);
+    database.CompletionObservations.Add(new CompletionObservation
+    {
+        EntryId = entry.Id, TargetId = entry.Id, UserId = userId,
+        JellyfinItemId = movie.Id, EvidenceAvailable = true, Played = true,
+        CompletedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
+        LastPlayedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
+        ObservedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
+    });
+    database.RetentionOperations.Add(operation);
+    await database.SaveChangesAsync();
+    return new(operation.Id, mediaPath, sidecarPath);
+}
+
 static void Assert(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+file sealed record RecoveryFixture(Guid OperationId, string MediaPath, string SidecarPath);
+
+file static class RetentionOperationStatesForTest
+{
+    public const string Prepared = "prepared";
+    public const string Unlinked = "unlinked";
 }
 
 file sealed class PlainHttpClientFactory : IHttpClientFactory

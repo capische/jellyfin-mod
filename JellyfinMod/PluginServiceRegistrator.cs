@@ -26,6 +26,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<CatalogSortName>();
         services.AddSingleton<ReconciliationLibraryLock>();
         services.AddSingleton<ReconciliationRunGate>();
+        services.AddSingleton<RetentionExecutionGate>();
         services.AddSingleton<MediaStorageIdentity>();
         services.AddSingleton<UnixFileInspector>();
         services.AddTransient<ReconciliationService>();
@@ -36,6 +37,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<RetentionCompletionService>();
         services.AddTransient<RetentionEvaluator>();
         services.AddTransient<RetentionPreviewService>();
+        services.AddTransient<RetentionExecutor>();
         services.AddTransient(provider => new TransmissionSeedClient(
             provider.GetRequiredService<IHttpClientFactory>(), () => Plugin.Instance!.Configuration,
             provider.GetRequiredService<UnixFileInspector>(), provider.GetRequiredService<ILogger<TransmissionSeedClient>>()));

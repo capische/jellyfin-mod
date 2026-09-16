@@ -20,11 +20,17 @@ public sealed class RetentionOperation
     /// <summary>Gets or sets the native Jellyfin item identity observed before unlink.</summary>
     public Guid JellyfinItemId { get; set; }
 
+    /// <summary>Gets or sets the library whose reconciliation is serialized with this operation.</summary>
+    public Guid TargetLibraryId { get; set; }
+
     /// <summary>Gets or sets the policy revision revalidated for this operation.</summary>
     public long PolicyVersion { get; set; }
 
     /// <summary>Gets or sets the exact canonical media file path selected for unlink.</summary>
     public string MediaPath { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the library mount identity observed for the media path.</summary>
+    public string StorageIdentity { get; set; } = string.Empty;
 
     /// <summary>Gets or sets the device and inode identity observed before unlink.</summary>
     [MaxLength(96)]

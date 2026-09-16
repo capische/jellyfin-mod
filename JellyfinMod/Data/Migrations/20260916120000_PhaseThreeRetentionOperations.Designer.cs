@@ -454,6 +454,9 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<Guid>("JellyfinItemId")
                         .HasColumnType("TEXT");
 
+                    b.Property<Guid>("TargetLibraryId")
+                        .HasColumnType("TEXT");
+
                     b.Property<long>("LogicalBytes")
                         .HasColumnType("INTEGER");
 
@@ -482,6 +485,10 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<string>("State")
                         .IsRequired()
                         .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("StorageIdentity")
+                        .IsRequired()
                         .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("UnlinkedAt")
