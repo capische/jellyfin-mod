@@ -40,4 +40,13 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Gets or sets a value indicating whether favourites are exempt from retention.</summary>
     public bool ExemptFavourites { get; set; } = true;
+
+    /// <summary>Gets or sets the Transmission RPC endpoint used for read-only seed checks.</summary>
+    public string TransmissionRpcUrl { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the optional Transmission RPC username.</summary>
+    public string TransmissionUsername { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the optional Transmission RPC password.</summary>
+    public string TransmissionPassword { get; set; } = string.Empty;
 }

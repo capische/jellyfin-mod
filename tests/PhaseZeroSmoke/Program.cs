@@ -57,7 +57,10 @@ try
         ReclaimAfterDays = 21,
         RetentionWatchedUserMode = WatchedUserMode.SelectedUser,
         RetentionSelectedUserId = selectedUserId,
-        ExemptFavourites = false
+        ExemptFavourites = false,
+        TransmissionRpcUrl = "http://transmission.test/transmission/rpc",
+        TransmissionUsername = "seed-reader",
+        TransmissionPassword = "private-test-password"
     };
     using var serialized = new StringWriter();
     serializer.Serialize(serialized, config);
@@ -65,7 +68,9 @@ try
     var restored = (PluginConfiguration)serializer.Deserialize(reader)!;
     Assert(restored.TmdbReadAccessToken == "test-read-token" && restored.ReclaimAfterDays == 21 &&
         restored.RetentionWatchedUserMode == WatchedUserMode.SelectedUser && restored.RetentionSelectedUserId == selectedUserId &&
-        !restored.ExemptFavourites && !restored.RetentionEnabled,
+        !restored.ExemptFavourites && !restored.RetentionEnabled &&
+        restored.TransmissionRpcUrl == "http://transmission.test/transmission/rpc" &&
+        restored.TransmissionUsername == "seed-reader" && restored.TransmissionPassword == "private-test-password",
         "Configuration survives XML round trip with retention disabled");
     Console.WriteLine("PASS: migrations, restart persistence, health readiness/failure, configuration XML");
 }

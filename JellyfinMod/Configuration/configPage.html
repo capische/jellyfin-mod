@@ -47,6 +47,24 @@
           <span>Never reclaim favourites</span>
         </label>
 
+        <h3 class="sectionTitle verticalSection">Seed protection</h3>
+        <div class="inputContainer">
+          <input is="emby-input" type="url" id="TransmissionRpcUrl" autocomplete="off"
+                 label="Transmission RPC URL" />
+          <div class="fieldDescription">
+            Used only for read-only seed checks. Leave blank to block reclamation because non-torrent status cannot be verified.
+          </div>
+        </div>
+        <div class="inputContainer">
+          <input is="emby-input" type="text" id="TransmissionUsername" autocomplete="off"
+                 label="Transmission username" />
+        </div>
+        <div class="inputContainer">
+          <input is="emby-input" type="password" id="TransmissionPassword" autocomplete="off"
+                 label="Transmission password" />
+          <div class="fieldDescription">Credentials stay in the server-side plugin configuration and never appear in preview diagnostics.</div>
+        </div>
+
         <h2 class="sectionTitle verticalSection">Library reconciliation</h2>
         <p>Run <strong>Reconcile JellyfinMod catalog</strong> from Dashboard → Scheduled Tasks to backfill or repair bindings.</p>
         <div id="ReconciliationSummary" class="fieldDescription">No reconciliation run has been recorded.</div>
@@ -91,6 +109,9 @@
             document.querySelector('#ReclaimAfterDays').value = config.ReclaimAfterDays;
             watchedUserMode.value = watchedUserModeValue(config.RetentionWatchedUserMode);
             document.querySelector('#ExemptFavourites').checked = !!config.ExemptFavourites;
+            document.querySelector('#TransmissionRpcUrl').value = config.TransmissionRpcUrl || '';
+            document.querySelector('#TransmissionUsername').value = config.TransmissionUsername || '';
+            document.querySelector('#TransmissionPassword').value = config.TransmissionPassword || '';
             return ApiClient.getUsers().then(function (users) {
               var configuredUserId = (config.RetentionSelectedUserId || '').replace(/-/g, '').toLowerCase();
               selectedUser.innerHTML = '';
@@ -141,6 +162,9 @@
             config.RetentionWatchedUserMode = parseInt(watchedUserMode.value, 10);
             config.RetentionSelectedUserId = watchedUserMode.value === '1' ? selectedUser.value : null;
             config.ExemptFavourites = document.querySelector('#ExemptFavourites').checked;
+            config.TransmissionRpcUrl = document.querySelector('#TransmissionRpcUrl').value.trim();
+            config.TransmissionUsername = document.querySelector('#TransmissionUsername').value;
+            config.TransmissionPassword = document.querySelector('#TransmissionPassword').value;
             ApiClient.updatePluginConfiguration(pluginId, config)
               .then(Dashboard.processPluginConfigurationUpdateResult);
           });
