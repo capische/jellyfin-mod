@@ -19,12 +19,29 @@ public sealed partial class UnixFileInspector
             var fullPath = Path.GetFullPath(path);
             if (!File.Exists(fullPath) || new FileInfo(fullPath).LinkTarget is not null) return false;
             var resolved = RealPath(fullPath);
-            if (resolved is null || NativeMethods.Statx(AtFileDescriptorCurrentWorkingDirectory, resolved, 0,
-                    StatxBasicStats, out var stat) != 0 || (stat.Mask & StatxRequiredStats) != StatxRequiredStats)
-                return false;
-            snapshot = new UnixFileSnapshot(resolved,
-                $"{stat.DeviceMajor:x8}:{stat.DeviceMinor:x8}:{stat.Inode:x16}", stat.LinkCount, stat.Size);
-            return true;
+            if (resolved is null) return false;
+            var buffer = Marshal.AllocHGlobal(256);
+            try
+            {
+                for (var offset = 0; offset < 256; offset += sizeof(long)) Marshal.WriteInt64(buffer, offset, 0);
+                if (NativeMethods.Statx(AtFileDescriptorCurrentWorkingDirectory, resolved, 0,
+                        StatxBasicStats, buffer) != 0)
+                    return false;
+                var mask = unchecked((uint)Marshal.ReadInt32(buffer, 0));
+                if ((mask & StatxRequiredStats) != StatxRequiredStats) return false;
+                var linkCount = unchecked((uint)Marshal.ReadInt32(buffer, 16));
+                var inode = unchecked((ulong)Marshal.ReadInt64(buffer, 32));
+                var size = unchecked((ulong)Marshal.ReadInt64(buffer, 40));
+                var deviceMajor = unchecked((uint)Marshal.ReadInt32(buffer, 136));
+                var deviceMinor = unchecked((uint)Marshal.ReadInt32(buffer, 140));
+                snapshot = new UnixFileSnapshot(resolved,
+                    $"{deviceMajor:x8}:{deviceMinor:x8}:{inode:x16}", linkCount, size);
+                return true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or
             NotSupportedException)
@@ -64,54 +81,10 @@ public sealed partial class UnixFileInspector
         }
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct StatxTimestamp
-    {
-        public long Seconds;
-        public uint Nanoseconds;
-        public int Reserved;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private unsafe struct StatxBuffer
-    {
-        public uint Mask;
-        public uint BlockSize;
-        public ulong Attributes;
-        public uint LinkCount;
-        public uint UserId;
-        public uint GroupId;
-        public ushort Mode;
-        public ushort Reserved;
-        public ulong Inode;
-        public ulong Size;
-        public ulong Blocks;
-        public ulong AttributesMask;
-        public StatxTimestamp AccessTime;
-        public StatxTimestamp BirthTime;
-        public StatxTimestamp ChangeTime;
-        public StatxTimestamp ModifyTime;
-        public uint RawDeviceMajor;
-        public uint RawDeviceMinor;
-        public uint DeviceMajor;
-        public uint DeviceMinor;
-        public ulong MountId;
-        public uint DirectIoAlignment;
-        public uint DirectIoOffsetAlignment;
-        public ulong Subvolume;
-        public uint AtomicWriteUnitMin;
-        public uint AtomicWriteUnitMax;
-        public uint AtomicWriteSegmentsMax;
-        public uint DirectIoReadOffsetAlignment;
-        public uint AtomicWriteUnitMaxOptimal;
-        public uint SpareOne;
-        public fixed ulong Spare[8];
-    }
-
     private static partial class NativeMethods
     {
         [LibraryImport("libc", EntryPoint = "statx", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
-        internal static partial int Statx(int directoryFileDescriptor, string path, int flags, uint mask, out StatxBuffer buffer);
+        internal static partial int Statx(int directoryFileDescriptor, string path, int flags, uint mask, IntPtr buffer);
 
         [LibraryImport("libc", EntryPoint = "realpath", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
         internal static partial IntPtr RealPath(string path, IntPtr resolvedPath);

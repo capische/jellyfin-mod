@@ -59,12 +59,6 @@ public sealed class RetentionPreviewService(
         }
 
         var inspected = targets.Select(target => Inspect(target, libraryRoots, now)).ToArray();
-        foreach (var candidate in inspected.Where(candidate => !candidate.File.HasValue))
-        {
-            if (candidate.Target.Path is { } path && files.TryInspect(path, out var observed))
-                candidate.AttachFileForSharedCheck(observed);
-        }
-
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
             if (activeItemIds is null)
@@ -130,6 +124,15 @@ public sealed class RetentionPreviewService(
                 }
 
                 candidate.MarkDue(torrentManaged: true, torrentFiles);
+            }
+        }
+
+        if (inspected.Any(candidate => candidate.State == RetentionPreviewStates.Due))
+        {
+            foreach (var candidate in inspected.Where(candidate => !candidate.File.HasValue))
+            {
+                if (candidate.Target.Path is { } path && files.TryInspect(path, out var observed))
+                    candidate.AttachFileForSharedCheck(observed);
             }
         }
 
