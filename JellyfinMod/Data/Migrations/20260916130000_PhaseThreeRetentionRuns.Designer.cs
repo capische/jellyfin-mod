@@ -3,6 +3,7 @@ using System;
 using JellyfinMod.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -10,9 +11,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace JellyfinMod.Data.Migrations
 {
     [DbContext(typeof(ModDbContext))]
-    partial class ModDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260916130000_PhaseThreeRetentionRuns")]
+    partial class PhaseThreeRetentionRuns
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.11");

@@ -69,7 +69,11 @@ internal static class ApiSmoke
         builder.Services.AddTransient(_ => new ModDbContext(dbPath));
         builder.Services.AddSingleton<DatabaseInitializer>();
         builder.Services.AddSingleton<ReconciliationLibraryLock>();
+        builder.Services.AddSingleton<RetentionExecutionGate>();
         builder.Services.AddTransient(_ => new LibraryAccess(users, library, localization));
+        builder.Services.AddTransient(provider => new RetentionEvaluator(
+            provider.GetRequiredService<ModDbContext>(), users,
+            provider.GetRequiredService<LibraryAccess>(), TimeProvider.System));
         var configuration = Stub<IServerConfigurationManager>.Create((method, args) => method.Name == "get_Configuration"
             ? new ServerConfiguration { SortRemoveWords = ["the", "a"], SortRemoveCharacters = [], SortReplaceCharacters = [] } : null);
         builder.Services.AddTransient(_ => new CatalogSortName(configuration));

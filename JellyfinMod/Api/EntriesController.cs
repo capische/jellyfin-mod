@@ -12,7 +12,14 @@ namespace JellyfinMod.Api;
 
 /// <summary>Authorized durable entries; no Phase 1 operation deletes media.</summary>
 [ApiController, Authorize, Route("JellyfinMod/Entries")]
-public sealed class EntriesController(ModDbContext database, DatabaseInitializer readiness, LibraryAccess access, TmdbClient tmdb, ReconciliationLibraryLock libraryLock) : ControllerBase
+public sealed class EntriesController(
+    ModDbContext database,
+    DatabaseInitializer readiness,
+    LibraryAccess access,
+    TmdbClient tmdb,
+    ReconciliationLibraryLock libraryLock,
+    RetentionExecutionGate retentionGate,
+    RetentionEvaluator retentionEvaluator) : ControllerBase
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
@@ -208,6 +215,41 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
         return new EntryDto(entry);
     }
 
+    /// <summary>Exempts an entry, including every episode in a series, from automatic retention.</summary>
+    [HttpPost("{id:guid}/Keep"), Authorize(Policy = Policies.RequiresElevation)]
+    public async Task<ActionResult<EntryDto>> Keep(Guid id, CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
+        var visible = await database.Entries.AsNoTracking().SingleOrDefaultAsync(
+            entry => entry.Id == id, cancellationToken).ConfigureAwait(false);
+        if (visible is null || !access.CanRead(user, visible)) return NotFound();
+        if (!visible.TargetLibraryId.HasValue) return BadRequest();
+
+        await using var executionLease = await retentionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        await using var libraryLease = await libraryLock.AcquireAsync(
+            visible.TargetLibraryId.Value, cancellationToken).ConfigureAwait(false);
+        database.ChangeTracker.Clear();
+        var entry = await database.Entries.SingleOrDefaultAsync(
+            candidate => candidate.Id == id, cancellationToken).ConfigureAwait(false);
+        if (entry is null || !access.CanRead(user, entry)) return NotFound();
+        if (entry.RetentionPolicy == RetentionPolicy.Never) return new EntryDto(entry);
+
+        entry.RetentionPolicy = RetentionPolicy.Never;
+        database.History.Add(new HistoryRecord
+        {
+            EntryId = entry.Id,
+            EventType = "retention_kept",
+            Summary = entry.MediaType == "series"
+                ? "Kept series and all episodes indefinitely"
+                : "Kept media indefinitely"
+        });
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await retentionEvaluator.EvaluateAllAsync(cancellationToken).ConfigureAwait(false);
+        return new EntryDto(entry);
+    }
+
     /// <summary>Updates an individual episode's future monitoring, restricted to administrators.</summary>
     [HttpPatch("{id:guid}/Episodes/{episodeId:guid}"), Authorize(Policy = Policies.RequiresElevation)]
     public async Task<ActionResult<EpisodeDto>> PatchEpisode(Guid id, Guid episodeId, PatchEntryRequest request, CancellationToken cancellationToken)
@@ -286,7 +328,50 @@ public sealed class EntriesController(ModDbContext database, DatabaseInitializer
         var user = access.GetUser(User)!;
         var history = await database.History.AsNoTracking().Where(h => h.EntryId == entry.Id).OrderByDescending(h => h.CreatedAt).ThenBy(h => h.Id).ToListAsync(cancellationToken);
         var episodes = await database.Episodes.AsNoTracking().Where(e => e.EntryId == entry.Id).OrderBy(e => e.SeasonNumber).ThenBy(e => e.EpisodeNumber).ToListAsync(cancellationToken);
+        var targetIds = episodes.Select(episode => episode.Id).Append(entry.Id).ToArray();
+        var evaluations = await database.RetentionEvaluations.AsNoTracking()
+            .Where(evaluation => targetIds.Contains(evaluation.TargetId))
+            .ToDictionaryAsync(evaluation => evaluation.TargetId, cancellationToken).ConfigureAwait(false);
+        var policy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
+            item => item.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
+        var episodeDtos = episodes.Where(e => access.CanReadEpisode(user, e))
+            .Select(e => new EpisodeDto(e, BuildRetentionSummary(entry, policy,
+                evaluations.GetValueOrDefault(e.Id)))).ToArray();
+        var entryRetention = entry.MediaType == "series"
+            ? BuildSeriesRetentionSummary(entry, policy, episodeDtos.Select(episode => episode.Retention!).ToArray())
+            : BuildRetentionSummary(entry, policy, evaluations.GetValueOrDefault(entry.Id));
         return new EntryDetail(new EntryDto(entry), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
-            DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodes.Where(e => access.CanReadEpisode(user, e)).Select(e => new EpisodeDto(e)).ToArray());
+            DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodeDtos, entryRetention);
+    }
+
+    private static RetentionSummaryDto BuildRetentionSummary(
+        Entry entry,
+        RetentionPolicySnapshot? policy,
+        RetentionEvaluation? evaluation)
+    {
+        if (entry.RetentionPolicy == RetentionPolicy.Never)
+            return new(policy?.Enabled == true, RetentionPolicies.ToWire(entry.RetentionPolicy),
+                "blocked", "kept", null);
+        if (policy?.Enabled != true)
+            return new(false, RetentionPolicies.ToWire(entry.RetentionPolicy),
+                "disabled", "retention_disabled", null);
+        return new(true, RetentionPolicies.ToWire(entry.RetentionPolicy),
+            evaluation?.State ?? "waiting", evaluation?.Reason ?? "evaluation_missing",
+            evaluation?.Deadline is { } deadline ? DateTime.SpecifyKind(deadline, DateTimeKind.Utc) : null);
+    }
+
+    private static RetentionSummaryDto BuildSeriesRetentionSummary(
+        Entry entry,
+        RetentionPolicySnapshot? policy,
+        IReadOnlyList<RetentionSummaryDto> episodes)
+    {
+        if (entry.RetentionPolicy == RetentionPolicy.Never || policy?.Enabled != true || episodes.Count == 0)
+            return BuildRetentionSummary(entry, policy, null);
+        var first = episodes[0];
+        if (episodes.All(item => item.State == first.State && item.Reason == first.Reason))
+            return first with { Deadline = episodes.Where(item => item.Deadline.HasValue)
+                .Select(item => item.Deadline).Min() };
+        return new(true, RetentionPolicies.ToWire(entry.RetentionPolicy), "mixed", "episode_states_vary",
+            episodes.Where(item => item.Deadline.HasValue).Select(item => item.Deadline).Min());
     }
 }

@@ -100,7 +100,8 @@ public sealed record CreateEntryResult([property: JsonPropertyName("entry")] Ent
 /// <summary>Entry metadata, history and individually tracked episodes.</summary>
 public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto Entry,
     [property: JsonPropertyName("history")] IReadOnlyList<HistoryDto> History,
-    [property: JsonPropertyName("episodes")] IReadOnlyList<EpisodeDto> Episodes);
+    [property: JsonPropertyName("episodes")] IReadOnlyList<EpisodeDto> Episodes,
+    [property: JsonPropertyName("retention")] RetentionSummaryDto Retention);
 
 /// <summary>Filtered remote page with an explicit continuation, not a misleading remote total.</summary>
 public sealed record DiscoveryResult([property: JsonPropertyName("items")] IReadOnlyList<TmdbMetadata> Items,

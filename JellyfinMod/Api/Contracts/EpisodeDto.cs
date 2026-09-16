@@ -4,7 +4,7 @@ using JellyfinMod.Data;
 namespace JellyfinMod.Api.Contracts;
 
 /// <summary>One individually tracked episode in a series entry.</summary>
-public sealed class EpisodeDto(Episode episode)
+public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention = null)
 {
     /// <summary>Gets id.</summary>
     [JsonPropertyName("id")]
@@ -49,4 +49,7 @@ public sealed class EpisodeDto(Episode episode)
     /// <summary>Gets jellyfinItemId.</summary>
     [JsonPropertyName("jellyfinItemId")]
     public Guid? JellyfinItemId { get; } = episode.JellyfinItemId;
+    /// <summary>Gets the privacy-safe automatic retention state on entry detail responses.</summary>
+    [JsonPropertyName("retention")]
+    public RetentionSummaryDto? Retention { get; } = retention;
 }

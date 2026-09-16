@@ -114,7 +114,14 @@ await app.StartAsync();
 try
 {
     var address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
-    var settings = new PluginConfiguration { TransmissionRpcUrl = address + "/transmission/rpc" };
+    var settings = new PluginConfiguration
+    {
+        TransmissionRpcUrl = address + "/transmission/rpc",
+        RetentionEnabled = true,
+        ReclaimAfterDays = 1,
+        RetentionWatchedUserMode = WatchedUserMode.AllUsers,
+        ExemptFavourites = true
+    };
     var inspector = new UnixFileInspector();
     var client = new TransmissionSeedClient(new PlainHttpClientFactory(), () => settings, inspector,
         NullLogger<TransmissionSeedClient>.Instance);
@@ -193,12 +200,15 @@ static async Task VerifyPreviewHttpAsync(
     var movie = new Movie { Id = Guid.NewGuid(), Name = "Retention fixture", Path = mediaPath };
     var secondVersion = new Movie { Id = Guid.NewGuid(), Name = "Retention fixture 2", Path = secondMedia };
     var escapedVersion = new Movie { Id = Guid.NewGuid(), Name = "Escaped fixture", Path = escapeMedia };
-    var series = new MediaBrowser.Controller.Entities.TV.Series { Id = Guid.NewGuid(), Name = "Favorite series" };
+    var series = new FixtureSeries { Id = Guid.NewGuid(), Name = "Favorite series" };
     var nativeEpisode = new MediaBrowser.Controller.Entities.TV.Episode
     {
         Id = Guid.NewGuid(), Name = "Favorite episode", Path = episodeMedia, SeriesId = series.Id,
         ParentIndexNumber = 1, IndexNumber = 1
     };
+    libraryFolder.Items.AddRange([movie, secondVersion, escapedVersion]);
+    tvLibraryFolder.Items.Add(series);
+    series.Items.Add(nativeEpisode);
     var items = new Dictionary<Guid, BaseItem>
     {
         [movie.Id] = movie,
@@ -282,14 +292,21 @@ static async Task VerifyPreviewHttpAsync(
     apiBuilder.Services.AddSingleton<UnixFileInspector>();
     apiBuilder.Services.AddSingleton<ReconciliationLibraryLock>();
     apiBuilder.Services.AddSingleton<RetentionExecutionGate>();
+    apiBuilder.Services.AddSingleton<RetentionRunGate>();
     apiBuilder.Services.AddSingleton<IHttpClientFactory, PlainHttpClientFactory>();
     apiBuilder.Services.AddTransient<LibraryAccess>();
+    apiBuilder.Services.AddTransient<RetentionPolicyService>();
+    apiBuilder.Services.AddSingleton(new RetentionConfigurationSource(() => settings));
     apiBuilder.Services.AddTransient<RetentionEvaluator>();
     apiBuilder.Services.AddTransient(provider => new TransmissionSeedClient(
         provider.GetRequiredService<IHttpClientFactory>(), () => settings,
         provider.GetRequiredService<UnixFileInspector>(), NullLogger<TransmissionSeedClient>.Instance));
     apiBuilder.Services.AddTransient<RetentionPreviewService>();
     apiBuilder.Services.AddTransient<RetentionExecutor>();
+    apiBuilder.Services.AddTransient<RetentionRunner>();
+    apiBuilder.Services.AddTransient(provider => new TmdbClient(
+        provider.GetRequiredService<IHttpClientFactory>(), () => settings,
+        NullLogger<TmdbClient>.Instance));
     await using var api = apiBuilder.Build();
     api.UseAuthentication();
     api.UseAuthorization();
@@ -386,6 +403,8 @@ static async Task VerifyPreviewHttpAsync(
         http.DefaultRequestHeaders.Add("X-Preview-User", user.Id.ToString());
         Assert((await http.GetAsync("/JellyfinMod/Retention/Preview")).StatusCode == HttpStatusCode.Forbidden,
             "Ordinary users cannot read physical retention paths or activity diagnostics");
+        Assert((await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Keep", null)).StatusCode ==
+            HttpStatusCode.Forbidden, "Ordinary users cannot write Keep through the real authorization policy");
         http.DefaultRequestHeaders.Add("X-Preview-Role", "admin");
         using var response = await http.GetAsync("/JellyfinMod/Retention/Preview");
         var body = await response.Content.ReadAsStringAsync();
@@ -407,6 +426,24 @@ static async Task VerifyPreviewHttpAsync(
             "A parent symlink that resolves outside its library root is blocked");
         Assert(episodeRow.GetProperty("reason").GetString() == "favorite_series",
             "A favorite series protects its otherwise eligible episode representation");
+
+        using var kept = await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Keep", null);
+        var keptBody = await kept.Content.ReadAsStringAsync();
+        Assert(kept.IsSuccessStatusCode, "An administrator can keep a series: " +
+            kept.StatusCode + " " + keptBody);
+        using var keptAgain = await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Keep", null);
+        Assert(keptAgain.IsSuccessStatusCode, "Keeping an already-kept series is idempotent");
+        using var keptDetail = await http.GetFromJsonAsync<JsonDocument>($"/JellyfinMod/Entries/{seriesEntry.Id}");
+        Assert(keptDetail!.RootElement.GetProperty("retention").GetProperty("reason").GetString() == "kept" &&
+            keptDetail.RootElement.GetProperty("episodes")[0].GetProperty("retention")
+                .GetProperty("reason").GetString() == "kept",
+            "Series detail reports that Keep protects the series and every child episode");
+        await using (var keptDatabase = new ModDbContext(databasePath))
+        {
+            Assert(await keptDatabase.History.CountAsync(history => history.EntryId == seriesEntry.Id &&
+                history.EventType == "retention_kept") == 1,
+                "Repeated Keep writes exactly one durable history event");
+        }
 
         sessionRows.Add(new SessionInfo(sessionManager, NullLogger.Instance)
         {
@@ -467,6 +504,7 @@ static async Task VerifyPreviewHttpAsync(
 
         var sharedMovie = new Movie { Id = Guid.NewGuid(), Name = "Shared physical fixture", Path = mediaPath };
         items[sharedMovie.Id] = sharedMovie;
+        sharedLibraryFolder.Items.Add(sharedMovie);
         var sharedEntry = new Entry
         {
             Id = Guid.NewGuid(), MediaType = "movie", TmdbId = 900004, Title = "Shared physical fixture",
@@ -506,7 +544,7 @@ static async Task VerifyPreviewHttpAsync(
             sharedPath.RootElement.GetProperty("disabled").GetInt32(),
             "Preview summary accounts for every representation state");
 
-        await VerifyReclamationAsync(api.Services, databasePath, libraryPath, storage, clock, settings,
+        await VerifyReclamationAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings,
             entry, movie, secondVersion, sharedEntry, sharedMovie, user.Id, libraryFolder.Id, items);
     }
     finally
@@ -522,6 +560,7 @@ static JsonElement FindRow(JsonElement preview, Guid jellyfinItemId) =>
 
 static async Task VerifyReclamationAsync(
     IServiceProvider services,
+    HttpClient http,
     string databasePath,
     string libraryPath,
     MediaStorageIdentity storage,
@@ -550,11 +589,35 @@ static async Task VerifyReclamationAsync(
 
     var secondSidecar = Path.ChangeExtension(secondVersion.Path, ".srt");
     await File.WriteAllTextAsync(secondSidecar, "sidecar survives");
-    var executor = services.GetRequiredService<RetentionExecutor>();
-    var reclaimed = await executor.ReclaimAsync(secondBindingId, default);
+    await using (var heldRun = await services.GetRequiredService<RetentionRunGate>().TryAcquireAsync(default))
+    {
+        Assert(heldRun is not null, "The retention run gate can be acquired for the overlap fixture");
+        using var overlap = await http.PostAsync("/JellyfinMod/Retention/Run", null);
+        Assert(overlap.StatusCode == HttpStatusCode.Conflict,
+            "A concurrent manual retention invocation is rejected without overlapping");
+    }
+
+    using var runResponse = await http.PostAsync("/JellyfinMod/Retention/Run", null);
+    var runBody = await runResponse.Content.ReadAsStringAsync();
+    Assert(runResponse.IsSuccessStatusCode, "Admin manual retention run succeeds through HTTP: " + runBody);
+    using var runJson = JsonDocument.Parse(runBody);
+    Assert(runJson.RootElement.GetProperty("status").GetString() == "completed" &&
+        runJson.RootElement.GetProperty("reclaimed").GetInt32() == 1 &&
+        runJson.RootElement.GetProperty("logicalBytesUnlinked").GetInt64() == 2048 &&
+        runJson.RootElement.GetProperty("physicalBytesReleased").GetInt64() == 0,
+        "The bounded runner reports one physical hardlink action and separate logical/physical space");
+    using var latestRun = await http.GetFromJsonAsync<JsonDocument>("/JellyfinMod/Retention/Runs/Latest");
+    Assert(latestRun!.RootElement.GetProperty("id").GetGuid() == runJson.RootElement.GetProperty("id").GetGuid(),
+        "The latest-run endpoint returns the durable manual run summary");
+    RetentionOperation savedOperation;
+    await using (var operationDatabase = new ModDbContext(databasePath))
+    {
+        savedOperation = await operationDatabase.RetentionOperations.SingleAsync(operation =>
+            operation.BindingId == secondBindingId);
+    }
     var source = Path.Combine(Path.GetDirectoryName(libraryPath)!, "downloads", "version2.mkv");
-    Assert(reclaimed.State == "completed" && reclaimed.Reason == "reclaimed" &&
-        reclaimed.LogicalBytesUnlinked == 2048 && reclaimed.PhysicalBytesReleased == 0 &&
+    Assert(savedOperation.State == "completed" && savedOperation.Reason == "reclaimed" &&
+        savedOperation.LogicalBytes == 2048 && savedOperation.PhysicalBytesReleased == 0 &&
         !File.Exists(secondVersion.Path) && File.Exists(source) && File.Exists(secondSidecar),
         "Exact-file reclamation preserves its source hardlink and sidecar and claims zero physical bytes");
     await using (var database = new ModDbContext(databasePath))
@@ -562,8 +625,8 @@ static async Task VerifyReclamationAsync(
         var saved = await database.Entries.SingleAsync(candidate => candidate.Id == entry.Id);
         Assert(saved.State == FileState.OnDisk && saved.JellyfinItemId == primaryMovie.Id &&
             await database.EntryBindings.CountAsync(candidate => candidate.EntryId == entry.Id) == 2 &&
-            await database.History.CountAsync(history => history.Id == reclaimed.OperationId) == 1 &&
-            (await database.RetentionOperations.SingleAsync(operation => operation.Id == reclaimed.OperationId)).State ==
+            await database.History.CountAsync(history => history.Id == savedOperation.Id) == 1 &&
+            (await database.RetentionOperations.SingleAsync(operation => operation.Id == savedOperation.Id)).State ==
                 "completed",
             "A reclaimed alternate version leaves surviving bindings playable and records one durable history event");
     }
@@ -594,6 +657,7 @@ static async Task VerifyReclamationAsync(
         string.Join(", ", sharedRows.Select(candidate => candidate.JellyfinItemId + "=" +
             candidate.State + "/" + candidate.Reason + "/" + candidate.Deadline)));
 
+    var executor = services.GetRequiredService<RetentionExecutor>();
     var sharedResult = await executor.ReclaimAsync(primaryBindingId, default);
     Assert(sharedResult.State == "completed" && !File.Exists(primaryMovie.Path) &&
         File.Exists(Path.Combine(Path.GetDirectoryName(libraryPath)!, "downloads", "fixture.mkv")) &&
@@ -639,6 +703,41 @@ static async Task VerifyReclamationAsync(
             "Repeated recovery writes exactly one reclaimed history event per operation");
     }
 
+    var cancellationFirst = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900106, "cancel-first", RetentionOperationStatesForTest.Prepared, keep: false);
+    var cancellationSecond = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900107, "cancel-second", RetentionOperationStatesForTest.Prepared, keep: false);
+    using (var cancellation = new CancellationTokenSource())
+    {
+        var cancelled = false;
+        try
+        {
+            await services.GetRequiredService<RetentionRunner>().RunAsync(
+                new InlineProgress(value =>
+                {
+                    if (value > 0) cancellation.Cancel();
+                }), cancellation.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            cancelled = true;
+        }
+
+        Assert(cancelled && File.Exists(cancellationFirst.MediaPath) != File.Exists(cancellationSecond.MediaPath),
+            "Cancellation is honored between exact physical operations and leaves the next file untouched");
+    }
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var cancelledRun = await database.RetentionRuns.OrderByDescending(run => run.StartedAt)
+            .ThenByDescending(run => run.Id).FirstAsync();
+        Assert(cancelledRun.Status == "cancelled" && cancelledRun.Interrupted == 1,
+            "The interrupted batch persists its cancellation and completed recovery count");
+    }
+    var cancellationRecovery = await executor.RecoverAsync(default);
+    Assert(cancellationRecovery.Count(result => result.OperationId == cancellationFirst.OperationId ||
+        result.OperationId == cancellationSecond.OperationId) == 1,
+        "Restart recovery finishes only the physical operation left by cancellation");
+
     var replaced = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
         userId, libraryId, 900103, "replaced", RetentionOperationStatesForTest.Prepared, keep: false);
     var replacement = replaced.MediaPath + ".replacement";
@@ -658,16 +757,13 @@ static async Task VerifyReclamationAsync(
 
     var disabled = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
         userId, libraryId, 900105, "disabled", RetentionOperationStatesForTest.Prepared, keep: false);
-    await using (var database = new ModDbContext(databasePath))
-    {
-        var policy = await database.RetentionPolicySnapshots.SingleAsync(candidate =>
-            candidate.Id == RetentionPolicyService.PolicyId);
-        policy.Enabled = false;
-        policy.EnabledAt = null;
-        policy.Version++;
-        policy.UpdatedAt = clock.GetUtcNow().UtcDateTime;
-        await database.SaveChangesAsync();
-    }
+    settings.RetentionEnabled = false;
+    using var disabledRun = await http.PostAsync("/JellyfinMod/Retention/Run", null);
+    using var disabledRunJson = JsonDocument.Parse(await disabledRun.Content.ReadAsStringAsync());
+    Assert(disabledRun.IsSuccessStatusCode &&
+        disabledRunJson.RootElement.GetProperty("status").GetString() == "disabled" &&
+        File.Exists(disabled.MediaPath),
+        "A disabled manual run records its status and changes no media");
 
     var disabledResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == disabled.OperationId);
     Assert(disabledResult.State == "blocked" && disabledResult.Reason == "retention_disabled" &&
@@ -744,6 +840,11 @@ static void Assert(bool condition, string message)
 
 file sealed record RecoveryFixture(Guid OperationId, string MediaPath, string SidecarPath);
 
+file sealed class InlineProgress(Action<double> report) : IProgress<double>
+{
+    public void Report(double value) => report(value);
+}
+
 file static class RetentionOperationStatesForTest
 {
     public const string Prepared = "prepared";
@@ -799,8 +900,18 @@ internal sealed class FixtureRoot(Guid userId, IReadOnlyList<BaseItem> libraries
 
 internal sealed class FixtureLibrary : CollectionFolder
 {
+    public List<BaseItem> Items { get; } = [];
+
     protected override MediaBrowser.Model.Querying.QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query) =>
-        new() { Items = [], TotalRecordCount = 0 };
+        new() { Items = Items.ToArray(), TotalRecordCount = Items.Count };
+}
+
+internal sealed class FixtureSeries : MediaBrowser.Controller.Entities.TV.Series
+{
+    public List<BaseItem> Items { get; } = [];
+
+    protected override MediaBrowser.Model.Querying.QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query) =>
+        new() { Items = Items.ToArray(), TotalRecordCount = Items.Count };
 }
 
 internal class Stub<T> : DispatchProxy where T : class

@@ -3,6 +3,13 @@ using Microsoft.EntityFrameworkCore;
 
 namespace JellyfinMod.Services;
 
+/// <summary>Reads the host's current XML configuration at each retention safety boundary.</summary>
+public sealed class RetentionConfigurationSource(Func<PluginConfiguration> current)
+{
+    /// <summary>Gets the configuration currently held by the plugin host.</summary>
+    public PluginConfiguration Current => current();
+}
+
 /// <summary>Persists the effective retention policy and advances its revision only on change.</summary>
 public sealed class RetentionPolicyService(ModDbContext database, TimeProvider clock)
 {

@@ -27,6 +27,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<ReconciliationLibraryLock>();
         services.AddSingleton<ReconciliationRunGate>();
         services.AddSingleton<RetentionExecutionGate>();
+        services.AddSingleton<RetentionRunGate>();
         services.AddSingleton<MediaStorageIdentity>();
         services.AddSingleton<UnixFileInspector>();
         services.AddTransient<ReconciliationService>();
@@ -34,10 +35,12 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<CatalogBackfillRunner>();
         services.AddTransient<JellyfinItemReconciliationRunner>();
         services.AddTransient<RetentionPolicyService>();
+        services.AddSingleton(_ => new RetentionConfigurationSource(() => Plugin.Instance!.Configuration));
         services.AddTransient<RetentionCompletionService>();
         services.AddTransient<RetentionEvaluator>();
         services.AddTransient<RetentionPreviewService>();
         services.AddTransient<RetentionExecutor>();
+        services.AddTransient<RetentionRunner>();
         services.AddTransient(provider => new TransmissionSeedClient(
             provider.GetRequiredService<IHttpClientFactory>(), () => Plugin.Instance!.Configuration,
             provider.GetRequiredService<UnixFileInspector>(), provider.GetRequiredService<ILogger<TransmissionSeedClient>>()));

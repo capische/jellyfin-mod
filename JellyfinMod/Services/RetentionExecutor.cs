@@ -11,6 +11,8 @@ namespace JellyfinMod.Services;
 public sealed class RetentionExecutor(
     ModDbContext database,
     RetentionPreviewService preview,
+    RetentionPolicyService policyService,
+    RetentionConfigurationSource configuration,
     RetentionExecutionGate executionGate,
     ReconciliationLibraryLock libraryLock,
     ILibraryManager library,
@@ -23,6 +25,7 @@ public sealed class RetentionExecutor(
     public async Task<RetentionExecutionResult> ReclaimAsync(Guid bindingId, CancellationToken cancellationToken)
     {
         await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
         var initialPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
         var initial = Find(initialPreview, bindingId);
         if (initial is null)
@@ -185,6 +188,13 @@ public sealed class RetentionExecutor(
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+        var livePolicy = await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
+        if (!livePolicy.Enabled)
+            return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                RetentionEvaluationReasons.RetentionDisabled, null, cancellationToken).ConfigureAwait(false);
+        if (operations.Any(operation => operation.PolicyVersion != livePolicy.Version))
+            return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                RetentionExecutionReasons.PolicyChanged, null, cancellationToken).ConfigureAwait(false);
         try
         {
             File.Delete(operations[0].MediaPath);

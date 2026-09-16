@@ -41,6 +41,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets durable physical reclamation intents and outcomes.</summary>
     public DbSet<RetentionOperation> RetentionOperations => Set<RetentionOperation>();
 
+    /// <summary>Gets durable scheduled/manual retention run summaries.</summary>
+    public DbSet<RetentionRun> RetentionRuns => Set<RetentionRun>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -105,6 +108,12 @@ public class ModDbContext : DbContext
             e.HasIndex(x => x.PreparedAt);
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<RetentionRun>(e =>
+        {
+            e.Property(x => x.Status).HasMaxLength(16);
+            e.HasIndex(x => x.StartedAt);
         });
 
         b.Entity<HistoryRecord>(e => e.HasIndex(x => x.EntryId));
