@@ -16,6 +16,7 @@ public partial class PhaseThreeRetentionOperations : Migration
             columns: table => new
             {
                 Id = table.Column<Guid>(type: "TEXT", nullable: false),
+                ActionId = table.Column<Guid>(type: "TEXT", nullable: false),
                 BindingId = table.Column<Guid>(type: "TEXT", nullable: false),
                 EntryId = table.Column<Guid>(type: "TEXT", nullable: false),
                 EpisodeId = table.Column<Guid>(type: "TEXT", nullable: true),
@@ -51,6 +52,11 @@ public partial class PhaseThreeRetentionOperations : Migration
                     principalColumn: "Id",
                     onDelete: ReferentialAction.Cascade);
             });
+
+        migrationBuilder.CreateIndex(
+            name: "IX_RetentionOperations_ActionId",
+            table: "RetentionOperations",
+            column: "ActionId");
 
         migrationBuilder.CreateIndex(
             name: "IX_RetentionOperations_BindingId_State",

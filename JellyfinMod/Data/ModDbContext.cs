@@ -99,6 +99,7 @@ public class ModDbContext : DbContext
 
         b.Entity<RetentionOperation>(e =>
         {
+            e.HasIndex(x => x.ActionId);
             e.HasIndex(x => new { x.BindingId, x.State });
             e.HasIndex(x => x.PhysicalIdentity);
             e.HasIndex(x => x.PreparedAt);

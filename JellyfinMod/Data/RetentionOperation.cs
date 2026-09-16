@@ -8,6 +8,9 @@ public sealed class RetentionOperation
     /// <summary>Gets or sets the operation identity.</summary>
     public Guid Id { get; set; } = Guid.NewGuid();
 
+    /// <summary>Gets or sets the physical unlink action shared by bindings that reference one exact path.</summary>
+    public Guid ActionId { get; set; }
+
     /// <summary>Gets or sets the representation binding selected for reclamation.</summary>
     public Guid BindingId { get; set; }
 

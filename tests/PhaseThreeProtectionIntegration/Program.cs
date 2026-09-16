@@ -507,7 +507,7 @@ static async Task VerifyPreviewHttpAsync(
             "Preview summary accounts for every representation state");
 
         await VerifyReclamationAsync(api.Services, databasePath, libraryPath, storage, clock, settings,
-            entry, movie, secondVersion, user.Id, libraryFolder.Id, items);
+            entry, movie, secondVersion, sharedEntry, sharedMovie, user.Id, libraryFolder.Id, items);
     }
     finally
     {
@@ -530,6 +530,8 @@ static async Task VerifyReclamationAsync(
     Entry entry,
     Movie primaryMovie,
     Movie secondVersion,
+    Entry sharedEntry,
+    Movie sharedMovie,
     Guid userId,
     Guid libraryId,
     IDictionary<Guid, BaseItem> nativeItems)
@@ -564,6 +566,55 @@ static async Task VerifyReclamationAsync(
             (await database.RetentionOperations.SingleAsync(operation => operation.Id == reclaimed.OperationId)).State ==
                 "completed",
             "A reclaimed alternate version leaves surviving bindings playable and records one durable history event");
+    }
+
+    Guid primaryBindingId;
+    var primarySidecar = Path.ChangeExtension(primaryMovie.Path, ".nfo");
+    await File.WriteAllTextAsync(primarySidecar, "shared sidecar survives");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        primaryBindingId = await database.EntryBindings.Where(candidate => candidate.JellyfinItemId == primaryMovie.Id)
+            .Select(candidate => candidate.Id).SingleAsync();
+        var completion = await database.CompletionObservations.SingleAsync(candidate =>
+            candidate.TargetId == sharedEntry.Id);
+        completion.Played = true;
+        completion.CompletedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3);
+        completion.LastPlayedAt = completion.CompletedAt;
+        completion.ObservedAt = clock.GetUtcNow().UtcDateTime;
+        await database.SaveChangesAsync();
+    }
+
+    _ = await services.GetRequiredService<RetentionPreviewService>().PreviewAsync(default);
+    clock.Advance(TimeSpan.FromDays(2));
+    var sharedPreview = await services.GetRequiredService<RetentionPreviewService>().PreviewAsync(default);
+    var sharedRows = sharedPreview.Items.Where(candidate =>
+        candidate.JellyfinItemId == primaryMovie.Id || candidate.JellyfinItemId == sharedMovie.Id).ToArray();
+    Assert(sharedRows.All(candidate => candidate.State == "due"),
+        "Every exact-path binding becomes due after the fresh grace period: " +
+        string.Join(", ", sharedRows.Select(candidate => candidate.JellyfinItemId + "=" +
+            candidate.State + "/" + candidate.Reason + "/" + candidate.Deadline)));
+
+    var sharedResult = await executor.ReclaimAsync(primaryBindingId, default);
+    Assert(sharedResult.State == "completed" && !File.Exists(primaryMovie.Path) &&
+        File.Exists(Path.Combine(Path.GetDirectoryName(libraryPath)!, "downloads", "fixture.mkv")) &&
+        File.Exists(primarySidecar),
+        $"One exact unlink safely resolves every eligible catalog binding to the same canonical path: " +
+        $"state={sharedResult.State} reason={sharedResult.Reason} media={File.Exists(primaryMovie.Path)} " +
+        $"source={File.Exists(Path.Combine(Path.GetDirectoryName(libraryPath)!, "downloads", "fixture.mkv"))} " +
+        $"sidecar={File.Exists(primarySidecar)}");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var selectedOperation = await database.RetentionOperations.SingleAsync(operation =>
+            operation.Id == sharedResult.OperationId);
+        var groupedOperations = await database.RetentionOperations.Where(operation =>
+            operation.ActionId == selectedOperation.ActionId).ToArrayAsync();
+        var savedShared = await database.Entries.SingleAsync(candidate => candidate.Id == sharedEntry.Id);
+        Assert(groupedOperations.Length == 2 && groupedOperations.All(operation => operation.State == "completed") &&
+            groupedOperations.Select(operation => operation.BindingId).Distinct().Count() == 2 &&
+            await database.History.CountAsync(history => groupedOperations.Select(operation => operation.Id)
+                .Contains(history.Id)) == 2 && savedShared.State == FileState.Reclaimed &&
+            !savedShared.JellyfinItemId.HasValue && !nativeItems.ContainsKey(sharedMovie.Id),
+            "Shared-path reclamation persists one physical action with per-entry bindings and history");
     }
 
     var before = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
@@ -657,9 +708,10 @@ static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
         TargetLibraryId = entry.TargetLibraryId!.Value, VersionGroupId = movie.Id, MediaPath = mediaPath,
         StorageIdentity = storage.Capture(mediaPath)
     };
+    var operationId = Guid.NewGuid();
     var operation = new RetentionOperation
     {
-        Id = Guid.NewGuid(), BindingId = binding.Id, EntryId = entry.Id, JellyfinItemId = movie.Id,
+        Id = operationId, ActionId = operationId, BindingId = binding.Id, EntryId = entry.Id, JellyfinItemId = movie.Id,
         TargetLibraryId = binding.TargetLibraryId, PolicyVersion = 1, MediaPath = observed.CanonicalPath,
         StorageIdentity = binding.StorageIdentity!, PhysicalIdentity = observed.PhysicalIdentity,
         LogicalBytes = checked((long)observed.LogicalBytes), HardlinkCountBefore = observed.HardlinkCount,
@@ -722,7 +774,11 @@ internal sealed class PreviewAuthentication(
 
 internal sealed class FixedTimeProvider(DateTime value) : TimeProvider
 {
+    private DateTime value = value;
+
     public override DateTimeOffset GetUtcNow() => new(value);
+
+    public void Advance(TimeSpan duration) => value = value.Add(duration);
 }
 
 internal enum SeedScenario

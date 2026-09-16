@@ -428,6 +428,9 @@ namespace JellyfinMod.Data.Migrations
 
             modelBuilder.Entity("JellyfinMod.Data.RetentionOperation", b =>
                 {
+                    b.Property<Guid>("ActionId")
+                        .HasColumnType("TEXT");
+
                     b.Property<Guid>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT");
@@ -495,6 +498,8 @@ namespace JellyfinMod.Data.Migrations
                         .HasColumnType("TEXT");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("ActionId");
 
                     b.HasIndex("EntryId");
 

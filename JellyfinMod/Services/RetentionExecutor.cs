@@ -23,156 +23,208 @@ public sealed class RetentionExecutor(
     public async Task<RetentionExecutionResult> ReclaimAsync(Guid bindingId, CancellationToken cancellationToken)
     {
         await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
-        var initial = Find(await preview.PreviewAsync(cancellationToken).ConfigureAwait(false), bindingId);
+        var initialPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
+        var initial = Find(initialPreview, bindingId);
         if (initial is null)
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
         if (initial.State != RetentionPreviewStates.Due)
             return RetentionExecutionResult.NotStarted(bindingId, initial.Reason);
 
-        await using var libraryLease = await libraryLock.AcquireAsync(initial.TargetLibraryId, cancellationToken)
-            .ConfigureAwait(false);
+        var initialGroup = SamePathGroup(initialPreview, initial);
+        var lockedLibraryIds = initialGroup.Select(candidate => candidate.TargetLibraryId).ToHashSet();
+        await using var libraryLease = await AcquireLibrariesAsync(
+            lockedLibraryIds, cancellationToken).ConfigureAwait(false);
         var existing = await database.RetentionOperations
             .Where(operation => operation.BindingId == bindingId &&
                 (operation.State == RetentionOperationStates.Prepared ||
                  operation.State == RetentionOperationStates.Unlinked))
             .OrderByDescending(operation => operation.PreparedAt)
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
-        if (existing is not null) return await RecoverUnderLeaseAsync(existing, cancellationToken).ConfigureAwait(false);
+        if (existing is not null)
+        {
+            var interrupted = await LoadOpenActionAsync(existing.ActionId, cancellationToken).ConfigureAwait(false);
+            return await RecoverUnderLeaseAsync(interrupted, bindingId, cancellationToken).ConfigureAwait(false);
+        }
 
-        var candidate = Find(await preview.PreviewAsync(cancellationToken).ConfigureAwait(false), bindingId);
+        var currentPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
+        var candidate = Find(currentPreview, bindingId);
         if (candidate is null || candidate.State != RetentionPreviewStates.Due)
             return RetentionExecutionResult.NotStarted(bindingId,
                 candidate?.Reason ?? RetentionExecutionReasons.BindingUnavailable);
-        if (!TryInspect(candidate, out var observed, out var inspectionReason))
-            return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
+        var candidates = SamePathGroup(currentPreview, candidate);
+        if (candidates.Any(item => item.State != RetentionPreviewStates.Due))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.SharedPathNotAllEligible);
+        if (candidates.Any(item => !lockedLibraryIds.Contains(item.TargetLibraryId)))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingSetChanged);
 
-        var evidence = await LoadEvidenceAsync(candidate, cancellationToken).ConfigureAwait(false);
-        if (!evidence.Valid)
-            return RetentionExecutionResult.NotStarted(bindingId, evidence.Reason);
-        var storageIdentity = await LoadStorageIdentityAsync(candidate, cancellationToken).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(storageIdentity))
-            return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.StorageUnavailable);
-
-        var operation = new RetentionOperation
+        var operations = new List<RetentionOperation>(candidates.Length);
+        var actionId = Guid.NewGuid();
+        var preparedAt = clock.GetUtcNow().UtcDateTime;
+        foreach (var item in candidates)
         {
-            BindingId = candidate.BindingId,
-            EntryId = candidate.EntryId,
-            EpisodeId = candidate.EpisodeId,
-            JellyfinItemId = candidate.JellyfinItemId,
-            TargetLibraryId = candidate.TargetLibraryId,
-            PolicyVersion = evidence.PolicyVersion,
-            MediaPath = observed.CanonicalPath,
-            StorageIdentity = storageIdentity,
-            PhysicalIdentity = observed.PhysicalIdentity,
-            LogicalBytes = checked((long)observed.LogicalBytes),
-            HardlinkCountBefore = observed.HardlinkCount,
-            Reason = RetentionPreviewReasons.Eligible,
-            PreparedAt = clock.GetUtcNow().UtcDateTime
-        };
-        database.RetentionOperations.Add(operation);
+            if (!TryInspect(item, out var observed, out var inspectionReason))
+                return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
+            var evidence = await LoadEvidenceAsync(item, cancellationToken).ConfigureAwait(false);
+            if (!evidence.Valid) return RetentionExecutionResult.NotStarted(bindingId, evidence.Reason);
+            var storageIdentity = await LoadStorageIdentityAsync(item, cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(storageIdentity))
+                return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.StorageUnavailable);
+            operations.Add(new RetentionOperation
+            {
+                ActionId = actionId,
+                BindingId = item.BindingId,
+                EntryId = item.EntryId,
+                EpisodeId = item.EpisodeId,
+                JellyfinItemId = item.JellyfinItemId,
+                TargetLibraryId = item.TargetLibraryId,
+                PolicyVersion = evidence.PolicyVersion,
+                MediaPath = observed.CanonicalPath,
+                StorageIdentity = storageIdentity,
+                PhysicalIdentity = observed.PhysicalIdentity,
+                LogicalBytes = checked((long)observed.LogicalBytes),
+                HardlinkCountBefore = observed.HardlinkCount,
+                Reason = RetentionPreviewReasons.Eligible,
+                PreparedAt = preparedAt
+            });
+        }
+
+        database.RetentionOperations.AddRange(operations);
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return await ExecutePreparedUnderLeaseAsync(operation, cancellationToken).ConfigureAwait(false);
+        return await ExecutePreparedUnderLeaseAsync(operations, bindingId, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Inspects and resolves operations left prepared or unlinked by an interrupted process.</summary>
     public async Task<IReadOnlyList<RetentionExecutionResult>> RecoverAsync(CancellationToken cancellationToken)
     {
         await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
-        var operationIds = await database.RetentionOperations.AsNoTracking()
+        var actionIds = await database.RetentionOperations.AsNoTracking()
             .Where(operation => operation.State == RetentionOperationStates.Prepared ||
                 operation.State == RetentionOperationStates.Unlinked)
-            .OrderBy(operation => operation.PreparedAt).Select(operation => operation.Id)
+            .OrderBy(operation => operation.PreparedAt).Select(operation => operation.ActionId).Distinct()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
-        var results = new List<RetentionExecutionResult>(operationIds.Length);
-        foreach (var operationId in operationIds)
+        var results = new List<RetentionExecutionResult>();
+        foreach (var actionId in actionIds)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var operation = await database.RetentionOperations.SingleAsync(
-                candidate => candidate.Id == operationId, cancellationToken).ConfigureAwait(false);
-            await using var libraryLease = await libraryLock.AcquireAsync(operation.TargetLibraryId, cancellationToken)
-                .ConfigureAwait(false);
-            results.Add(await RecoverUnderLeaseAsync(operation, cancellationToken).ConfigureAwait(false));
+            var operations = await LoadOpenActionAsync(actionId, cancellationToken).ConfigureAwait(false);
+            await using var libraryLease = await AcquireLibrariesAsync(
+                operations.Select(operation => operation.TargetLibraryId), cancellationToken).ConfigureAwait(false);
+            await RecoverUnderLeaseAsync(operations, null, cancellationToken).ConfigureAwait(false);
+            results.AddRange(operations.Select(RetentionExecutionResult.From));
         }
 
         return results;
     }
 
     private async Task<RetentionExecutionResult> RecoverUnderLeaseAsync(
-        RetentionOperation operation,
+        IReadOnlyList<RetentionOperation> operations,
+        Guid? requestedBindingId,
         CancellationToken cancellationToken)
     {
-        if (!IsStorageCurrent(operation))
-            return await FinishAsync(operation, RetentionOperationStates.Failed,
+        var selected = operations.SingleOrDefault(operation => operation.BindingId == requestedBindingId) ??
+            operations[0];
+        if (operations.Any(operation => !IsStorageCurrent(operation)))
+            return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
                 RetentionPreviewReasons.StorageUnavailable, null, cancellationToken).ConfigureAwait(false);
+        if (operations.Select(operation => operation.MediaPath).Distinct(StringComparer.Ordinal).Count() != 1)
+            return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
+                RetentionExecutionReasons.ActionPathMismatch, null, cancellationToken).ConfigureAwait(false);
 
-        if (operation.State == RetentionOperationStates.Unlinked)
+        if (operations.Any(operation => operation.State == RetentionOperationStates.Unlinked))
         {
-            if (File.Exists(operation.MediaPath))
-                return await FinishAsync(operation, RetentionOperationStates.Failed,
+            if (File.Exists(selected.MediaPath))
+                return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
                     RetentionExecutionReasons.MediaReappeared, null, cancellationToken).ConfigureAwait(false);
-            return await CompleteUnderLeaseAsync(operation, cancellationToken).ConfigureAwait(false);
+            return await CompleteUnderLeaseAsync(operations, selected.BindingId, cancellationToken).ConfigureAwait(false);
         }
 
-        if (!File.Exists(operation.MediaPath))
+        if (!File.Exists(selected.MediaPath))
         {
-            operation.State = RetentionOperationStates.Unlinked;
-            operation.UnlinkedAt ??= clock.GetUtcNow().UtcDateTime;
-            operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
+            foreach (var operation in operations)
+            {
+                operation.State = RetentionOperationStates.Unlinked;
+                operation.UnlinkedAt ??= clock.GetUtcNow().UtcDateTime;
+                operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
+            }
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            TryRemoveNative(operation);
-            return await CompleteUnderLeaseAsync(operation, cancellationToken).ConfigureAwait(false);
+            foreach (var operation in operations) TryRemoveNative(operation);
+            return await CompleteUnderLeaseAsync(operations, selected.BindingId, cancellationToken).ConfigureAwait(false);
         }
 
-        if (!files.TryInspect(operation.MediaPath, out var observed) ||
-            !SameFile(operation, observed))
-            return await FinishAsync(operation, RetentionOperationStates.Failed,
+        if (!files.TryInspect(selected.MediaPath, out var observed) ||
+            operations.Any(operation => !SameFile(operation, observed)))
+            return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
                 RetentionPreviewReasons.MediaIdentityChanged, null, cancellationToken).ConfigureAwait(false);
-        return await ExecutePreparedUnderLeaseAsync(operation, cancellationToken).ConfigureAwait(false);
+        return await ExecutePreparedUnderLeaseAsync(operations, selected.BindingId, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<RetentionExecutionResult> ExecutePreparedUnderLeaseAsync(
-        RetentionOperation operation,
+        IReadOnlyList<RetentionOperation> operations,
+        Guid requestedBindingId,
         CancellationToken cancellationToken)
     {
-        var candidate = Find(await preview.PreviewAsync(cancellationToken).ConfigureAwait(false), operation.BindingId);
-        if (candidate is null || candidate.State != RetentionPreviewStates.Due)
-            return await FinishAsync(operation, RetentionOperationStates.Blocked,
-                candidate?.Reason ?? RetentionExecutionReasons.BindingUnavailable, null, cancellationToken)
-                .ConfigureAwait(false);
-        var evidence = await LoadEvidenceAsync(candidate, cancellationToken).ConfigureAwait(false);
-        if (!evidence.Valid || evidence.PolicyVersion != operation.PolicyVersion)
-            return await FinishAsync(operation, RetentionOperationStates.Blocked,
-                evidence.Valid ? RetentionExecutionReasons.PolicyChanged : evidence.Reason, null, cancellationToken)
-                .ConfigureAwait(false);
-        if (!TryInspect(candidate, out var observed, out var inspectionReason) || !SameFile(operation, observed))
-            return await FinishAsync(operation, RetentionOperationStates.Blocked,
-                inspectionReason == RetentionPreviewReasons.Eligible
-                    ? RetentionPreviewReasons.MediaIdentityChanged
-                    : inspectionReason,
-                null, cancellationToken).ConfigureAwait(false);
+        var currentPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var operation in operations)
+        {
+            var candidate = Find(currentPreview, operation.BindingId);
+            if (candidate is null || candidate.State != RetentionPreviewStates.Due)
+                return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                    candidate?.Reason ?? RetentionExecutionReasons.BindingUnavailable, null, cancellationToken)
+                    .ConfigureAwait(false);
+            var evidence = await LoadEvidenceAsync(candidate, cancellationToken).ConfigureAwait(false);
+            if (!evidence.Valid || evidence.PolicyVersion != operation.PolicyVersion)
+                return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                    evidence.Valid ? RetentionExecutionReasons.PolicyChanged : evidence.Reason, null, cancellationToken)
+                    .ConfigureAwait(false);
+            if (!TryInspect(candidate, out var observed, out var inspectionReason) || !SameFile(operation, observed))
+                return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                    inspectionReason == RetentionPreviewReasons.Eligible
+                        ? RetentionPreviewReasons.MediaIdentityChanged
+                        : inspectionReason,
+                    null, cancellationToken).ConfigureAwait(false);
+        }
 
         cancellationToken.ThrowIfCancellationRequested();
         try
         {
-            File.Delete(operation.MediaPath);
-            if (File.Exists(operation.MediaPath)) throw new IOException("The media path still exists after unlink.");
+            File.Delete(operations[0].MediaPath);
+            if (File.Exists(operations[0].MediaPath)) throw new IOException("The media path still exists after unlink.");
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException)
         {
-            return await FinishAsync(operation, RetentionOperationStates.Failed,
+            return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Failed,
                 RetentionExecutionReasons.UnlinkFailed, error, cancellationToken).ConfigureAwait(false);
         }
 
-        operation.State = RetentionOperationStates.Unlinked;
-        operation.Reason = RetentionExecutionReasons.Unlinked;
-        operation.UnlinkedAt = clock.GetUtcNow().UtcDateTime;
-        operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
+        var unlinkedAt = clock.GetUtcNow().UtcDateTime;
+        foreach (var operation in operations)
+        {
+            operation.State = RetentionOperationStates.Unlinked;
+            operation.Reason = RetentionExecutionReasons.Unlinked;
+            operation.UnlinkedAt = unlinkedAt;
+            operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
+        }
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        TryRemoveNative(operation);
-        return await CompleteUnderLeaseAsync(operation, cancellationToken).ConfigureAwait(false);
+        foreach (var operation in operations) TryRemoveNative(operation);
+        return await CompleteUnderLeaseAsync(operations, requestedBindingId, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<RetentionExecutionResult> CompleteUnderLeaseAsync(
+        IReadOnlyList<RetentionOperation> operations,
+        Guid requestedBindingId,
+        CancellationToken cancellationToken)
+    {
+        RetentionExecutionResult? requested = null;
+        foreach (var operation in operations)
+        {
+            var result = await CompleteOneUnderLeaseAsync(operation, cancellationToken).ConfigureAwait(false);
+            if (operation.BindingId == requestedBindingId) requested = result;
+        }
+
+        return requested ?? RetentionExecutionResult.From(operations[0]);
+    }
+
+    private async Task<RetentionExecutionResult> CompleteOneUnderLeaseAsync(
         RetentionOperation operation,
         CancellationToken cancellationToken)
     {
@@ -211,7 +263,12 @@ public sealed class RetentionExecutor(
             entry.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
         }
 
-        if (!await database.History.AnyAsync(history => history.Id == operation.Id, cancellationToken)
+        var actionEntryLeaderId = await database.RetentionOperations.AsNoTracking()
+            .Where(candidate => candidate.ActionId == operation.ActionId && candidate.EntryId == operation.EntryId)
+            .OrderBy(candidate => candidate.Id).Select(candidate => candidate.Id)
+            .FirstAsync(cancellationToken).ConfigureAwait(false);
+        if (operation.Id == actionEntryLeaderId &&
+            !await database.History.AnyAsync(history => history.Id == operation.Id, cancellationToken)
                 .ConfigureAwait(false))
         {
             database.History.Add(new HistoryRecord
@@ -225,6 +282,7 @@ public sealed class RetentionExecutor(
                 Data = JsonSerializer.Serialize(new
                 {
                     operationId = operation.Id,
+                    operation.ActionId,
                     operation.BindingId,
                     operation.EpisodeId,
                     operation.JellyfinItemId,
@@ -265,19 +323,32 @@ public sealed class RetentionExecutor(
     }
 
     private async Task<RetentionExecutionResult> FinishAsync(
-        RetentionOperation operation,
+        IReadOnlyList<RetentionOperation> operations,
+        Guid requestedBindingId,
         string state,
         string reason,
         Exception? error,
         CancellationToken cancellationToken)
     {
-        operation.State = state;
-        operation.Reason = reason;
-        operation.Error = error is null ? operation.Error : Bound(error.Message);
-        operation.CompletedAt = clock.GetUtcNow().UtcDateTime;
+        var completedAt = clock.GetUtcNow().UtcDateTime;
+        foreach (var operation in operations)
+        {
+            operation.State = state;
+            operation.Reason = reason;
+            operation.Error = error is null ? operation.Error : Bound(error.Message);
+            operation.CompletedAt = completedAt;
+        }
+
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return RetentionExecutionResult.From(operation);
+        return RetentionExecutionResult.From(
+            operations.SingleOrDefault(operation => operation.BindingId == requestedBindingId) ?? operations[0]);
     }
+
+    private async Task<RetentionOperation[]> LoadOpenActionAsync(Guid actionId, CancellationToken cancellationToken) =>
+        await database.RetentionOperations.Where(operation => operation.ActionId == actionId &&
+                (operation.State == RetentionOperationStates.Prepared ||
+                 operation.State == RetentionOperationStates.Unlinked))
+            .OrderBy(operation => operation.Id).ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
     private async Task<RetentionEvidence> LoadEvidenceAsync(
         RetentionRepresentationDto candidate,
@@ -352,9 +423,44 @@ public sealed class RetentionExecutor(
     private static RetentionRepresentationDto? Find(RetentionPreviewDto result, Guid bindingId) =>
         result.Items.SingleOrDefault(candidate => candidate.BindingId == bindingId);
 
+    private static RetentionRepresentationDto[] SamePathGroup(
+        RetentionPreviewDto result,
+        RetentionRepresentationDto selected) =>
+        result.Items.Where(candidate => string.Equals(candidate.CanonicalPath, selected.CanonicalPath,
+                StringComparison.Ordinal))
+            .OrderBy(candidate => candidate.BindingId).ToArray();
+
+    private async ValueTask<IAsyncDisposable> AcquireLibrariesAsync(
+        IEnumerable<Guid> libraryIds,
+        CancellationToken cancellationToken)
+    {
+        var leases = new List<IAsyncDisposable>();
+        try
+        {
+            foreach (var libraryId in libraryIds.Distinct().Order())
+                leases.Add(await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false));
+            return new CombinedLease(leases);
+        }
+        catch
+        {
+            for (var index = leases.Count - 1; index >= 0; index--)
+                await leases[index].DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
     private static string Bound(string value) => value.Length <= 1024 ? value : value[..1024];
 
     private readonly record struct RetentionEvidence(bool Valid, long PolicyVersion, string Reason);
+
+    private sealed class CombinedLease(IReadOnlyList<IAsyncDisposable> leases) : IAsyncDisposable
+    {
+        public async ValueTask DisposeAsync()
+        {
+            for (var index = leases.Count - 1; index >= 0; index--)
+                await leases[index].DisposeAsync().ConfigureAwait(false);
+        }
+    }
 }
 
 /// <summary>Serializes retention operations within one plugin process.</summary>
@@ -400,6 +506,8 @@ internal static class RetentionExecutionReasons
 {
     public const string BindingUnavailable = "binding_unavailable";
     public const string PolicyChanged = "policy_changed";
+    public const string ActionPathMismatch = "action_path_mismatch";
+    public const string BindingSetChanged = "binding_set_changed";
     public const string MediaReappeared = "media_reappeared";
     public const string UnlinkFailed = "unlink_failed";
     public const string Unlinked = "unlinked";
