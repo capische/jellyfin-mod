@@ -18,6 +18,7 @@ public sealed class RetentionEvaluator(
     /// <summary>Re-evaluates every bound movie and episode.</summary>
     public async Task EvaluateAllAsync(CancellationToken cancellationToken)
     {
+        database.ChangeTracker.Clear();
         var movieTargets = await database.EntryBindings.AsNoTracking()
             .Join(database.Entries.AsNoTracking().Where(entry => entry.MediaType == "movie"),
                 binding => binding.EntryId, entry => entry.Id, (_, entry) => entry)
@@ -40,6 +41,7 @@ public sealed class RetentionEvaluator(
     /// <summary>Re-evaluates the stable target represented by a native movie or episode.</summary>
     public async Task EvaluateNativeItemAsync(Guid jellyfinItemId, CancellationToken cancellationToken)
     {
+        database.ChangeTracker.Clear();
         var episode = await database.EpisodeBindings.AsNoTracking()
             .Where(binding => binding.JellyfinItemId == jellyfinItemId)
             .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, item => item.Id,
