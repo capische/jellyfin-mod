@@ -20,6 +20,9 @@ public sealed class BrowseRequest
     /// <summary>Gets or sets the OR group of file states.</summary>
     [JsonPropertyName("state")]
     public string[] State { get; set; } = [];
+    /// <summary>Gets or sets the inclusive future retention deadline window.</summary>
+    [Range(1, 3650), JsonPropertyName("dueWithinDays")]
+    public int? DueWithinDays { get; set; }
     /// <summary>Gets or sets the exact sort field sequence.</summary>
     [JsonPropertyName("sortBy")]
     public string[] SortBy { get; set; } = ["SortName"];
@@ -77,7 +80,8 @@ public sealed class BrowseFilters
 public sealed record BrowseRow(
     [property: JsonPropertyName("kind")] string Kind,
     [property: JsonPropertyName("nativeItem")] BaseItemDto? NativeItem,
-    [property: JsonPropertyName("entry")] EntryDto? Entry);
+    [property: JsonPropertyName("entry")] EntryDto? Entry,
+    [property: JsonPropertyName("retention")] RetentionSummaryDto? Retention);
 
 /// <summary>One correctly paginated combined result with its exact filtered total.</summary>
 public sealed record BrowseResult(

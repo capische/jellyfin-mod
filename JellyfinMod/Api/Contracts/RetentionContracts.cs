@@ -91,3 +91,46 @@ public sealed record RetentionSummaryDto(
     [property: JsonPropertyName("state")] string State,
     [property: JsonPropertyName("reason")] string Reason,
     [property: JsonPropertyName("deadline")] DateTime? Deadline);
+
+/// <summary>Builds retention summaries without exposing per-user playback evidence.</summary>
+internal static class RetentionSummaries
+{
+    /// <summary>Builds a movie summary or an access-safe aggregate across a series' episodes.</summary>
+    public static RetentionSummaryDto ForEntry(
+        Entry entry,
+        RetentionPolicySnapshot? policy,
+        IEnumerable<RetentionEvaluation> evaluations)
+    {
+        var rows = evaluations.Where(evaluation => evaluation.EntryId == entry.Id).ToArray();
+        if (entry.MediaType == "movie")
+            return ForTarget(entry, policy, rows.SingleOrDefault(evaluation => evaluation.TargetId == entry.Id));
+        if (entry.RetentionPolicy == RetentionPolicy.Never || policy?.Enabled != true || rows.Length == 0)
+            return ForTarget(entry, policy, null);
+        var summaries = rows.Select(evaluation => ForTarget(entry, policy, evaluation)).ToArray();
+        var first = summaries[0];
+        if (summaries.All(summary => summary.State == first.State && summary.Reason == first.Reason))
+            return first with { Deadline = Earliest(summaries) };
+        return new(true, RetentionPolicies.ToWire(entry.RetentionPolicy), "mixed", "episode_states_vary",
+            Earliest(summaries));
+    }
+
+    /// <summary>Builds one movie or episode summary from durable policy and evaluation evidence.</summary>
+    public static RetentionSummaryDto ForTarget(
+        Entry entry,
+        RetentionPolicySnapshot? policy,
+        RetentionEvaluation? evaluation)
+    {
+        if (entry.RetentionPolicy == RetentionPolicy.Never)
+            return new(policy?.Enabled == true, RetentionPolicies.ToWire(entry.RetentionPolicy),
+                "blocked", "kept", null);
+        if (policy?.Enabled != true)
+            return new(false, RetentionPolicies.ToWire(entry.RetentionPolicy),
+                "disabled", "retention_disabled", null);
+        return new(true, RetentionPolicies.ToWire(entry.RetentionPolicy),
+            evaluation?.State ?? "waiting", evaluation?.Reason ?? "evaluation_missing",
+            evaluation?.Deadline is { } deadline ? DateTime.SpecifyKind(deadline, DateTimeKind.Utc) : null);
+    }
+
+    private static DateTime? Earliest(IEnumerable<RetentionSummaryDto> summaries) =>
+        summaries.Where(summary => summary.Deadline.HasValue).Select(summary => summary.Deadline).Min();
+}

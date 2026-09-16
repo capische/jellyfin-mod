@@ -335,43 +335,10 @@ public sealed class EntriesController(
         var policy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
             item => item.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
         var episodeDtos = episodes.Where(e => access.CanReadEpisode(user, e))
-            .Select(e => new EpisodeDto(e, BuildRetentionSummary(entry, policy,
+            .Select(e => new EpisodeDto(e, RetentionSummaries.ForTarget(entry, policy,
                 evaluations.GetValueOrDefault(e.Id)))).ToArray();
-        var entryRetention = entry.MediaType == "series"
-            ? BuildSeriesRetentionSummary(entry, policy, episodeDtos.Select(episode => episode.Retention!).ToArray())
-            : BuildRetentionSummary(entry, policy, evaluations.GetValueOrDefault(entry.Id));
+        var entryRetention = RetentionSummaries.ForEntry(entry, policy, evaluations.Values);
         return new EntryDetail(new EntryDto(entry), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
             DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodeDtos, entryRetention);
-    }
-
-    private static RetentionSummaryDto BuildRetentionSummary(
-        Entry entry,
-        RetentionPolicySnapshot? policy,
-        RetentionEvaluation? evaluation)
-    {
-        if (entry.RetentionPolicy == RetentionPolicy.Never)
-            return new(policy?.Enabled == true, RetentionPolicies.ToWire(entry.RetentionPolicy),
-                "blocked", "kept", null);
-        if (policy?.Enabled != true)
-            return new(false, RetentionPolicies.ToWire(entry.RetentionPolicy),
-                "disabled", "retention_disabled", null);
-        return new(true, RetentionPolicies.ToWire(entry.RetentionPolicy),
-            evaluation?.State ?? "waiting", evaluation?.Reason ?? "evaluation_missing",
-            evaluation?.Deadline is { } deadline ? DateTime.SpecifyKind(deadline, DateTimeKind.Utc) : null);
-    }
-
-    private static RetentionSummaryDto BuildSeriesRetentionSummary(
-        Entry entry,
-        RetentionPolicySnapshot? policy,
-        IReadOnlyList<RetentionSummaryDto> episodes)
-    {
-        if (entry.RetentionPolicy == RetentionPolicy.Never || policy?.Enabled != true || episodes.Count == 0)
-            return BuildRetentionSummary(entry, policy, null);
-        var first = episodes[0];
-        if (episodes.All(item => item.State == first.State && item.Reason == first.Reason))
-            return first with { Deadline = episodes.Where(item => item.Deadline.HasValue)
-                .Select(item => item.Deadline).Min() };
-        return new(true, RetentionPolicies.ToWire(entry.RetentionPolicy), "mixed", "episode_states_vary",
-            episodes.Where(item => item.Deadline.HasValue).Select(item => item.Deadline).Min());
     }
 }

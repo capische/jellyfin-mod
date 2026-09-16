@@ -379,6 +379,41 @@ internal static class ApiSmoke
             episodeRows.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9099).GetProperty("availability").GetString() == "unaired" &&
             detailJson.RootElement.GetProperty("history")[0].GetProperty("entryId").GetString()! == seriesId,
             "TVDB-only series and episode bind by verified parent identity while missing and unaired states remain distinct: " + await detail.Content.ReadAsStringAsync());
+        await using (var retentionDatabase = new ModDbContext(dbPath))
+        {
+            retentionDatabase.RetentionPolicySnapshots.Add(new RetentionPolicySnapshot
+            {
+                Id = RetentionPolicyService.PolicyId,
+                Version = 1,
+                Enabled = true,
+                ReclaimAfterDays = 14,
+                WatchedUserMode = WatchedUserMode.AllUsers,
+                EnabledAt = DateTime.UtcNow.AddDays(-1),
+                UpdatedAt = DateTime.UtcNow
+            });
+            retentionDatabase.RetentionEvaluations.Add(new RetentionEvaluation
+            {
+                EntryId = Guid.Parse(seriesId),
+                EpisodeId = Guid.Parse(episodeId),
+                TargetId = Guid.Parse(episodeId),
+                PolicyVersion = 1,
+                State = "scheduled",
+                Reason = "completion_policy_satisfied",
+                Deadline = DateTime.UtcNow.AddDays(3),
+                EvaluatedAt = DateTime.UtcNow
+            });
+            await retentionDatabase.SaveChangesAsync();
+        }
+        using var dueBrowse = await client.PostAsJsonAsync("/JellyfinMod/Browse", new
+        {
+            mediaType = "series", targetLibraryId = tvLibrary.Id, dueWithinDays = 7
+        });
+        using var dueBrowseJson = JsonDocument.Parse(await dueBrowse.Content.ReadAsStringAsync());
+        Assert(dueBrowse.IsSuccessStatusCode &&
+            dueBrowseJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 1 &&
+            dueBrowseJson.RootElement.GetProperty("items")[0].GetProperty("retention")
+                .GetProperty("state").GetString() == "scheduled",
+            "Due-within filtering uses persisted episode eligibility before paging and returns its privacy-safe summary");
         client.DefaultRequestHeaders.Remove("X-Smoke-Role");
         Assert((await client.PatchAsJsonAsync($"/JellyfinMod/Entries/{seriesId}/Episodes/{episodeId}", new { monitored = false })).StatusCode == HttpStatusCode.Forbidden,
             "Ordinary users cannot change episode monitoring");

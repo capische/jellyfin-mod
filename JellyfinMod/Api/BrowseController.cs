@@ -43,6 +43,12 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         var query = database.Entries.AsNoTracking().Where(entry => entry.MediaType == request.MediaType);
         if (request.TargetLibraryId.HasValue) query = query.Where(entry => entry.TargetLibraryId == request.TargetLibraryId);
         var entries = (await query.ToListAsync(cancellationToken)).Where(entry => access.CanRead(user, entry)).ToArray();
+        var entryIds = entries.Select(entry => entry.Id).ToArray();
+        var evaluations = await database.RetentionEvaluations.AsNoTracking()
+            .Where(evaluation => entryIds.Contains(evaluation.EntryId))
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        var retentionPolicy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
+            policy => policy.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
         var native = access.GetNativeItems(user, request.MediaType, request.TargetLibraryId);
         var hasNativeQueryFilters = new Array[] { filters.Genres, filters.Years, filters.OfficialRatings, filters.Tags,
             filters.StudioIds, filters.SeriesStatus, filters.VideoTypes, filters.Features, filters.VideoBasicFilter }.Any(values => values.Length > 0);
@@ -80,6 +86,15 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             ? StringComparer.Ordinal.Compare(row.SortName, "a") < 0 : row.SortName.StartsWith(request.Alphabet, StringComparison.OrdinalIgnoreCase));
         if (!string.IsNullOrWhiteSpace(request.Query)) candidates = candidates.Where(row => row.Title.Contains(request.Query, StringComparison.OrdinalIgnoreCase));
         if (request.State.Length > 0) candidates = candidates.Where(row => request.State.Contains(row.Native is null ? FileStates.ToWire(row.Entry!.State) : "onDisk"));
+        if (request.DueWithinDays.HasValue)
+        {
+            var deadline = DateTime.UtcNow.AddDays(request.DueWithinDays.Value);
+            var dueEntryIds = evaluations.Where(evaluation => evaluation.State == RetentionEvaluationStates.Scheduled &&
+                    evaluation.Deadline.HasValue && evaluation.Deadline.Value <= deadline)
+                .Select(evaluation => evaluation.EntryId).ToHashSet();
+            candidates = candidates.Where(row => row.Entry is { State: FileState.OnDisk } &&
+                dueEntryIds.Contains(row.Entry.Id));
+        }
         if (!request.TargetLibraryId.HasValue) candidates = candidates.GroupBy(row => row.TitleIdentity).Select(group => group.OrderBy(row => row.Native is null).ThenBy(row => row.Identity, StringComparer.Ordinal).First());
         var filtered = candidates.ToArray();
         Array.Sort(filtered, (left, right) => Compare(left, right, request));
@@ -87,7 +102,8 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         if (request.Limit.HasValue) page = page.Take(request.Limit.Value);
         var options = new DtoOptions { Fields = [ItemFields.PrimaryImageAspectRatio, ItemFields.MediaSourceCount, ItemFields.DateCreated] };
         var rows = page.Select(row => new BrowseRow(row.Native is null ? "entry" : "native",
-            row.Native is null ? null : dto.GetBaseItemDto(row.Native, options, user), row.Entry is null ? null : new EntryDto(row.Entry))).ToArray();
+            row.Native is null ? null : dto.GetBaseItemDto(row.Native, options, user), row.Entry is null ? null : new EntryDto(row.Entry),
+            row.Entry is null ? null : RetentionSummaries.ForEntry(row.Entry, retentionPolicy, evaluations))).ToArray();
         return new BrowseResult(rows, filtered.Length, entries.Length > 0);
     }
 
