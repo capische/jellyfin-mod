@@ -38,6 +38,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets durable access-aware completion policy results.</summary>
     public DbSet<RetentionEvaluation> RetentionEvaluations => Set<RetentionEvaluation>();
 
+    /// <summary>Gets durable physical reclamation intents and outcomes.</summary>
+    public DbSet<RetentionOperation> RetentionOperations => Set<RetentionOperation>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -90,6 +93,15 @@ public class ModDbContext : DbContext
         {
             e.HasIndex(x => x.TargetId).IsUnique();
             e.HasIndex(x => x.Deadline);
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<RetentionOperation>(e =>
+        {
+            e.HasIndex(x => new { x.BindingId, x.State });
+            e.HasIndex(x => x.PhysicalIdentity);
+            e.HasIndex(x => x.PreparedAt);
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
         });
