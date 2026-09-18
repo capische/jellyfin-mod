@@ -19,7 +19,8 @@ public sealed class EntriesController(
     TmdbClient tmdb,
     ReconciliationLibraryLock libraryLock,
     RetentionExecutionGate retentionGate,
-    RetentionEvaluator retentionEvaluator) : ControllerBase
+    RetentionEvaluator retentionEvaluator,
+    CatalogSortName sortNames) : ControllerBase
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
@@ -40,8 +41,15 @@ public sealed class EntriesController(
         if (mediaType is not null) candidates = candidates.Where(entry => entry.MediaType == mediaType);
         if (targetLibraryId.HasValue) candidates = candidates.Where(entry => entry.TargetLibraryId == targetLibraryId);
         if (jellyfinItemId.HasValue) candidates = candidates.Where(entry => entry.JellyfinItemId == jellyfinItemId);
-        var visible = (await candidates.ToListAsync(cancellationToken)).Where(entry => access.CanRead(user, entry));
-        if (!string.IsNullOrWhiteSpace(query)) visible = visible.Where(entry => entry.Title.Contains(query, StringComparison.OrdinalIgnoreCase));
+        var candidateRows = await candidates.ToListAsync(cancellationToken);
+        var nativeIds = candidateRows.Where(entry => entry.JellyfinItemId.HasValue).Select(entry => entry.MediaType).Distinct()
+            .ToDictionary(type => type, type => (IReadOnlySet<Guid>)access.GetNativeItems(user, type, targetLibraryId).Select(item => item.Id).ToHashSet());
+        var visible = candidateRows.Where(entry => access.CanRead(user, entry, nativeIds.GetValueOrDefault(entry.MediaType) ?? new HashSet<Guid>()));
+        if (!string.IsNullOrWhiteSpace(query))
+        {
+            var search = sortNames.GetSearchKey(query);
+            visible = visible.Where(entry => sortNames.GetSearchKey(entry.Title).Contains(search, StringComparison.Ordinal));
+        }
         if (state?.Length > 0) visible = visible.Where(entry => state.Contains(FileStates.ToWire(entry.State)));
         var rows = visible.ToArray();
         Func<Entry, object?> key = sortBy switch { "DateCreated" => entry => entry.AddedAt, "ProductionYear" => entry => entry.Year, _ => entry => entry.Title };
@@ -162,7 +170,8 @@ public sealed class EntriesController(
                 }
             }
 
-            database.Episodes.RemoveRange(byTmdbId.Values);
+            // TMDB's series and season endpoints can briefly disagree for airing shows.
+            // Preserve unmatched local episodes so a partial snapshot is never interpreted as deletion.
             entry.Title = metadata.Title;
             entry.Year = metadata.PremiereDate?.Year;
             entry.ImdbId = metadata.ImdbId;
@@ -334,7 +343,13 @@ public sealed class EntriesController(
             .ToDictionaryAsync(evaluation => evaluation.TargetId, cancellationToken).ConfigureAwait(false);
         var policy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
             item => item.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
-        var episodeDtos = episodes.Where(e => access.CanReadEpisode(user, e))
+        var visibleEpisodeIds = new HashSet<Guid>();
+        if (entry.JellyfinItemId is { } nativeId)
+        {
+            var series = access.GetNativeItems(user, "series", entry.TargetLibraryId).SingleOrDefault(item => item.Id == nativeId);
+            if (series is not null) visibleEpisodeIds.UnionWith(access.GetEpisodes(user, series).Select(item => item.Id));
+        }
+        var episodeDtos = episodes.Where(e => LibraryAccess.CanReadEpisode(e, visibleEpisodeIds))
             .Select(e => new EpisodeDto(e, RetentionSummaries.ForTarget(entry, policy,
                 evaluations.GetValueOrDefault(e.Id)))).ToArray();
         var entryRetention = RetentionSummaries.ForEntry(entry, policy, evaluations.Values);

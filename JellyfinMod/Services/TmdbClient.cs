@@ -59,8 +59,7 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         {
             using var json = await GetAsync($"tv/{series.TmdbId}/season/{season.Number}", token);
             if (!json.RootElement.TryGetProperty("episodes", out var episodeArray) || episodeArray.ValueKind != JsonValueKind.Array ||
-                (json.RootElement.TryGetProperty("season_number", out _) && Number(json.RootElement, "season_number") != season.Number) ||
-                episodeArray.GetArrayLength() != season.EpisodeCount)
+                (json.RootElement.TryGetProperty("season_number", out _) && Number(json.RootElement, "season_number") != season.Number))
                 throw new TmdbException("TMDB returned incomplete season metadata.", HttpStatusCode.BadGateway);
             foreach (var item in episodeArray.EnumerateArray())
             {
@@ -171,7 +170,8 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             item.TryGetProperty("vote_average", out var score) && score.ValueKind == JsonValueKind.Number && score.TryGetDouble(out var number) ? number : null,
             Number(item, "runtime"), Array(item, "genres").Select(g => Text(g, "name")).OfType<string>().ToArray(),
             certifications.Distinct().ToArray(), Array(item, "seasons").Select(s => new TmdbSeason(Number(s, "season_number") ?? 0,
-                Text(s, "name") ?? string.Empty, Number(s, "episode_count") ?? 0, Text(s, "air_date"), Text(s, "poster_path"))).ToArray());
+                Text(s, "name") ?? string.Empty, Number(s, "episode_count") ?? 0, Text(s, "air_date"), Text(s, "poster_path"))).ToArray(),
+            Text(item, mediaType == "movie" ? "original_title" : "original_name"));
     }
 
     private static string? Text(JsonElement item, string name) => item.ValueKind == JsonValueKind.Object && item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
@@ -199,7 +199,8 @@ public sealed record TmdbMetadata(
     [property: JsonPropertyName("runtimeMinutes")] int? RuntimeMinutes,
     [property: JsonPropertyName("genres")] string[] Genres,
     [property: JsonPropertyName("certifications")] TmdbCertification[] Certifications,
-    [property: JsonPropertyName("seasons")] TmdbSeason[] Seasons);
+    [property: JsonPropertyName("seasons")] TmdbSeason[] Seasons,
+    [property: JsonPropertyName("originalTitle")] string? OriginalTitle = null);
 
 /// <summary>A regional parental certification.</summary>
 public sealed record TmdbCertification(

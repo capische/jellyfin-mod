@@ -25,9 +25,11 @@ public sealed class DiscoverController(ModDbContext database, DatabaseInitialize
         if (targetLibraryId.HasValue && !access.CanUseLibrary(user, type, targetLibraryId)) return NotFound();
         if (access.GetLibraries(user, type).Count == 0) return new DiscoveryResult([], null);
         var entries = await database.Entries.AsNoTracking().Where(e => e.MediaType == type && (!targetLibraryId.HasValue || e.TargetLibraryId == targetLibraryId)).ToListAsync(cancellationToken);
-        var held = entries.Where(e => access.CanRead(user, e)).Select(e => e.TmdbId).ToHashSet();
+        var nativeItems = access.GetNativeItems(user, type, targetLibraryId);
+        var nativeIds = nativeItems.Select(item => item.Id).ToHashSet();
+        var held = entries.Where(e => access.CanRead(user, e, nativeIds)).Select(e => e.TmdbId).ToHashSet();
         var heldTvdb = new HashSet<int>();
-        foreach (var native in access.GetNativeItems(user, type, targetLibraryId))
+        foreach (var native in nativeItems)
         {
             if (native.ProviderIds.TryGetValue("Tmdb", out var value) && int.TryParse(value, out var id)) held.Add(id);
             if (type == "series" && native.ProviderIds.TryGetValue("Tvdb", out var tvdbValue) && int.TryParse(tvdbValue, out var tvdbId)) heldTvdb.Add(tvdbId);

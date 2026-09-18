@@ -347,6 +347,27 @@ internal static class ApiSmoke
         using var seriesAdd = await client.PostAsJsonAsync("/JellyfinMod/Entries", new { mediaType = "series", tmdbId = 123, targetLibraryId = tvLibrary.Id });
         using var seriesJson = JsonDocument.Parse(await seriesAdd.Content.ReadAsStringAsync());
         var seriesId = seriesJson.RootElement.GetProperty("entry").GetProperty("id").GetString()!;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.AddRange(Enumerable.Range(1, 20).Select(index => new Entry
+            {
+                MediaType = "series", TmdbId = 5000 + index, Title = "Bound fixture " + index,
+                TargetLibraryId = tvLibrary.Id, JellyfinItemId = nativeSeries.Id, State = FileState.OnDisk
+            }));
+            await database.SaveChangesAsync();
+        }
+        tvLibrary.QueryCount = 0;
+        using (var batchedEntries = await client.GetAsync("/JellyfinMod/Entries?mediaType=series"))
+        {
+            using var batchedEntriesJson = JsonDocument.Parse(await batchedEntries.Content.ReadAsStringAsync());
+            Assert(batchedEntries.IsSuccessStatusCode && batchedEntriesJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 21 &&
+                tvLibrary.QueryCount == 1, "Entry authorization enumerates the native TV library once per HTTP request");
+        }
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.RemoveRange(database.Entries.Where(entry => entry.TmdbId >= 5001 && entry.TmdbId <= 5020));
+            await database.SaveChangesAsync();
+        }
         var nativeLookup = $"/JellyfinMod/Entries?jellyfinItemId={nativeSeries.Id}&limit=1";
         using var nativeEntries = await client.GetAsync(nativeLookup);
         using var nativeEntriesJson = JsonDocument.Parse(await nativeEntries.Content.ReadAsStringAsync());
@@ -461,8 +482,11 @@ internal static class ApiSmoke
             : uri.AbsolutePath.Contains("/season/0", StringComparison.Ordinal)
                 ? Json("{\"season_number\":0,\"episodes\":[{\"id\":9099,\"season_number\":0,\"episode_number\":1,\"name\":\"Future special\"}]}")
                 : Json("{\"id\":123,\"name\":\"Partial show\",\"external_ids\":{\"tvdb_id\":777},\"seasons\":[{\"season_number\":0,\"name\":\"Specials\",\"episode_count\":1},{\"season_number\":1,\"name\":\"Season 1\",\"episode_count\":3}]}");
-        Assert((await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null)).StatusCode == HttpStatusCode.BadGateway,
-            "Partial refresh is rejected at the HTTP boundary");
+        using var partialRefresh = await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null);
+        using var partialRefreshJson = JsonDocument.Parse(await partialRefresh.Content.ReadAsStringAsync());
+        Assert(partialRefresh.IsSuccessStatusCode && partialRefreshJson.RootElement.GetProperty("episodes").GetArrayLength() == 4 &&
+            partialRefreshJson.RootElement.GetProperty("episodes").EnumerateArray().Any(episode => episode.GetProperty("tmdbId").GetInt32() == 9002),
+            "An airing show's partial TMDB snapshot updates known episodes without deleting unmatched local episodes");
         http.Response = _ => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
         Assert((await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null)).StatusCode == HttpStatusCode.BadGateway,
             "Failed upstream refresh is sanitized at the HTTP boundary");
@@ -504,7 +528,7 @@ internal static class ApiSmoke
         using var fileBrowse = await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie", targetLibraryId = libraryFolder.Id, state = new[] { "onDisk" } });
         using var fileBrowseJson = JsonDocument.Parse(await fileBrowse.Content.ReadAsStringAsync());
         Assert(fileBrowseJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 0, "Browse filters file states before total and page");
-        libraryFolder.Items = [new MediaBrowser.Controller.Entities.Movies.Movie { Id = Guid.NewGuid(), Name = "Éclair 3", SortName = "eclair 0000000003" }];
+        libraryFolder.Items = [new MediaBrowser.Controller.Entities.Movies.Movie { Id = Guid.NewGuid(), Name = "Éclair 3", OriginalTitle = "Amélie", SortName = "eclair 0000000003" }];
         using var mixed = await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie", targetLibraryId = libraryFolder.Id, startIndex = 1, limit = 1 });
         var mixedBody = await mixed.Content.ReadAsStringAsync();
         Assert(mixed.IsSuccessStatusCode, $"Mixed browse returned {(int)mixed.StatusCode}: {mixedBody}");
@@ -513,6 +537,11 @@ internal static class ApiSmoke
             mixedJson.RootElement.GetProperty("items")[0].GetProperty("kind").GetString() == "native" &&
             mixedJson.RootElement.GetProperty("items")[0].GetProperty("nativeItem").GetProperty("Name").GetString() == "Éclair 3",
             "Native DTO and file-less entry interleave before pagination without synthetic native identities");
+        using var foldedSearch = await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie", targetLibraryId = libraryFolder.Id, query = "amelie" });
+        using var foldedSearchJson = JsonDocument.Parse(await foldedSearch.Content.ReadAsStringAsync());
+        Assert(foldedSearch.IsSuccessStatusCode && foldedSearchJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 1 &&
+            foldedSearchJson.RootElement.GetProperty("items")[0].GetProperty("nativeItem").GetProperty("Name").GetString() == "Éclair 3",
+            "Combined search folds diacritics and matches a native original title");
         foreach (var direction in new[] { "Ascending", "Descending" })
         {
             var titles = new List<string>();
@@ -590,7 +619,12 @@ internal static class ApiSmoke
     private sealed class EmptyMovieLibrary : CollectionFolder
     {
         public IReadOnlyList<BaseItem> Items { get; set; } = [];
-        protected override MediaBrowser.Model.Querying.QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query) => new() { Items = Items, TotalRecordCount = Items.Count };
+        public int QueryCount { get; set; }
+        protected override MediaBrowser.Model.Querying.QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query)
+        {
+            QueryCount++;
+            return new() { Items = Items, TotalRecordCount = Items.Count };
+        }
     }
     private sealed class TestSeries : Folder
     {

@@ -24,6 +24,8 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     /// <summary>Gets accessible real movie/TV libraries compatible with the requested media type.</summary>
     public IReadOnlyList<CollectionFolder> GetLibraries(User user, string mediaType)
     {
+        if (mediaType is not ("movie" or "series"))
+            throw new ArgumentException("Media type must be movie or series.", nameof(mediaType));
         var key = (user.Id, mediaType);
         if (_libraries.TryGetValue(key, out var cached)) return cached;
         var folders = library.GetUserRootFolder().GetChildren(user, true).OfType<CollectionFolder>()
@@ -43,9 +45,18 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     /// <summary>Checks access to a durable entry without leaking its native binding or metadata.</summary>
     public bool CanRead(User user, Entry entry)
     {
-        if (!CanUseLibrary(user, entry.MediaType, entry.TargetLibraryId)) return false;
-        if (entry.JellyfinItemId is { } nativeId)
-            return GetNativeItems(user, entry.MediaType, entry.TargetLibraryId).Any(native => native.Id == nativeId);
+        if (entry.MediaType is not ("movie" or "series")) return false;
+        var nativeIds = entry.JellyfinItemId.HasValue
+            ? GetNativeItems(user, entry.MediaType, entry.TargetLibraryId).Select(item => item.Id).ToHashSet()
+            : [];
+        return CanRead(user, entry, nativeIds);
+    }
+
+    /// <summary>Checks access using native IDs already enumerated for this request.</summary>
+    public bool CanRead(User user, Entry entry, IReadOnlySet<Guid> nativeIds)
+    {
+        if (entry.MediaType is not ("movie" or "series") || !CanUseLibrary(user, entry.MediaType, entry.TargetLibraryId)) return false;
+        if (entry.JellyfinItemId is { } nativeId) return nativeIds.Contains(nativeId);
         return entry.MetadataJson is { } json && CanReadMetadata(user, JsonSerializer.Deserialize<TmdbMetadata>(json)!);
     }
 
@@ -125,6 +136,10 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     /// <summary>Checks a bound episode's own restrictions before returning its metadata.</summary>
     public bool CanReadEpisode(User user, Episode episode) => episode.JellyfinItemId is not { } id ||
         GetNativeItems(user, "series").SelectMany(series => GetEpisodes(user, series)).Any(native => native.Id == id);
+
+    /// <summary>Checks a bound episode using native episode IDs already enumerated for this request.</summary>
+    public static bool CanReadEpisode(Episode episode, IReadOnlySet<Guid> nativeEpisodeIds) =>
+        episode.JellyfinItemId is not { } id || nativeEpisodeIds.Contains(id);
 
     /// <summary>Finds an owned match only within the authorized destination library.</summary>
     public BaseItem? FindOwned(User user, TmdbMetadata metadata, Guid libraryId)

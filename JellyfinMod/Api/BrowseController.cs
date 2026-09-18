@@ -42,14 +42,15 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             filters.VideoBasicFilter.Any(value => value is not ("IsSD" or "IsHD" or "Is4K" or "Is3D"))) return BadRequest();
         var query = database.Entries.AsNoTracking().Where(entry => entry.MediaType == request.MediaType);
         if (request.TargetLibraryId.HasValue) query = query.Where(entry => entry.TargetLibraryId == request.TargetLibraryId);
-        var entries = (await query.ToListAsync(cancellationToken)).Where(entry => access.CanRead(user, entry)).ToArray();
+        var native = access.GetNativeItems(user, request.MediaType, request.TargetLibraryId);
+        var nativeIds = native.Select(item => item.Id).ToHashSet();
+        var entries = (await query.ToListAsync(cancellationToken)).Where(entry => access.CanRead(user, entry, nativeIds)).ToArray();
         var entryIds = entries.Select(entry => entry.Id).ToArray();
         var evaluations = await database.RetentionEvaluations.AsNoTracking()
             .Where(evaluation => entryIds.Contains(evaluation.EntryId))
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
         var retentionPolicy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
             policy => policy.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
-        var native = access.GetNativeItems(user, request.MediaType, request.TargetLibraryId);
         var hasNativeQueryFilters = new Array[] { filters.Genres, filters.Years, filters.OfficialRatings, filters.Tags,
             filters.StudioIds, filters.SeriesStatus, filters.VideoTypes, filters.Features, filters.VideoBasicFilter }.Any(values => values.Length > 0);
         var nativeMatches = (hasNativeQueryFilters ? access.GetNativeItems(user, request.MediaType, request.TargetLibraryId, query =>
@@ -74,7 +75,6 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
                     filters.SubtitleLanguages.Length > 0 && !streams.Any(stream => stream.Type == MediaStreamType.Subtitle && filters.SubtitleLanguages.Contains(stream.Language, StringComparer.OrdinalIgnoreCase));
             });
         }
-        var nativeIds = native.Select(item => item.Id).ToHashSet();
         var boundEntries = entries.Where(entry => entry.JellyfinItemId.HasValue && nativeIds.Contains(entry.JellyfinItemId.Value))
             .GroupBy(entry => entry.JellyfinItemId!.Value).ToDictionary(group => group.Key, group => group.OrderBy(entry => entry.Id).First());
         var candidates = native.Select(item => new Candidate(item, boundEntries.GetValueOrDefault(item.Id), null, item.SortName, userData.GetUserData(user, item),
@@ -84,7 +84,11 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         candidates = candidates.Where(row => row.Native is null ? MatchesMetadata(row, filters) : nativeMatches.Contains(row.Native.Id) && MatchesStatus(row.UserData, filters.Status));
         if (!string.IsNullOrEmpty(request.Alphabet)) candidates = candidates.Where(row => request.Alphabet == "#"
             ? StringComparer.Ordinal.Compare(row.SortName, "a") < 0 : row.SortName.StartsWith(request.Alphabet, StringComparison.OrdinalIgnoreCase));
-        if (!string.IsNullOrWhiteSpace(request.Query)) candidates = candidates.Where(row => row.Title.Contains(request.Query, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(request.Query))
+        {
+            var search = sortNames.GetSearchKey(request.Query);
+            candidates = candidates.Where(row => row.SearchValues.Any(value => sortNames.GetSearchKey(value).Contains(search, StringComparison.Ordinal)));
+        }
         if (request.State.Length > 0) candidates = candidates.Where(row => request.State.Contains(row.Native is null ? FileStates.ToWire(row.Entry!.State) : "onDisk"));
         if (request.DueWithinDays.HasValue)
         {
@@ -158,6 +162,7 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
     private sealed record Candidate(BaseItem? Native, Entry? Entry, TmdbMetadata? Metadata, string SortName, UserItemData? UserData, DateTime? SeriesDatePlayed)
     {
         public string Title => Native?.Name ?? Entry!.Title;
+        public IEnumerable<string> SearchValues => new[] { Title, Native?.OriginalTitle, Native?.SortName, Metadata?.OriginalTitle }.OfType<string>();
         public string Identity => Native is null ? "entry:" + Entry!.Id : "native:" + Native.Id;
         public string TitleIdentity => Entry is not null ? "tmdb:" + Entry.TmdbId :
             Native!.ProviderIds.TryGetValue("Tmdb", out var id) ? "tmdb:" + id : Identity;

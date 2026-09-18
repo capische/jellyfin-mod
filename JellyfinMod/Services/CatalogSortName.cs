@@ -41,6 +41,14 @@ public sealed class CatalogSortName(IServerConfigurationManager configurationMan
         return NormalizeChunks(sortable);
     }
 
+    /// <summary>Returns a case-insensitive, diacritic-folded key for title search.</summary>
+    public string GetSearchKey(string title)
+    {
+        ArgumentNullException.ThrowIfNull(title);
+        var normalized = title.Trim().ToLowerInvariant().RemoveDiacritics();
+        return normalized.All(char.IsAscii) ? normalized : normalized.Transliterated();
+    }
+
     private static string NormalizeChunks(ReadOnlySpan<char> value)
     {
         if (value.IsEmpty)
