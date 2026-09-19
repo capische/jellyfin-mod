@@ -13,10 +13,19 @@ public static class ImportPaths
     /// Applies the longest matching explicit mapping, then the client's own verified download-folder pair. Returns null when
     /// nothing maps the path, which blocks the import as <c>path_unmapped</c>.
     /// </summary>
-    public static string? Map(string clientPath, IEnumerable<DownloadClientPathMapping> mappings, AcquisitionDownloadClient client)
+    public static string? Map(string clientPath, IEnumerable<DownloadClientPathMapping> mappings, AcquisitionDownloadClient client) =>
+        Resolve(clientPath, mappings, client, out var local) == PathMapOutcome.Mapped ? local : null;
+
+    /// <summary>
+    /// Resolves a client path through the longest matching explicit mapping, then the client's own verified download-folder
+    /// pair, and says whether a verified prefix matched, an unverified prefix was the best match, or nothing matched.
+    /// </summary>
+    public static PathMapOutcome Resolve(string clientPath, IEnumerable<DownloadClientPathMapping> mappings,
+        AcquisitionDownloadClient client, out string? localPath)
     {
+        localPath = null;
         var normalized = Normalize(clientPath);
-        if (normalized is null) return null;
+        if (normalized is null) return PathMapOutcome.Unmatched;
         // An unverified mapping is kept on the client but never used: when it is the best match, the import blocks as
         // path_unmapped instead of falling back to a shorter prefix that would point somewhere else.
         var pairs = mappings
@@ -29,12 +38,13 @@ public static class ImportPaths
         foreach (var (prefix, local, verified, _) in pairs)
         {
             if (!Within(prefix!, normalized)) continue;
-            if (!verified) return null;
+            if (!verified) return PathMapOutcome.Unverified;
             var relative = normalized.Length == prefix!.Length ? string.Empty : normalized[(prefix.Length + (prefix == "/" ? 0 : 1))..];
-            return relative.Length == 0 ? local : local!.TrimEnd('/') + "/" + relative;
+            localPath = relative.Length == 0 ? local : local!.TrimEnd('/') + "/" + relative;
+            return PathMapOutcome.Mapped;
         }
 
-        return null;
+        return PathMapOutcome.Unmatched;
     }
 
     /// <summary>Normalizes an absolute path: forward slashes, no trailing slash, no <c>..</c> segment.</summary>
@@ -51,6 +61,19 @@ public static class ImportPaths
     /// <summary>Returns true when <paramref name="path"/> equals or lies below <paramref name="prefix"/>.</summary>
     public static bool Within(string prefix, string path) =>
         prefix == "/" || path == prefix || path.StartsWith(prefix + "/", StringComparison.Ordinal);
+}
+
+/// <summary>How a client path resolved against a client's path mappings.</summary>
+public enum PathMapOutcome
+{
+    /// <summary>No mapping prefix covers the path.</summary>
+    Unmatched,
+
+    /// <summary>A verified prefix mapped the path to a local one.</summary>
+    Mapped,
+
+    /// <summary>The best matching prefix is unverified, so the path must not be used.</summary>
+    Unverified
 }
 
 /// <summary>The file chosen from a completed torrent, or why none could be chosen.</summary>

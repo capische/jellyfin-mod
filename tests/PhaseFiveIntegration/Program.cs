@@ -828,6 +828,47 @@ internal static partial class Phase5
         Assert(lateL.Id == scanningL.Id, "A later scan still binds the file and completes the same operation");
         world.Native.AutoScan = true;
 
+        // ================= P4.A6 (b): the Phase 3 seed reader reads the same daemon and sees its paths through the mappings.
+        configuration.TransmissionRpcUrl = transmission.Endpoint.ToString();
+        configuration.TransmissionUsername = transmission.Username;
+        configuration.TransmissionPassword = transmission.Password;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            AddEntry(database, ids, "movieM", "movie", 119, "Reader Movie", 2021, "tt0000119", null, world.Movies.Id);
+            await database.SaveChangesAsync();
+        }
+
+        var fixtureM = TorrentFixture.Single("Reader.Movie.2021.1080p.WEB-DL-GRP.mkv", Size);
+        torznab.Torrents["movieM"] = fixtureM.Bytes;
+        transmission.Register(fixtureM);
+        lock (torznab.MovieItems)
+            torznab.MovieItems.Add(new("Reader.Movie.2021.1080p.WEB-DL-GRP", "guid-movieM", torznab.Download("movieM"), Size, 25,
+                new() { ["imdbid"] = "0000119" }));
+        var (grabM, hashM) = await GrabAsync(admin, ids["movieM"], null, fixtureM);
+        transmission.Progress(hashM, 1.0);
+        var completedM = await CompleteAsync(dbPath, grabM, Tick);
+        Assert(transmission.Torrents[hashM].DownloadDir == "/data/torrents/jfmod" && !File.Exists("/data/torrents/jfmod/" + fixtureM.Name) &&
+            File.Exists(completedM.SourceLocalPath!), "The daemon reports a path that exists only through the client's mapping");
+        // The administrator drops the row but keeps the torrent seeding; the plugin no longer tracks a release for it.
+        await ReadAsync(await admin.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"/JellyfinMod/Queue/{completedM.Id}")
+            { Content = JsonContent.Create(new { removeFromClient = false, blocklist = false }) }), 200, "Remove the seeding row without the client");
+        Assert(transmission.Torrents.ContainsKey(hashM), "The torrent keeps seeding in the client");
+        Guid thirdBindingId;
+        await using (var database = new ModDbContext(dbPath))
+            thirdBindingId = (await database.EntryBindings.AsNoTracking().SingleAsync(value => value.EntryId == ids["movieC"] &&
+                value.MediaPath == thirdExisting)).Id;
+        _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
+        time.Offset += TimeSpan.FromDays(2);
+        preview = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview"));
+        var previewM = PreviewItem(preview, completedM.BindingId!.Value);
+        Assert(previewM.GetProperty("state").GetString() == "blocked" && previewM.GetProperty("torrentManaged").ValueKind == JsonValueKind.True &&
+            previewM.GetProperty("reason").GetString() == "seed_goal_unbounded",
+            "The reader finds the mapped seeding copy of the library file instead of reporting an incomplete index: " + previewM);
+        var previewThird = PreviewItem(preview, thirdBindingId);
+        Assert(preview.GetProperty("seedIndexUnresolvedFiles").GetInt32() > 0 && previewThird.GetProperty("state").GetString() == "blocked" &&
+            previewThird.GetProperty("reason").GetString() == "seed_index_incomplete",
+            "Torrent data that no mapping resolves still blocks non-torrent media (fail closed): " + previewThird);
+
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))
         {

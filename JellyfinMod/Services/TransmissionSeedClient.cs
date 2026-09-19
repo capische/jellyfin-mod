@@ -1,5 +1,9 @@
 using System.Text.Json;
+using JellyfinMod.Data;
+using JellyfinMod.Services.Acquisition;
+using JellyfinMod.Services.Import;
 using MediaBrowser.Common.Net;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace JellyfinMod.Services;
@@ -18,11 +22,16 @@ public sealed class TransmissionSeedClient(
     private static readonly string[] TorrentFields =
     [
         "id", "hashString", "downloadDir", "files", "fileStats", "leftUntilDone", "percentDone", "status", "uploadRatio",
-        "secondsSeeding", "seedRatioMode", "seedRatioLimit", "seedIdleMode", "seedIdleLimit", "etaIdle", "isFinished"
+        "secondsSeeding", "seedRatioMode", "seedRatioLimit", "seedIdleMode", "seedIdleLimit", "etaIdle", "isFinished", "labels"
     ];
 
     /// <summary>Gets one complete, read-only snapshot or an unavailable result that blocks deletion.</summary>
-    public async Task<TransmissionSeedSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <param name="database">
+    /// The plugin database. When given, the path mappings of the acquisition client that uses this same RPC endpoint
+    /// translate the daemon's paths to this server's (P4.A6 (b)); without it, paths are read as the daemon reports them.
+    /// </param>
+    public async Task<TransmissionSeedSnapshot> GetSnapshotAsync(CancellationToken cancellationToken, ModDbContext? database = null)
     {
         var settings = configuration();
         if (!Uri.TryCreate(settings.TransmissionRpcUrl, UriKind.Absolute, out var endpoint) ||
@@ -31,6 +40,9 @@ public sealed class TransmissionSeedClient(
 
         try
         {
+            var context = database is null
+                ? SeedContext.Empty
+                : await SeedContext.LoadAsync(database, settings.TransmissionRpcUrl, cancellationToken).ConfigureAwait(false);
             // The saved password lives in the secret store (user decision 3); a value on the object is used as given.
             var password = settings.TransmissionPassword.Length > 0 || secrets is null
                 ? settings.TransmissionPassword
@@ -71,9 +83,10 @@ public sealed class TransmissionSeedClient(
                     continue;
                 }
 
+                var paths = context.PathsFor(torrent);
                 foreach (var file in torrentFiles)
                 {
-                    if (!TryInspectTorrentFile(file, downloadDirectory, session, out var observed))
+                    if (!TryInspectTorrentFile(file, downloadDirectory, session, paths, out var observed))
                     {
                         // Unwanted or not-yet-started files have no data on disk to protect. Only a wanted
                         // file with downloaded data that cannot be found leaves the index incomplete (P3.T17).
@@ -129,14 +142,15 @@ public sealed class TransmissionSeedClient(
 
     /// <summary>
     /// Finds a torrent file where Transmission keeps it: the download directory or, while downloading,
-    /// the incomplete directory, under its own name or with the partial-file suffix.
+    /// the incomplete directory, under its own name or with the partial-file suffix. Daemon paths pass through the
+    /// client's path mappings; a path whose best mapping is unverified is never read, so the file stays unresolved.
     /// </summary>
     private bool TryInspectTorrentFile(TransmissionFile file, string downloadDirectory, TransmissionSession session,
-        out UnixFileSnapshot observed)
+        PathTranslator paths, out UnixFileSnapshot observed)
     {
         foreach (var directory in session.IncompleteDirectory is { } incomplete ? [downloadDirectory, incomplete] : new[] { downloadDirectory })
         {
-            var path = Path.GetFullPath(file.Name, directory);
+            if (paths.Translate(Path.GetFullPath(file.Name, directory)) is not { } path) continue;
             if (files.TryInspect(path, out observed)) return true;
             if (session.RenamePartialFiles && files.TryInspect(path + ".part", out observed)) return true;
         }
@@ -144,6 +158,78 @@ public sealed class TransmissionSeedClient(
         observed = default;
         return false;
     }
+
+    /// <summary>Translates daemon paths to local ones for one torrent.</summary>
+    private sealed class PathTranslator(AcquisitionDownloadClient? client, IReadOnlyList<DownloadClientPathMapping> mappings)
+    {
+        public static PathTranslator Identity { get; } = new(null, []);
+
+        /// <summary>
+        /// Returns the local path: mapped through a verified prefix, unchanged when no prefix covers it (the daemon shares
+        /// this server's paths), or null when the best matching prefix is unverified.
+        /// </summary>
+        public string? Translate(string clientPath)
+        {
+            if (client is null) return clientPath;
+            return ImportPaths.Resolve(clientPath, mappings, client, out var local) switch
+            {
+                PathMapOutcome.Mapped => local,
+                PathMapOutcome.Unmatched => clientPath,
+                _ => null
+            };
+        }
+    }
+
+    /// <summary>The plugin's own knowledge of the daemon this reader protects: its clients and their path mappings.</summary>
+    private sealed class SeedContext
+    {
+        public static SeedContext Empty { get; } = new([], null);
+
+        private readonly IReadOnlyList<(AcquisitionDownloadClient Client, PathTranslator Paths)> clients;
+        private readonly PathTranslator primary;
+
+        private SeedContext(IReadOnlyList<(AcquisitionDownloadClient Client, PathTranslator Paths)> clients, Guid? primaryId)
+        {
+            this.clients = clients;
+            primary = clients.OrderBy(entry => entry.Client.Id == primaryId ? 0 : 1).ThenBy(entry => entry.Client.Id)
+                .Select(entry => entry.Paths).FirstOrDefault() ?? PathTranslator.Identity;
+        }
+
+        /// <summary>Loads the Transmission acquisition clients configured for the same RPC endpoint.</summary>
+        public static async Task<SeedContext> LoadAsync(ModDbContext database, string rpcUrl, CancellationToken cancellationToken)
+        {
+            var endpoint = AcquisitionConfiguration.NormalizeEndpoint(rpcUrl);
+            var matching = (await database.AcquisitionDownloadClients.AsNoTracking()
+                    .Where(client => client.Kind == TransmissionDriver.DriverKind).ToListAsync(cancellationToken).ConfigureAwait(false))
+                .Where(client => AcquisitionConfiguration.NormalizeEndpoint(client.BaseUrl) == endpoint).ToList();
+            if (matching.Count == 0) return Empty;
+            var ids = matching.Select(client => client.Id).ToArray();
+            var mappings = await database.DownloadClientPathMappings.AsNoTracking().Where(mapping => ids.Contains(mapping.DownloadClientId))
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var selected = await database.AcquisitionSettings.AsNoTracking().Where(value => value.Id == AcquisitionSettings.SingletonId)
+                .Select(value => value.DownloadClientId).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            return new SeedContext(matching.Select(client => (client, new PathTranslator(client,
+                mappings.Where(mapping => mapping.DownloadClientId == client.Id).ToList()))).ToList(), selected);
+        }
+
+        /// <summary>
+        /// Chooses the client whose mappings apply to a torrent: the one whose label the torrent carries, else the client
+        /// acquisition uses, else the first configured for this endpoint.
+        /// </summary>
+        public PathTranslator PathsFor(JsonElement torrent)
+        {
+            if (clients.Count == 0) return PathTranslator.Identity;
+            var labels = Labels(torrent);
+            return clients.Where(entry => entry.Client.Label.Length > 0 && labels.Contains(entry.Client.Label))
+                .OrderBy(entry => entry.Client.Id).Select(entry => entry.Paths).FirstOrDefault() ?? primary;
+        }
+    }
+
+    private static HashSet<string> Labels(JsonElement torrent) =>
+        torrent.TryGetProperty("labels", out var labels) && labels.ValueKind == JsonValueKind.Array
+            ? labels.EnumerateArray().Where(label => label.ValueKind == JsonValueKind.String).Select(label => label.GetString()!)
+                .ToHashSet(StringComparer.Ordinal)
+            : [];
 
     private static bool TryParseTorrent(
         JsonElement torrent,

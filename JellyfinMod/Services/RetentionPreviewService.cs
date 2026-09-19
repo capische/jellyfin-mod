@@ -121,7 +121,7 @@ public sealed class RetentionPreviewService(
         var unresolvedSeedFiles = 0;
         if (seedCandidates.Length > 0)
         {
-            var seedSnapshot = await transmission.GetSnapshotAsync(cancellationToken).ConfigureAwait(false);
+            var seedSnapshot = await transmission.GetSnapshotAsync(cancellationToken, database).ConfigureAwait(false);
             unresolvedSeedFiles = seedSnapshot.UnresolvedFiles;
             foreach (var candidate in seedCandidates)
             {
