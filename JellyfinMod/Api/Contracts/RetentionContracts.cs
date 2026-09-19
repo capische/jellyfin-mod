@@ -140,6 +140,25 @@ internal static class RetentionSummaries
             evaluation?.Deadline is { } deadline ? DateTime.SpecifyKind(deadline, DateTimeKind.Utc) : null);
     }
 
+    /// <summary>
+    /// Maps a summary to the public vocabulary shown to non-administrators (P3.T15). Specific reasons
+    /// and deadlines derive from other users' favourites, resume positions and completion times.
+    /// </summary>
+    public static RetentionSummaryDto ForViewer(RetentionSummaryDto summary, bool isAdmin)
+    {
+        if (isAdmin) return summary;
+        var reason = summary.Reason switch
+        {
+            RetentionEvaluationReasons.Kept => "kept",
+            RetentionEvaluationReasons.RetentionDisabled => "retention_disabled",
+            RetentionEvaluationReasons.CompletionPolicySatisfied => "scheduled",
+            "episode_states_vary" => "episode_states_vary",
+            _ when summary.State == RetentionEvaluationStates.Blocked => "protected",
+            _ => "waiting"
+        };
+        return summary with { Reason = reason, Deadline = null };
+    }
+
     private static DateTime? Earliest(IEnumerable<RetentionSummaryDto> summaries) =>
         summaries.Where(summary => summary.Deadline.HasValue).Select(summary => summary.Deadline).Min();
 }

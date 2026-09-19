@@ -18,7 +18,8 @@ namespace JellyfinMod.Api;
 /// <summary>Interleaves authorized native and catalog candidates before any pagination.</summary>
 [ApiController, Authorize, Route("JellyfinMod/Browse")]
 public sealed class BrowseController(ModDbContext database, DatabaseInitializer readiness, LibraryAccess access,
-    CatalogSortName sortNames, IDtoService dto, IUserDataManager userData, IMediaSourceManager mediaSources) : ControllerBase
+    CatalogSortName sortNames, IDtoService dto, IUserDataManager userData, IMediaSourceManager mediaSources,
+    IAuthorizationService? authorization = null) : ControllerBase
 {
     private static readonly HashSet<string> SupportedSorts = ["SortName", "DateCreated", "ProductionYear", "PremiereDate", "CommunityRating", "CriticRating", "Runtime", "DateLastContentAdded", "OfficialRating", "DatePlayed", "PlayCount", "Random", "SeriesDatePlayed"];
 
@@ -104,10 +105,13 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         Array.Sort(filtered, (left, right) => Compare(left, right, request));
         var page = filtered.Skip(request.StartIndex);
         if (request.Limit.HasValue) page = page.Take(request.Limit.Value);
+        var isAdmin = authorization is not null &&
+            (await authorization.AuthorizeAsync(User, MediaBrowser.Common.Api.Policies.RequiresElevation)).Succeeded;
         var options = new DtoOptions { Fields = [ItemFields.PrimaryImageAspectRatio, ItemFields.MediaSourceCount, ItemFields.DateCreated] };
         var rows = page.Select(row => new BrowseRow(row.Native is null ? "entry" : "native",
             row.Native is null ? null : dto.GetBaseItemDto(row.Native, options, user), row.Entry is null ? null : new EntryDto(row.Entry),
-            row.Entry is null ? null : RetentionSummaries.ForEntry(row.Entry, retentionPolicy, evaluations))).ToArray();
+            row.Entry is null ? null : RetentionSummaries.ForViewer(
+                RetentionSummaries.ForEntry(row.Entry, retentionPolicy, evaluations), isAdmin))).ToArray();
         return new BrowseResult(rows, filtered.Length, entries.Length > 0);
     }
 

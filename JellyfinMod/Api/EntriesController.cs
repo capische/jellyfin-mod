@@ -21,7 +21,8 @@ public sealed class EntriesController(
     RetentionExecutionGate retentionGate,
     RetentionEvaluator retentionEvaluator,
     CatalogSortName sortNames,
-    JellyfinItemReconciliationRunner? reconciliation = null) : ControllerBase
+    JellyfinItemReconciliationRunner? reconciliation = null,
+    IAuthorizationService? authorization = null) : ControllerBase
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
@@ -374,6 +375,9 @@ public sealed class EntriesController(
     private Task<Entry?> FindExisting(CreateEntryRequest request, CancellationToken cancellationToken) => database.Entries.SingleOrDefaultAsync(entry =>
         entry.MediaType == request.MediaType && entry.TmdbId == request.TmdbId && entry.TargetLibraryId == request.TargetLibraryId, cancellationToken);
 
+    private async Task<bool> IsAdministratorAsync() => authorization is not null &&
+        (await authorization.AuthorizeAsync(User, Policies.RequiresElevation)).Succeeded;
+
     private async Task<EntryDetail> BuildDetail(Entry entry, CancellationToken cancellationToken)
     {
         var user = access.GetUser(User)!;
@@ -391,10 +395,15 @@ public sealed class EntriesController(
             var series = access.GetNativeItems(user, "series", entry.TargetLibraryId).SingleOrDefault(item => item.Id == nativeId);
             if (series is not null) visibleEpisodeIds.UnionWith(access.GetEpisodes(user, series).Select(item => item.Id));
         }
-        var episodeDtos = episodes.Where(e => LibraryAccess.CanReadEpisode(e, visibleEpisodeIds))
-            .Select(e => new EpisodeDto(e, RetentionSummaries.ForTarget(entry, policy,
-                evaluations.GetValueOrDefault(e.Id)))).ToArray();
-        var entryRetention = RetentionSummaries.ForEntry(entry, policy, evaluations.Values);
+        var isAdmin = await IsAdministratorAsync();
+        var readableEpisodes = episodes.Where(e => LibraryAccess.CanReadEpisode(e, visibleEpisodeIds)).ToArray();
+        var episodeDtos = readableEpisodes
+            .Select(e => new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,
+                evaluations.GetValueOrDefault(e.Id)), isAdmin))).ToArray();
+        // A series aggregate is built only from episodes this requester may read (P3.T15).
+        var readableTargets = readableEpisodes.Select(e => e.Id).Append(entry.Id).ToHashSet();
+        var entryRetention = RetentionSummaries.ForViewer(RetentionSummaries.ForEntry(entry, policy,
+            evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
         return new EntryDetail(new EntryDto(entry), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
             DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodeDtos, entryRetention);
     }

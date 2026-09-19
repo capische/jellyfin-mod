@@ -435,7 +435,24 @@ internal static class ApiSmoke
             dueBrowseJson.RootElement.GetProperty("items")[0].GetProperty("retention")
                 .GetProperty("state").GetString() == "scheduled",
             "Due-within filtering uses persisted episode eligibility before paging and returns its privacy-safe summary");
+        var adminRetention = dueBrowseJson.RootElement.GetProperty("items")[0].GetProperty("retention");
+        Assert(adminRetention.GetProperty("reason").GetString() == "completion_policy_satisfied" &&
+            adminRetention.GetProperty("deadline").ValueKind == JsonValueKind.String,
+            "Administrators see the specific retention reason and deadline");
         client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+        // P3.T15: ordinary users get the public vocabulary and no deadline derived from others' activity.
+        using (var userBrowse = await client.PostAsJsonAsync("/JellyfinMod/Browse", new
+        {
+            mediaType = "series", targetLibraryId = tvLibrary.Id, dueWithinDays = 7
+        }))
+        {
+            using var userBrowseJson = JsonDocument.Parse(await userBrowse.Content.ReadAsStringAsync());
+            var userRetention = userBrowseJson.RootElement.GetProperty("items")[0].GetProperty("retention");
+            Assert(userBrowse.IsSuccessStatusCode && userRetention.GetProperty("state").GetString() == "scheduled" &&
+                userRetention.GetProperty("reason").GetString() == "scheduled" &&
+                (!userRetention.TryGetProperty("deadline", out var userDeadline) || userDeadline.ValueKind == JsonValueKind.Null),
+                "Ordinary users see a public reason and no deadline derived from other users' activity: " + userRetention);
+        }
         Assert((await client.PatchAsJsonAsync($"/JellyfinMod/Entries/{seriesId}/Episodes/{episodeId}", new { monitored = false })).StatusCode == HttpStatusCode.Forbidden,
             "Ordinary users cannot change episode monitoring");
         Assert((await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null)).StatusCode == HttpStatusCode.Forbidden,
