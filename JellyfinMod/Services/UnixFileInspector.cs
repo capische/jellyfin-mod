@@ -191,17 +191,20 @@ public sealed partial class UnixFileInspector
         }
     }
 
+    // realpath writes into a caller-owned PATH_MAX buffer: freeing a libc-allocated result from managed code
+    // aborted the host with "free(): invalid pointer" inside Jellyfin (P3.T18).
+    private const int PathMax = 4096;
+
     private static string? RealPath(string path)
     {
-        var pointer = NativeMethods.RealPath(path, IntPtr.Zero);
-        if (pointer == IntPtr.Zero) return null;
+        var buffer = Marshal.AllocHGlobal(PathMax);
         try
         {
-            return Marshal.PtrToStringUTF8(pointer);
+            return NativeMethods.RealPath(path, buffer) == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(buffer);
         }
         finally
         {
-            NativeMethods.Free(pointer);
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -212,9 +215,6 @@ public sealed partial class UnixFileInspector
 
         [LibraryImport("libc", EntryPoint = "realpath", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
         internal static partial IntPtr RealPath(string path, IntPtr resolvedPath);
-
-        [LibraryImport("libc", EntryPoint = "free")]
-        internal static partial void Free(IntPtr pointer);
 
         [LibraryImport("libc", EntryPoint = "access", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
         internal static partial int Access(string path, int mode);

@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Http.Headers;
-using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using MediaBrowser.Common.Net;
@@ -109,7 +108,10 @@ public sealed class TransmissionSeedClient(
     {
         var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
         {
-            Content = JsonContent.Create(new { method, arguments })
+            // A buffered body carries Content-Length; JsonContent streams it chunked, which minimal RPC
+            // servers and proxies can read as an empty request (P3.T18).
+            Content = new StringContent(JsonSerializer.Serialize(new { method, arguments }, JsonSerializerOptions.Web),
+                Encoding.UTF8, "application/json")
         };
         if (!string.IsNullOrEmpty(settings.TransmissionUsername) || !string.IsNullOrEmpty(settings.TransmissionPassword))
         {
