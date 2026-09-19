@@ -132,11 +132,13 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
 
         try
         {
+            var skipped = new List<SkippedNativeEpisode>();
             var episodes = work.MediaType == "series"
-                ? GetEpisodes(copies.Cast<Series>().ToArray(), folder.Id, cancellationToken) : [];
+                ? GetEpisodes(copies.Cast<Series>().ToArray(), skipped, cancellationToken) : [];
             return new(representative.Id, folder.Id, representative.Name,
                 Snapshot(work.MediaType, providerId, folder.Id, representative, copies,
-                    copies.Select(item => item.Id).ToHashSet(), episodes), false, null);
+                    copies.Select(item => item.Id).ToHashSet(), episodes) with { SkippedEpisodes = skipped },
+                false, null);
         }
         catch (InvalidOperationException error)
         {
@@ -211,7 +213,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
 
     private NativeEpisodeSnapshot[] GetEpisodes(
         IReadOnlyCollection<Series> seriesCopies,
-        Guid libraryId,
+        ICollection<SkippedNativeEpisode> skipped,
         CancellationToken cancellationToken)
     {
         var episodes = new List<NativeEpisodeSnapshot>();
@@ -230,8 +232,15 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             {
                 if (episode.SeriesId != series.Id)
                     throw new InvalidOperationException($"Native episode {episode.Id} has conflicting series provenance.");
+                // Date-named, unparsed or "Season Unknown" episodes cannot be matched by position. They are
+                // diagnosed one at a time instead of failing the whole series (P2.R6).
                 if (!episode.ParentIndexNumber.HasValue || !episode.IndexNumber.HasValue)
-                    throw new InvalidOperationException($"Native episode {episode.Id} has no season/episode identity.");
+                {
+                    skipped.Add(new(episode.Id, episode.SeriesId, IsPlayable(episode), episode.Name ?? string.Empty,
+                        "The native episode has no season and episode number."));
+                    continue;
+                }
+
                 episodes.Add(new(episode.Id, episode.SeriesId, ProviderTmdbId(episode), episode.ParentIndexNumber.Value,
                     episode.IndexNumber.Value, IsPlayable(episode), episode.Name, episode.Overview, null,
                     episode.PremiereDate, RuntimeMinutes(episode), episode.Path, _mediaStorage.Capture(episode.Path)));
@@ -289,6 +298,9 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
 /// <summary>One native title work item or a bounded diagnostic produced while inspecting it.</summary>
 public sealed record NativeCatalogObservation(Guid NativeItemId, Guid TargetLibraryId, string Title,
     NativeTitleSnapshot? Snapshot, bool IsConflict, string? Detail);
+
+/// <summary>A native episode left out of matching because it has no usable season and episode number.</summary>
+public sealed record SkippedNativeEpisode(Guid JellyfinItemId, Guid SeriesItemId, bool IsPlayable, string Title, string Detail);
 
 /// <summary>A native media library and its configured storage locations.</summary>
 internal sealed record NativeLibraryStorage(Guid LibraryId, string Name, IReadOnlyList<string> Locations);

@@ -68,6 +68,7 @@
         <h2 class="sectionTitle verticalSection">Library reconciliation</h2>
         <p>Run <strong>Reconcile JellyfinMod catalog</strong> from Dashboard → Scheduled Tasks to backfill or repair bindings.</p>
         <div id="ReconciliationSummary" class="fieldDescription">No reconciliation run has been recorded.</div>
+        <ul id="ReconciliationLibraryReasons" class="fieldDescription"></ul>
 
         <div>
           <button is="emby-button" type="submit" class="raised button-submit block">
@@ -143,6 +144,16 @@
               ' · unchanged ' + run.unchangedItems + ' · unmatched ' + run.unmatchedItems +
               ' · conflicts ' + run.conflictedItems + ' · failed ' + run.failedItems +
               ' · missing ' + run.missingItems + ' · incomplete libraries ' + run.incompleteLibraries;
+            // Library-level reasons carry an empty native item id (P2.R6).
+            var reasons = document.querySelector('#ReconciliationLibraryReasons');
+            reasons.innerHTML = '';
+            (run.diagnostics || []).filter(function (diagnostic) {
+              return /^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(diagnostic.nativeItemId);
+            }).forEach(function (diagnostic) {
+              var item = document.createElement('li');
+              item.textContent = diagnostic.title + ': ' + diagnostic.detail;
+              reasons.appendChild(item);
+            });
           }, function () {});
         });
 

@@ -149,9 +149,13 @@ internal static class BackfillIntegration
 
         var first = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
         Assert(first.Status == "completed" && first.TotalItems == 58 && first.ScannedItems == 58 &&
-            first.CreatedEntries == 54 && first.UnmatchedItems == 2 && first.FailedItems == 1 &&
+            first.CreatedEntries == 55 && first.UnmatchedItems == 2 && first.FailedItems == 0 &&
             first.ConflictedItems == 1 && first.UpdatedBindings == 0 && first.UnchangedItems == 0,
             "Backfill reports exact bounded outcome counts while one bad title does not stop later work");
+        // An unnumbered episode is diagnosed on its own instead of failing its series (P2.R6).
+        Assert(await database.Entries.AnyAsync(entry => entry.TmdbId == 7001 && entry.State == FileState.None) &&
+            first.DiagnosticsJson?.Contains("no season and episode number", StringComparison.Ordinal) == true,
+            "A series whose only episode is unnumbered is backfilled with a per-episode diagnostic");
         var seriesEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 7000);
         Assert(await database.Episodes.CountAsync(episode => episode.EntryId == seriesEntry.Id) == 2 &&
             await database.EpisodeBindings.CountAsync(binding => binding.TargetLibraryId == tvLibraryId) == 3,
@@ -167,15 +171,15 @@ internal static class BackfillIntegration
 
         database.ChangeTracker.Clear();
         var rerun = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
-        Assert(rerun.CreatedEntries == 0 && rerun.UpdatedBindings == 0 && rerun.UnchangedItems == 54 &&
-            rerun.UnmatchedItems == 2 && rerun.FailedItems == 1 && rerun.ConflictedItems == 1 &&
-            await database.History.CountAsync() == 54,
+        Assert(rerun.CreatedEntries == 0 && rerun.UpdatedBindings == 0 && rerun.UnchangedItems == 55 &&
+            rerun.UnmatchedItems == 2 && rerun.FailedItems == 0 && rerun.ConflictedItems == 1 &&
+            await database.History.CountAsync() == 55,
             "A complete rerun is idempotent and creates no duplicate entries or transition history");
 
         failedProvider = 5;
         var failedItemRun = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
         Assert(failedItemRun.ScannedItems == 58 && failedItemRun.TotalItems == 58 &&
-            failedItemRun.UnchangedItems == 53 && failedItemRun.FailedItems == 2 &&
+            failedItemRun.UnchangedItems == 54 && failedItemRun.FailedItems == 1 &&
             failedItemRun.UnmatchedItems == 2 && failedItemRun.ConflictedItems == 1,
             "Production transient registrations retain every preceding outcome after a mid-run item failure");
         failedProvider = null;

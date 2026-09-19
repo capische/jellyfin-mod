@@ -232,10 +232,12 @@ internal static class AbsenceIntegration
         database.ChangeTracker.Clear();
         movieEntry = await database.Entries.SingleAsync(entry => entry.Id == movieEntry.Id);
         var incomplete = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt).FirstAsync();
-        Assert(incomplete.IncompleteLibraries == 1 && incomplete.MissingItems == 0 &&
+        Assert(incomplete.IncompleteLibraries == 0 && incomplete.MissingItems == 0 &&
             movieEntry.State == FileState.OnDisk && movieEntry.JellyfinItemId == movieB.Id &&
-            await database.EntryBindings.CountAsync(binding => binding.EntryId == movieEntry.Id) == 1,
-            "A disappeared nested media mount preserves the last playable binding even when its stale root is non-empty");
+            await database.EntryBindings.CountAsync(binding => binding.EntryId == movieEntry.Id) == 1 &&
+            incomplete.DiagnosticsJson?.Contains("Absence was not confirmed for this title", StringComparison.Ordinal) == true,
+            "A disappeared nested media mount preserves the last playable binding even when its stale root is non-empty, " +
+            "excluding only that title from absence confirmation");
 
         await WriteMountInfoAsync(mountInfoPath, folder, moviePath, tvPath, true, true);
         database.ChangeTracker.Clear();
@@ -285,6 +287,107 @@ internal static class AbsenceIntegration
             !await database.EntryBindings.AnyAsync(binding => binding.EntryId == seriesEntry.Id) &&
             !await database.EpisodeBindings.AnyAsync(binding => binding.EpisodeId == trackedEpisode.Id),
             "Series availability and individual episode bindings clear only after their final playable copy disappears");
+
+        // P2.R6: incompleteness belongs to one title, not to the library.
+        var dailySeries = Series(9700, "Daily series", tvPath);
+        var dailyNumbered = Episode(9701, dailySeries.Id, "Daily numbered", tvPath);
+        var dailyUnnumbered = Episode(9702, dailySeries.Id, "Daily 2026-09-19", tvPath, 2);
+        dailyUnnumbered.ParentIndexNumber = null;
+        dailyUnnumbered.IndexNumber = null;
+        var keptSeries = Series(9710, "Kept series", tvPath);
+        var keptOne = Episode(9711, keptSeries.Id, "Kept one", tvPath);
+        var keptTwo = Episode(9712, keptSeries.Id, "Kept two", tvPath, 2);
+        var losingSeries = Series(9720, "Losing identity", tvPath);
+        var losingEpisode = Episode(9721, losingSeries.Id, "Losing identity episode", tvPath);
+        series.AddRange([dailySeries, keptSeries, losingSeries]);
+        episodes.AddRange([dailyNumbered, dailyUnnumbered, keptOne, keptTwo, losingEpisode]);
+        database.ChangeTracker.Clear();
+        await task.Run(new InlineProgress(), default);
+        database.ChangeTracker.Clear();
+        var r6Run = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt).FirstAsync();
+        var dailyEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 9700);
+        Assert(r6Run.IncompleteLibraries == 0 && r6Run.FailedItems == 0 && dailyEntry.State == FileState.OnDisk &&
+            await database.Episodes.AnyAsync(episode => episode.EntryId == dailyEntry.Id && episode.TmdbId == 9701 &&
+                episode.State == FileState.OnDisk) &&
+            !await database.Episodes.AnyAsync(episode => episode.TmdbId == 9702) &&
+            r6Run.DiagnosticsJson?.Contains("no season and episode number", StringComparison.Ordinal) == true,
+            "An unnumbered episode is diagnosed on its own while its series' numbered episodes still bind");
+
+        var losingEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 9720);
+        var keptEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 9710);
+        var keptTwoEpisode = await database.Episodes.SingleAsync(episode => episode.TmdbId == 9712);
+        episodes.Remove(keptTwo);
+        File.Delete(keptTwo.Path);
+        losingSeries.ProviderIds.Remove("Tmdb");
+        await task.Run(new InlineProgress(), default);
+        database.ChangeTracker.Clear();
+        r6Run = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt).FirstAsync();
+        losingEntry = await database.Entries.SingleAsync(entry => entry.Id == losingEntry.Id);
+        keptTwoEpisode = await database.Episodes.SingleAsync(episode => episode.Id == keptTwoEpisode.Id);
+        Assert(r6Run.IncompleteLibraries == 0 && r6Run.UnmatchedItems == 1 && r6Run.MissingItems == 1 &&
+            keptTwoEpisode.State == FileState.None &&
+            await database.History.CountAsync(history => history.EntryId == keptEntry.Id &&
+                history.EventType == "episode_media_missing") == 1,
+            "A hand-deleted episode is confirmed missing while an unnumbered episode and an unmatched series share its library");
+        Assert(losingEntry.State == FileState.OnDisk && losingEntry.JellyfinItemId == losingSeries.Id &&
+            await database.EntryBindings.CountAsync(binding => binding.EntryId == losingEntry.Id) == 1 &&
+            await database.EpisodeBindings.CountAsync(binding => binding.TargetLibraryId == tvLibrary.Id &&
+                binding.JellyfinItemId == losingEpisode.Id) == 1 &&
+            !await database.History.AnyAsync(history => history.EntryId == losingEntry.Id &&
+                (history.EventType == "media_missing" || history.EventType == "episode_media_missing")),
+            "A bound series that loses its TMDB identity keeps its bindings and state with no missing events");
+
+        // A binding recorded without a storage identity, or from a retired location, is resolved by a direct
+        // existence check; an existing file Jellyfin no longer lists is kept.
+        var keptOneBinding = await database.EpisodeBindings.SingleAsync(binding => binding.JellyfinItemId == keptOne.Id);
+        keptOneBinding.StorageIdentity = null;
+        var retiredLocation = Path.Combine(folder, "retired-location");
+        Directory.CreateDirectory(retiredLocation);
+        await File.WriteAllTextAsync(Path.Combine(retiredLocation, "still-mounted"), "present");
+        var dailyBinding = await database.EpisodeBindings.SingleAsync(binding => binding.JellyfinItemId == dailyNumbered.Id);
+        dailyBinding.MediaPath = Path.Combine(retiredLocation, "Daily numbered.mkv");
+        var unlistedMovie = pagedMovies[0];
+        var unlistedBinding = await database.EntryBindings.SingleAsync(binding => binding.JellyfinItemId == unlistedMovie.Id);
+        unlistedBinding.MediaPath = Path.Combine(retiredLocation, "still-mounted");
+        await database.SaveChangesAsync();
+        episodes.Remove(keptOne);
+        File.Delete(keptOne.Path);
+        episodes.Remove(dailyNumbered);
+        File.Delete(dailyNumbered.Path);
+        movies.Remove(unlistedMovie);
+        database.ChangeTracker.Clear();
+        await task.Run(new InlineProgress(), default);
+        database.ChangeTracker.Clear();
+        r6Run = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt).FirstAsync();
+        var unlistedEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 9600);
+        Assert(r6Run.IncompleteLibraries == 0 &&
+            await database.Episodes.AnyAsync(episode => episode.TmdbId == 9711 && episode.State == FileState.None) &&
+            await database.Episodes.AnyAsync(episode => episode.TmdbId == 9701 && episode.State == FileState.None) &&
+            !await database.EpisodeBindings.AnyAsync(binding =>
+                binding.JellyfinItemId == keptOne.Id || binding.JellyfinItemId == dailyNumbered.Id),
+            "Bindings with no storage identity or outside current locations are confirmed absent by a direct existence check");
+        Assert(unlistedEntry.State == FileState.OnDisk &&
+            await database.EntryBindings.AnyAsync(binding => binding.EntryId == unlistedEntry.Id) &&
+            r6Run.DiagnosticsJson?.Contains("still exists although Jellyfin no longer lists it", StringComparison.Ordinal) == true,
+            "A media file that still exists is not treated as absent, and only that title is excluded");
+        movies.Add(unlistedMovie);
+
+        // A reboot or USB re-enumeration changes only the device number and source of the same mount.
+        await WriteMountInfoAsync(mountInfoPath, folder, moviePath, tvPath, true, true, "3:9", "/dev/sdb1");
+        series.Remove(keptSeries);
+        Directory.Delete(keptSeries.Path, true);
+        database.ChangeTracker.Clear();
+        await task.Run(new InlineProgress(), default);
+        database.ChangeTracker.Clear();
+        r6Run = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt).FirstAsync();
+        keptEntry = await database.Entries.SingleAsync(entry => entry.Id == keptEntry.Id);
+        Assert(r6Run.IncompleteLibraries == 0 && keptEntry.State == FileState.None &&
+            !await database.EntryBindings.AnyAsync(binding => binding.EntryId == keptEntry.Id) &&
+            await database.EpisodeBindings.Where(binding => binding.TargetLibraryId == tvLibrary.Id)
+                .AllAsync(binding => binding.StorageIdentity != null && binding.StorageIdentity.StartsWith("3:9|")) &&
+            await database.EntryBindings.Where(binding => binding.TargetLibraryId == tvLibrary.Id)
+                .AllAsync(binding => binding.StorageIdentity != null && binding.StorageIdentity.StartsWith("3:9|")),
+            "A device-number change re-baselines every binding in the library before absence is confirmed");
     }
 
     private static Movie Movie(int tmdbId, string name, string root)
@@ -329,7 +432,9 @@ internal static class AbsenceIntegration
         string moviePath,
         string tvPath,
         bool movieMounted,
-        bool tvMounted)
+        bool tvMounted,
+        string tvDevice = "3:1",
+        string tvSource = "/dev/tv")
     {
         var lines = new List<string>
         {
@@ -338,7 +443,7 @@ internal static class AbsenceIntegration
         if (movieMounted)
             lines.Add($"11 10 2:1 /library/movies {EscapeMount(moviePath)} rw - ext4 /dev/movies rw");
         if (tvMounted)
-            lines.Add($"12 10 3:1 /library/tv {EscapeMount(tvPath)} rw - ext4 /dev/tv rw");
+            lines.Add($"12 10 {tvDevice} /library/tv {EscapeMount(tvPath)} rw - ext4 {tvSource} rw");
         return File.WriteAllLinesAsync(mountInfoPath, lines);
     }
 

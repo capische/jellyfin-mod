@@ -387,6 +387,9 @@ static async Task VerifyPreviewHttpAsync(
     apiBuilder.Services.AddSingleton<MediaStorageIdentity>();
     apiBuilder.Services.AddSingleton<UnixFileInspector>();
     apiBuilder.Services.AddSingleton<ReconciliationLibraryLock>();
+    // The retention runner re-baselines storage identity through reconciliation before its preview (P2.R6).
+    apiBuilder.Services.AddTransient<ReconciliationService>();
+    apiBuilder.Services.AddTransient<JellyfinNativeTitleSource>();
     apiBuilder.Services.AddSingleton<RetentionExecutionGate>();
     apiBuilder.Services.AddSingleton<RetentionRunGate>();
     apiBuilder.Services.AddSingleton<IHttpClientFactory, PlainHttpClientFactory>();

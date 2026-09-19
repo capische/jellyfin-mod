@@ -25,11 +25,67 @@ public sealed class ReconciliationService(
     internal Task<ReconciliationResult> ReconcileUnderLeaseAsync(NativeTitleSnapshot snapshot,
         CancellationToken cancellationToken) => ReconcileAsync(snapshot, true, cancellationToken);
 
-    /// <summary>Clears bindings absent from a complete observation while the caller holds the library lease.</summary>
+    /// <summary>
+    /// Refreshes recorded storage identities in one library whose mount only changed device number or
+    /// source (P2.R6), so a reboot does not block absence confirmation and retention indefinitely. The
+    /// caller holds the library lease.
+    /// </summary>
+    internal async Task<int> RebaselineStorageUnderLeaseAsync(
+        Guid libraryId,
+        IReadOnlyList<string> libraryLocations,
+        CancellationToken cancellationToken)
+    {
+        if (!LibraryStorageProbe.IsAvailable(libraryLocations, out _)) return 0;
+        var changed = 0;
+        foreach (var binding in await database.EntryBindings.Where(binding => binding.TargetLibraryId == libraryId)
+                     .ToListAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (!MediaStorageIdentity.IsWithin(binding.MediaPath, libraryLocations)) continue;
+            if (_mediaStorage.Rebaseline(binding.MediaPath, binding.StorageIdentity) is not { } current) continue;
+            binding.StorageIdentity = current;
+            changed++;
+        }
+
+        foreach (var binding in await database.EpisodeBindings.Where(binding => binding.TargetLibraryId == libraryId)
+                     .ToListAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (!MediaStorageIdentity.IsWithin(binding.MediaPath, libraryLocations)) continue;
+            if (_mediaStorage.Rebaseline(binding.MediaPath, binding.StorageIdentity) is not { } current) continue;
+            binding.StorageIdentity = current;
+            changed++;
+        }
+
+        if (changed > 0) await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return changed;
+    }
+
+    /// <summary>Re-baselines every available library, taking each library lease in turn.</summary>
+    internal async Task<int> RebaselineStorageAsync(
+        IEnumerable<NativeLibraryStorage> libraries,
+        CancellationToken cancellationToken)
+    {
+        var changed = 0;
+        foreach (var storage in libraries)
+        {
+            await using var lease = await libraryLock.AcquireAsync(storage.LibraryId, cancellationToken).ConfigureAwait(false);
+            changed += await RebaselineStorageUnderLeaseAsync(storage.LibraryId, storage.Locations, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// Clears bindings absent from a complete observation while the caller holds the library lease. Titles
+    /// that could not be observed, matched or verified are excluded one at a time (P2.R6); they keep their
+    /// bindings and state and the rest of the library is still confirmed.
+    /// </summary>
     internal async Task<AbsenceConfirmationResult> ConfirmAbsenceUnderLeaseAsync(
         ConfirmedLibrarySnapshot observation,
         CancellationToken cancellationToken)
     {
+        await RebaselineStorageUnderLeaseAsync(observation.LibraryId, observation.LibraryLocations, cancellationToken)
+            .ConfigureAwait(false);
         var entries = await database.Entries.Where(entry => entry.TargetLibraryId == observation.LibraryId)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         var entryIds = entries.Select(entry => entry.Id).ToHashSet();
@@ -40,23 +96,47 @@ public sealed class ReconciliationService(
         var episodeIds = episodes.Select(episode => episode.Id).ToHashSet();
         var episodeBindings = await database.EpisodeBindings.Where(binding => episodeIds.Contains(binding.EpisodeId))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var episodeOwners = episodes.ToDictionary(episode => episode.Id, episode => episode.EntryId);
+
+        var excluded = entries.Where(entry => observation.ProtectedEntryIds.Contains(entry.Id) ||
+                observation.ProtectedTmdbIds.Contains(entry.TmdbId) ||
+                entry.JellyfinItemId is { } nativeId && observation.ProtectedNativeIds.Contains(nativeId))
+            .Select(entry => entry.Id).ToHashSet();
+        excluded.UnionWith(bindings.Where(binding => observation.ProtectedNativeIds.Contains(binding.JellyfinItemId))
+            .Select(binding => binding.EntryId));
+        excluded.UnionWith(episodeBindings.Where(binding => observation.ProtectedNativeIds.Contains(binding.SeriesItemId) ||
+                observation.ProtectedNativeIds.Contains(binding.JellyfinItemId))
+            .Select(binding => episodeOwners[binding.EpisodeId]));
+
+        var unverified = new List<ExcludedTitle>();
+        foreach (var binding in bindings.Where(binding => !excluded.Contains(binding.EntryId) &&
+                     !observation.TitleIds.Contains(binding.JellyfinItemId)))
+        {
+            if (excluded.Contains(binding.EntryId) ||
+                IsProvenAbsent(binding.MediaPath, binding.StorageIdentity, observation.LibraryLocations, out var detail))
+                continue;
+            excluded.Add(binding.EntryId);
+            unverified.Add(new(binding.EntryId, entries.Single(entry => entry.Id == binding.EntryId).Title, detail));
+        }
+
+        foreach (var binding in episodeBindings.Where(binding => !observation.EpisodeIds.Contains(binding.JellyfinItemId)))
+        {
+            var ownerId = episodeOwners[binding.EpisodeId];
+            if (excluded.Contains(ownerId) ||
+                IsProvenAbsent(binding.MediaPath, binding.StorageIdentity, observation.LibraryLocations, out var detail))
+                continue;
+            excluded.Add(ownerId);
+            unverified.Add(new(ownerId, entries.Single(entry => entry.Id == ownerId).Title, detail));
+        }
+
+        entries = entries.Where(entry => !excluded.Contains(entry.Id)).ToList();
+        bindings = bindings.Where(binding => !excluded.Contains(binding.EntryId)).ToList();
+        episodes = episodes.Where(episode => !excluded.Contains(episode.EntryId)).ToList();
+        episodeBindings = episodeBindings.Where(binding => !excluded.Contains(episodeOwners[binding.EpisodeId])).ToList();
         var absentBindings = bindings.Where(binding =>
             !observation.TitleIds.Contains(binding.JellyfinItemId)).ToArray();
         var absentEpisodeBindings = episodeBindings.Where(binding =>
             !observation.EpisodeIds.Contains(binding.JellyfinItemId)).ToArray();
-        foreach (var binding in absentBindings)
-        {
-            if (!_mediaStorage.IsCurrent(binding.MediaPath, binding.StorageIdentity, observation.LibraryLocations,
-                    out var detail))
-                return new(0, false, detail);
-        }
-
-        foreach (var binding in absentEpisodeBindings)
-        {
-            if (!_mediaStorage.IsCurrent(binding.MediaPath, binding.StorageIdentity, observation.LibraryLocations,
-                    out var detail))
-                return new(0, false, detail);
-        }
 
         database.EntryBindings.RemoveRange(absentBindings);
         database.EpisodeBindings.RemoveRange(absentEpisodeBindings);
@@ -141,7 +221,16 @@ public sealed class ReconciliationService(
         }
 
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        return new(missingItems, true, null);
+        return new(missingItems, true, null, excluded.Count, unverified);
+    }
+
+    private bool IsProvenAbsent(string? path, string? identity, IReadOnlyList<string> locations, out string detail)
+    {
+        // A binding recorded before identities existed, or from a library location that was since removed,
+        // has no mount to compare; prove the file itself is gone instead.
+        if (string.IsNullOrWhiteSpace(identity) || !MediaStorageIdentity.IsWithin(path, locations))
+            return MediaStorageIdentity.IsProvablyAbsent(path, out detail);
+        return _mediaStorage.IsCurrent(path, identity, locations, out detail);
     }
 
     private async Task<ReconciliationResult> ReconcileAsync(
@@ -275,8 +364,8 @@ public sealed class ReconciliationService(
         }
 
         var playableRepresentations = snapshot.MediaType == "series"
-            ? snapshot.Representations.Where(representation => snapshot.Episodes.Any(episode =>
-                episode.SeriesItemId == representation.JellyfinItemId && episode.IsPlayable)).ToArray()
+            ? snapshot.Representations.Where(representation => snapshot.HasPlayableEpisode(representation.JellyfinItemId))
+                .ToArray()
             : snapshot.Representations.Where(representation => representation.IsPlayable).ToArray();
         var selected = SelectRepresentation(entry.JellyfinItemId, playableRepresentations);
 
@@ -610,7 +699,16 @@ public sealed class ReconciliationService(
 public sealed record NativeTitleSnapshot(string MediaType, int? TmdbId, Guid TargetLibraryId, string Title,
     int? Year, string? ImdbId, string? Overview, string? PosterPath, string? MetadataJson,
     IReadOnlyList<NativeRepresentation> Representations, IReadOnlyList<NativeEpisodeSnapshot> Episodes,
-    DateTime? DateCreated = null);
+    DateTime? DateCreated = null)
+{
+    /// <summary>Native episodes left out of matching because they have no season and episode number (P2.R6).</summary>
+    public IReadOnlyList<SkippedNativeEpisode> SkippedEpisodes { get; init; } = [];
+
+    /// <summary>Returns true when a series copy has at least one playable episode, numbered or not.</summary>
+    public bool HasPlayableEpisode(Guid seriesItemId) =>
+        Episodes.Any(episode => episode.SeriesItemId == seriesItemId && episode.IsPlayable) ||
+        SkippedEpisodes.Any(episode => episode.SeriesItemId == seriesItemId && episode.IsPlayable);
+}
 
 /// <summary>One native movie or series representation.</summary>
 public sealed record NativeRepresentation(Guid JellyfinItemId, Guid TargetLibraryId, bool IsPlayable,
@@ -623,11 +721,17 @@ public sealed record NativeEpisodeSnapshot(Guid JellyfinItemId, Guid SeriesItemI
     string? MediaPath = null, string? StorageIdentity = null);
 
 /// <summary>A complete successful observation used to remove stale native bindings for one available library.</summary>
+/// <remarks>Protected identities belong to titles that failed, conflicted or lost their provider identity.</remarks>
 internal sealed record ConfirmedLibrarySnapshot(Guid LibraryId, IReadOnlyList<string> LibraryLocations,
     IReadOnlySet<Guid> TitleIds, IReadOnlySet<Guid> PlayableTitleIds, IReadOnlySet<Guid> EpisodeIds,
-    IReadOnlySet<Guid> PlayableEpisodeIds);
+    IReadOnlySet<Guid> PlayableEpisodeIds, IReadOnlySet<Guid> ProtectedNativeIds,
+    IReadOnlySet<int> ProtectedTmdbIds, IReadOnlySet<Guid> ProtectedEntryIds);
 
-internal sealed record AbsenceConfirmationResult(int MissingItems, bool IsComplete, string? Detail);
+internal sealed record AbsenceConfirmationResult(int MissingItems, bool IsComplete, string? Detail,
+    int ExcludedTitles = 0, IReadOnlyList<ExcludedTitle>? UnverifiedTitles = null);
+
+/// <summary>A title whose absent media could not be proven gone, so it kept its bindings and state.</summary>
+internal sealed record ExcludedTitle(Guid EntryId, string Title, string Detail);
 
 /// <summary>The durable effect of one reconciliation operation.</summary>
 public sealed record ReconciliationResult(ReconciliationOutcome Outcome, Guid? EntryId, int ChangedEpisodes, string? Detail);

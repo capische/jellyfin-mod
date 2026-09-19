@@ -86,6 +86,7 @@ public sealed class RetentionRunner(
 
             if (processedActions < BatchSize)
             {
+                await RebaselineStorageAsync(cancellationToken).ConfigureAwait(false);
                 var preview = await PreviewAsync(cancellationToken).ConfigureAwait(false);
                 run.Inspected = preview.Inspected;
                 run.Eligible = preview.Due;
@@ -149,6 +150,28 @@ public sealed class RetentionRunner(
         var policy = await scope.ServiceProvider.GetRequiredService<RetentionPolicyService>()
             .SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
         return policy.Enabled;
+    }
+
+    /// <summary>
+    /// Refreshes storage identities whose device number changed across a reboot before the preview compares
+    /// them (P2.R6). A failure leaves identities unchanged, so the preview still blocks those targets.
+    /// </summary>
+    private async Task RebaselineStorageAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var libraries = scope.ServiceProvider.GetRequiredService<JellyfinNativeTitleSource>()
+                .GetLibraryStorage(cancellationToken);
+            var changed = await scope.ServiceProvider.GetRequiredService<ReconciliationService>()
+                .RebaselineStorageAsync(libraries, cancellationToken).ConfigureAwait(false);
+            if (changed > 0)
+                logger.LogInformation("JellyfinMod re-baselined {Count} media storage identities", changed);
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            logger.LogWarning(error, "JellyfinMod could not re-baseline media storage identities");
+        }
     }
 
     private async Task<Api.Contracts.RetentionPreviewDto> PreviewAsync(CancellationToken cancellationToken)

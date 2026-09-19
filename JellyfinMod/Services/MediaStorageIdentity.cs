@@ -85,6 +85,80 @@ public sealed class MediaStorageIdentity(string mountInfoPath = "/proc/self/moun
         return true;
     }
 
+    /// <summary>
+    /// Returns the path's current identity when only the device number or mount source changed since it was
+    /// recorded, as after a reboot or USB re-enumeration (P2.R6). Returns null when nothing changed or when
+    /// the mount point, root or filesystem type differ.
+    /// </summary>
+    public string? Rebaseline(string? path, string? recordedIdentity)
+    {
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(recordedIdentity)) return null;
+        var current = Capture(path);
+        if (current is null || string.Equals(current, recordedIdentity, StringComparison.Ordinal)) return null;
+        var recorded = recordedIdentity.Split('|');
+        var observed = current.Split('|');
+        if (recorded.Length != 5 || observed.Length != 5) return null;
+        return recorded[1] == observed[1] && recorded[2] == observed[2] && recorded[3] == observed[3]
+            ? current
+            : null;
+    }
+
+    /// <summary>Returns true when the path is inside one of the configured library locations.</summary>
+    public static bool IsWithin(string? path, IReadOnlyList<string> locations)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        var fullPath = Path.GetFullPath(path);
+        return locations.Where(location => !string.IsNullOrWhiteSpace(location))
+            .Any(location => Contains(Path.GetFullPath(location), fullPath));
+    }
+
+    /// <summary>
+    /// Proves absence without a trusted mount identity (P2.R6): the file is gone and its nearest existing
+    /// ancestor directory is readable and not empty, so an empty unmounted mount point cannot pass.
+    /// </summary>
+    public static bool IsProvablyAbsent(string? path, out string detail)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            detail = "A missing binding has no recorded media path.";
+            return false;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(path);
+            if (File.Exists(fullPath) || Directory.Exists(fullPath))
+            {
+                detail = $"The media file still exists although Jellyfin no longer lists it: {path}";
+                return false;
+            }
+
+            var ancestor = Path.GetDirectoryName(fullPath);
+            while (ancestor is not null && !Directory.Exists(ancestor))
+                ancestor = Path.GetDirectoryName(ancestor);
+            if (ancestor is null || ancestor == Path.GetPathRoot(fullPath))
+            {
+                detail = $"No readable parent directory proves the media is gone: {path}";
+                return false;
+            }
+
+            using var entries = Directory.EnumerateFileSystemEntries(ancestor).GetEnumerator();
+            if (!entries.MoveNext())
+            {
+                detail = $"The nearest parent directory is empty and may be an unmounted mount point: {path}";
+                return false;
+            }
+        }
+        catch (Exception)
+        {
+            detail = $"The media path could not be checked: {path}";
+            return false;
+        }
+
+        detail = string.Empty;
+        return true;
+    }
+
     private IReadOnlyList<MountInfo> ReadMounts()
     {
         var mounts = new List<MountInfo>();

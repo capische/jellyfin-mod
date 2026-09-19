@@ -51,7 +51,10 @@ public sealed class CatalogBackfillRunner(
                         .ReconcileAsync(work, cancellationToken).ConfigureAwait(false);
                     var observation = observed.Observation;
                     if (libraryObservations.TryGetValue(work.TargetLibraryId, out var libraryObservation))
-                        libraryObservation.Observe(observation, observed.Result);
+                        libraryObservation.Observe(work, observation, observed.Result);
+                    foreach (var skipped in observation.Snapshot?.SkippedEpisodes ?? [])
+                        AddDiagnostic(diagnostics, new(skipped.JellyfinItemId, work.TargetLibraryId,
+                            $"{observation.Title}: {skipped.Title}", null, false, null), skipped.Detail);
                     if (observation.IsConflict && !countedConflicts.Add((work.TargetLibraryId, observation.NativeItemId)))
                         continue;
                     run.ScannedItems++;
@@ -83,7 +86,7 @@ public sealed class CatalogBackfillRunner(
                 catch (Exception error)
                 {
                     if (libraryObservations.TryGetValue(work.TargetLibraryId, out var libraryObservation))
-                        libraryObservation.IsComplete = false;
+                        libraryObservation.Protect(work, null, null);
                     run.ScannedItems++;
                     run.FailedItems++;
                     AddDiagnostic(diagnostics, new(work.NativeItemId, work.TargetLibraryId, work.Title, null, false, null), error.Message);
@@ -134,7 +137,7 @@ public sealed class CatalogBackfillRunner(
             if (!observation.IsComplete || !LibraryStorageProbe.IsAvailable(observation.Storage.Locations, out detail))
             {
                 RecordIncompleteLibrary(run, diagnostics, observation.Storage,
-                    observation.IsComplete ? detail : "One or more native titles could not be observed completely.");
+                    observation.IsComplete ? detail : "The native library could not be enumerated.");
                 continue;
             }
 
@@ -142,6 +145,9 @@ public sealed class CatalogBackfillRunner(
                 .ConfigureAwait(false);
             var current = ObserveLibrary(observation.Storage, cancellationToken);
             var confirmation = ObserveLibrary(observation.Storage, cancellationToken);
+            // Reconciliation conflicts are only known from the first pass; they stay excluded.
+            current.ProtectFrom(observation);
+            confirmation.ProtectFrom(observation);
 
             if (!current.IsComplete || !confirmation.IsComplete ||
                 !current.IsEquivalentTo(confirmation) ||
@@ -160,7 +166,12 @@ public sealed class CatalogBackfillRunner(
             var result = await scope.ServiceProvider.GetRequiredService<ReconciliationService>()
                 .ConfirmAbsenceUnderLeaseAsync(confirmation.ToSnapshot(), cancellationToken).ConfigureAwait(false);
             if (result.IsComplete)
+            {
                 run.MissingItems += result.MissingItems;
+                foreach (var title in result.UnverifiedTitles ?? [])
+                    AddDiagnostic(diagnostics, new(Guid.Empty, current.Storage.LibraryId, title.Title, null, false, null),
+                        "Absence was not confirmed for this title: " + title.Detail);
+            }
             else
                 RecordIncompleteLibrary(run, diagnostics, current.Storage,
                     result.Detail ?? "The stored media mount could not be confirmed.");
@@ -175,7 +186,26 @@ public sealed class CatalogBackfillRunner(
         try
         {
             foreach (var work in source.GetLibraryWorkItems(storage.LibraryId, cancellationToken))
-                observation.ObserveNative(source.GetObservation(work, cancellationToken));
+            {
+                if (work.NativeItemId == Guid.Empty)
+                {
+                    observation.IsComplete = false;
+                    continue;
+                }
+
+                try
+                {
+                    observation.ObserveNative(work, source.GetObservation(work, cancellationToken));
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception)
+                {
+                    observation.Protect(work, null, null);
+                }
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -223,37 +253,44 @@ public sealed class CatalogBackfillRunner(
     private sealed class CompleteLibraryObservation(NativeLibraryStorage storage)
     {
         public NativeLibraryStorage Storage { get; } = storage;
+        /// <summary>False only when the library itself could not be enumerated.</summary>
         public bool IsComplete { get; set; } = true;
         private HashSet<Guid> TitleIds { get; } = [];
         private HashSet<Guid> PlayableTitleIds { get; } = [];
         private HashSet<Guid> EpisodeIds { get; } = [];
         private HashSet<Guid> PlayableEpisodeIds { get; } = [];
+        private HashSet<Guid> ProtectedNativeIds { get; } = [];
+        private HashSet<int> ProtectedTmdbIds { get; } = [];
+        private HashSet<Guid> ProtectedEntryIds { get; } = [];
 
-        public void Observe(NativeCatalogObservation observation, ReconciliationResult? result)
+        public void Observe(NativeTitleWorkItem work, NativeCatalogObservation observation, ReconciliationResult? result)
         {
-            if (result is null || result.Outcome == ReconciliationOutcome.Conflict)
+            if (work.NativeItemId == Guid.Empty)
             {
                 IsComplete = false;
                 return;
             }
 
-            ObserveNative(observation);
+            ObserveNative(work, observation);
+            if (result is null || result.Outcome is ReconciliationOutcome.Conflict or ReconciliationOutcome.Unmatched)
+                Protect(work, observation, result?.EntryId);
         }
 
-        public void ObserveNative(NativeCatalogObservation observation)
+        public void ObserveNative(NativeTitleWorkItem work, NativeCatalogObservation observation)
         {
             if (observation.Snapshot is not { } snapshot)
             {
-                IsComplete = false;
+                Protect(work, observation, null);
                 return;
             }
 
+            // A title that lost its provider identity keeps its bindings and state (P2.R6).
+            if (snapshot.TmdbId is not > 0) Protect(work, observation, null);
             foreach (var representation in snapshot.Representations)
             {
                 TitleIds.Add(representation.JellyfinItemId);
                 var isPlayable = snapshot.MediaType == "movie" && representation.IsPlayable ||
-                    snapshot.MediaType == "series" && snapshot.Episodes.Any(episode =>
-                        episode.SeriesItemId == representation.JellyfinItemId && episode.IsPlayable);
+                    snapshot.MediaType == "series" && snapshot.HasPlayableEpisode(representation.JellyfinItemId);
                 if (isPlayable) PlayableTitleIds.Add(representation.JellyfinItemId);
             }
 
@@ -262,16 +299,45 @@ public sealed class CatalogBackfillRunner(
                 EpisodeIds.Add(episode.JellyfinItemId);
                 if (episode.IsPlayable) PlayableEpisodeIds.Add(episode.JellyfinItemId);
             }
+
+            // An unnumbered episode is still present; a binding to it must not be read as missing media.
+            foreach (var episode in snapshot.SkippedEpisodes)
+            {
+                EpisodeIds.Add(episode.JellyfinItemId);
+                if (episode.IsPlayable) PlayableEpisodeIds.Add(episode.JellyfinItemId);
+            }
+        }
+
+        /// <summary>Excludes one title from absence decisions without failing its library (P2.R6).</summary>
+        public void Protect(NativeTitleWorkItem work, NativeCatalogObservation? observation, Guid? entryId)
+        {
+            ProtectedNativeIds.Add(work.NativeItemId);
+            if (observation is not null && observation.NativeItemId != Guid.Empty)
+                ProtectedNativeIds.Add(observation.NativeItemId);
+            foreach (var representation in observation?.Snapshot?.Representations ?? [])
+                ProtectedNativeIds.Add(representation.JellyfinItemId);
+            if (work.TmdbId is { } tmdbId) ProtectedTmdbIds.Add(tmdbId);
+            if (entryId is { } id) ProtectedEntryIds.Add(id);
+        }
+
+        public void ProtectFrom(CompleteLibraryObservation other)
+        {
+            ProtectedNativeIds.UnionWith(other.ProtectedNativeIds);
+            ProtectedTmdbIds.UnionWith(other.ProtectedTmdbIds);
+            ProtectedEntryIds.UnionWith(other.ProtectedEntryIds);
         }
 
         public bool IsEquivalentTo(CompleteLibraryObservation other) =>
             TitleIds.SetEquals(other.TitleIds) &&
             PlayableTitleIds.SetEquals(other.PlayableTitleIds) &&
             EpisodeIds.SetEquals(other.EpisodeIds) &&
-            PlayableEpisodeIds.SetEquals(other.PlayableEpisodeIds);
+            PlayableEpisodeIds.SetEquals(other.PlayableEpisodeIds) &&
+            ProtectedNativeIds.SetEquals(other.ProtectedNativeIds) &&
+            ProtectedTmdbIds.SetEquals(other.ProtectedTmdbIds);
 
         public ConfirmedLibrarySnapshot ToSnapshot() => new(Storage.LibraryId, Storage.Locations,
-            TitleIds, PlayableTitleIds, EpisodeIds, PlayableEpisodeIds);
+            TitleIds, PlayableTitleIds, EpisodeIds, PlayableEpisodeIds, ProtectedNativeIds, ProtectedTmdbIds,
+            ProtectedEntryIds);
     }
 }
 
