@@ -57,7 +57,9 @@ try
     {
         await restarted.Database.MigrateAsync();
         var appliedMigrations = (await restarted.Database.GetAppliedMigrationsAsync()).ToArray();
-        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length == 15, "Restart preserves rows and migrations");
+        // Every migration the assembly knows is applied; later phases add migrations, so the count is not fixed.
+        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length >= 15 &&
+            appliedMigrations.SequenceEqual(restarted.Database.GetMigrations()), "Restart preserves rows and migrations");
         Assert(appliedMigrations.Contains("20260910233343_PhaseTwoBindings"),
             "Published Phase 2 migration identity remains compatible with deployed databases");
         Assert(appliedMigrations.Contains("20260914125924_PhaseTwoBindingProvenance"),

@@ -92,7 +92,10 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
                 VALUES ({episodeIds[index]}, {seriesId}, {2000 + index}, {numbers[index].Item1}, {numbers[index].Item2}, 'Episode', 45, 1, 0)
                 """);
         await database.Database.MigrateAsync();
-        Assert((await database.Database.GetAppliedMigrationsAsync()).Last() == "20260919071544_PhaseFourAcquisition",
+        var applied = (await database.Database.GetAppliedMigrationsAsync()).ToList();
+        // Later phases append migrations; the Phase 4 one must still follow the latest Phase 3 migration.
+        Assert(applied.IndexOf("20260919071544_PhaseFourAcquisition") > applied.IndexOf("20260919043933_PhaseThreeNativeVisibility") &&
+            applied.IndexOf("20260919043933_PhaseThreeNativeVisibility") >= 0,
             "The Phase 4 migration applies after the latest Phase 3 migration");
         Assert(await database.Entries.CountAsync() == 3 && await database.Episodes.CountAsync() == 4 &&
             await database.Entries.AllAsync(entry => entry.QualityProfileId == null) &&
@@ -585,11 +588,15 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         var viewerDetail = await ReadAsync(await ordinary.GetAsync($"/JellyfinMod/Entries/{movieId}"), 200, "Viewer entry detail after grab");
         Assert(movieDetail.GetProperty("acquisition").GetProperty("state").GetString() == "accepted" &&
             movieDetail.GetProperty("acquisition").GetProperty("operationId").AsGuid() == movieGrabId &&
-            movieDetail.GetProperty("entry").GetProperty("state").GetString() == "none" &&
+            // Phase 5 projects an accepted grab onto the file-less card as "grabbed" (PHASE4 A6); the stored state is unchanged.
+            movieDetail.GetProperty("entry").GetProperty("state").GetString() == "grabbed" &&
             viewerDetail.GetProperty("acquisition").GetProperty("state").GetString() == "accepted" &&
             viewerDetail.GetProperty("acquisition").GetProperty("operationId").ValueKind == JsonValueKind.Null &&
             viewerDetail.GetProperty("acquisition").GetProperty("releaseTitle").ValueKind == JsonValueKind.Null,
             "Entry detail summarizes the grab without changing file state; ordinary users see only its state");
+        await using (var stored = new ModDbContext(dbPath))
+            Assert((await stored.Entries.AsNoTracking().SingleAsync(entry => entry.Id == movieId)).State == FileState.None,
+                "The grab projection never writes the entry's file state");
         var blocked = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "Search after grab");
         Assert(!blocked.GetProperty("grab").GetProperty("available").GetBoolean() &&
             blocked.GetProperty("grab").GetProperty("reason").GetString() == "grab_active" &&
