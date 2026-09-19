@@ -51,10 +51,10 @@ public sealed class EntryDto(Entry entry)
     /// <summary>Gets addedAt.</summary>
     [JsonPropertyName("addedAt")]
     public DateTime AddedAt { get; } = DateTime.SpecifyKind(entry.AddedAt, DateTimeKind.Utc);
-    /// <summary>Gets watchedAt.</summary>
+    /// <summary>Gets watchedAt. Deprecated: never written; retention state is in <c>retention</c> (P1.P11).</summary>
     [JsonPropertyName("watchedAt")]
     public DateTime? WatchedAt { get; } = Utc(entry.WatchedAt);
-    /// <summary>Gets reclaimAt.</summary>
+    /// <summary>Gets reclaimAt. Deprecated: never written; the deadline is <c>retention.deadline</c> (P1.P11).</summary>
     [JsonPropertyName("reclaimAt")]
     public DateTime? ReclaimAt { get; } = Utc(entry.ReclaimAt);
     /// <summary>Gets reclaimAfterDays.</summary>

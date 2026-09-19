@@ -667,6 +667,7 @@ internal static class ApiSmoke
         await VerifyEpisodeConflictsAsync(client, dbPath, user, tvLibrary.Id);
         await VerifyReclaimedVisibilityAsync(client, dbPath, user, libraryFolder.Id);
         await VerifyDiscoveryBudgetAsync(client, http, user);
+        await VerifyContractHygieneAsync(client, dbPath, user, libraryFolder.Id);
         // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
         http.Response = null;
         http.BeforeResponse = null;
@@ -684,6 +685,45 @@ internal static class ApiSmoke
         }
         await app.StopAsync();
         Console.WriteLine("PASS: HTTP auth/access/CRUD, duplicate history, wire-state filter binding, unknown fields and no media deletion");
+    }
+
+    /// <summary>P1.P11: API keys get 401 on user-scoped endpoints, and any bound copy finds its entry.</summary>
+    private static async Task VerifyContractHygieneAsync(HttpClient client, string dbPath, User user, Guid libraryId)
+    {
+        var entry = new Entry
+        {
+            MediaType = "movie", TmdbId = 88500, TargetLibraryId = libraryId, Title = "Two copies",
+            MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("movie", 88500, "Two copies",
+                null, null, null, null, null, null, false, null, null, [], [], []))
+        };
+        var secondCopy = Guid.NewGuid();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.Add(entry);
+            database.EntryBindings.Add(new EntryBinding
+            {
+                EntryId = entry.Id, JellyfinItemId = secondCopy, TargetLibraryId = libraryId, VersionGroupId = secondCopy
+            });
+            await database.SaveChangesAsync();
+        }
+
+        client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+        using (var byCopy = await client.GetAsync($"/JellyfinMod/Entries?jellyfinItemId={secondCopy}"))
+        {
+            using var json = JsonDocument.Parse(await byCopy.Content.ReadAsStringAsync());
+            Assert(byCopy.IsSuccessStatusCode && json.RootElement.GetProperty("items").EnumerateArray()
+                    .Any(row => Guid.Parse(row.GetProperty("id").GetString()!) == entry.Id),
+                "A non-primary bound native copy finds its entry through its binding");
+        }
+
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", Guid.Empty.ToString());
+        Assert((await client.GetAsync("/JellyfinMod/Entries")).StatusCode == HttpStatusCode.Unauthorized &&
+            (await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie" })).StatusCode == HttpStatusCode.Unauthorized &&
+            (await client.GetAsync("/JellyfinMod/Discover/Search?q=x&type=movie")).StatusCode == HttpStatusCode.Unauthorized,
+            "An API-key request without a user gets 401 from Entries, Browse and Discover");
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
     }
 
     /// <summary>P1.P8: discovery never walks pages it cannot show, and one failed candidate is skipped.</summary>

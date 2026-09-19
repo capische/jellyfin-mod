@@ -18,8 +18,11 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     private readonly Dictionary<(Guid UserId, string MediaType), IReadOnlyList<CollectionFolder>> _libraries = new();
 
     /// <summary>Resolves only the authenticated Jellyfin user claim; request IDs are never trusted.</summary>
+    /// <remarks>An API key carries no user (an empty id), so user-scoped endpoints answer 401 (P1.P11).</remarks>
     public User? GetUser(ClaimsPrincipal principal) =>
-        Guid.TryParse(principal.FindFirst("Jellyfin-UserId")?.Value, out var id) ? users.GetUserById(id) : null;
+        Guid.TryParse(principal.FindFirst("Jellyfin-UserId")?.Value, out var id) && id != Guid.Empty
+            ? users.GetUserById(id)
+            : null;
 
     /// <summary>Gets accessible real movie/TV libraries compatible with the requested media type.</summary>
     public IReadOnlyList<CollectionFolder> GetLibraries(User user, string mediaType)

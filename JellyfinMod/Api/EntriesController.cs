@@ -43,7 +43,10 @@ public sealed class EntriesController(
         var candidates = database.Entries.AsNoTracking().AsQueryable();
         if (mediaType is not null) candidates = candidates.Where(entry => entry.MediaType == mediaType);
         if (targetLibraryId.HasValue) candidates = candidates.Where(entry => entry.TargetLibraryId == targetLibraryId);
-        if (jellyfinItemId.HasValue) candidates = candidates.Where(entry => entry.JellyfinItemId == jellyfinItemId);
+        // Any bound native copy finds its entry, not only the selected one (P1.P11).
+        if (jellyfinItemId.HasValue)
+            candidates = candidates.Where(entry => entry.JellyfinItemId == jellyfinItemId ||
+                database.EntryBindings.Any(binding => binding.EntryId == entry.Id && binding.JellyfinItemId == jellyfinItemId));
         var candidateRows = await candidates.ToListAsync(cancellationToken);
         var nativeIds = candidateRows.Where(entry => entry.JellyfinItemId.HasValue).Select(entry => entry.MediaType).Distinct()
             .ToDictionary(type => type, type => (IReadOnlySet<Guid>)access.GetNativeItems(user, type, targetLibraryId).Select(item => item.Id).ToHashSet());
@@ -69,13 +72,17 @@ public sealed class EntriesController(
         if (user is null) return Unauthorized();
         if (!access.CanUseLibrary(user, request.MediaType, request.TargetLibraryId)) return NotFound();
         var existing = await FindExisting(request, cancellationToken);
-        if (existing is not null) return access.CanRead(user, existing) ? new CreateEntryResult(new EntryDto(existing), false) : NotFound();
+        if (existing is not null && access.CanRead(user, existing)) return new CreateEntryResult(new EntryDto(existing), false);
+        // A hidden existing title answers exactly like a metadata-restricted one, after the same TMDB call, so
+        // neither the body nor the timing reveals that it is held (P1.P11).
+        var hiddenExisting = existing is not null;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(60));
         try
         {
             var metadata = await tmdb.GetDetailsAsync(request.MediaType, request.TmdbId, timeout.Token);
             var episodes = await tmdb.GetEpisodesAsync(metadata, timeout.Token);
+            if (hiddenExisting) return NotFound();
             await using var lease = await libraryLock.TryAcquireAsync(request.TargetLibraryId, LibraryWait, timeout.Token);
             if (lease is null) return LibraryBusy();
             var owned = access.FindOwned(user, metadata, request.TargetLibraryId);
