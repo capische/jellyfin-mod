@@ -38,12 +38,13 @@ public sealed class ReconciliationService(
         CancellationToken cancellationToken)
     {
         if (!LibraryStorageProbe.IsAvailable(libraryLocations, out _)) return 0;
+        var mounts = _mediaStorage.ReadMountTable();
         var changed = 0;
         foreach (var binding in await database.EntryBindings.Where(binding => binding.TargetLibraryId == libraryId)
                      .ToListAsync(cancellationToken).ConfigureAwait(false))
         {
             if (!MediaStorageIdentity.IsWithin(binding.MediaPath, libraryLocations)) continue;
-            if (_mediaStorage.Rebaseline(binding.MediaPath, binding.StorageIdentity) is not { } current) continue;
+            if (_mediaStorage.Rebaseline(binding.MediaPath, binding.StorageIdentity, mounts) is not { } current) continue;
             binding.StorageIdentity = current;
             changed++;
         }
@@ -52,7 +53,7 @@ public sealed class ReconciliationService(
                      .ToListAsync(cancellationToken).ConfigureAwait(false))
         {
             if (!MediaStorageIdentity.IsWithin(binding.MediaPath, libraryLocations)) continue;
-            if (_mediaStorage.Rebaseline(binding.MediaPath, binding.StorageIdentity) is not { } current) continue;
+            if (_mediaStorage.Rebaseline(binding.MediaPath, binding.StorageIdentity, mounts) is not { } current) continue;
             binding.StorageIdentity = current;
             changed++;
         }
@@ -871,6 +872,13 @@ internal sealed record ExistingEpisodeBinding(Guid JellyfinItemId, Guid SeriesIt
 
 internal sealed record DurableEpisodeConflict(Guid EntryId, string Detail);
 
+/// <summary>How long an Add or Refresh waits for a library that reconciliation is checking (P2.R8).</summary>
+public sealed record LibraryWriteBudget(TimeSpan Wait)
+{
+    /// <summary>The production budget, well inside the request's 60-second TMDB budget.</summary>
+    public static LibraryWriteBudget Default { get; } = new(TimeSpan.FromSeconds(20));
+}
+
 /// <summary>Serializes overlapping catalog writes for one target library within the host process.</summary>
 public sealed class ReconciliationLibraryLock
 {
@@ -882,6 +890,17 @@ public sealed class ReconciliationLibraryLock
         var gate = _locks.GetOrAdd(libraryId, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         return new Lease(gate);
+    }
+
+    /// <summary>
+    /// Waits at most <paramref name="wait"/> for the library, so a request can report "library busy"
+    /// instead of spending its whole budget behind a long absence confirmation (P2.R8).
+    /// </summary>
+    public async ValueTask<IAsyncDisposable?> TryAcquireAsync(Guid libraryId, TimeSpan wait,
+        CancellationToken cancellationToken)
+    {
+        var gate = _locks.GetOrAdd(libraryId, static _ => new SemaphoreSlim(1, 1));
+        return await gate.WaitAsync(wait, cancellationToken).ConfigureAwait(false) ? new Lease(gate) : null;
     }
 
     private sealed class Lease(SemaphoreSlim gate) : IAsyncDisposable

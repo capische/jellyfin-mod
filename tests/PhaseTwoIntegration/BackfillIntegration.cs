@@ -82,8 +82,10 @@ internal static class BackfillIntegration
         IEnumerable<BaseItem> AllItems() => movies.Concat(tvItems).Concat(nativeEpisodes);
         int? failedProvider = null;
         var pagedReads = new List<(Guid ParentId, int StartIndex, int? Limit)>();
+        var episodeEnumerations = 0;
         IReadOnlyList<BaseItem> Query(InternalItemsQuery query)
         {
+            if (query.AncestorIds.Length > 0) Interlocked.Increment(ref episodeEnumerations);
             if (query.HasAnyProviderId?.GetValueOrDefault("Tmdb") == failedProvider?.ToString() && failedProvider.HasValue)
                 throw new InvalidOperationException("Isolated native metadata failure");
             if (query.Limit.HasValue) pagedReads.Add((query.ParentId, query.StartIndex ?? 0, query.Limit));
@@ -220,7 +222,8 @@ internal static class BackfillIntegration
             handler!(null, eventArgs);
         }
 
-        await RunEventIntegrationAsync(folder, library, movieLibrary, movies, Raise, () => virtualFolderReads);
+        await RunEventIntegrationAsync(folder, library, movieLibrary, movies, Raise, () => virtualFolderReads,
+            [goodPilot, goodSpecial], () => Volatile.Read(ref episodeEnumerations));
     }
 
     private static async Task RunEventIntegrationAsync(
@@ -229,7 +232,9 @@ internal static class BackfillIntegration
         CollectionFolder movieLibrary,
         List<BaseItem> movies,
         Action<string, ItemChangeEventArgs> raise,
-        Func<int> getEnumerationCount)
+        Func<int> getEnumerationCount,
+        IReadOnlyList<BaseItem> seriesEpisodes,
+        Func<int> getEpisodeEnumerations)
     {
         var dbPath = Path.Combine(folder, "events.db");
         var services = new ServiceCollection();
@@ -318,6 +323,25 @@ internal static class BackfillIntegration
                 "A removal notification alone does not clear a binding before successful absence evidence");
             Assert(await afterRemoval.History.CountAsync(history => history.EntryId == entryId) == 3,
                 "Coalesced repeated update notifications do not duplicate transition history");
+
+            // P2.R8: a burst of episode events becomes one series observation, and unchanged updates are dropped.
+            var beforeBurst = getEpisodeEnumerations();
+            for (var repeat = 0; repeat < 20; repeat++)
+                foreach (var episode in seriesEpisodes)
+                    raise("added", new ItemChangeEventArgs { Item = episode });
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (getEpisodeEnumerations() == beforeBurst && DateTime.UtcNow < deadline) await Task.Delay(50);
+            await Task.Delay(2500);
+            var afterBurst = getEpisodeEnumerations();
+            // One observation reads each of the series' two grouped copies once.
+            Assert(afterBurst - beforeBurst is > 0 and <= 2,
+                $"Forty episode events of one series coalesce into one series observation ({afterBurst - beforeBurst} episode reads)");
+            for (var repeat = 0; repeat < 20; repeat++)
+                foreach (var episode in seriesEpisodes)
+                    raise("updated", new ItemChangeEventArgs { Item = episode });
+            await Task.Delay(2500);
+            Assert(getEpisodeEnumerations() == afterBurst,
+                "Updates that change no identity, path or playability do not trigger an observation");
         }
         finally
         {

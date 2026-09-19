@@ -142,9 +142,12 @@ public sealed class CatalogBackfillRunner(
                 continue;
             }
 
+            // The first walk runs without the lease; only the confirming walk and the writes hold it, so an Add
+            // to this library waits for one walk instead of two (P2.R8). Any change between the walks makes
+            // them disagree and leaves absence unconfirmed.
+            var current = ObserveLibrary(observation.Storage, cancellationToken);
             await using var libraryLease = await libraryLock.AcquireAsync(observation.Storage.LibraryId, cancellationToken)
                 .ConfigureAwait(false);
-            var current = ObserveLibrary(observation.Storage, cancellationToken);
             var confirmation = ObserveLibrary(observation.Storage, cancellationToken);
             // Reconciliation conflicts are only known from the first pass; they stay excluded.
             current.ProtectFrom(observation);

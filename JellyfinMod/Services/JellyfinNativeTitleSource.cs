@@ -112,7 +112,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         if (providerId is null)
             return new(representative.Id, folder.Id, representative.Name,
                 Snapshot(work.MediaType, null, folder.Id, representative, copies,
-                    copies.Select(item => item.Id).ToHashSet(), []), false, null);
+                    copies.Select(item => item.Id).ToHashSet(), [], _mediaStorage.ReadMountTable()), false, null);
         if (work.MediaType == "movie")
         {
             foreach (var movie in copies.Cast<Movie>())
@@ -132,12 +132,13 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
 
         try
         {
+            var mounts = _mediaStorage.ReadMountTable();
             var skipped = new List<SkippedNativeEpisode>();
             var episodes = work.MediaType == "series"
-                ? GetEpisodes(copies.Cast<Series>().ToArray(), skipped, cancellationToken) : [];
+                ? GetEpisodes(copies.Cast<Series>().ToArray(), skipped, mounts, cancellationToken) : [];
             return new(representative.Id, folder.Id, representative.Name,
                 Snapshot(work.MediaType, providerId, folder.Id, representative, copies,
-                    copies.Select(item => item.Id).ToHashSet(), episodes) with { SkippedEpisodes = skipped },
+                    copies.Select(item => item.Id).ToHashSet(), episodes, mounts) with { SkippedEpisodes = skipped },
                 false, null);
         }
         catch (InvalidOperationException error)
@@ -198,7 +199,8 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         BaseItem representative,
         IReadOnlyCollection<BaseItem> copies,
         IReadOnlySet<Guid>? movieIds,
-        IReadOnlyList<NativeEpisodeSnapshot> episodes)
+        IReadOnlyList<NativeEpisodeSnapshot> episodes,
+        MountTable mounts)
     {
         var metadata = new TmdbMetadata(mediaType, tmdbId ?? 0, representative.Name,
             representative.PremiereDate, representative.Overview, null, null, ProviderId(representative, "Imdb"),
@@ -207,13 +209,14 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             metadata.ImdbId, representative.Overview, null, JsonSerializer.Serialize(metadata),
             copies.Select(copy => new NativeRepresentation(copy.Id, libraryId, IsPlayable(copy),
                 mediaType == "movie" ? VersionGroup((Movie)copy, movieIds!) : copy.Id, copy.Path,
-                _mediaStorage.Capture(copy.Path))).ToArray(), episodes,
+                mounts.Capture(copy.Path))).ToArray(), episodes,
             copies.Min(copy => copy.DateCreated));
     }
 
     private NativeEpisodeSnapshot[] GetEpisodes(
         IReadOnlyCollection<Series> seriesCopies,
         ICollection<SkippedNativeEpisode> skipped,
+        MountTable mounts,
         CancellationToken cancellationToken)
     {
         var episodes = new List<NativeEpisodeSnapshot>();
@@ -243,7 +246,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
 
                 episodes.Add(new(episode.Id, episode.SeriesId, ProviderTmdbId(episode), episode.ParentIndexNumber.Value,
                     episode.IndexNumber.Value, IsPlayable(episode), episode.Name, episode.Overview, null,
-                    episode.PremiereDate, RuntimeMinutes(episode), episode.Path, _mediaStorage.Capture(episode.Path)));
+                    episode.PremiereDate, RuntimeMinutes(episode), episode.Path, mounts.Capture(episode.Path)));
             }
         }
 

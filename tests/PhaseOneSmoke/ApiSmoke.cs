@@ -75,6 +75,7 @@ internal static class ApiSmoke
         builder.Services.AddTransient(_ => new ModDbContext(dbPath));
         builder.Services.AddSingleton<DatabaseInitializer>();
         builder.Services.AddSingleton<ReconciliationLibraryLock>();
+        builder.Services.AddSingleton(new LibraryWriteBudget(TimeSpan.FromMilliseconds(500)));
         builder.Services.AddSingleton<RetentionExecutionGate>();
         builder.Services.AddTransient(_ => new LibraryAccess(users, library, localization));
         builder.Services.AddTransient(provider => new RetentionEvaluator(
@@ -660,6 +661,21 @@ internal static class ApiSmoke
         Assert((await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie", targetLibraryId = libraryFolder.Id })).StatusCode == HttpStatusCode.NotFound,
             "Combined browse does not disclose an inaccessible library");
         await VerifyStaleAndOrphanedEntriesAsync(client, dbPath, user, libraryFolder.Id);
+        // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
+        http.Response = null;
+        http.BeforeResponse = null;
+        http.Status = HttpStatusCode.OK;
+        http.Body = """{"id":88100,"title":"Busy library"}""";
+        await using (await app.Services.GetRequiredService<ReconciliationLibraryLock>().AcquireAsync(secondLibrary.Id, default))
+        {
+            using var busy = await client.PostAsJsonAsync("/JellyfinMod/Entries",
+                new { mediaType = "movie", tmdbId = 88100, targetLibraryId = secondLibrary.Id });
+            var busyBody = await busy.Content.ReadAsStringAsync();
+            Assert(busy.StatusCode == HttpStatusCode.ServiceUnavailable && busy.Headers.RetryAfter is not null &&
+                busyBody.Contains("library_busy", StringComparison.Ordinal) &&
+                !busyBody.Contains("timed out", StringComparison.Ordinal),
+                "An Add to a library held by reconciliation returns a documented 503 library_busy: " + busyBody);
+        }
         await app.StopAsync();
         Console.WriteLine("PASS: HTTP auth/access/CRUD, duplicate history, wire-state filter binding, unknown fields and no media deletion");
     }

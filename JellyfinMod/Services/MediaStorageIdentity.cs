@@ -4,23 +4,25 @@ namespace JellyfinMod.Services;
 public sealed class MediaStorageIdentity(string mountInfoPath = "/proc/self/mountinfo")
 {
     /// <summary>Returns a stable identity for the most specific mount containing the path.</summary>
-    public string? Capture(string? path)
+    public string? Capture(string? path) => ReadMountTable().Capture(path);
+
+    /// <summary>
+    /// Reads the mount table once, so an observation of a title with many episodes does not re-parse it
+    /// for every path (P2.R8). An unreadable table captures no identities.
+    /// </summary>
+    public MountTable ReadMountTable()
     {
-        if (string.IsNullOrWhiteSpace(path)) return null;
-        var fullPath = Path.GetFullPath(path);
         try
         {
-            var mount = ReadMounts().Where(candidate => Contains(candidate.MountPoint, fullPath))
-                .OrderByDescending(candidate => candidate.MountPoint.Length).FirstOrDefault();
-            return mount is null ? null : mount.Identity;
+            return new(ReadMounts());
         }
         catch (IOException)
         {
-            return null;
+            return new([]);
         }
         catch (UnauthorizedAccessException)
         {
-            return null;
+            return new([]);
         }
     }
 
@@ -90,10 +92,10 @@ public sealed class MediaStorageIdentity(string mountInfoPath = "/proc/self/moun
     /// recorded, as after a reboot or USB re-enumeration (P2.R6). Returns null when nothing changed or when
     /// the mount point, root or filesystem type differ.
     /// </summary>
-    public string? Rebaseline(string? path, string? recordedIdentity)
+    public string? Rebaseline(string? path, string? recordedIdentity, MountTable? mounts = null)
     {
         if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(recordedIdentity)) return null;
-        var current = Capture(path);
+        var current = (mounts ?? ReadMountTable()).Capture(path);
         if (current is null || string.Equals(current, recordedIdentity, StringComparison.Ordinal)) return null;
         var recorded = recordedIdentity.Split('|');
         var observed = current.Split('|');
@@ -179,7 +181,7 @@ public sealed class MediaStorageIdentity(string mountInfoPath = "/proc/self/moun
         return mounts;
     }
 
-    private static bool Contains(string root, string path)
+    internal static bool Contains(string root, string path)
     {
         var trimmed = Path.TrimEndingDirectorySeparator(root);
         if (trimmed.Length == 0) trimmed = Path.DirectorySeparatorChar.ToString();
@@ -193,5 +195,22 @@ public sealed class MediaStorageIdentity(string mountInfoPath = "/proc/self/moun
         .Replace(@"\012", "\n", StringComparison.Ordinal)
         .Replace(@"\134", "\\", StringComparison.Ordinal);
 
-    private sealed record MountInfo(string MountPoint, string Identity);
+    internal sealed record MountInfo(string MountPoint, string Identity);
+}
+
+/// <summary>One parsed reading of the mount table.</summary>
+public sealed class MountTable
+{
+    private readonly IReadOnlyList<MediaStorageIdentity.MountInfo> _mounts;
+
+    internal MountTable(IReadOnlyList<MediaStorageIdentity.MountInfo> mounts) => _mounts = mounts;
+
+    /// <summary>Returns the identity of the most specific mount containing the path.</summary>
+    public string? Capture(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return null;
+        var fullPath = Path.GetFullPath(path);
+        return _mounts.Where(candidate => MediaStorageIdentity.Contains(candidate.MountPoint, fullPath))
+            .OrderByDescending(candidate => candidate.MountPoint.Length).FirstOrDefault()?.Identity;
+    }
 }

@@ -22,7 +22,8 @@ public sealed class EntriesController(
     RetentionEvaluator retentionEvaluator,
     CatalogSortName sortNames,
     JellyfinItemReconciliationRunner? reconciliation = null,
-    IAuthorizationService? authorization = null) : ControllerBase
+    IAuthorizationService? authorization = null,
+    LibraryWriteBudget? writeBudget = null) : ControllerBase
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
@@ -75,7 +76,8 @@ public sealed class EntriesController(
         {
             var metadata = await tmdb.GetDetailsAsync(request.MediaType, request.TmdbId, timeout.Token);
             var episodes = await tmdb.GetEpisodesAsync(metadata, timeout.Token);
-            await using var lease = await libraryLock.AcquireAsync(request.TargetLibraryId, timeout.Token);
+            await using var lease = await libraryLock.TryAcquireAsync(request.TargetLibraryId, LibraryWait, timeout.Token);
+            if (lease is null) return LibraryBusy();
             var owned = access.FindOwned(user, metadata, request.TargetLibraryId);
             if (owned is null && !access.CanReadMetadata(user, metadata)) return NotFound();
             existing = await FindExisting(request, timeout.Token);
@@ -141,8 +143,9 @@ public sealed class EntriesController(
             // reconciliation and retention, so it serializes with both and never sets them (P3.T10).
             Guid? nativeSeriesId;
             await using (await retentionGate.AcquireAsync(timeout.Token))
-            await using (await libraryLock.AcquireAsync(libraryId, timeout.Token))
+            await using (var libraryLease = await libraryLock.TryAcquireAsync(libraryId, LibraryWait, timeout.Token))
             {
+                if (libraryLease is null) return LibraryBusy();
                 database.ChangeTracker.Clear();
                 var entry = await database.Entries.SingleOrDefaultAsync(e => e.Id == id, timeout.Token);
                 if (entry is null) return NotFound();
@@ -376,6 +379,19 @@ public sealed class EntriesController(
 
     private Task<Entry?> FindExisting(CreateEntryRequest request, CancellationToken cancellationToken) => database.Entries.SingleOrDefaultAsync(entry =>
         entry.MediaType == request.MediaType && entry.TmdbId == request.TmdbId && entry.TargetLibraryId == request.TargetLibraryId, cancellationToken);
+
+    private TimeSpan LibraryWait => (writeBudget ?? LibraryWriteBudget.Default).Wait;
+
+    /// <summary>
+    /// A documented 503 with Retry-After when the library stays locked by reconciliation, so a slow check is
+    /// never reported as a TMDB timeout (P2.R8).
+    /// </summary>
+    private ObjectResult LibraryBusy()
+    {
+        Response.Headers.RetryAfter = "30";
+        return Problem(statusCode: 503, title: "The library is busy being checked. Try again in a moment.",
+            type: "library_busy");
+    }
 
     private async Task<bool> IsAdministratorAsync() => authorization is not null &&
         (await authorization.AuthorizeAsync(User, Policies.RequiresElevation)).Succeeded;
