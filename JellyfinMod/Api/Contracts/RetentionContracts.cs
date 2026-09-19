@@ -92,6 +92,10 @@ public sealed record RetentionSummaryDto(
     [property: JsonPropertyName("reason")] string Reason,
     [property: JsonPropertyName("deadline")] DateTime? Deadline);
 
+/// <summary>Acknowledges that a retention batch was queued on the native scheduled task.</summary>
+/// <param name="Status">Always <c>queued</c>.</param>
+public sealed record RetentionRunQueuedDto([property: JsonPropertyName("status")] string Status);
+
 /// <summary>Builds retention summaries without exposing per-user playback evidence.</summary>
 internal static class RetentionSummaries
 {

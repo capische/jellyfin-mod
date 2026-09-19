@@ -58,4 +58,5 @@ internal static class RetentionRunStatuses
     public const string Disabled = "disabled";
     public const string Cancelled = "cancelled";
     public const string Failed = "failed";
+    public const string Interrupted = "interrupted";
 }

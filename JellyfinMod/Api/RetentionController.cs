@@ -4,6 +4,7 @@ using JellyfinMod.Services;
 using MediaBrowser.Common.Api;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using MediaBrowser.Model.Tasks;
 using Microsoft.EntityFrameworkCore;
 
 namespace JellyfinMod.Api;
@@ -12,7 +13,7 @@ namespace JellyfinMod.Api;
 [ApiController, Route("JellyfinMod/Retention"), Authorize(Policy = Policies.RequiresElevation)]
 public sealed class RetentionController(
     RetentionPreviewService preview,
-    RetentionRunner runner,
+    ITaskManager taskManager,
     ModDbContext database,
     DatabaseInitializer readiness) : ControllerBase
 {
@@ -34,19 +35,15 @@ public sealed class RetentionController(
         return run is null ? NotFound() : new RetentionRunDto(run);
     }
 
-    /// <summary>Starts the same bounded batch exposed by Jellyfin's scheduled-task page.</summary>
+    /// <summary>
+    /// Queues the same bounded batch exposed by Jellyfin's scheduled-task page. The batch runs on the
+    /// native task, so a closed tab or proxy timeout cannot cancel it; poll Runs/Latest for the outcome.
+    /// </summary>
     [HttpPost("Run")]
-    public async Task<ActionResult<RetentionRunDto>> Run(CancellationToken cancellationToken)
+    public ActionResult<RetentionRunQueuedDto> Run()
     {
         if (!readiness.IsReady) return StatusCode(503);
-        try
-        {
-            var run = await runner.RunAsync(new Progress<double>(), cancellationToken).ConfigureAwait(false);
-            return new RetentionRunDto(run);
-        }
-        catch (RetentionRunAlreadyActiveException error)
-        {
-            return Conflict(new ProblemDetails { Status = 409, Title = error.Message });
-        }
+        taskManager.QueueScheduledTask<RetentionReclamationTask>();
+        return Accepted(new RetentionRunQueuedDto("queued"));
     }
 }

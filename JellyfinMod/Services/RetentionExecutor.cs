@@ -26,6 +26,23 @@ public sealed class RetentionExecutor(
     public async Task<RetentionExecutionResult> ReclaimAsync(Guid bindingId, CancellationToken cancellationToken)
     {
         await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+
+        // An interrupted operation is recovered before any preview: once its file is unlinked the preview
+        // can no longer report the binding as due, and the operation would stay open forever (P3.T9).
+        var existing = await database.RetentionOperations
+            .Where(operation => operation.BindingId == bindingId &&
+                (operation.State == RetentionOperationStates.Prepared ||
+                 operation.State == RetentionOperationStates.Unlinked))
+            .OrderByDescending(operation => operation.PreparedAt)
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (existing is not null)
+        {
+            var interrupted = await LoadOpenActionAsync(existing.ActionId, cancellationToken).ConfigureAwait(false);
+            await using var recoveryLease = await AcquireLibrariesAsync(
+                interrupted.Select(operation => operation.TargetLibraryId), cancellationToken).ConfigureAwait(false);
+            return await RecoverUnderLeaseAsync(interrupted, bindingId, cancellationToken).ConfigureAwait(false);
+        }
+
         await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
         var initialPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
         var initial = Find(initialPreview, bindingId);
@@ -38,18 +55,6 @@ public sealed class RetentionExecutor(
         var lockedLibraryIds = initialGroup.Select(candidate => candidate.TargetLibraryId).ToHashSet();
         await using var libraryLease = await AcquireLibrariesAsync(
             lockedLibraryIds, cancellationToken).ConfigureAwait(false);
-        var existing = await database.RetentionOperations
-            .Where(operation => operation.BindingId == bindingId &&
-                (operation.State == RetentionOperationStates.Prepared ||
-                 operation.State == RetentionOperationStates.Unlinked))
-            .OrderByDescending(operation => operation.PreparedAt)
-            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
-        if (existing is not null)
-        {
-            var interrupted = await LoadOpenActionAsync(existing.ActionId, cancellationToken).ConfigureAwait(false);
-            return await RecoverUnderLeaseAsync(interrupted, bindingId, cancellationToken).ConfigureAwait(false);
-        }
-
         var currentPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
         var candidate = Find(currentPreview, bindingId);
         if (candidate is null || candidate.State != RetentionPreviewStates.Due)
@@ -68,6 +73,9 @@ public sealed class RetentionExecutor(
         {
             if (!TryInspect(item, out var observed, out var inspectionReason))
                 return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
+            // A read-only mount or directory would fail every run; never prepare an operation for it.
+            if (!files.CanUnlink(observed.CanonicalPath))
+                return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.MediaNotWritable);
             var evidence = await LoadEvidenceAsync(item, cancellationToken).ConfigureAwait(false);
             if (!evidence.Valid) return RetentionExecutionResult.NotStarted(bindingId, evidence.Reason);
             var storageIdentity = await LoadStorageIdentityAsync(item, cancellationToken).ConfigureAwait(false);
@@ -127,6 +135,19 @@ public sealed class RetentionExecutor(
     {
         var selected = operations.SingleOrDefault(operation => operation.BindingId == requestedBindingId) ??
             operations[0];
+        if (operations.Any(operation => operation.State == RetentionOperationStates.Unlinked))
+        {
+            // The file was already unlinked by this plugin; only the catalog bookkeeping remains. It is
+            // finished outside the caller's cancellation, and left open while storage cannot be checked.
+            var unlinkedPresence = files.Probe(selected.MediaPath);
+            if (unlinkedPresence == PathPresence.Unknown || operations.Any(operation => !IsStorageCurrent(operation)))
+                return RetentionExecutionResult.From(selected);
+            if (unlinkedPresence == PathPresence.Present)
+                return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
+                    RetentionExecutionReasons.MediaReappeared, null, CancellationToken.None).ConfigureAwait(false);
+            return await CompleteUnderLeaseAsync(operations, selected.BindingId, CancellationToken.None).ConfigureAwait(false);
+        }
+
         if (operations.Any(operation => !IsStorageCurrent(operation)))
             return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
                 RetentionPreviewReasons.StorageUnavailable, null, cancellationToken).ConfigureAwait(false);
@@ -134,25 +155,14 @@ public sealed class RetentionExecutor(
             return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
                 RetentionExecutionReasons.ActionPathMismatch, null, cancellationToken).ConfigureAwait(false);
 
-        if (operations.Any(operation => operation.State == RetentionOperationStates.Unlinked))
+        var preparedPresence = files.Probe(selected.MediaPath);
+        if (preparedPresence == PathPresence.Unknown) return RetentionExecutionResult.From(selected);
+        if (preparedPresence == PathPresence.Absent)
         {
-            if (File.Exists(selected.MediaPath))
-                return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
-                    RetentionExecutionReasons.MediaReappeared, null, cancellationToken).ConfigureAwait(false);
-            return await CompleteUnderLeaseAsync(operations, selected.BindingId, cancellationToken).ConfigureAwait(false);
-        }
-
-        if (!File.Exists(selected.MediaPath))
-        {
-            foreach (var operation in operations)
-            {
-                operation.State = RetentionOperationStates.Unlinked;
-                operation.UnlinkedAt ??= clock.GetUtcNow().UtcDateTime;
-                operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
-            }
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            foreach (var operation in operations) TryRemoveNative(operation);
-            return await CompleteUnderLeaseAsync(operations, selected.BindingId, cancellationToken).ConfigureAwait(false);
+            // Nothing proves this plugin removed the file, so it is not a reclamation: no history and no
+            // bytes. Reconciliation will record the loss like any other external removal.
+            return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Vanished,
+                RetentionExecutionReasons.MediaVanished, null, cancellationToken).ConfigureAwait(false);
         }
 
         if (!files.TryInspect(selected.MediaPath, out var observed) ||
@@ -207,6 +217,8 @@ public sealed class RetentionExecutor(
                     liveReason, null, cancellationToken).ConfigureAwait(false);
         }
 
+        // The last point at which cancellation is honoured; everything after the unlink must finish.
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
             File.Delete(operations[0].MediaPath);
@@ -226,9 +238,9 @@ public sealed class RetentionExecutor(
             operation.UnlinkedAt = unlinkedAt;
             operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
         }
-        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         foreach (var operation in operations) TryRemoveNative(operation);
-        return await CompleteUnderLeaseAsync(operations, requestedBindingId, cancellationToken).ConfigureAwait(false);
+        return await CompleteUnderLeaseAsync(operations, requestedBindingId, CancellationToken.None).ConfigureAwait(false);
     }
 
     private async Task<RetentionExecutionResult> CompleteUnderLeaseAsync(
@@ -538,6 +550,9 @@ internal static class RetentionExecutionReasons
     public const string BindingSetChanged = "binding_set_changed";
     public const string MediaReappeared = "media_reappeared";
     public const string UnlinkFailed = "unlink_failed";
+    public const string MediaNotWritable = "media_not_writable";
+    public const string MediaVanished = "media_vanished";
+    public const string MediaStateUnknown = "media_state_unknown";
     public const string Unlinked = "unlinked";
     public const string Reclaimed = "reclaimed";
     public const string ReclaimedNativeCleanupFailed = "reclaimed_native_cleanup_failed";

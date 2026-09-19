@@ -18,6 +18,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
+using MediaBrowser.Model.Tasks;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -272,6 +273,34 @@ static async Task VerifyPreviewHttpAsync(
         ? sessionRows.ToArray()
         : null);
 
+    // POST /Retention/Run queues the native task (P3.T9); this stands in for Jellyfin's task manager
+    // and runs the real batch on its own uncancellable task.
+    IServiceProvider? hostServices = null;
+    var taskManager = Stub<ITaskManager>.Create((method, arguments) =>
+    {
+        if (method.Name == "QueueScheduledTask")
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var scope = hostServices!.CreateScope();
+                    await scope.ServiceProvider.GetRequiredService<RetentionRunner>()
+                        .RunAsync(new Progress<double>(), CancellationToken.None);
+                }
+                catch (RetentionRunAlreadyActiveException)
+                {
+                }
+                catch (Exception error)
+                {
+                    Console.Error.WriteLine("Queued retention run failed: " + error);
+                }
+            });
+        }
+
+        return null;
+    });
+
     var apiBuilder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions
     {
         ContentRootPath = folder,
@@ -290,6 +319,7 @@ static async Task VerifyPreviewHttpAsync(
     apiBuilder.Services.AddSingleton(library);
     apiBuilder.Services.AddSingleton(userData);
     apiBuilder.Services.AddSingleton(sessionManager);
+    apiBuilder.Services.AddSingleton(taskManager);
     apiBuilder.Services.AddSingleton(localization);
     // EntriesController needs the sort-name service since the P1.P7 carry-forward of fba11e3.
     var serverConfiguration = Stub<MediaBrowser.Controller.Configuration.IServerConfigurationManager>.Create((method, _) =>
@@ -323,6 +353,7 @@ static async Task VerifyPreviewHttpAsync(
         provider.GetRequiredService<IHttpClientFactory>(), () => settings,
         NullLogger<TmdbClient>.Instance));
     await using var api = apiBuilder.Build();
+    hostServices = api.Services;
     api.UseAuthentication();
     api.UseAuthorization();
     api.MapControllers();
@@ -577,6 +608,8 @@ static async Task VerifyPreviewHttpAsync(
             entry, movie, secondVersion, sharedEntry, sharedMovie, user.Id, libraryFolder.Id, items);
         await VerifyLiveStateRevalidationAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
             user.Id, libraryFolder.Id, liveStates, sessionRows, sessionManager);
+        await VerifyHonestRecoveryAsync(api.Services, databasePath, libraryPath, storage, clock, items,
+            user.Id, libraryFolder.Id);
     }
     finally
     {
@@ -623,15 +656,27 @@ static async Task VerifyReclamationAsync(
     await using (var heldRun = await services.GetRequiredService<RetentionRunGate>().TryAcquireAsync(default))
     {
         Assert(heldRun is not null, "The retention run gate can be acquired for the overlap fixture");
-        using var overlap = await http.PostAsync("/JellyfinMod/Retention/Run", null);
-        Assert(overlap.StatusCode == HttpStatusCode.Conflict,
-            "A concurrent manual retention invocation is rejected without overlapping");
+        var rejected = false;
+        try
+        {
+            await services.GetRequiredService<RetentionRunner>().RunAsync(new Progress<double>(), default);
+        }
+        catch (RetentionRunAlreadyActiveException)
+        {
+            rejected = true;
+        }
+
+        Assert(rejected, "A concurrent retention batch is rejected without overlapping");
     }
 
+    // The fixture clock is frozen; each run needs a later StartedAt for Runs/Latest to find it.
+    clock.Advance(TimeSpan.FromSeconds(1));
+    var previousRunId = await LatestRunIdAsync(http);
     using var runResponse = await http.PostAsync("/JellyfinMod/Retention/Run", null);
     var runBody = await runResponse.Content.ReadAsStringAsync();
-    Assert(runResponse.IsSuccessStatusCode, "Admin manual retention run succeeds through HTTP: " + runBody);
-    using var runJson = JsonDocument.Parse(runBody);
+    Assert(runResponse.StatusCode == HttpStatusCode.Accepted && runBody.Contains("\"queued\"", StringComparison.Ordinal),
+        "Admin manual retention run is queued on the native task through HTTP: " + runBody);
+    using var runJson = await WaitForRunAsync(http, previousRunId);
     Assert(runJson.RootElement.GetProperty("status").GetString() == "completed" &&
         runJson.RootElement.GetProperty("reclaimed").GetInt32() == 1 &&
         runJson.RootElement.GetProperty("logicalBytesUnlinked").GetInt64() == 2048 &&
@@ -791,16 +836,22 @@ static async Task VerifyReclamationAsync(
     var disabled = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
         userId, libraryId, 900105, "disabled", RetentionOperationStatesForTest.Prepared, keep: false);
     settings.RetentionEnabled = false;
+    clock.Advance(TimeSpan.FromSeconds(1));
+    var beforeDisabledRunId = await LatestRunIdAsync(http);
     using var disabledRun = await http.PostAsync("/JellyfinMod/Retention/Run", null);
-    using var disabledRunJson = JsonDocument.Parse(await disabledRun.Content.ReadAsStringAsync());
-    Assert(disabledRun.IsSuccessStatusCode &&
+    using var disabledRunJson = await WaitForRunAsync(http, beforeDisabledRunId);
+    Assert(disabledRun.StatusCode == HttpStatusCode.Accepted &&
         disabledRunJson.RootElement.GetProperty("status").GetString() == "disabled" &&
         File.Exists(disabled.MediaPath),
         "A disabled manual run records its status and changes no media");
 
-    var disabledResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == disabled.OperationId);
-    Assert(disabledResult.State == "blocked" && disabledResult.Reason == "retention_disabled" &&
-        File.Exists(disabled.MediaPath), "Disabling retention before unlink wins during recovery revalidation");
+    // The disabled batch still recovers open operations first; revalidation blocks the prepared one.
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var disabledOperation = await database.RetentionOperations.SingleAsync(operation => operation.Id == disabled.OperationId);
+        Assert(disabledOperation.State == "blocked" && disabledOperation.Reason == "retention_disabled" &&
+            File.Exists(disabled.MediaPath), "Disabling retention before unlink wins during recovery revalidation");
+    }
     Console.WriteLine("PASS: recoverable exact-file reclamation, history and physical-space accounting");
 }
 
@@ -877,6 +928,96 @@ static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
 static void Assert(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+// P3.T9: the runner recovers interrupted work first and records only what it can prove.
+static async Task VerifyHonestRecoveryAsync(
+    IServiceProvider services,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    IDictionary<Guid, BaseItem> nativeItems,
+    Guid userId,
+    Guid libraryId)
+{
+    Guid deadRunId;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var dead = new RetentionRun { StartedAt = clock.GetUtcNow().UtcDateTime.AddHours(-1) };
+        database.RetentionRuns.Add(dead);
+        await database.SaveChangesAsync();
+        deadRunId = dead.Id;
+    }
+
+    // Unlinked by this plugin before a crash: the preview can no longer call it due, but the run finishes it.
+    var unlinked = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900301, "t9-unlinked", RetentionOperationStatesForTest.Unlinked, keep: false);
+    File.Delete(unlinked.MediaPath);
+
+    // Prepared, then removed by something else: not a reclamation.
+    var vanished = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900302, "t9-vanished", RetentionOperationStatesForTest.Prepared, keep: false);
+    File.Delete(vanished.MediaPath);
+
+    var run = await services.GetRequiredService<RetentionRunner>().RunAsync(new Progress<double>(), default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var dead = await database.RetentionRuns.SingleAsync(candidate => candidate.Id == deadRunId);
+        Assert(dead.Status == "interrupted" && dead.CompletedAt is not null,
+            $"A run left 'running' by a stopped process is marked interrupted: {dead.Status}");
+
+        var completed = await database.RetentionOperations.SingleAsync(operation => operation.Id == unlinked.OperationId);
+        var completedEntry = await database.Entries.SingleAsync(entry => entry.Id == completed.EntryId);
+        Assert(completed.State == "completed" && completedEntry.State == FileState.Reclaimed &&
+            await database.History.CountAsync(history => history.Id == completed.Id && history.EventType == "reclaimed") == 1 &&
+            !await database.History.AnyAsync(history => history.EntryId == completed.EntryId && history.EventType == "media_missing"),
+            $"The runner completes an unlinked operation with one reclaimed event: {completed.State}/{completedEntry.State}");
+
+        var gone = await database.RetentionOperations.SingleAsync(operation => operation.Id == vanished.OperationId);
+        Assert(gone.State == "vanished" && gone.Reason == "media_vanished" && gone.UnlinkedAt is null &&
+            !await database.History.AnyAsync(history => history.Id == gone.Id),
+            $"A prepared file removed by something else ends vanished, with no reclaimed history: {gone.State}/{gone.Reason}");
+
+        Assert(run.Interrupted == 2 && run.Reclaimed == 1 && run.LogicalBytesUnlinked == completed.LogicalBytes,
+            $"Interrupted counts resolved actions and only the proven unlink counts as reclaimed: " +
+            $"{run.Interrupted}/{run.Reclaimed}/{run.LogicalBytesUnlinked}");
+
+        foreach (var entryId in new[] { completed.EntryId, gone.EntryId })
+            database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == entryId));
+        await database.SaveChangesAsync();
+    }
+
+    File.Delete(unlinked.SidecarPath);
+    File.Delete(vanished.SidecarPath);
+}
+
+static async Task<Guid?> LatestRunIdAsync(HttpClient http)
+{
+    using var response = await http.GetAsync("/JellyfinMod/Retention/Runs/Latest");
+    if (response.StatusCode == HttpStatusCode.NotFound) return null;
+    using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+    return json.RootElement.GetProperty("id").GetGuid();
+}
+
+static async Task<JsonDocument> WaitForRunAsync(HttpClient http, Guid? previousRunId)
+{
+    for (var attempt = 0; attempt < 1200; attempt++)
+    {
+        using var response = await http.GetAsync("/JellyfinMod/Retention/Runs/Latest");
+        if (response.IsSuccessStatusCode)
+        {
+            var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var root = json.RootElement;
+            if (root.GetProperty("id").GetGuid() != previousRunId && root.GetProperty("status").GetString() != "running")
+                return json;
+            json.Dispose();
+        }
+
+        await Task.Delay(50);
+    }
+
+    throw new InvalidOperationException("The queued retention run did not finish");
 }
 
 // P3.T8: the executor re-reads live Jellyfin state immediately before unlinking.

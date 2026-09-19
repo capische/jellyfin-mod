@@ -67,6 +67,42 @@ public sealed partial class UnixFileInspector
         }
     }
 
+    /// <summary>
+    /// Reports whether a path exists. Only a missing file or directory counts as absent; permission or
+    /// I/O errors are unknown, so an unreadable mount is never mistaken for a removed file.
+    /// </summary>
+    public PathPresence Probe(string path)
+    {
+        try
+        {
+            _ = File.GetAttributes(path);
+            return PathPresence.Present;
+        }
+        catch (Exception error) when (error is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return PathPresence.Absent;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or
+            NotSupportedException)
+        {
+            return PathPresence.Unknown;
+        }
+    }
+
+    /// <summary>
+    /// Reports whether this process may remove the file: its directory must be writable and searchable.
+    /// A read-only mount fails this check even for root.
+    /// </summary>
+    public bool CanUnlink(string path)
+    {
+        if (!OperatingSystem.IsLinux() || string.IsNullOrWhiteSpace(path)) return false;
+        var directory = Path.GetDirectoryName(Path.GetFullPath(path));
+        return !string.IsNullOrEmpty(directory) && NativeMethods.Access(directory, AccessWrite | AccessExecute) == 0;
+    }
+
+    private const int AccessWrite = 2;
+    private const int AccessExecute = 1;
+
     private static string? RealPath(string path)
     {
         var pointer = NativeMethods.RealPath(path, IntPtr.Zero);
@@ -91,7 +127,23 @@ public sealed partial class UnixFileInspector
 
         [LibraryImport("libc", EntryPoint = "free")]
         internal static partial void Free(IntPtr pointer);
+
+        [LibraryImport("libc", EntryPoint = "access", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int Access(string path, int mode);
     }
+}
+
+/// <summary>Whether a path exists, is gone, or could not be determined.</summary>
+public enum PathPresence
+{
+    /// <summary>The path exists.</summary>
+    Present,
+
+    /// <summary>The path does not exist (ENOENT).</summary>
+    Absent,
+
+    /// <summary>Existence could not be determined, for example because the mount is unreadable.</summary>
+    Unknown
 }
 
 /// <summary>One immutable observation of a Linux regular file.</summary>

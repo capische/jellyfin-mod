@@ -80,4 +80,7 @@ internal static class RetentionOperationStates
     public const string Completed = "completed";
     public const string Blocked = "blocked";
     public const string Failed = "failed";
+
+    /// <summary>The prepared file disappeared without evidence that this plugin removed it.</summary>
+    public const string Vanished = "vanished";
 }

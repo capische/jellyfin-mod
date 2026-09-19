@@ -15,38 +15,40 @@ public sealed class RetentionRunner(
     ILogger<RetentionRunner> logger)
 {
     private const int BatchSize = 25;
+    private const int MaxAttemptsPerAction = 4;
 
     /// <summary>Runs recovery and due reclamation without allowing another batch to overlap.</summary>
     public async Task<RetentionRun> RunAsync(IProgress<double> progress, CancellationToken cancellationToken)
     {
         await using var lease = await runGate.TryAcquireAsync(cancellationToken).ConfigureAwait(false)
             ?? throw new RetentionRunAlreadyActiveException();
-        var run = new RetentionRun { StartedAt = clock.GetUtcNow().UtcDateTime };
+        var now = clock.GetUtcNow().UtcDateTime;
+
+        // Only this process runs batches, and it holds the run gate, so any other "running" row belongs
+        // to a process that stopped before finishing it (P3.T9).
+        foreach (var stale in await database.RetentionRuns.Where(candidate => candidate.Status == RetentionRunStatuses.Running)
+                     .ToListAsync(cancellationToken).ConfigureAwait(false))
+        {
+            stale.Status = RetentionRunStatuses.Interrupted;
+            stale.CompletedAt = now;
+            stale.Detail = "The process stopped before this run finished.";
+        }
+
+        var run = new RetentionRun { StartedAt = now };
         database.RetentionRuns.Add(run);
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
-            if (!await IsEnabledAsync(cancellationToken).ConfigureAwait(false))
-            {
-                await FinishAsync(run, RetentionRunStatuses.Disabled,
-                    "Retention is disabled; no media was changed.").ConfigureAwait(false);
-                progress.Report(100);
-                return run;
-            }
-
+            // Recover interrupted operations first. Finishing an unlinked operation deletes nothing and a
+            // prepared one revalidates every protection, so this also runs while retention is disabled.
             var processedActions = 0;
             var openActionIds = await database.RetentionOperations.AsNoTracking()
                 .Where(operation => operation.State == RetentionOperationStates.Prepared ||
                     operation.State == RetentionOperationStates.Unlinked)
                 .GroupBy(operation => operation.ActionId)
-                .Select(group => new
-                {
-                    ActionId = group.Key,
-                    PreparedAt = group.Min(operation => operation.PreparedAt)
-                })
-                .OrderBy(action => action.PreparedAt)
-                .ThenBy(action => action.ActionId)
+                .Select(group => new { ActionId = group.Key, PreparedAt = group.Min(operation => operation.PreparedAt) })
+                .OrderBy(action => action.PreparedAt).ThenBy(action => action.ActionId)
                 .Take(BatchSize)
                 .ToArrayAsync(cancellationToken).ConfigureAwait(false);
             var actionIds = openActionIds.Select(action => action.ActionId).ToArray();
@@ -55,29 +57,26 @@ public sealed class RetentionRunner(
                     (operation.State == RetentionOperationStates.Prepared ||
                      operation.State == RetentionOperationStates.Unlinked))
                 .ToArrayAsync(cancellationToken).ConfigureAwait(false);
-            var openActions = openActionIds
-                .Select(group => new
-                {
-                    BindingId = openOperations.Where(operation => operation.ActionId == group.ActionId)
-                        .OrderBy(operation => operation.Id).First().BindingId
-                })
-                .ToArray();
-
-            foreach (var action in openActions)
+            foreach (var action in openActionIds)
             {
+                // One action at a time, so cancellation is honoured between physical operations.
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!await IsEnabledAsync(cancellationToken).ConfigureAwait(false))
-                {
-                    await FinishAsync(run, RetentionRunStatuses.Disabled,
-                        "Retention was disabled during the batch; remaining media was not changed.").ConfigureAwait(false);
-                    return run;
-                }
-
-                var result = await ExecuteAsync(action.BindingId, cancellationToken).ConfigureAwait(false);
-                run.Interrupted++;
+                var bindingId = openOperations.Where(operation => operation.ActionId == action.ActionId)
+                    .OrderBy(operation => operation.Id).First().BindingId;
+                var result = await ExecuteAsync(bindingId, cancellationToken).ConfigureAwait(false);
+                if (result.State is not (RetentionOperationStates.Prepared or RetentionOperationStates.Unlinked))
+                    run.Interrupted++;
                 Count(run, result);
                 processedActions++;
                 await CheckpointAsync(run, progress, processedActions).ConfigureAwait(false);
+            }
+
+            if (!await IsEnabledAsync(cancellationToken).ConfigureAwait(false))
+            {
+                await FinishAsync(run, RetentionRunStatuses.Disabled,
+                    "Retention is disabled; no media was changed.").ConfigureAwait(false);
+                progress.Report(100);
+                return run;
             }
 
             if (processedActions < BatchSize)
@@ -86,16 +85,24 @@ public sealed class RetentionRunner(
                 run.Inspected = preview.Inspected;
                 run.Eligible = preview.Due;
                 run.Blocked = preview.Blocked;
+                var recentlyFailed = (await database.RetentionOperations.AsNoTracking()
+                        .Where(operation => operation.State == RetentionOperationStates.Failed &&
+                            operation.CompletedAt >= now.AddDays(-1))
+                        .Select(operation => operation.BindingId).ToArrayAsync(cancellationToken).ConfigureAwait(false))
+                    .ToHashSet();
+                // Bindings that failed recently go last, so a few undeletable files cannot starve the rest.
                 var candidates = preview.Items
                     .Where(item => item.State == RetentionPreviewStates.Due && item.CanonicalPath is not null)
                     .GroupBy(item => item.CanonicalPath!, StringComparer.Ordinal)
-                    .OrderBy(group => group.Key, StringComparer.Ordinal)
                     .Select(group => group.OrderBy(item => item.BindingId).First())
-                    .Take(BatchSize - processedActions)
+                    .OrderBy(item => recentlyFailed.Contains(item.BindingId))
+                    .ThenBy(item => item.CanonicalPath, StringComparer.Ordinal)
+                    .Take(BatchSize * MaxAttemptsPerAction)
                     .ToArray();
 
                 foreach (var candidate in candidates)
                 {
+                    if (processedActions >= BatchSize) break;
                     cancellationToken.ThrowIfCancellationRequested();
                     if (!await IsEnabledAsync(cancellationToken).ConfigureAwait(false))
                     {
@@ -106,7 +113,9 @@ public sealed class RetentionRunner(
 
                     var result = await ExecuteAsync(candidate.BindingId, cancellationToken).ConfigureAwait(false);
                     Count(run, result);
-                    processedActions++;
+                    // Only candidates that prepared an operation use the batch budget; a blocked candidate
+                    // (for example media_not_writable) must not stop writable due media behind it.
+                    if (result.OperationId.HasValue) processedActions++;
                     await CheckpointAsync(run, progress, processedActions).ConfigureAwait(false);
                 }
             }
