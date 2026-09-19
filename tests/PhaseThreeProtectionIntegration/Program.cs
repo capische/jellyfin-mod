@@ -1267,6 +1267,17 @@ static async Task VerifyLiveStateRevalidationAsync(
             $"Missing evidence is read live without a repair run: {observation?.SourceReason}/{evaluation.State}/{evaluation.Reason}");
     }
 
+    // P3.T16: a stacked multi-part movie is never reclaimed; unlinking one part would strand the rest.
+    var multiPart = await SeedAsync(900205, "t16-multipart");
+    var secondPart = Path.Combine(libraryPath, "t16-multipart-cd2.mkv");
+    await File.WriteAllBytesAsync(secondPart, new byte[512]);
+    ((Movie)nativeItems[multiPart.ItemId]).AdditionalParts = [secondPart];
+    var multiPartResult = await RecoverAsync(multiPart.Fixture);
+    Assert(multiPartResult.State == "blocked" && multiPartResult.Reason == "multi_part_unsupported" &&
+        File.Exists(multiPart.Fixture.MediaPath) && File.Exists(secondPart),
+        $"A stacked multi-part movie is blocked and both parts survive: {multiPartResult.State}/{multiPartResult.Reason}");
+    File.Delete(secondPart);
+
     // Leave the suite's later state unchanged.
     settings.RetentionEnabled = false;
     await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
@@ -1274,7 +1285,7 @@ static async Task VerifyLiveStateRevalidationAsync(
     nativeItems.Remove(versionB.Id);
     await using (var database = new ModDbContext(databasePath))
     {
-        foreach (var entryId in new[] { favorite.EntryId, unwatched.EntryId, grouped.EntryId, missing.EntryId })
+        foreach (var entryId in new[] { favorite.EntryId, unwatched.EntryId, grouped.EntryId, missing.EntryId, multiPart.EntryId })
             database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == entryId));
         await database.SaveChangesAsync();
     }

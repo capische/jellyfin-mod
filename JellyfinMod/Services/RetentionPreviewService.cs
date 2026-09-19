@@ -227,6 +227,13 @@ public sealed class RetentionPreviewService(
         }
         if (native is null || string.IsNullOrWhiteSpace(native.Path))
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.NativeBindingMissing, evaluation.Deadline);
+        // The executor unlinks one exact file. A stacked movie keeps its other parts, and a multi-episode
+        // file also holds later episodes that may be unwatched, so neither is reclaimed (P3.T16).
+        if (native is Video { AdditionalParts.Length: > 0 })
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiPartUnsupported, evaluation.Deadline);
+        if (native is MediaBrowser.Controller.Entities.TV.Episode { IndexNumberEnd: { } lastEpisode } multiEpisode &&
+            lastEpisode > (multiEpisode.IndexNumber ?? lastEpisode))
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiEpisodeUnsupported, evaluation.Deadline);
         try
         {
             if (new FileInfo(native.Path).LinkTarget is not null)
@@ -363,6 +370,8 @@ internal static class RetentionPreviewReasons
     public const string FavoriteSeries = "favorite_series";
     public const string SeedStateUnknown = "seed_state_unknown";
     public const string SeedIndexIncomplete = "seed_index_incomplete";
+    public const string MultiPartUnsupported = "multi_part_unsupported";
+    public const string MultiEpisodeUnsupported = "multi_episode_unsupported";
     public const string SeedingIncomplete = "seeding_incomplete";
     public const string SeedGoalUnbounded = "seed_goal_unbounded";
     public const string SeedGoalUnmet = "seed_goal_unmet";
