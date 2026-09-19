@@ -92,8 +92,9 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
                 VALUES ({episodeIds[index]}, {seriesId}, {2000 + index}, {numbers[index].Item1}, {numbers[index].Item2}, 'Episode', 45, 1, 0)
                 """);
         await database.Database.MigrateAsync();
-        Assert((await database.Database.GetAppliedMigrationsAsync()).Last() == "20260919071544_PhaseFourAcquisition",
-            "The Phase 4 migration applies after the latest Phase 3 migration");
+        Assert((await database.Database.GetAppliedMigrationsAsync()).Contains("20260919071544_PhaseFourAcquisition") &&
+            !(await database.Database.GetPendingMigrationsAsync()).Any(),
+            "The Phase 4 migration applies over an existing Phase 3 database");
         Assert(await database.Entries.CountAsync() == 3 && await database.Episodes.CountAsync() == 4 &&
             await database.Entries.AllAsync(entry => entry.QualityProfileId == null) &&
             (await database.Entries.SingleAsync(entry => entry.Id == copyId)).State == FileState.Reclaimed &&
