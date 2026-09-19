@@ -1515,6 +1515,9 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<Guid?>("SelectedUserId")
                         .HasColumnType("TEXT");
 
+                    b.Property<int>("TestWindowMinutes")
+                        .HasColumnType("INTEGER");
+
                     b.Property<DateTime>("UpdatedAt")
                         .HasColumnType("TEXT");
 

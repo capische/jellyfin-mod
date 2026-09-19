@@ -24,6 +24,7 @@ public sealed class RetentionPolicyService(ModDbContext database, TimeProvider c
             ? configuration.RetentionSelectedUserId
             : null;
         var reclaimAfterDays = Math.Clamp(configuration.ReclaimAfterDays, 1, 3650);
+        var testWindowMinutes = Math.Clamp(configuration.RetentionTestWindowMinutes, 0, 1440);
         var snapshot = await database.RetentionPolicySnapshots.SingleOrDefaultAsync(
             policy => policy.Id == PolicyId, cancellationToken).ConfigureAwait(false);
 
@@ -37,6 +38,7 @@ public sealed class RetentionPolicyService(ModDbContext database, TimeProvider c
                 WatchedUserMode = configuration.RetentionWatchedUserMode,
                 SelectedUserId = selectedUserId,
                 ReclaimAfterDays = reclaimAfterDays,
+                TestWindowMinutes = testWindowMinutes,
                 ExemptFavourites = configuration.ExemptFavourites,
                 EnabledAt = configuration.RetentionEnabled ? now : null,
                 UpdatedAt = now
@@ -50,6 +52,7 @@ public sealed class RetentionPolicyService(ModDbContext database, TimeProvider c
             snapshot.WatchedUserMode != configuration.RetentionWatchedUserMode ||
             snapshot.SelectedUserId != selectedUserId ||
             snapshot.ReclaimAfterDays != reclaimAfterDays ||
+            snapshot.TestWindowMinutes != testWindowMinutes ||
             snapshot.ExemptFavourites != configuration.ExemptFavourites;
         if (!changed) return snapshot;
 
@@ -59,6 +62,7 @@ public sealed class RetentionPolicyService(ModDbContext database, TimeProvider c
         snapshot.WatchedUserMode = configuration.RetentionWatchedUserMode;
         snapshot.SelectedUserId = selectedUserId;
         snapshot.ReclaimAfterDays = reclaimAfterDays;
+        snapshot.TestWindowMinutes = testWindowMinutes;
         snapshot.ExemptFavourites = configuration.ExemptFavourites;
         snapshot.Version++;
         snapshot.UpdatedAt = now;

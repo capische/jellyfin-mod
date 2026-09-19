@@ -21,6 +21,9 @@ public sealed class RetentionPolicySnapshot
     /// <summary>Gets or sets the global retention duration.</summary>
     public int ReclaimAfterDays { get; set; }
 
+    /// <summary>Gets or sets the test-only minute window; zero means the day windows apply.</summary>
+    public int TestWindowMinutes { get; set; }
+
     /// <summary>Gets or sets a value indicating whether favourites are protected.</summary>
     public bool ExemptFavourites { get; set; }
 
