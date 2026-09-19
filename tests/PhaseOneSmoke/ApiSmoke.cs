@@ -669,6 +669,14 @@ internal static class ApiSmoke
         await VerifyDiscoveryBudgetAsync(client, http, user);
         await VerifyContractHygieneAsync(client, dbPath, user, libraryFolder.Id, tvLibrary.Id);
         await VerifyBoundCopyPreferenceAsync(client, dbPath, libraryFolder, secondLibrary, raceLibrary, nativeById);
+        // P1.W14: Health lists the request fields this build understands.
+        using (var health = await client.GetAsync("/JellyfinMod/Health"))
+        {
+            using var json = JsonDocument.Parse(await health.Content.ReadAsStringAsync());
+            Assert(health.IsSuccessStatusCode && json.RootElement.GetProperty("Capabilities").EnumerateArray()
+                    .Select(value => value.GetString()).Contains("browse.dueWithinDays"),
+                "Health advertises capabilities so newer clients can gate newer request fields");
+        }
         // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
         http.Response = null;
         http.BeforeResponse = null;

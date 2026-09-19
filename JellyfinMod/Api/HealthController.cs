@@ -31,6 +31,22 @@ public class HealthController : ControllerBase
     {
         Name = Plugin.Instance?.Name,
         Version = Plugin.Instance?.Version.ToString(),
-        Ok = _database.IsReady
+        Ok = _database.IsReady,
+        Capabilities = Capabilities
     });
+
+    /// <summary>
+    /// Request fields and endpoints this build understands, so a newer web client never sends a field an older
+    /// plugin rejects with 400 (P1.W14). Names are only ever added.
+    /// </summary>
+    public static readonly IReadOnlyList<string> Capabilities =
+    [
+        "browse.dueWithinDays",
+        "browse.features",
+        "retention.summary",
+        "discover.skipped",
+        "reconciliation.conflicts",
+        "reconciliation.orphans",
+        "entries.libraryBusy"
+    ];
 }
