@@ -39,6 +39,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<RetentionCompletionService>();
         services.AddTransient<RetentionEvaluator>();
         services.AddTransient<RetentionPreviewService>();
+        services.AddTransient<RetentionLiveCheck>();
         services.AddTransient<RetentionExecutor>();
         services.AddTransient<RetentionRunner>();
         services.AddTransient(provider => new TransmissionSeedClient(

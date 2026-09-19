@@ -13,7 +13,8 @@ public sealed class RetentionEvaluator(
     ModDbContext database,
     IUserManager users,
     LibraryAccess access,
-    TimeProvider clock)
+    TimeProvider clock,
+    RetentionCompletionService? completion = null)
 {
     /// <summary>Re-evaluates every bound movie and episode.</summary>
     public async Task EvaluateAllAsync(CancellationToken cancellationToken)
@@ -156,12 +157,18 @@ public sealed class RetentionEvaluator(
                 .Select(binding => binding.JellyfinItemId).ToArrayAsync(cancellationToken).ConfigureAwait(false)
             : await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == target.Entry.Id)
                 .Select(binding => binding.JellyfinItemId).ToArrayAsync(cancellationToken).ConfigureAwait(false);
-        // Evidence read from a representation that is no longer bound says nothing about the current file.
-        var observations = (await database.CompletionObservations.AsNoTracking()
-                .Where(observation => observation.TargetId == targetId && userIds.Contains(observation.UserId))
-                .ToArrayAsync(cancellationToken).ConfigureAwait(false))
-            .Where(observation => boundItemIds.Contains(observation.JellyfinItemId))
-            .ToDictionary(observation => observation.UserId);
+        var observations = await LoadCurrentObservationsAsync(targetId, userIds, boundItemIds, cancellationToken)
+            .ConfigureAwait(false);
+        var missingUserIds = userIds.Where(userId => !observations.ContainsKey(userId)).ToArray();
+        if (missingUserIds.Length > 0 && boundItemIds.Length > 0 && completion is not null)
+        {
+            // A user who never touched the item has no event to record; read their live state now
+            // instead of blocking Any and Selected mode until a manual repair (prior-H1).
+            foreach (var userId in missingUserIds)
+                await completion.RefreshAsync(userId, boundItemIds[0], "Evaluate", cancellationToken).ConfigureAwait(false);
+            observations = await LoadCurrentObservationsAsync(targetId, userIds, boundItemIds, cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (userIds.Any(userId => !observations.TryGetValue(userId, out var observation) || !observation.EvidenceAvailable))
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.CompletionEvidenceMissing);
@@ -231,6 +238,15 @@ public sealed class RetentionEvaluator(
     }
 
     private static DateTime Latest(DateTime left, DateTime right) => left > right ? left : right;
+
+    /// <summary>Loads each user's observation, ignoring evidence read from a representation that is no longer bound.</summary>
+    private async Task<Dictionary<Guid, CompletionObservation>> LoadCurrentObservationsAsync(
+        Guid targetId, Guid[] userIds, Guid[] boundItemIds, CancellationToken cancellationToken) =>
+        (await database.CompletionObservations.AsNoTracking()
+            .Where(observation => observation.TargetId == targetId && userIds.Contains(observation.UserId))
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false))
+        .Where(observation => boundItemIds.Contains(observation.JellyfinItemId))
+        .ToDictionary(observation => observation.UserId);
 
     /// <summary>
     /// Returns when this user's completion counts. After a reset only a completion at or after the

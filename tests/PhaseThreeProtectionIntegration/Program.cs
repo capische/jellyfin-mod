@@ -259,10 +259,14 @@ static async Task VerifyPreviewHttpAsync(
         _ => null
     });
     var localization = Stub<ILocalizationManager>.Create((_, _) => null);
-    var userData = Stub<IUserDataManager>.Create((method, arguments) => method.Name == "GetUserData" &&
-        arguments?[1] is BaseItem item && item.Id == series.Id
-            ? new UserItemData { Key = "favorite-series", IsFavorite = true }
-            : null);
+    // Real Jellyfin never returns null user data; items default to the fixtures' played state, and
+    // liveStates overrides individual items for the P3.T8 live-revalidation scenarios.
+    var liveStates = new Dictionary<Guid, UserItemData>();
+    var userData = Stub<IUserDataManager>.Create((method, arguments) =>
+        method.Name != "GetUserData" || arguments?[1] is not BaseItem item ? null
+        : liveStates.TryGetValue(item.Id, out var live) ? live
+        : item.Id == series.Id ? new UserItemData { Key = "favorite-series", IsFavorite = true }
+        : new UserItemData { Key = item.Id.ToString("N"), Played = true, LastPlayedDate = now.AddDays(-3) });
     var sessionRows = new List<SessionInfo>();
     var sessionManager = Stub<ISessionManager>.Create((method, _) => method.Name == "get_Sessions"
         ? sessionRows.ToArray()
@@ -311,6 +315,8 @@ static async Task VerifyPreviewHttpAsync(
         provider.GetRequiredService<IHttpClientFactory>(), () => settings,
         provider.GetRequiredService<UnixFileInspector>(), NullLogger<TransmissionSeedClient>.Instance));
     apiBuilder.Services.AddTransient<RetentionPreviewService>();
+    apiBuilder.Services.AddTransient<RetentionCompletionService>();
+    apiBuilder.Services.AddTransient<RetentionLiveCheck>();
     apiBuilder.Services.AddTransient<RetentionExecutor>();
     apiBuilder.Services.AddTransient<RetentionRunner>();
     apiBuilder.Services.AddTransient(provider => new TmdbClient(
@@ -569,6 +575,8 @@ static async Task VerifyPreviewHttpAsync(
 
         await VerifyReclamationAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings,
             entry, movie, secondVersion, sharedEntry, sharedMovie, user.Id, libraryFolder.Id, items);
+        await VerifyLiveStateRevalidationAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
+            user.Id, libraryFolder.Id, liveStates, sessionRows, sessionManager);
     }
     finally
     {
@@ -869,6 +877,142 @@ static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
 static void Assert(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+// P3.T8: the executor re-reads live Jellyfin state immediately before unlinking.
+static async Task VerifyLiveStateRevalidationAsync(
+    IServiceProvider services,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    PluginConfiguration settings,
+    IDictionary<Guid, BaseItem> nativeItems,
+    Guid userId,
+    Guid libraryId,
+    Dictionary<Guid, UserItemData> liveStates,
+    List<SessionInfo> sessionRows,
+    ISessionManager sessionManager)
+{
+    var executor = services.GetRequiredService<RetentionExecutor>();
+    var fixtures = new List<RecoveryFixture>();
+
+    // The previous scenario disabled retention. Re-enabling starts a fresh grace period, so let it elapse.
+    settings.RetentionEnabled = true;
+    var policy = await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
+    clock.Advance(TimeSpan.FromDays(2));
+
+    async Task<(RecoveryFixture Fixture, Guid ItemId, Guid EntryId)> SeedAsync(int tmdbId, string name)
+    {
+        var fixture = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+            userId, libraryId, tmdbId, name, RetentionOperationStatesForTest.Prepared, keep: false);
+        fixtures.Add(fixture);
+        await using var database = new ModDbContext(databasePath);
+        var operation = await database.RetentionOperations.SingleAsync(candidate => candidate.Id == fixture.OperationId);
+        operation.PolicyVersion = policy.Version;
+        (await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == operation.EntryId))
+            .PolicyVersion = policy.Version;
+        await database.SaveChangesAsync();
+        return (fixture, operation.JellyfinItemId, operation.EntryId);
+    }
+
+    async Task<RetentionExecutionResult> RecoverAsync(RecoveryFixture fixture) =>
+        (await executor.RecoverAsync(default)).Single(result => result.OperationId == fixture.OperationId);
+
+    // A favourite that the stored observation missed blocks the unlink.
+    var favorite = await SeedAsync(900201, "live-favorite");
+    liveStates[favorite.ItemId] = new UserItemData { Key = "live-favorite", Played = true, IsFavorite = true };
+    var favoriteResult = await RecoverAsync(favorite.Fixture);
+    Assert(favoriteResult.State == "blocked" && favoriteResult.Reason == "live_favorite" &&
+        File.Exists(favorite.Fixture.MediaPath),
+        $"A live favourite missed by stored evidence blocks the unlink: {favoriteResult.State}/{favoriteResult.Reason}");
+
+    // Marking the title unwatched after the stored completion blocks the unlink.
+    var unwatched = await SeedAsync(900202, "live-unwatched");
+    liveStates[unwatched.ItemId] = new UserItemData { Key = "live-unwatched", Played = false };
+    var unwatchedResult = await RecoverAsync(unwatched.Fixture);
+    Assert(unwatchedResult.State == "blocked" && unwatchedResult.Reason == "live_not_completed" &&
+        File.Exists(unwatched.Fixture.MediaPath),
+        $"A live unwatched state blocks the unlink: {unwatchedResult.State}/{unwatchedResult.Reason}");
+
+    // Another version of the same title playing, reported only through its media source, protects every version.
+    var grouped = await SeedAsync(900203, "live-version");
+    var versionB = new Movie { Id = Guid.NewGuid(), Name = "live-version-b", Path = Path.Combine(libraryPath, "live-version-b.mkv") };
+    nativeItems[versionB.Id] = versionB;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.EntryBindings.Add(new EntryBinding
+        {
+            EntryId = grouped.EntryId, JellyfinItemId = versionB.Id, TargetLibraryId = libraryId,
+            VersionGroupId = grouped.ItemId, MediaPath = versionB.Path
+        });
+        await database.SaveChangesAsync();
+    }
+
+    sessionRows.Add(new SessionInfo(sessionManager, NullLogger.Instance)
+    {
+        PlayState = new MediaBrowser.Model.Session.PlayerStateInfo { MediaSourceId = versionB.Id.ToString("N") }
+    });
+    var groupedResult = await RecoverAsync(grouped.Fixture);
+    sessionRows.Clear();
+    Assert(groupedResult.State == "blocked" && groupedResult.Reason is "active_session" or "live_active_session" &&
+        File.Exists(grouped.Fixture.MediaPath),
+        $"Playing another version protects the whole version group: {groupedResult.State}/{groupedResult.Reason}");
+
+    // Conflicting per-version user data aggregates to protected: a resume on version B protects version A.
+    liveStates[grouped.ItemId] = new UserItemData { Key = "version-a", Played = true, LastPlayedDate = clock.GetUtcNow().UtcDateTime };
+    liveStates[versionB.Id] = new UserItemData { Key = "version-b", PlaybackPositionTicks = 5000 };
+    await services.GetRequiredService<RetentionCompletionService>().RefreshAsync(userId, grouped.ItemId, "Repair", default);
+    await services.GetRequiredService<RetentionEvaluator>().EvaluateAllAsync(default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var observation = await database.CompletionObservations.SingleAsync(candidate =>
+            candidate.TargetId == grouped.EntryId && candidate.UserId == userId);
+        var evaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == grouped.EntryId);
+        Assert(observation.PlaybackPositionTicks == 5000 && observation.CompletedAt is null &&
+            evaluation.State == "blocked" && evaluation.Reason == "active_resume",
+            $"A resume on any version protects the title: {observation.PlaybackPositionTicks}/{evaluation.State}/{evaluation.Reason}");
+    }
+
+    // A user with no stored observation is read live instead of blocking until a manual repair.
+    var missing = await SeedAsync(900204, "live-missing");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.CompletionObservations.RemoveRange(database.CompletionObservations.Where(candidate =>
+            candidate.TargetId == missing.EntryId));
+        database.RetentionOperations.RemoveRange(database.RetentionOperations.Where(candidate =>
+            candidate.Id == missing.Fixture.OperationId));
+        await database.SaveChangesAsync();
+    }
+
+    await services.GetRequiredService<RetentionEvaluator>().EvaluateAllAsync(default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var observation = await database.CompletionObservations.SingleOrDefaultAsync(candidate =>
+            candidate.TargetId == missing.EntryId && candidate.UserId == userId);
+        var evaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == missing.EntryId);
+        Assert(observation is { EvidenceAvailable: true, SourceReason: "Evaluate" } &&
+            evaluation.Reason != "completion_evidence_missing",
+            $"Missing evidence is read live without a repair run: {observation?.SourceReason}/{evaluation.State}/{evaluation.Reason}");
+    }
+
+    // Leave the suite's later state unchanged.
+    settings.RetentionEnabled = false;
+    await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
+    liveStates.Clear();
+    nativeItems.Remove(versionB.Id);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        foreach (var entryId in new[] { favorite.EntryId, unwatched.EntryId, grouped.EntryId, missing.EntryId })
+            database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == entryId));
+        await database.SaveChangesAsync();
+    }
+
+    foreach (var fixture in fixtures)
+    {
+        File.Delete(fixture.MediaPath);
+        File.Delete(fixture.SidecarPath);
+    }
 }
 
 // P3.T7: a fully reclaimed target must not hand its old schedule or completion to re-acquired media.

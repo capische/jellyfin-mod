@@ -213,7 +213,8 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         await WaitForObservationAsync(path, firstUser.Id, movie.Id,
             observation => observation.ObservedAt == clock.GetUtcNow().UtcDateTime);
         await using (var duplicate = new ModDbContext(path))
-            Assert((await duplicate.CompletionObservations.SingleAsync(observation => observation.UserId == firstUser.Id)).CompletedAt == firstCompletion,
+            Assert((await duplicate.CompletionObservations.SingleAsync(observation => observation.UserId == firstUser.Id &&
+                observation.TargetId == movieEntryId)).CompletedAt == firstCompletion,
                 "Duplicate completed notifications do not move the original completion time");
 
         clock.Advance(TimeSpan.FromHours(1));
@@ -232,7 +233,8 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         Raise(secondUser.Id, movie, UserDataSaveReason.TogglePlayed);
         states[(secondUser.Id, nativeEpisode.Id)] = State(true, 0, replayCompletion);
         Raise(secondUser.Id, nativeEpisode, UserDataSaveReason.PlaybackFinished);
-        await WaitForAsync(path, async database => await database.CompletionObservations.CountAsync() == 3,
+        // P3.T8: evaluation reads missing users live, so the first user's episode evidence exists too.
+        await WaitForAsync(path, async database => await database.CompletionObservations.CountAsync() == 4,
             "Movie and episode observations did not remain isolated by user and stable target");
 
         items.Remove(movie.Id);

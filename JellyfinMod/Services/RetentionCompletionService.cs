@@ -50,31 +50,45 @@ public sealed class RetentionCompletionService(
             database.CompletionObservations.Add(observation);
         }
 
-        var item = library.GetItemById(jellyfinItemId);
-        var current = item is null ? null : userData.GetUserData(user, item);
+        // One observation covers every bound version of the target: a resume or favourite on any
+        // version protects it, and finishing any version completes it (plugin-retention-policy#4).
+        var boundItemIds = await BoundItemIdsAsync(target, cancellationToken).ConfigureAwait(false);
+        if (!boundItemIds.Contains(jellyfinItemId)) boundItemIds = [.. boundItemIds, jellyfinItemId];
+        var states = boundItemIds.Select(id => library.GetItemById(id) is { } item ? userData.GetUserData(user, item) : null)
+            .ToArray();
         observation.JellyfinItemId = jellyfinItemId;
         observation.ObservedAt = now;
         observation.SourceReason = sourceReason;
-        observation.EvidenceAvailable = current is not null;
-        if (current is null)
+        observation.EvidenceAvailable = states.All(state => state is not null);
+        if (!observation.EvidenceAvailable)
         {
             observation.CompletedAt = null;
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
 
+        var current = states.OfType<UserItemData>().ToArray();
         var wasCompleted = observation.Played && observation.PlaybackPositionTicks == 0 &&
             observation.CompletedAt.HasValue;
-        var isCompleted = current.Played && current.PlaybackPositionTicks == 0;
-        observation.Played = current.Played;
-        observation.IsFavorite = current.IsFavorite;
-        observation.PlaybackPositionTicks = current.PlaybackPositionTicks;
-        observation.LastPlayedAt = Utc(current.LastPlayedDate);
+        var finished = current.Any(state => state.Played && state.PlaybackPositionTicks == 0);
+        var resume = current.Max(state => state.PlaybackPositionTicks);
+        var isCompleted = finished && resume == 0;
+        observation.Played = finished;
+        observation.IsFavorite = current.Any(state => state.IsFavorite);
+        observation.PlaybackPositionTicks = resume;
+        observation.LastPlayedAt = Utc(current.Max(state => state.LastPlayedDate));
         observation.CompletedAt = isCompleted
             ? wasCompleted ? observation.CompletedAt : CompletionTime(observation.LastPlayedAt, now)
             : null;
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    private async Task<Guid[]> BoundItemIdsAsync(RetentionTarget target, CancellationToken cancellationToken) =>
+        target.EpisodeId is { } episodeId
+            ? await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == episodeId)
+                .Select(binding => binding.JellyfinItemId).ToArrayAsync(cancellationToken).ConfigureAwait(false)
+            : await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == target.EntryId)
+                .Select(binding => binding.JellyfinItemId).ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
     /// <summary>Repairs missed completion notifications for every bound movie and episode.</summary>
     public async Task RefreshAllAsync(IProgress<double> progress, CancellationToken cancellationToken)

@@ -28,7 +28,15 @@ public sealed class RetentionEvidenceRepairTask(IServiceScopeFactory scopeFactor
     public bool IsLogged => true;
 
     /// <inheritdoc />
-    public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() => [];
+    public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() =>
+    [
+        // Repairs missed events after downtime shortly before the 03:00 reclamation task (P3.T8).
+        new()
+        {
+            Type = TaskTriggerInfoType.DailyTrigger,
+            TimeOfDayTicks = TimeSpan.FromMinutes(150).Ticks
+        }
+    ];
 
     /// <inheritdoc />
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)

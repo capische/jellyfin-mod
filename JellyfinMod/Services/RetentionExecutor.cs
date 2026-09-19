@@ -19,7 +19,8 @@ public sealed class RetentionExecutor(
     MediaStorageIdentity storage,
     UnixFileInspector files,
     TimeProvider clock,
-    ILogger<RetentionExecutor> logger)
+    ILogger<RetentionExecutor> logger,
+    RetentionLiveCheck liveCheck)
 {
     /// <summary>Revalidates and reclaims one binding selected by the shared retention preview.</summary>
     public async Task<RetentionExecutionResult> ReclaimAsync(Guid bindingId, CancellationToken cancellationToken)
@@ -195,6 +196,17 @@ public sealed class RetentionExecutor(
         if (operations.Any(operation => operation.PolicyVersion != livePolicy.Version))
             return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
                 RetentionExecutionReasons.PolicyChanged, null, cancellationToken).ConfigureAwait(false);
+
+        // Stored observations can miss a favourite, unwatched or resume event, and a session can be
+        // playing another version. Re-read live Jellyfin state for every affected target last.
+        foreach (var operation in operations)
+        {
+            var liveReason = await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken).ConfigureAwait(false);
+            if (liveReason is not null)
+                return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                    liveReason, null, cancellationToken).ConfigureAwait(false);
+        }
+
         try
         {
             File.Delete(operations[0].MediaPath);

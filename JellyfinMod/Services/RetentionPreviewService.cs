@@ -49,8 +49,13 @@ public sealed class RetentionPreviewService(
         HashSet<Guid>? activeItemIds;
         try
         {
+            // An alternate version plays under its primary item; its media source names the version.
             activeItemIds = sessions.Sessions
-                .SelectMany(session => new[] { session.FullNowPlayingItem?.Id, session.NowPlayingItem?.Id })
+                .SelectMany(session => new[]
+                {
+                    session.FullNowPlayingItem?.Id, session.NowPlayingItem?.Id,
+                    Guid.TryParse(session.PlayState?.MediaSourceId, out var source) ? source : null
+                })
                 .Where(id => id.HasValue).Select(id => id!.Value).ToHashSet();
         }
         catch
@@ -58,6 +63,10 @@ public sealed class RetentionPreviewService(
             activeItemIds = null;
         }
 
+        // Playing any member of a movie's version group protects every version in it (prior-M6).
+        var activeGroups = activeItemIds is null ? null : targets
+            .Where(target => activeItemIds.Contains(target.JellyfinItemId) || activeItemIds.Contains(target.VersionGroupId))
+            .Select(target => target.VersionGroupId).ToHashSet();
         var inspected = targets.Select(target => Inspect(target, libraryRoots, now)).ToArray();
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
@@ -67,7 +76,7 @@ public sealed class RetentionPreviewService(
                 continue;
             }
 
-            if (activeItemIds.Contains(candidate.Target.JellyfinItemId))
+            if (activeItemIds.Contains(candidate.Target.JellyfinItemId) || activeGroups!.Contains(candidate.Target.VersionGroupId))
             {
                 candidate.Block(RetentionPreviewReasons.ActiveSession);
                 continue;
@@ -171,11 +180,11 @@ public sealed class RetentionPreviewService(
                 (row, entry) => new { row.Binding, row.Episode, Entry = entry })
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
         return movies.Select(row => new PreviewTarget(row.Binding.Id, row.Entry.Id, null,
-                row.Binding.JellyfinItemId, row.Binding.TargetLibraryId, row.Binding.MediaPath,
+                row.Binding.JellyfinItemId, row.Binding.VersionGroupId, row.Binding.TargetLibraryId, row.Binding.MediaPath,
                 row.Binding.StorageIdentity, null, row.Entry,
                 evaluations.GetValueOrDefault(row.Entry.Id)))
             .Concat(episodes.Select(row => new PreviewTarget(row.Binding.Id, row.Entry.Id, row.Episode.Id,
-                row.Binding.JellyfinItemId, row.Binding.TargetLibraryId, row.Binding.MediaPath,
+                row.Binding.JellyfinItemId, row.Binding.JellyfinItemId, row.Binding.TargetLibraryId, row.Binding.MediaPath,
                 row.Binding.StorageIdentity, row.Binding.SeriesItemId, row.Entry,
                 evaluations.GetValueOrDefault(row.Episode.Id))))
             .ToArray();
@@ -267,6 +276,7 @@ public sealed class RetentionPreviewService(
         Guid EntryId,
         Guid? EpisodeId,
         Guid JellyfinItemId,
+        Guid VersionGroupId,
         Guid TargetLibraryId,
         string? Path,
         string? StorageIdentity,
