@@ -56,8 +56,39 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     public bool CanRead(User user, Entry entry, IReadOnlySet<Guid> nativeIds)
     {
         if (entry.MediaType is not ("movie" or "series") || !CanUseLibrary(user, entry.MediaType, entry.TargetLibraryId)) return false;
-        if (entry.JellyfinItemId is { } nativeId) return nativeIds.Contains(nativeId);
+        if (entry.JellyfinItemId is { } nativeId)
+        {
+            if (nativeIds.Contains(nativeId)) return true;
+            // A binding to an item that was deleted, moved to another library or dropped by a monitor is
+            // stale, not a restriction; the entry falls back to the unbound rule (P2.R7).
+            if (!IsStaleBinding(nativeId, entry.TargetLibraryId)) return false;
+        }
+
         return entry.MetadataJson is { } json && CanReadMetadata(user, JsonSerializer.Deserialize<TmdbMetadata>(json)!);
+    }
+
+    /// <summary>
+    /// Lets an administrator manage an entry that ordinary access hides only because its library was removed
+    /// or its native item is gone (P2.R7). Callers must already require elevation.
+    /// </summary>
+    public bool CanManage(User user, Entry entry) =>
+        CanRead(user, entry) || !IsLiveLibrary(entry.TargetLibraryId);
+
+    /// <summary>Returns true when the id belongs to a configured movie or TV library.</summary>
+    public bool IsLiveLibrary(Guid? libraryId)
+    {
+        _liveLibraries ??= (library.GetVirtualFolders() ?? [])
+            .Select(folder => Guid.TryParse(folder.ItemId, out var id) ? id : Guid.Empty)
+            .Where(id => id != Guid.Empty).ToHashSet();
+        return libraryId.HasValue && _liveLibraries.Contains(libraryId.Value);
+    }
+
+    private HashSet<Guid>? _liveLibraries;
+
+    private bool IsStaleBinding(Guid nativeId, Guid? libraryId)
+    {
+        var item = library.GetItemById(nativeId);
+        return item is null || !(library.GetCollectionFolders(item) ?? []).Any(folder => folder.Id == libraryId);
     }
 
     /// <summary>Checks ratings and tag allowlists for metadata with no native item.</summary>

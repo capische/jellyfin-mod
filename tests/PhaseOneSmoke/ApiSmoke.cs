@@ -14,6 +14,7 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
@@ -45,6 +46,11 @@ internal static class ApiSmoke
         {
             "GetUserRootFolder" => root,
             "GetItemById" when args?[0] is Guid id => nativeById.GetValueOrDefault(id),
+            "GetVirtualFolders" => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }
+                .Select(folder => new VirtualFolderInfo { ItemId = folder.Id.ToString(), Name = folder.Id.ToString("N") })
+                .ToList(),
+            "GetCollectionFolders" when args?[0] is BaseItem item => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }
+                .Where(folder => folder.Items.Any(native => native.Id == item.Id)).Cast<Folder>().ToList(),
             _ => null
         });
         var users = Stub<IUserManager>.Create((method, args) => method.Name == "GetUserById" ? ((Guid)args![0]! == user.Id ? user : otherUser) : null);
@@ -653,8 +659,51 @@ internal static class ApiSmoke
         client.DefaultRequestHeaders.Add("X-Smoke-User", otherUser.Id.ToString());
         Assert((await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie", targetLibraryId = libraryFolder.Id })).StatusCode == HttpStatusCode.NotFound,
             "Combined browse does not disclose an inaccessible library");
+        await VerifyStaleAndOrphanedEntriesAsync(client, dbPath, user, libraryFolder.Id);
         await app.StopAsync();
         Console.WriteLine("PASS: HTTP auth/access/CRUD, duplicate history, wire-state filter binding, unknown fields and no media deletion");
+    }
+
+    /// <summary>P2.R7: stale and orphaned entries stay manageable by administrators.</summary>
+    private static async Task VerifyStaleAndOrphanedEntriesAsync(HttpClient client, string dbPath, User user, Guid libraryId)
+    {
+        static string Metadata(int tmdbId) => JsonSerializer.Serialize(new TmdbMetadata("movie", tmdbId, "Unrated",
+            null, null, null, null, null, null, false, null, null, [], [], []));
+        var stale = new Entry
+        {
+            MediaType = "movie", TmdbId = 87101, TargetLibraryId = libraryId, Title = "Deleted in Jellyfin",
+            JellyfinItemId = Guid.NewGuid(), State = FileState.OnDisk, MetadataJson = Metadata(87101)
+        };
+        var orphan = new Entry
+        {
+            MediaType = "movie", TmdbId = 87102, TargetLibraryId = Guid.NewGuid(), Title = "Removed library",
+            MetadataJson = Metadata(87102)
+        };
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.AddRange(stale, orphan);
+            await database.SaveChangesAsync();
+        }
+
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
+        Assert((await client.GetAsync($"/JellyfinMod/Entries/{stale.Id}")).StatusCode == HttpStatusCode.OK,
+            "An entry whose only native item was deleted falls back to the unbound access rule");
+        Assert((await client.GetAsync($"/JellyfinMod/Entries/{orphan.Id}")).StatusCode == HttpStatusCode.NotFound,
+            "An entry in a removed library stays hidden from ordinary users");
+        client.DefaultRequestHeaders.Add("X-Smoke-Role", "admin");
+        Assert((await client.GetAsync($"/JellyfinMod/Entries/{orphan.Id}")).StatusCode == HttpStatusCode.OK,
+            "An administrator can open an entry in a removed library");
+        using var orphans = await client.GetAsync("/JellyfinMod/Reconciliation/Orphans");
+        using var orphansJson = JsonDocument.Parse(await orphans.Content.ReadAsStringAsync());
+        Assert(orphans.StatusCode == HttpStatusCode.OK &&
+            orphansJson.RootElement.EnumerateArray().Select(row => Guid.Parse(row.GetProperty("id").GetString()!)).SequenceEqual([orphan.Id]),
+            "Administrator diagnostics list exactly the entries whose library is no longer live");
+        Assert((await client.DeleteAsync($"/JellyfinMod/Entries/{stale.Id}")).StatusCode == HttpStatusCode.NoContent &&
+            (await client.DeleteAsync($"/JellyfinMod/Entries/{orphan.Id}")).StatusCode == HttpStatusCode.NoContent,
+            "An administrator can remove stale-bound and orphaned entries instead of receiving 404");
+        client.DefaultRequestHeaders.Remove("X-Smoke-Role");
     }
 
     private static HttpResponseMessage Json(string body) => new(HttpStatusCode.OK) { Content = new StringContent(body) };

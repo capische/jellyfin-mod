@@ -69,6 +69,7 @@
         <p>Run <strong>Reconcile JellyfinMod catalog</strong> from Dashboard → Scheduled Tasks to backfill or repair bindings.</p>
         <div id="ReconciliationSummary" class="fieldDescription">No reconciliation run has been recorded.</div>
         <ul id="ReconciliationLibraryReasons" class="fieldDescription"></ul>
+        <div id="OrphanedEntries" class="fieldDescription"></div>
 
         <div>
           <button is="emby-button" type="submit" class="raised button-submit block">
@@ -154,6 +155,17 @@
               item.textContent = diagnostic.title + ': ' + diagnostic.detail;
               reasons.appendChild(item);
             });
+          }, function () {});
+          // Entries whose library was removed stay hidden from users until their media reappears (P2.R7).
+          ApiClient.ajax({
+            type: 'GET',
+            url: ApiClient.getUrl('JellyfinMod/Reconciliation/Orphans'),
+            dataType: 'json'
+          }).then(function (orphans) {
+            document.querySelector('#OrphanedEntries').textContent = orphans.length === 0 ? '' :
+              'Entries in removed libraries: ' + orphans.map(function (orphan) {
+                return orphan.title + ' (' + orphan.mediaType + ')';
+              }).join(', ');
           }, function () {});
         });
 

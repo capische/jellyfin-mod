@@ -64,12 +64,13 @@ public sealed class CatalogBackfillRunner(
                         {
                             case ReconciliationOutcome.Created: run.CreatedEntries++; break;
                             case ReconciliationOutcome.Updated: run.UpdatedBindings++; break;
-                            case ReconciliationOutcome.Unchanged: run.UnchangedItems++; break;
+                            case ReconciliationOutcome.Unchanged or ReconciliationOutcome.Overlap: run.UnchangedItems++; break;
                             case ReconciliationOutcome.Unmatched: run.UnmatchedItems++; break;
                             case ReconciliationOutcome.Conflict: run.ConflictedItems++; break;
                         }
 
-                        if (result.Outcome is ReconciliationOutcome.Unmatched or ReconciliationOutcome.Conflict)
+                        if (result.Outcome is ReconciliationOutcome.Unmatched or ReconciliationOutcome.Conflict or
+                            ReconciliationOutcome.Overlap)
                             AddDiagnostic(diagnostics, observation, result.Detail ?? result.Outcome.ToString());
                     }
                     else
@@ -272,7 +273,8 @@ public sealed class CatalogBackfillRunner(
             }
 
             ObserveNative(work, observation);
-            if (result is null || result.Outcome is ReconciliationOutcome.Conflict or ReconciliationOutcome.Unmatched)
+            if (result is null || result.Outcome is ReconciliationOutcome.Conflict or ReconciliationOutcome.Unmatched or
+                ReconciliationOutcome.Overlap)
                 Protect(work, observation, result?.EntryId);
         }
 

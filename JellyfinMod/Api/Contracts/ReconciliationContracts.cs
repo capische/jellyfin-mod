@@ -32,3 +32,12 @@ public sealed record ReconciliationRunDto(
     {
     }
 }
+
+/// <summary>An entry whose target library is no longer configured, listed for administrators (P2.R7).</summary>
+public sealed record OrphanedEntryDto(
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("mediaType")] string MediaType,
+    [property: JsonPropertyName("tmdbId")] int TmdbId,
+    [property: JsonPropertyName("targetLibraryId")] Guid? TargetLibraryId,
+    [property: JsonPropertyName("state")] string State);

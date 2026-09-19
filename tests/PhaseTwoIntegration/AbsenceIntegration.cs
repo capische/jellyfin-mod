@@ -57,6 +57,11 @@ internal static class AbsenceIntegration
         var series = new List<Series> { seriesA, seriesB };
         var episodes = new List<MediaBrowser.Controller.Entities.TV.Episode> { episodeA, episodeB, episodeOnly };
         var folders = new List<VirtualFolderInfo> { movieFolder, tvFolder };
+        var overlapLibrary = new CollectionFolder
+        {
+            Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.tvshows
+        };
+        Series? overlapSeries = null;
         var mutatePagedObservation = false;
         var pageFiftyReads = 0;
 
@@ -77,7 +82,8 @@ internal static class AbsenceIntegration
             }
 
             IEnumerable<BaseItem> items = query.ParentId == movieLibrary.Id ? movies :
-                query.ParentId == tvLibrary.Id ? series : AllItems();
+                query.ParentId == tvLibrary.Id ? series :
+                query.ParentId == overlapLibrary.Id ? series.Where(candidate => candidate == overlapSeries) : AllItems();
             if (query.AncestorIds.Length > 0)
                 items = episodes.Where(episode => query.AncestorIds.Contains(episode.SeriesId));
             if (query.ItemIds.Length > 0)
@@ -100,9 +106,12 @@ internal static class AbsenceIntegration
             "GetCount" => Query((InternalItemsQuery)arguments![0]!).Count,
             "GetCollectionFolders" => ((BaseItem)arguments![0]!) is Movie
                 ? new List<Folder> { movieLibrary }
-                : new List<Folder> { tvLibrary },
+                : arguments[0] == overlapSeries
+                    ? new List<Folder> { tvLibrary, overlapLibrary }
+                    : new List<Folder> { tvLibrary },
             "GetItemById" when (Guid)arguments![0]! == movieLibrary.Id => movieLibrary,
             "GetItemById" when (Guid)arguments![0]! == tvLibrary.Id => tvLibrary,
+            "GetItemById" when (Guid)arguments![0]! == overlapLibrary.Id => overlapLibrary,
             "GetItemById" => AllItems().FirstOrDefault(item => item.Id == (Guid)arguments![0]!),
             _ => throw new NotSupportedException(method.ToString())
         };
@@ -388,6 +397,62 @@ internal static class AbsenceIntegration
             await database.EntryBindings.Where(binding => binding.TargetLibraryId == tvLibrary.Id)
                 .AllAsync(binding => binding.StorageIdentity != null && binding.StorageIdentity.StartsWith("3:9|")),
             "A device-number change re-baselines every binding in the library before absence is confirmed");
+
+        // P2.R7: re-adding the TV path under a new name gives the library a new identity.
+        dailyEntry = await database.Entries.SingleAsync(entry => entry.Id == dailyEntry.Id);
+        dailyEntry.RetentionPolicy = RetentionPolicy.Never;
+        dailyEntry.Monitored = true;
+        await database.SaveChangesAsync();
+        var oldTvLibraryId = tvLibrary.Id;
+        tvLibrary = new CollectionFolder { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.tvshows };
+        folders.Remove(tvFolder);
+        folders.Add(new VirtualFolderInfo
+        {
+            Name = "TV re-added", ItemId = tvLibrary.Id.ToString(), CollectionType = CollectionTypeOptions.tvshows,
+            Locations = [tvPath]
+        });
+        // A user wanted the same title in the new library before reconciliation re-homed it.
+        var wanted = new Entry
+        {
+            MediaType = "series", TmdbId = 9700, TargetLibraryId = tvLibrary.Id, Title = "Daily series",
+            Monitored = false
+        };
+        database.Entries.Add(wanted);
+        database.Episodes.Add(new JellyfinMod.Data.Episode { EntryId = wanted.Id, TmdbId = 9799, SeasonNumber = 2, EpisodeNumber = 1 });
+        database.History.Add(new HistoryRecord { EntryId = wanted.Id, EventType = "added", Summary = "Added" });
+        await database.SaveChangesAsync();
+        // A second library shares the TV path and lists one series as well.
+        overlapSeries = Series(9730, "Shared path series", tvPath);
+        series.Add(overlapSeries);
+        episodes.Add(Episode(9731, overlapSeries.Id, "Shared path episode", tvPath));
+        folders.Add(new VirtualFolderInfo
+        {
+            Name = "Zz overlapping TV", ItemId = overlapLibrary.Id.ToString(), CollectionType = CollectionTypeOptions.tvshows,
+            Locations = [tvPath]
+        });
+        database.ChangeTracker.Clear();
+        await task.Run(new InlineProgress(), default);
+        database.ChangeTracker.Clear();
+        var r7Run = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt).FirstAsync();
+        dailyEntry = await database.Entries.SingleAsync(entry => entry.Id == dailyEntry.Id);
+        Assert(r7Run.ConflictedItems == 0 && r7Run.IncompleteLibraries == 0 &&
+            dailyEntry.TargetLibraryId == tvLibrary.Id && dailyEntry.RetentionPolicy == RetentionPolicy.Never &&
+            dailyEntry.Monitored && dailyEntry.State == FileState.OnDisk &&
+            await database.History.CountAsync(history => history.EntryId == dailyEntry.Id &&
+                history.EventType == "library_moved") == 1 &&
+            await database.EntryBindings.Where(binding => binding.EntryId == dailyEntry.Id)
+                .AllAsync(binding => binding.TargetLibraryId == tvLibrary.Id),
+            "A re-created library re-homes its entries with one library_moved event and Keep and monitoring preserved");
+        Assert(!await database.Entries.AnyAsync(entry => entry.Id == wanted.Id) &&
+            await database.Episodes.AnyAsync(episode => episode.EntryId == dailyEntry.Id && episode.TmdbId == 9799) &&
+            await database.History.AnyAsync(history => history.EntryId == dailyEntry.Id && history.EventType == "added"),
+            "A file-less entry for the same title in the new library is merged into the re-homed entry");
+        Assert(await database.Entries.CountAsync(entry => entry.TmdbId == 9730) == 1 &&
+            await database.Entries.AnyAsync(entry => entry.TmdbId == 9730 && entry.TargetLibraryId == tvLibrary.Id) &&
+            r7Run.DiagnosticsJson?.Contains("owned by another library", StringComparison.Ordinal) == true,
+            "Overlapping libraries follow one rule: the first library by name owns the title and the other reports an overlap");
+        Assert((await database.Entries.SingleAsync(entry => entry.Id == losingEntry.Id)).TargetLibraryId == oldTvLibraryId,
+            "An unmatched title is not re-homed and stays listed as an orphan");
     }
 
     private static Movie Movie(int tmdbId, string name, string root)

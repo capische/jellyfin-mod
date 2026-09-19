@@ -126,7 +126,7 @@ public sealed class EntriesController(
         var user = access.GetUser(User);
         if (user is null) return Unauthorized();
         var visible = await database.Entries.AsNoTracking().SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
-        if (visible is null || !access.CanRead(user, visible)) return NotFound();
+        if (visible is null || !access.CanManage(user, visible)) return NotFound();
         if (visible.MediaType != "series" || visible.TargetLibraryId is not { } libraryId) return BadRequest();
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -219,7 +219,9 @@ public sealed class EntriesController(
         var user = access.GetUser(User);
         if (user is null) return Unauthorized();
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
-        if (entry is null || !access.CanRead(user, entry)) return NotFound();
+        // Administrators can open an entry whose library was removed, so they can Refresh or Remove it (P2.R7).
+        if (entry is null || !access.CanRead(user, entry) &&
+            !(!access.IsLiveLibrary(entry.TargetLibraryId) && await IsAdministratorAsync())) return NotFound();
         return await BuildDetail(entry, cancellationToken);
     }
 
@@ -247,7 +249,7 @@ public sealed class EntriesController(
         if (user is null) return Unauthorized();
         var visible = await database.Entries.AsNoTracking().SingleOrDefaultAsync(
             entry => entry.Id == id, cancellationToken).ConfigureAwait(false);
-        if (visible is null || !access.CanRead(user, visible)) return NotFound();
+        if (visible is null || !access.CanManage(user, visible)) return NotFound();
         if (!visible.TargetLibraryId.HasValue) return BadRequest();
 
         await using var executionLease = await retentionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
@@ -303,7 +305,7 @@ public sealed class EntriesController(
         if (user is null) return Unauthorized();
         if (deleteFiles) return BadRequest("File deletion is not available in Phase 1.");
         var visible = await database.Entries.AsNoTracking().SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
-        if (visible is null || !access.CanRead(user, visible) || visible.TargetLibraryId is not { } libraryId) return NotFound();
+        if (visible is null || !access.CanManage(user, visible) || visible.TargetLibraryId is not { } libraryId) return NotFound();
 
         // Serialized with retention and reconciliation, so a Remove can never race an unlink.
         await using var executionLease = await retentionGate.AcquireAsync(cancellationToken);

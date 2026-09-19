@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using JellyfinMod.Data;
+using MediaBrowser.Controller.Library;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
@@ -11,7 +12,8 @@ public sealed class ReconciliationService(
     ModDbContext database,
     ReconciliationLibraryLock libraryLock,
     MediaStorageIdentity? mediaStorage = null,
-    TimeProvider? clock = null)
+    TimeProvider? clock = null,
+    ILibraryManager? library = null)
 {
     private readonly MediaStorageIdentity _mediaStorage = mediaStorage ?? new();
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
@@ -266,6 +268,8 @@ public sealed class ReconciliationService(
         if (observationConflict is not null)
             return new(ReconciliationOutcome.Conflict, null, 0, observationConflict);
 
+        await RehomeOrphanedEntryAsync(snapshot, representationIds, cancellationToken).ConfigureAwait(false);
+
         var conflictingEntry = await (from binding in database.EntryBindings.AsNoTracking()
             join boundEntry in database.Entries.AsNoTracking() on binding.EntryId equals boundEntry.Id
             where representationIds.Contains(binding.JellyfinItemId) &&
@@ -277,8 +281,16 @@ public sealed class ReconciliationService(
             (entry.MediaType != snapshot.MediaType || entry.TmdbId != snapshot.TmdbId || entry.TargetLibraryId != snapshot.TargetLibraryId),
             cancellationToken).ConfigureAwait(false);
         if (conflictingEntry is not null)
+        {
+            // Two libraries that share a path both list the same native item. The library whose name sorts
+            // first owns the binding; the other reports the overlap instead of a conflict (P2.R7).
+            if (conflictingEntry.MediaType == snapshot.MediaType && conflictingEntry.TmdbId == snapshot.TmdbId &&
+                conflictingEntry.TargetLibraryId is { } ownerLibrary && IsLiveLibrary(ownerLibrary))
+                return new(ReconciliationOutcome.Overlap, conflictingEntry.Id, 0,
+                    "This title is owned by another library that shares its path.");
             return new(ReconciliationOutcome.Conflict, conflictingEntry.Id, 0,
                 "A native representation is already bound to a different catalog identity.");
+        }
 
         var episodeIds = snapshot.Episodes.Select(episode => episode.JellyfinItemId).ToHashSet();
         var boundEpisodes = await (from binding in database.EpisodeBindings.AsNoTracking()
@@ -452,6 +464,106 @@ public sealed class ReconciliationService(
 
         return new(created ? ReconciliationOutcome.Created : entryChanged || entryBindingChanges > 0 || episodeChanges > 0
             ? ReconciliationOutcome.Updated : ReconciliationOutcome.Unchanged, entry.Id, episodeChanges, null);
+    }
+
+    /// <summary>
+    /// Moves an entry whose library was re-created or renamed to the library where its native media now
+    /// appears (P2.R7), keeping Keep, monitoring, retention state and history. A file-less entry for the
+    /// same title in the new library is merged into it.
+    /// </summary>
+    private async Task RehomeOrphanedEntryAsync(
+        NativeTitleSnapshot snapshot,
+        IReadOnlySet<Guid> representationIds,
+        CancellationToken cancellationToken)
+    {
+        var episodeIds = snapshot.Episodes.Select(episode => episode.JellyfinItemId).ToHashSet();
+        var candidates = await database.Entries.AsNoTracking().Where(entry =>
+                entry.MediaType == snapshot.MediaType && entry.TmdbId == snapshot.TmdbId &&
+                entry.TargetLibraryId != snapshot.TargetLibraryId &&
+                (entry.JellyfinItemId != null && representationIds.Contains(entry.JellyfinItemId.Value) ||
+                 database.EntryBindings.Any(binding => binding.EntryId == entry.Id &&
+                     representationIds.Contains(binding.JellyfinItemId)) ||
+                 database.Episodes.Any(episode => episode.EntryId == entry.Id &&
+                     database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id &&
+                         episodeIds.Contains(binding.JellyfinItemId)))))
+            .Select(entry => new { entry.Id, entry.TargetLibraryId })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var orphan = candidates.FirstOrDefault(candidate =>
+            candidate.TargetLibraryId is not { } libraryId || !IsLiveLibrary(libraryId));
+        if (orphan is null) return;
+
+        await using var oldLease = orphan.TargetLibraryId is { } oldLibrary && oldLibrary != snapshot.TargetLibraryId
+            ? await libraryLock.AcquireAsync(oldLibrary, cancellationToken).ConfigureAwait(false)
+            : null;
+        var entry = await database.Entries.SingleOrDefaultAsync(candidate => candidate.Id == orphan.Id, cancellationToken)
+            .ConfigureAwait(false);
+        if (entry is null || entry.TargetLibraryId == snapshot.TargetLibraryId) return;
+        var previousLibrary = entry.TargetLibraryId;
+
+        var existing = await database.Entries.SingleOrDefaultAsync(candidate => candidate.MediaType == snapshot.MediaType &&
+            candidate.TmdbId == snapshot.TmdbId && candidate.TargetLibraryId == snapshot.TargetLibraryId,
+            cancellationToken).ConfigureAwait(false);
+        if (existing is not null)
+        {
+            // Only a file-less wanted entry can be merged; one with its own media stays a conflict.
+            if (await database.EntryBindings.AnyAsync(binding => binding.EntryId == existing.Id, cancellationToken)
+                    .ConfigureAwait(false) ||
+                await database.Episodes.AnyAsync(episode => episode.EntryId == existing.Id &&
+                    database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id), cancellationToken)
+                    .ConfigureAwait(false))
+                return;
+            if (existing.RetentionPolicy == RetentionPolicy.Never) entry.RetentionPolicy = RetentionPolicy.Never;
+            entry.Monitored |= existing.Monitored;
+            var trackedEpisodes = await database.Episodes.Where(episode => episode.EntryId == entry.Id)
+                .Select(episode => episode.TmdbId).ToListAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var wanted in await database.Episodes.Where(episode => episode.EntryId == existing.Id)
+                         .ToListAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (trackedEpisodes.Contains(wanted.TmdbId))
+                    database.Episodes.Remove(wanted);
+                else
+                    wanted.EntryId = entry.Id;
+            }
+
+            foreach (var record in await database.History.Where(history => history.EntryId == existing.Id)
+                         .ToListAsync(cancellationToken).ConfigureAwait(false))
+                record.EntryId = entry.Id;
+            // The wanted entry's rows move first so its removal cannot cascade them away.
+            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            database.Entries.Remove(existing);
+        }
+
+        entry.TargetLibraryId = snapshot.TargetLibraryId;
+        foreach (var binding in await database.EntryBindings.Where(binding => binding.EntryId == entry.Id)
+                     .ToListAsync(cancellationToken).ConfigureAwait(false))
+            binding.TargetLibraryId = snapshot.TargetLibraryId;
+        foreach (var binding in await (from episodeBinding in database.EpisodeBindings
+                     join episode in database.Episodes on episodeBinding.EpisodeId equals episode.Id
+                     where episode.EntryId == entry.Id
+                     select episodeBinding).ToListAsync(cancellationToken).ConfigureAwait(false))
+            binding.TargetLibraryId = snapshot.TargetLibraryId;
+        database.History.Add(new HistoryRecord
+        {
+            EntryId = entry.Id,
+            EventType = "library_moved",
+            Summary = "Moved to the library where its media now appears",
+            Data = JsonSerializer.Serialize(new { fromLibraryId = previousLibrary, toLibraryId = snapshot.TargetLibraryId,
+                mergedEntryId = existing?.Id })
+        });
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        database.ChangeTracker.Clear();
+    }
+
+    private HashSet<Guid>? _liveLibraries;
+
+    /// <summary>Checks the configured movie and TV libraries, read only when an ownership question arises.</summary>
+    private bool IsLiveLibrary(Guid libraryId)
+    {
+        if (library is null) return true;
+        _liveLibraries ??= library.GetVirtualFolders()
+            .Select(folder => Guid.TryParse(folder.ItemId, out var id) ? id : Guid.Empty)
+            .Where(id => id != Guid.Empty).ToHashSet();
+        return _liveLibraries.Contains(libraryId);
     }
 
     private static NativeRepresentation? SelectRepresentation(Guid? currentId, IReadOnlyList<NativeRepresentation> candidates)
@@ -748,7 +860,9 @@ public enum ReconciliationOutcome
     /// <summary>No provider identity was available.</summary>
     Unmatched,
     /// <summary>The observation conflicts with durable provider identity.</summary>
-    Conflict
+    Conflict,
+    /// <summary>Another library that shares the path owns this title (P2.R7).</summary>
+    Overlap
 }
 
 internal sealed record ExistingEpisodeBinding(Guid JellyfinItemId, Guid SeriesItemId, Guid BindingLibraryId,
