@@ -287,6 +287,15 @@ static async Task VerifyPreviewHttpAsync(
     apiBuilder.Services.AddSingleton(userData);
     apiBuilder.Services.AddSingleton(sessionManager);
     apiBuilder.Services.AddSingleton(localization);
+    // EntriesController needs the sort-name service since the P1.P7 carry-forward of fba11e3.
+    var serverConfiguration = Stub<MediaBrowser.Controller.Configuration.IServerConfigurationManager>.Create((method, _) =>
+        method.Name == "get_Configuration"
+            ? new MediaBrowser.Model.Configuration.ServerConfiguration
+            {
+                SortRemoveWords = ["the", "a"], SortRemoveCharacters = [], SortReplaceCharacters = []
+            }
+            : null);
+    apiBuilder.Services.AddTransient(_ => new CatalogSortName(serverConfiguration));
     apiBuilder.Services.AddSingleton<TimeProvider>(clock);
     apiBuilder.Services.AddSingleton<MediaStorageIdentity>();
     apiBuilder.Services.AddSingleton<UnixFileInspector>();
