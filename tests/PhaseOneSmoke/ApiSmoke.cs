@@ -668,6 +668,7 @@ internal static class ApiSmoke
         await VerifyReclaimedVisibilityAsync(client, dbPath, user, libraryFolder.Id);
         await VerifyDiscoveryBudgetAsync(client, http, user);
         await VerifyContractHygieneAsync(client, dbPath, user, libraryFolder.Id);
+        await VerifyBoundCopyPreferenceAsync(client, dbPath, libraryFolder, secondLibrary, raceLibrary, nativeById);
         // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
         http.Response = null;
         http.BeforeResponse = null;
@@ -685,6 +686,55 @@ internal static class ApiSmoke
         }
         await app.StopAsync();
         Console.WriteLine("PASS: HTTP auth/access/CRUD, duplicate history, wire-state filter binding, unknown fields and no media deletion");
+    }
+
+    /// <summary>P1.P10: global Browse shows the native copy that carries the bound entry.</summary>
+    private static async Task VerifyBoundCopyPreferenceAsync(HttpClient client, string dbPath,
+        EmptyMovieLibrary first, EmptyMovieLibrary second, EmptyMovieLibrary third, Dictionary<Guid, BaseItem> nativeById)
+    {
+        var unbound = new MediaBrowser.Controller.Entities.Movies.Movie
+        {
+            Id = Guid.Parse("00000000-0000-0000-0000-00000000a001"), Name = "Shared copy", SortName = "shared copy"
+        };
+        var bound = new MediaBrowser.Controller.Entities.Movies.Movie
+        {
+            Id = Guid.Parse("ffffffff-0000-0000-0000-00000000b002"), Name = "Shared copy", SortName = "shared copy"
+        };
+        unbound.ProviderIds["Tmdb"] = bound.ProviderIds["Tmdb"] = "88600";
+        // Only these two copies are listed, so the global request sees nothing from earlier fixtures.
+        var firstItems = first.Items;
+        var secondItems = second.Items;
+        var thirdItems = third.Items;
+        first.Items = [unbound];
+        second.Items = [bound];
+        third.Items = [];
+        nativeById[unbound.Id] = unbound;
+        nativeById[bound.Id] = bound;
+        var entry = new Entry
+        {
+            MediaType = "movie", TmdbId = 88600, TargetLibraryId = second.Id, Title = "Shared copy",
+            JellyfinItemId = bound.Id, State = FileState.OnDisk
+        };
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.Add(entry);
+            await database.SaveChangesAsync();
+        }
+
+        using var browse = await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie" });
+        using var json = JsonDocument.Parse(await browse.Content.ReadAsStringAsync());
+        var shared = json.RootElement.GetProperty("items").EnumerateArray()
+            .Where(row => row.GetProperty("kind").GetString() == "native" &&
+                Guid.Parse(row.GetProperty("nativeItem").GetProperty("Id").GetString()!) is var id &&
+                (id == unbound.Id || id == bound.Id))
+            .ToArray();
+        Assert(browse.IsSuccessStatusCode && shared.Length == 1 &&
+            Guid.Parse(shared[0].GetProperty("nativeItem").GetProperty("Id").GetString()!) == bound.Id &&
+            Guid.Parse(shared[0].GetProperty("entry").GetProperty("id").GetString()!) == entry.Id,
+            "Global Browse shows the bound copy of a title held in two libraries, with its entry");
+        first.Items = firstItems;
+        second.Items = secondItems;
+        third.Items = thirdItems;
     }
 
     /// <summary>P1.P11: API keys get 401 on user-scoped endpoints, and any bound copy finds its entry.</summary>

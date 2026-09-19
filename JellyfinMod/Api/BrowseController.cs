@@ -52,8 +52,14 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
         var retentionPolicy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
             policy => policy.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
+        // A series is played when all its episodes are; only the native query applies Jellyfin's episode-based
+        // semantics, so series Played/Unplayed go there instead of to the series row's own user data (P1.P10).
+        var seriesPlayed = request.MediaType == "series"
+            ? filters.Status.Where(value => value is "IsPlayed" or "IsUnplayed").ToArray()
+            : [];
         var hasNativeQueryFilters = new Array[] { filters.Genres, filters.Years, filters.OfficialRatings, filters.Tags,
-            filters.StudioIds, filters.SeriesStatus, filters.VideoTypes, filters.Features, filters.VideoBasicFilter }.Any(values => values.Length > 0);
+            filters.StudioIds, filters.SeriesStatus, filters.VideoTypes, filters.Features, filters.VideoBasicFilter,
+            seriesPlayed }.Any(values => values.Length > 0);
         var nativeMatches = (hasNativeQueryFilters ? access.GetNativeItems(user, request.MediaType, request.TargetLibraryId, query =>
         {
             query.Genres = filters.Genres;
@@ -64,7 +70,11 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             query.SeriesStatuses = filters.SeriesStatus.Select(Enum.Parse<SeriesStatus>).ToArray();
             query.VideoTypes = filters.VideoTypes.Select(Enum.Parse<VideoType>).ToArray();
             foreach (var value in filters.Features.Concat(filters.VideoBasicFilter.Where(value => value != "IsHD" || !filters.VideoBasicFilter.Contains("IsSD")))) ApplyFeature(query, value);
+            if (seriesPlayed.Length == 1) query.IsPlayed = seriesPlayed[0] == "IsPlayed";
         }) : native).Select(item => item.Id).ToHashSet();
+        // Played and Unplayed together match nothing, as in the native filter.
+        if (seriesPlayed.Length > 1) nativeMatches.Clear();
+        var rowStatus = filters.Status.Except(seriesPlayed).ToArray();
         if (filters.AudioLanguages.Length > 0 || filters.SubtitleLanguages.Length > 0)
         {
             var nativeById = native.ToDictionary(item => item.Id);
@@ -82,7 +92,7 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
                 request.MediaType == "series" && request.SortBy.Contains("SeriesDatePlayed") ? access.GetSeriesDatePlayed(user, item, userData) : null))
             .Concat(entries.Where(entry => !entry.JellyfinItemId.HasValue || !nativeIds.Contains(entry.JellyfinItemId.Value))
                 .Select(entry => new Candidate(null, entry, entry.MetadataJson is null ? null : JsonSerializer.Deserialize<TmdbMetadata>(entry.MetadataJson), sortNames.GetKey(entry.Title), null, null)));
-        candidates = candidates.Where(row => row.Native is null ? MatchesMetadata(row, filters) : nativeMatches.Contains(row.Native.Id) && MatchesStatus(row.UserData, filters.Status));
+        candidates = candidates.Where(row => row.Native is null ? MatchesMetadata(row, filters) : nativeMatches.Contains(row.Native.Id) && MatchesStatus(row.UserData, rowStatus));
         if (!string.IsNullOrEmpty(request.Alphabet)) candidates = candidates.Where(row => request.Alphabet == "#"
             ? StringComparer.Ordinal.Compare(row.SortName, "a") < 0 : row.SortName.StartsWith(request.Alphabet, StringComparison.OrdinalIgnoreCase));
         if (!string.IsNullOrWhiteSpace(request.Query))
@@ -100,7 +110,10 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             candidates = candidates.Where(row => row.Entry is { State: FileState.OnDisk } &&
                 dueEntryIds.Contains(row.Entry.Id));
         }
-        if (!request.TargetLibraryId.HasValue) candidates = candidates.GroupBy(row => row.TitleIdentity).Select(group => group.OrderBy(row => row.Native is null).ThenBy(row => row.Identity, StringComparer.Ordinal).First());
+        // Across libraries, the native copy that carries the bound entry (and its retention summary) wins (P1.P10).
+        if (!request.TargetLibraryId.HasValue) candidates = candidates.GroupBy(row => row.TitleIdentity).Select(group => group
+            .OrderBy(row => row.Native is null).ThenBy(row => row.Entry is null)
+            .ThenBy(row => row.Identity, StringComparer.Ordinal).First());
         var filtered = candidates.ToArray();
         Array.Sort(filtered, (left, right) => Compare(left, right, request));
         var page = filtered.Skip(request.StartIndex);
