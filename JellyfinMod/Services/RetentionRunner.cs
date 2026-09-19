@@ -96,12 +96,16 @@ public sealed class RetentionRunner(
                             operation.CompletedAt >= now.AddDays(-1))
                         .Select(operation => operation.BindingId).ToArrayAsync(cancellationToken).ConfigureAwait(false))
                     .ToHashSet();
-                // Bindings that failed recently go last, so a few undeletable files cannot starve the rest.
+                // Bindings that failed recently go last, so a few undeletable files cannot starve the rest. Within one
+                // target the lowest quality goes first (P6.M7): a higher version blocked by seeding never stops it.
+                var qualityRank = await VersionRankAsync(preview.Items, cancellationToken).ConfigureAwait(false);
                 var candidates = preview.Items
                     .Where(item => item.State == RetentionPreviewStates.Due && item.CanonicalPath is not null)
                     .GroupBy(item => item.CanonicalPath!, StringComparer.Ordinal)
                     .Select(group => group.OrderBy(item => item.BindingId).First())
                     .OrderBy(item => recentlyFailed.Contains(item.BindingId))
+                    .ThenBy(item => item.EpisodeId ?? item.EntryId)
+                    .ThenBy(item => qualityRank.GetValueOrDefault(item.BindingId))
                     .ThenBy(item => item.CanonicalPath, StringComparer.Ordinal)
                     .Take(BatchSize * MaxAttemptsPerAction)
                     .ToArray();
@@ -172,6 +176,25 @@ public sealed class RetentionRunner(
         {
             logger.LogWarning(error, "JellyfinMod could not re-baseline media storage identities");
         }
+    }
+
+    /// <summary>Ranks each representation by resolution: parsed from its file name, else read from the native item.</summary>
+    private Task<Dictionary<Guid, int>> VersionRankAsync(IReadOnlyList<Api.Contracts.RetentionRepresentationDto> items,
+        CancellationToken cancellationToken)
+    {
+        using var scope = scopeFactory.CreateScope();
+        var library = scope.ServiceProvider.GetService<MediaBrowser.Controller.Library.ILibraryManager>();
+        var result = new Dictionary<Guid, int>();
+        foreach (var item in items)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var rank = Automation.VersionQuality.ResolutionRank(item.CanonicalPath ?? item.Path);
+            if (rank == 0 && library?.GetItemById(item.JellyfinItemId) is MediaBrowser.Controller.Entities.Video { Width: > 0 } video)
+                rank = Automation.VersionQuality.WidthRank(video.Width);
+            result[item.BindingId] = rank;
+        }
+
+        return Task.FromResult(result);
     }
 
     private async Task<Api.Contracts.RetentionPreviewDto> PreviewAsync(CancellationToken cancellationToken)
