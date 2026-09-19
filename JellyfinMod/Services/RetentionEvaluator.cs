@@ -203,6 +203,9 @@ public sealed class RetentionEvaluator(
                 await completion.RefreshAsync(userId, boundItemIds[0], "Evaluate", cancellationToken).ConfigureAwait(false);
             observations = await LoadCurrentObservationsAsync(targetId, userIds, boundItemIds, cancellationToken)
                 .ConfigureAwait(false);
+            // Evidence read just now may carry a last-played instant after the start of this evaluation; it is not
+            // from the future and must not be discarded as such.
+            now = clock.GetUtcNow().UtcDateTime;
         }
         if (userIds.Any(userId => !observations.TryGetValue(userId, out var observation) || !observation.EvidenceAvailable))
         {
@@ -267,7 +270,14 @@ public sealed class RetentionEvaluator(
         }
 
         var priorDeadline = result.State == RetentionEvaluationStates.Scheduled ? result.Deadline : null;
+        var priorBasis = result.State == RetentionEvaluationStates.Scheduled ? result.CompletionBasisAt : null;
         var policyChanged = priorPolicyVersion != 0 && priorPolicyVersion != policy.Version;
+        // A target that stayed completed keeps the completion that scheduled it. Re-reading evidence from a remaining
+        // version after a sibling version was reclaimed or removed can report a later instant, which must not restart the
+        // title's window (P6.M7). A new completion always passes through waiting or blocked first; a policy or access
+        // change recomputes as before and still never shortens the prior deadline.
+        if (priorBasis is { } keptBasis && !policyChanged && !accessChanged && keptBasis < completionBasis.Value)
+            completionBasis = keptBasis;
         var eligibleAt = Latest(Latest(completionBasis.Value, policy.EnabledAt ?? now), result.BaselineAt);
         if (!priorDeadline.HasValue && (accessChanged || policyChanged ||
             (hadPriorEvaluation && priorState != RetentionEvaluationStates.Disabled)))

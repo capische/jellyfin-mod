@@ -575,9 +575,11 @@ internal static class Phase6
         time.Offset += TimeSpan.FromMinutes(1);
         _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
         _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
+        DateTime? scheduledDeadline;
         await using (var database = new ModDbContext(dbPath))
         {
             var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(value => value.TargetId == ids["up"]);
+            scheduledDeadline = evaluation.Deadline;
             var observations = await database.CompletionObservations.AsNoTracking().Where(value => value.TargetId == ids["up"]).ToListAsync();
             Assert(evaluation.State == "scheduled", $"The upgraded title is scheduled after it was watched: {evaluation.State} {evaluation.Reason} " +
                 $"{evaluation.Deadline:o} baseline {evaluation.BaselineAt:o} fresh {evaluation.RequiresFreshCompletion}; observations " +
@@ -604,15 +606,36 @@ internal static class Phase6
                 $"preview {rows}; run {lastRun.Status} {lastRun.Detail} eligible {lastRun.Eligible} blocked {lastRun.Blocked} reclaimed {lastRun.Reclaimed})");
         }
 
+        string afterRunEvaluation;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(value => value.TargetId == ids["up"]);
+            afterRunEvaluation = $"{evaluation.State} {evaluation.Reason} {evaluation.Deadline:o} baseline {evaluation.BaselineAt:o}";
+        }
+
         var afterFirst = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}")).GetProperty("versions").EnumerateArray().Single();
         Assert(afterFirst.GetProperty("retention").GetProperty("reason").GetString() == "seed_goal_unmet",
             "The remaining version shows it waits for seeding");
+        // Completion is re-read from the remaining version once its sibling is gone; the title's window must not restart.
+        time.Offset += TimeSpan.FromMinutes(5);
+        _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(value => value.TargetId == ids["up"]);
+            var observations = await database.CompletionObservations.AsNoTracking().Where(value => value.TargetId == ids["up"]).ToListAsync();
+            Assert(evaluation.State == "scheduled" && scheduledDeadline is not null && evaluation.Deadline == scheduledDeadline,
+                $"A reclaimed sibling version does not restart the remaining version's window: {evaluation.State} {evaluation.Reason} " +
+                $"deadline {evaluation.Deadline:o} was {scheduledDeadline:o} eligible {evaluation.EligibleAt:o} basis {evaluation.CompletionBasisAt:o} " +
+                $"baseline {evaluation.BaselineAt:o} fresh {evaluation.RequiresFreshCompletion} after-run {afterRunEvaluation}; history " +
+                string.Join(", ", await database.History.AsNoTracking().Where(value => value.EntryId == ids["up"]).OrderBy(value => value.CreatedAt)
+                    .Select(value => value.EventType + "@" + value.CreatedAt.ToString("o")).ToListAsync()) + "; observations " + string.Join(", ", observations.Select(value =>
+                    $"{value.JellyfinItemId} played {value.Played} at {value.CompletedAt:o} last {value.LastPlayedAt:o}")));
+        }
+
         transmission.Torrents[up2160Hash].UploadRatio = 5;
         await Tick();
-        // Phase 3 re-reads completion from the remaining version once one is gone, which restarts its window (see the
-        // PHASE6 risks); the window is waited out again before the last version goes.
+        // No further waiting: the deadline already passed, so the seed goal alone held the last version back.
         _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
-        time.Offset += TimeSpan.FromDays(2);
         await using (var scope = host.App.Services.CreateAsyncScope())
             await scope.ServiceProvider.GetRequiredService<RetentionRunner>().RunAsync(new Progress<double>(), CancellationToken.None);
         await using (var database = new ModDbContext(dbPath))
