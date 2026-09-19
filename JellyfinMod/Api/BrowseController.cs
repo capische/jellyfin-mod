@@ -19,7 +19,7 @@ namespace JellyfinMod.Api;
 [ApiController, Authorize, Route("JellyfinMod/Browse")]
 public sealed class BrowseController(ModDbContext database, DatabaseInitializer readiness, LibraryAccess access,
     CatalogSortName sortNames, IDtoService dto, IUserDataManager userData, IMediaSourceManager mediaSources,
-    IAuthorizationService? authorization = null) : ControllerBase
+    IAuthorizationService? authorization = null, JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null) : ControllerBase
 {
     private static readonly HashSet<string> SupportedSorts = ["SortName", "DateCreated", "ProductionYear", "PremiereDate", "CommunityRating", "CriticRating", "Runtime", "DateLastContentAdded", "OfficialRating", "DatePlayed", "PlayCount", "Random", "SeriesDatePlayed"];
 
@@ -100,7 +100,9 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             var search = sortNames.GetSearchKey(request.Query);
             candidates = candidates.Where(row => row.SearchValues.Any(value => sortNames.GetSearchKey(value).Contains(search, StringComparison.Ordinal)));
         }
-        if (request.State.Length > 0) candidates = candidates.Where(row => request.State.Contains(row.Native is null ? FileStates.ToWire(row.Entry!.State) : "onDisk"));
+        var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots, entryIds, cancellationToken);
+        if (request.State.Length > 0) candidates = candidates.Where(row => request.State.Contains(row.Native is null
+            ? new EntryDto(row.Entry!, projections.GetValueOrDefault(row.Entry!.Id)).State : "onDisk"));
         if (request.DueWithinDays.HasValue)
         {
             var deadline = DateTime.UtcNow.AddDays(request.DueWithinDays.Value);
@@ -122,7 +124,7 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             (await authorization.AuthorizeAsync(User, MediaBrowser.Common.Api.Policies.RequiresElevation)).Succeeded;
         var options = new DtoOptions { Fields = [ItemFields.PrimaryImageAspectRatio, ItemFields.MediaSourceCount, ItemFields.DateCreated] };
         var rows = page.Select(row => new BrowseRow(row.Native is null ? "entry" : "native",
-            row.Native is null ? null : dto.GetBaseItemDto(row.Native, options, user), row.Entry is null ? null : new EntryDto(row.Entry),
+            row.Native is null ? null : dto.GetBaseItemDto(row.Native, options, user), row.Entry is null ? null : new EntryDto(row.Entry, projections.GetValueOrDefault(row.Entry.Id)),
             row.Entry is null ? null : RetentionSummaries.ForViewer(
                 RetentionSummaries.ForEntry(row.Entry, retentionPolicy, evaluations), isAdmin))).ToArray();
         return new BrowseResult(rows, filtered.Length, entries.Length > 0);

@@ -23,7 +23,8 @@ public sealed class EntriesController(
     CatalogSortName sortNames,
     JellyfinItemReconciliationRunner? reconciliation = null,
     IAuthorizationService? authorization = null,
-    LibraryWriteBudget? writeBudget = null) : ControllerBase
+    LibraryWriteBudget? writeBudget = null,
+    JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null) : ControllerBase
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
@@ -61,11 +62,15 @@ public sealed class EntriesController(
             var search = sortNames.GetSearchKey(query);
             visible = visible.Where(entry => sortNames.GetSearchKey(entry.Title).Contains(search, StringComparison.Ordinal));
         }
-        if (state?.Length > 0) visible = visible.Where(entry => state.Contains(FileStates.ToWire(entry.State)));
-        var rows = visible.ToArray();
-        Func<Entry, object?> key = sortBy switch { "DateCreated" => entry => entry.AddedAt, "ProductionYear" => entry => entry.Year, _ => entry => entry.Title };
+        var visibleRows = visible.ToArray();
+        var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots,
+            visibleRows.Select(entry => entry.Id).ToArray(), cancellationToken);
+        // The File filter follows the projected state, so a downloading title is found under Downloading (PHASE4 A6 (d)).
+        var rows = visibleRows.Select(entry => new EntryDto(entry, projections.GetValueOrDefault(entry.Id)))
+            .Where(dto => state is not { Length: > 0 } || state.Contains(dto.State)).ToArray();
+        Func<EntryDto, object?> key = sortBy switch { "DateCreated" => entry => entry.AddedAt, "ProductionYear" => entry => entry.Year, _ => entry => entry.Title };
         var ordered = sortOrder == "Descending" ? rows.OrderByDescending(key) : rows.OrderBy(key);
-        return new EntriesResult(ordered.ThenBy(entry => entry.Id).Skip(startIndex).Take(limit).Select(entry => new EntryDto(entry)).ToArray(), rows.Length);
+        return new EntriesResult(ordered.ThenBy(entry => entry.Id).Skip(startIndex).Take(limit).ToArray(), rows.Length);
     }
 
     /// <summary>Creates a title and episode snapshot atomically, or returns its unchanged existing entry.</summary>
@@ -359,6 +364,16 @@ public sealed class EntriesController(
                 Status = 409, Type = "grab_active",
                 Title = "A grab for this title is still active. Resolve it in the download client, then recheck it."
             });
+        // An open import or seeding copy keeps its title: removal would orphan the library link or the torrent (P5.I7).
+        if (await database.ImportOperations.AnyAsync(operation => operation.EntryId == id &&
+                JellyfinMod.Data.ImportStates.Open.Contains(operation.State), cancellationToken) ||
+            await database.SeedReleaseOperations.AnyAsync(operation => operation.EntryId == id &&
+                JellyfinMod.Data.SeedReleaseStates.Open.Contains(operation.State), cancellationToken))
+            return Conflict(new ProblemDetails
+            {
+                Status = 409, Type = "import_active",
+                Title = "This title is still downloading, importing or seeding. Remove it from the queue first."
+            });
         var episodeIds = await database.Episodes.Where(episode => episode.EntryId == id).Select(episode => episode.Id)
             .ToArrayAsync(cancellationToken);
         if (await database.EntryBindings.AnyAsync(binding => binding.EntryId == id, cancellationToken) ||
@@ -458,14 +473,16 @@ public sealed class EntriesController(
             .ToDictionary(group => group.Key ?? Guid.Empty, group => group.OrderByDescending(operation => operation.CreatedAt).First());
         AcquisitionSummaryDto? Summary(Guid? targetId) => latestGrab.TryGetValue(targetId ?? Guid.Empty, out var operation)
             ? AcquisitionSummaryDto.From(operation, isAdmin) : null;
+        var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots, [entry.Id], cancellationToken)
+            .ConfigureAwait(false);
         var episodeDtos = readableEpisodes
             .Select(e => new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,
-                evaluations.GetValueOrDefault(e.Id)), isAdmin), Summary(e.Id))).ToArray();
+                evaluations.GetValueOrDefault(e.Id)), isAdmin), Summary(e.Id), projections.GetValueOrDefault(e.Id))).ToArray();
         // A series aggregate is built only from episodes this requester may read (P3.T15).
         var readableTargets = readableEpisodes.Select(e => e.Id).Append(entry.Id).ToHashSet();
         var entryRetention = RetentionSummaries.ForViewer(RetentionSummaries.ForEntry(entry, policy,
             evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
-        return new EntryDetail(new EntryDto(entry), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
+        return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id)), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
             DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodeDtos, entryRetention,
             entry.MediaType == "movie" ? Summary(null) : null);
     }

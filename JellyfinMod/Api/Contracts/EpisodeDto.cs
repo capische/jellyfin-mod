@@ -4,8 +4,12 @@ using JellyfinMod.Data;
 namespace JellyfinMod.Api.Contracts;
 
 /// <summary>One individually tracked episode in a series entry.</summary>
-public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention = null, AcquisitionSummaryDto? acquisition = null)
+public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention = null, AcquisitionSummaryDto? acquisition = null,
+    JellyfinMod.Services.Import.ProjectedAcquisition? projected = null)
 {
+    // A downloading episode keeps its file availability; only its state and progress are projected (P5.I3).
+    private readonly JellyfinMod.Services.Import.ProjectedAcquisition? _projected = episode.State == FileState.OnDisk ? null : projected;
+
     /// <summary>Gets id.</summary>
     [JsonPropertyName("id")]
     public Guid Id { get; } = episode.Id;
@@ -41,7 +45,11 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     public bool Monitored { get; } = episode.Monitored;
     /// <summary>Gets state.</summary>
     [JsonPropertyName("state")]
-    public string State { get; } = FileStates.ToWire(episode.State);
+    public string State => _projected?.State ?? FileStates.ToWire(episode.State);
+
+    /// <summary>Gets the projected download progress 0–100 while the episode is downloading; null otherwise.</summary>
+    [JsonPropertyName("progress"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public int? Progress => _projected?.Progress;
     /// <summary>Gets whether media is on disk, reclaimed after watching, unaired, or aired without media.</summary>
     [JsonPropertyName("availability")]
     public string Availability { get; } = episode.State == FileState.OnDisk ? "onDisk" :

@@ -7,8 +7,12 @@ using JellyfinMod.Services;
 namespace JellyfinMod.Api.Contracts;
 
 /// <summary>The stable plugin wire representation, independent of host serializer defaults.</summary>
-public sealed class EntryDto(Entry entry)
+public sealed class EntryDto(Entry entry, JellyfinMod.Services.Import.ProjectedAcquisition? acquisition = null)
 {
+    // Acquisition is projected only onto file-less entries; an on-disk title keeps its native state (P5.I3).
+    private readonly JellyfinMod.Services.Import.ProjectedAcquisition? _projected =
+        entry.MediaType == "movie" && entry.State is FileState.None or FileState.Reclaimed ? acquisition : null;
+
     /// <summary>Gets id.</summary>
     [JsonPropertyName("id")]
     public Guid Id { get; } = entry.Id;
@@ -35,7 +39,7 @@ public sealed class EntryDto(Entry entry)
     public string? PosterPath { get; } = entry.PosterPath;
     /// <summary>Gets state.</summary>
     [JsonPropertyName("state")]
-    public string State { get; } = FileStates.ToWire(entry.State);
+    public string State => _projected?.State ?? FileStates.ToWire(entry.State);
     /// <summary>Gets monitored.</summary>
     [JsonPropertyName("monitored")]
     public bool Monitored { get; } = entry.Monitored;
@@ -47,7 +51,7 @@ public sealed class EntryDto(Entry entry)
     public Guid? TargetLibraryId { get; } = entry.TargetLibraryId;
     /// <summary>Gets progress.</summary>
     [JsonPropertyName("progress")]
-    public int? Progress { get; } = entry.Progress;
+    public int? Progress => _projected is null ? entry.Progress : _projected.Progress;
     /// <summary>Gets addedAt.</summary>
     [JsonPropertyName("addedAt")]
     public DateTime AddedAt { get; } = DateTime.SpecifyKind(entry.AddedAt, DateTimeKind.Utc);

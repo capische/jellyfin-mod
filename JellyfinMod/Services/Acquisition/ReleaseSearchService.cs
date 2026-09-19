@@ -113,7 +113,25 @@ public sealed class ReleaseSearchService(
             }
         })).ConfigureAwait(false);
 
+        // A release an administrator blocklisted from the queue is rejected with a visible reason (P5.I7).
+        var blocklist = await database.ReleaseBlocklist.AsNoTracking().ToListAsync(cancellationToken).ConfigureAwait(false);
+        var blockedHashes = blocklist.Where(entry => entry.InfoHash is not null).Select(entry => entry.InfoHash!).ToHashSet(StringComparer.Ordinal);
+        var blockedGuids = blocklist.Where(entry => entry.IndexerId is not null && entry.SourceGuid is not null)
+            .Select(entry => (entry.IndexerId!.Value, entry.SourceGuid!)).ToHashSet();
         var candidates = results.SelectMany(result => result.Candidates)
+            .Select(candidate => candidate.InfoHash is { } hash && blockedHashes.Contains(hash) ||
+                blockedGuids.Contains((candidate.IndexerId, candidate.SourceGuid))
+                    ? candidate with
+                    {
+                        Evaluation = candidate.Evaluation with
+                        {
+                            Eligible = false,
+                            Rejections = candidate.Evaluation.Rejections
+                                .Append(new ReleaseRejection("blocklisted", "An administrator removed this release from the queue and blocked it."))
+                                .ToArray()
+                        }
+                    }
+                    : candidate)
             .OrderByDescending(candidate => candidate.Evaluation.Eligible)
             .ThenByDescending(candidate => candidate.Evaluation.Score)
             .ThenBy(candidate => candidate.Seeders is null)
