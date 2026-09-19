@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using Microsoft.EntityFrameworkCore;
 
 namespace JellyfinMod.Data;
 
@@ -43,6 +44,14 @@ public sealed class RetentionEvaluation
 
     /// <summary>Gets or sets when this result was computed.</summary>
     public DateTime EvaluatedAt { get; set; }
+
+    /// <summary>Gets or sets the earliest instant the current representation's grace may start.</summary>
+    /// <remarks>Set when the target is first evaluated and again when its last representation is reclaimed or unbound.</remarks>
+    public DateTime BaselineAt { get; set; }
+
+    /// <summary>Gets or sets a value indicating whether only completions after <see cref="BaselineAt"/> count.</summary>
+    /// <remarks>Re-acquired media must be finished again; Jellyfin can reattach old user data to a re-added item.</remarks>
+    public bool RequiresFreshCompletion { get; set; }
 }
 
 /// <summary>Internal T1 evaluation states.</summary>
@@ -68,4 +77,36 @@ internal static class RetentionEvaluationReasons
     public const string Favorite = "favorite";
     public const string WaitingForCompletion = "waiting_for_completion";
     public const string CompletionPolicySatisfied = "completion_policy_satisfied";
+    public const string RepresentationReset = "representation_reset";
+}
+
+/// <summary>Resets a target's retention evidence when its last playable representation goes away.</summary>
+internal static class RetentionTargetReset
+{
+    /// <summary>
+    /// Clears any schedule and requires a completion after <paramref name="now"/>, so re-acquired or
+    /// re-bound media never inherits a deadline or completion from the representation that was removed.
+    /// The caller saves the context, inside its own transaction where one exists.
+    /// </summary>
+    public static async Task ResetAsync(ModDbContext database, Guid entryId, Guid? episodeId, DateTime now,
+        CancellationToken cancellationToken)
+    {
+        var targetId = episodeId ?? entryId;
+        var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(
+            candidate => candidate.TargetId == targetId, cancellationToken).ConfigureAwait(false);
+        if (evaluation is null)
+        {
+            evaluation = new RetentionEvaluation { EntryId = entryId, EpisodeId = episodeId, TargetId = targetId };
+            database.RetentionEvaluations.Add(evaluation);
+        }
+
+        evaluation.State = RetentionEvaluationStates.Waiting;
+        evaluation.Reason = RetentionEvaluationReasons.RepresentationReset;
+        evaluation.CompletionBasisAt = null;
+        evaluation.EligibleAt = null;
+        evaluation.Deadline = null;
+        evaluation.EvaluatedAt = now;
+        evaluation.BaselineAt = now;
+        evaluation.RequiresFreshCompletion = true;
+    }
 }

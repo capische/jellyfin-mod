@@ -254,6 +254,9 @@ public sealed class RetentionExecutor(
                 .FirstOrDefault(candidate => candidate.JellyfinItemId == episode.JellyfinItemId)?.JellyfinItemId ??
                 remaining.FirstOrDefault()?.JellyfinItemId;
             episode.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
+            if (remaining.Length == 0)
+                await RetentionTargetReset.ResetAsync(database, operation.EntryId, episode.Id,
+                    clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
         }
         else
         {
@@ -271,6 +274,9 @@ public sealed class RetentionExecutor(
                 .FirstOrDefault(candidate => candidate.JellyfinItemId == entry.JellyfinItemId)?.JellyfinItemId ??
                 remaining.FirstOrDefault()?.JellyfinItemId;
             entry.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
+            if (remaining.Length == 0)
+                await RetentionTargetReset.ResetAsync(database, entry.Id, null,
+                    clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
         }
 
         var actionEntryLeaderId = await database.RetentionOperations.AsNoTracking()

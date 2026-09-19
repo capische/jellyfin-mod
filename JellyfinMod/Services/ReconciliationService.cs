@@ -10,9 +10,11 @@ namespace JellyfinMod.Services;
 public sealed class ReconciliationService(
     ModDbContext database,
     ReconciliationLibraryLock libraryLock,
-    MediaStorageIdentity? mediaStorage = null)
+    MediaStorageIdentity? mediaStorage = null,
+    TimeProvider? clock = null)
 {
     private readonly MediaStorageIdentity _mediaStorage = mediaStorage ?? new();
+    private readonly TimeProvider _clock = clock ?? TimeProvider.System;
     /// <summary>Reconciles one library-scoped native title observation.</summary>
     public async Task<ReconciliationResult> ReconcileAsync(NativeTitleSnapshot snapshot, CancellationToken cancellationToken)
     {
@@ -58,6 +60,24 @@ public sealed class ReconciliationService(
 
         database.EntryBindings.RemoveRange(absentBindings);
         database.EpisodeBindings.RemoveRange(absentEpisodeBindings);
+
+        // A movie or episode that lost its last representation must not keep a schedule or completion
+        // evidence that a later re-acquired file would inherit.
+        var now = _clock.GetUtcNow().UtcDateTime;
+        foreach (var entryId in absentBindings.Select(binding => binding.EntryId).Distinct())
+        {
+            var entry = entries.Single(candidate => candidate.Id == entryId);
+            if (entry.MediaType == "movie" && bindings.All(binding => binding.EntryId != entryId || absentBindings.Contains(binding)))
+                await RetentionTargetReset.ResetAsync(database, entryId, null, now, cancellationToken).ConfigureAwait(false);
+        }
+
+        foreach (var episodeId in absentEpisodeBindings.Select(binding => binding.EpisodeId).Distinct())
+        {
+            if (episodeBindings.All(binding => binding.EpisodeId != episodeId || absentEpisodeBindings.Contains(binding)))
+                await RetentionTargetReset.ResetAsync(database,
+                    episodes.Single(episode => episode.Id == episodeId).EntryId, episodeId, now, cancellationToken)
+                    .ConfigureAwait(false);
+        }
 
         var missingItems = 0;
         foreach (var entry in entries)

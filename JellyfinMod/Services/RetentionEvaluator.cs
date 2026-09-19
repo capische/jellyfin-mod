@@ -71,11 +71,14 @@ public sealed class RetentionEvaluator(
             candidate => candidate.TargetId == targetId, cancellationToken).ConfigureAwait(false);
         if (result is null)
         {
+            // A target's grace never starts before it was first evaluated, which is at or after its
+            // binding. Historical native play dates must not make newly bound media due at once.
             result = new RetentionEvaluation
             {
                 EntryId = target.Entry.Id,
                 EpisodeId = target.EpisodeId,
-                TargetId = targetId
+                TargetId = targetId,
+                BaselineAt = now
             };
             database.RetentionEvaluations.Add(result);
         }
@@ -148,9 +151,17 @@ public sealed class RetentionEvaluator(
         }
 
         var userIds = accessibleUsers.Select(user => user.Id).ToArray();
-        var observations = await database.CompletionObservations.AsNoTracking()
-            .Where(observation => observation.TargetId == targetId && userIds.Contains(observation.UserId))
-            .ToDictionaryAsync(observation => observation.UserId, cancellationToken).ConfigureAwait(false);
+        var boundItemIds = target.EpisodeId is { } episodeId
+            ? await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == episodeId)
+                .Select(binding => binding.JellyfinItemId).ToArrayAsync(cancellationToken).ConfigureAwait(false)
+            : await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == target.Entry.Id)
+                .Select(binding => binding.JellyfinItemId).ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        // Evidence read from a representation that is no longer bound says nothing about the current file.
+        var observations = (await database.CompletionObservations.AsNoTracking()
+                .Where(observation => observation.TargetId == targetId && userIds.Contains(observation.UserId))
+                .ToArrayAsync(cancellationToken).ConfigureAwait(false))
+            .Where(observation => boundItemIds.Contains(observation.JellyfinItemId))
+            .ToDictionary(observation => observation.UserId);
         if (userIds.Any(userId => !observations.TryGetValue(userId, out var observation) || !observation.EvidenceAvailable))
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.CompletionEvidenceMissing);
@@ -173,8 +184,9 @@ public sealed class RetentionEvaluator(
         }
 
         var completed = observations.Values
-            .Where(observation => observation.Played && observation.PlaybackPositionTicks == 0 && observation.CompletedAt.HasValue)
-            .ToDictionary(observation => observation.UserId, observation => observation.CompletedAt!.Value);
+            .Select(observation => (observation.UserId, CompletedAt: CompletionInstant(observation, result, now)))
+            .Where(item => item.CompletedAt.HasValue)
+            .ToDictionary(item => item.UserId, item => item.CompletedAt!.Value);
         DateTime? completionBasis = policy.WatchedUserMode switch
         {
             WatchedUserMode.AllUsers when userIds.All(completed.ContainsKey) => completed.Values.Max(),
@@ -191,7 +203,7 @@ public sealed class RetentionEvaluator(
 
         var priorDeadline = result.State == RetentionEvaluationStates.Scheduled ? result.Deadline : null;
         var policyChanged = priorPolicyVersion != 0 && priorPolicyVersion != policy.Version;
-        var eligibleAt = Latest(completionBasis.Value, policy.EnabledAt ?? now);
+        var eligibleAt = Latest(Latest(completionBasis.Value, policy.EnabledAt ?? now), result.BaselineAt);
         if (!priorDeadline.HasValue && (accessChanged || policyChanged ||
             (hadPriorEvaluation && priorState != RetentionEvaluationStates.Disabled)))
             eligibleAt = Latest(eligibleAt, now);
@@ -219,6 +231,21 @@ public sealed class RetentionEvaluator(
     }
 
     private static DateTime Latest(DateTime left, DateTime right) => left > right ? left : right;
+
+    /// <summary>
+    /// Returns when this user's completion counts. After a reset only a completion at or after the
+    /// baseline counts; the stored start of the completed state may predate it when Jellyfin
+    /// reattached old user data, so a later native last-played value is accepted as the fresh one.
+    /// </summary>
+    private static DateTime? CompletionInstant(CompletionObservation observation, RetentionEvaluation result, DateTime now)
+    {
+        if (!observation.Played || observation.PlaybackPositionTicks != 0 || !observation.CompletedAt.HasValue) return null;
+        if (!result.RequiresFreshCompletion) return observation.CompletedAt.Value;
+        if (observation.CompletedAt.Value >= result.BaselineAt) return observation.CompletedAt.Value;
+        return observation.LastPlayedAt is { } lastPlayed && lastPlayed >= result.BaselineAt && lastPlayed <= now
+            ? lastPlayed
+            : null;
+    }
 
     private static void Set(RetentionEvaluation result, string state, string reason)
     {

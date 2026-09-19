@@ -399,6 +399,20 @@ static async Task VerifyPreviewHttpAsync(
             LastPlayedAt = now.AddDays(-3),
             ObservedAt = now.AddDays(-3)
         });
+        // Both targets were already tracked when retention was enabled three days ago (P3.T7 grace
+        // floors at a target's first evaluation, so the fixture records that earlier evaluation).
+        database.RetentionEvaluations.AddRange(
+            new RetentionEvaluation
+            {
+                EntryId = entry.Id, TargetId = entry.Id, State = "disabled", Reason = "retention_disabled",
+                PolicyVersion = 1, EvaluatedAt = now.AddDays(-3), BaselineAt = now.AddDays(-3)
+            },
+            new RetentionEvaluation
+            {
+                EntryId = seriesEntry.Id, EpisodeId = episode.Id, TargetId = episode.Id, State = "disabled",
+                Reason = "retention_disabled", PolicyVersion = 1, EvaluatedAt = now.AddDays(-3),
+                BaselineAt = now.AddDays(-3)
+            });
         await database.SaveChangesAsync();
     }
 
@@ -690,6 +704,8 @@ static async Task VerifyReclamationAsync(
             "Shared-path reclamation persists one physical action with per-entry bindings and history");
     }
 
+    await VerifyReacquiredMediaStartsFreshAsync(services, databasePath, clock, sharedEntry, userId, libraryId, nativeItems);
+
     var before = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
         userId, libraryId, 900101, "before-unlink", RetentionOperationStatesForTest.Prepared, keep: false);
     var beforeResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == before.OperationId);
@@ -837,6 +853,14 @@ static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
         LastPlayedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
         ObservedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
     });
+    // A prepared operation implies the target was already tracked and due (P3.T7 floors grace at the
+    // target's first evaluation), so record that earlier evaluation under the operation's policy.
+    database.RetentionEvaluations.Add(new RetentionEvaluation
+    {
+        EntryId = entry.Id, TargetId = entry.Id, State = "disabled", Reason = "retention_disabled",
+        PolicyVersion = operation.PolicyVersion, EvaluatedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
+        BaselineAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
+    });
     database.RetentionOperations.Add(operation);
     await database.SaveChangesAsync();
     return new(operation.Id, mediaPath, sidecarPath);
@@ -845,6 +869,137 @@ static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
 static void Assert(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+// P3.T7: a fully reclaimed target must not hand its old schedule or completion to re-acquired media.
+static async Task VerifyReacquiredMediaStartsFreshAsync(
+    IServiceProvider services,
+    string databasePath,
+    FixedTimeProvider clock,
+    Entry sharedEntry,
+    Guid userId,
+    Guid libraryId,
+    IDictionary<Guid, BaseItem> nativeItems)
+{
+    DateTime resetAt;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var reset = await database.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == sharedEntry.Id);
+        Assert(reset.State == "waiting" && reset.Reason == "representation_reset" && reset.Deadline is null &&
+            reset.RequiresFreshCompletion && reset.BaselineAt == clock.GetUtcNow().UtcDateTime,
+            "Reclaiming the last representation resets the target's schedule and requires a fresh completion");
+        resetAt = reset.BaselineAt;
+    }
+
+    // Re-acquire: a new native item is bound and Jellyfin reattaches the old played state to it.
+    clock.Advance(TimeSpan.FromHours(6));
+    var reacquired = new Movie { Id = Guid.NewGuid(), Name = "Reacquired", Path = "/fixture/reacquired.mkv" };
+    nativeItems[reacquired.Id] = reacquired;
+    var oldCompletion = resetAt.AddDays(-5);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var entry = await database.Entries.SingleAsync(candidate => candidate.Id == sharedEntry.Id);
+        entry.State = FileState.OnDisk;
+        entry.JellyfinItemId = reacquired.Id;
+        database.EntryBindings.Add(new EntryBinding
+        {
+            EntryId = sharedEntry.Id, JellyfinItemId = reacquired.Id, TargetLibraryId = libraryId,
+            VersionGroupId = reacquired.Id, MediaPath = reacquired.Path
+        });
+        var observation = await database.CompletionObservations.SingleAsync(candidate =>
+            candidate.TargetId == sharedEntry.Id && candidate.UserId == userId);
+        observation.JellyfinItemId = reacquired.Id;
+        observation.EvidenceAvailable = true;
+        observation.Played = true;
+        observation.PlaybackPositionTicks = 0;
+        observation.CompletedAt = oldCompletion;
+        observation.LastPlayedAt = oldCompletion;
+        observation.ObservedAt = clock.GetUtcNow().UtcDateTime;
+        await database.SaveChangesAsync();
+    }
+
+    await services.GetRequiredService<RetentionEvaluator>().EvaluateAllAsync(default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var stale = await database.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == sharedEntry.Id);
+        Assert(stale.State == "waiting" && stale.Reason == "waiting_for_completion" && stale.Deadline is null,
+            $"Re-acquired media with only reattached old completion is not scheduled: {stale.State}/{stale.Reason}/{stale.Deadline}");
+    }
+
+    // The user genuinely finishes it again after it came back.
+    clock.Advance(TimeSpan.FromHours(1));
+    var rewatched = clock.GetUtcNow().UtcDateTime;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var observation = await database.CompletionObservations.SingleAsync(candidate =>
+            candidate.TargetId == sharedEntry.Id && candidate.UserId == userId);
+        observation.LastPlayedAt = rewatched;
+        observation.ObservedAt = rewatched;
+        await database.SaveChangesAsync();
+    }
+
+    await services.GetRequiredService<RetentionEvaluator>().EvaluateAllAsync(default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var fresh = await database.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == sharedEntry.Id);
+        Assert(fresh.State == "scheduled" && fresh.CompletionBasisAt == rewatched && fresh.Deadline >= rewatched.AddDays(1) &&
+            fresh.Deadline > clock.GetUtcNow().UtcDateTime,
+            $"A completion after re-acquisition schedules a full window from the rewatch: {fresh.State}/{fresh.CompletionBasisAt}/{fresh.Deadline}");
+
+        // Leave the fixture unbound again so later scenarios see the same catalog state as before.
+        database.EntryBindings.RemoveRange(database.EntryBindings.Where(binding => binding.JellyfinItemId == reacquired.Id));
+        var entry = await database.Entries.SingleAsync(candidate => candidate.Id == sharedEntry.Id);
+        entry.State = FileState.Reclaimed;
+        entry.JellyfinItemId = null;
+        fresh.State = "waiting";
+        fresh.Reason = "representation_reset";
+        fresh.CompletionBasisAt = null;
+        fresh.EligibleAt = null;
+        fresh.Deadline = null;
+        fresh.BaselineAt = clock.GetUtcNow().UtcDateTime;
+        fresh.RequiresFreshCompletion = true;
+        await database.SaveChangesAsync();
+    }
+
+    nativeItems.Remove(reacquired.Id);
+
+    // A title bound only now, whose native last-played date predates the retention baseline, gets a
+    // full window from its first evaluation instead of being due at once.
+    var newlyBound = new Movie { Id = Guid.NewGuid(), Name = "Newly bound", Path = "/fixture/newly-bound.mkv" };
+    var newEntryId = Guid.NewGuid();
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var enabledAt = (await database.RetentionPolicySnapshots.SingleAsync()).EnabledAt!.Value;
+        database.Entries.Add(new Entry
+        {
+            Id = newEntryId, MediaType = "movie", TmdbId = 990001, Title = "Newly bound", State = FileState.OnDisk,
+            TargetLibraryId = libraryId, JellyfinItemId = newlyBound.Id
+        });
+        database.EntryBindings.Add(new EntryBinding
+        {
+            EntryId = newEntryId, JellyfinItemId = newlyBound.Id, TargetLibraryId = libraryId,
+            VersionGroupId = newlyBound.Id, MediaPath = newlyBound.Path
+        });
+        database.CompletionObservations.Add(new CompletionObservation
+        {
+            EntryId = newEntryId, TargetId = newEntryId, UserId = userId, JellyfinItemId = newlyBound.Id,
+            EvidenceAvailable = true, Played = true, CompletedAt = enabledAt.AddDays(-30),
+            LastPlayedAt = enabledAt.AddDays(-30), ObservedAt = clock.GetUtcNow().UtcDateTime, SourceReason = "Repair"
+        });
+        await database.SaveChangesAsync();
+    }
+
+    var firstEvaluatedAt = clock.GetUtcNow().UtcDateTime;
+    await services.GetRequiredService<RetentionEvaluator>().EvaluateAllAsync(default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var evaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == newEntryId);
+        Assert(evaluation.State == "scheduled" && evaluation.BaselineAt == firstEvaluatedAt &&
+            evaluation.EligibleAt >= firstEvaluatedAt && evaluation.Deadline >= firstEvaluatedAt.AddDays(1),
+            $"A newly bound target's grace starts no earlier than its first evaluation: {evaluation.EligibleAt}/{evaluation.Deadline}");
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == newEntryId));
+        await database.SaveChangesAsync();
+    }
 }
 
 file sealed record RecoveryFixture(Guid OperationId, string MediaPath, string SidecarPath);

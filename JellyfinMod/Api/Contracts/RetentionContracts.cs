@@ -104,6 +104,9 @@ internal static class RetentionSummaries
         var rows = evaluations.Where(evaluation => evaluation.EntryId == entry.Id).ToArray();
         if (entry.MediaType == "movie")
             return ForTarget(entry, policy, rows.SingleOrDefault(evaluation => evaluation.TargetId == entry.Id));
+        // Reclaimed or unbound episodes have no representation to schedule; they must not make a
+        // series look mixed or supply its earliest deadline.
+        rows = rows.Where(evaluation => evaluation.Reason != RetentionEvaluationReasons.RepresentationReset).ToArray();
         if (entry.RetentionPolicy == RetentionPolicy.Never || policy?.Enabled != true || rows.Length == 0)
             return ForTarget(entry, policy, null);
         var summaries = rows.Select(evaluation => ForTarget(entry, policy, evaluation)).ToArray();
