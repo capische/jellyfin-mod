@@ -95,7 +95,9 @@ public sealed class ReconciliationService(
             }
             else
             {
-                var becameMissing = entry.State == FileState.OnDisk || entry.JellyfinItemId.HasValue;
+                // Retention already recorded this loss as a reclamation; it is not an external removal.
+                var becameMissing = entry.State != FileState.Reclaimed &&
+                    (entry.State == FileState.OnDisk || entry.JellyfinItemId.HasValue);
                 entry.JellyfinItemId = null;
                 if (entry.State == FileState.OnDisk) entry.State = FileState.None;
                 if (becameMissing)
@@ -228,6 +230,9 @@ public sealed class ReconciliationService(
                 MetadataJson = snapshot.MetadataJson,
                 Monitored = false
             };
+            // A backfilled title was added when Jellyfin first saw it, not when the plugin did (P3.T14).
+            if (snapshot.DateCreated is { } nativeCreated && nativeCreated > DateTime.MinValue)
+                entry.AddedAt = DateTime.SpecifyKind(nativeCreated, DateTimeKind.Utc);
             database.Entries.Add(entry);
         }
 
@@ -604,7 +609,8 @@ public sealed class ReconciliationService(
 /// <summary>A complete positive observation of one native title and its known copies.</summary>
 public sealed record NativeTitleSnapshot(string MediaType, int? TmdbId, Guid TargetLibraryId, string Title,
     int? Year, string? ImdbId, string? Overview, string? PosterPath, string? MetadataJson,
-    IReadOnlyList<NativeRepresentation> Representations, IReadOnlyList<NativeEpisodeSnapshot> Episodes);
+    IReadOnlyList<NativeRepresentation> Representations, IReadOnlyList<NativeEpisodeSnapshot> Episodes,
+    DateTime? DateCreated = null);
 
 /// <summary>One native movie or series representation.</summary>
 public sealed record NativeRepresentation(Guid JellyfinItemId, Guid TargetLibraryId, bool IsPlayable,

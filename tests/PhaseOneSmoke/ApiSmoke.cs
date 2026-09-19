@@ -526,7 +526,14 @@ internal static class ApiSmoke
         }
         http.Response = completeSnapshot;
         using (var keptStates = await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null))
-            Assert(keptStates.IsSuccessStatusCode, "Admin refresh succeeds with a reclaimed episode present");
+        {
+            using var keptJson = JsonDocument.Parse(await keptStates.Content.ReadAsStringAsync());
+            var reclaimedDto = keptJson.RootElement.GetProperty("episodes").EnumerateArray()
+                .Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9002);
+            // P3.T14: a reclaimed episode is reported as reclaimed, not as missing.
+            Assert(keptStates.IsSuccessStatusCode && reclaimedDto.GetProperty("availability").GetString() == "reclaimed",
+                "Admin refresh succeeds and reports the reclaimed episode's availability as reclaimed: " + reclaimedDto);
+        }
         await using (var database = new ModDbContext(dbPath))
         {
             var reclaimed = await database.Episodes.SingleAsync(episode => episode.EntryId == Guid.Parse(seriesId) && episode.TmdbId == 9002);

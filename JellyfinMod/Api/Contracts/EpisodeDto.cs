@@ -42,9 +42,10 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     /// <summary>Gets state.</summary>
     [JsonPropertyName("state")]
     public string State { get; } = FileStates.ToWire(episode.State);
-    /// <summary>Gets whether media is on disk, unaired, or aired without media.</summary>
+    /// <summary>Gets whether media is on disk, reclaimed after watching, unaired, or aired without media.</summary>
     [JsonPropertyName("availability")]
     public string Availability { get; } = episode.State == FileState.OnDisk ? "onDisk" :
+        episode.State == FileState.Reclaimed ? "reclaimed" :
         episode.AirDate is { } airDate && airDate.Date > DateTime.UtcNow.Date ? "unaired" : "missing";
     /// <summary>Gets jellyfinItemId.</summary>
     [JsonPropertyName("jellyfinItemId")]

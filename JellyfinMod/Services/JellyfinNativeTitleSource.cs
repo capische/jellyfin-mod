@@ -205,7 +205,8 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             metadata.ImdbId, representative.Overview, null, JsonSerializer.Serialize(metadata),
             copies.Select(copy => new NativeRepresentation(copy.Id, libraryId, IsPlayable(copy),
                 mediaType == "movie" ? VersionGroup((Movie)copy, movieIds!) : copy.Id, copy.Path,
-                _mediaStorage.Capture(copy.Path))).ToArray(), episodes);
+                _mediaStorage.Capture(copy.Path))).ToArray(), episodes,
+            copies.Min(copy => copy.DateCreated));
     }
 
     private NativeEpisodeSnapshot[] GetEpisodes(

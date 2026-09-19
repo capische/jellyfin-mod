@@ -71,6 +71,11 @@ public sealed class RetentionRunner(
                 await CheckpointAsync(run, progress, processedActions).ConfigureAwait(false);
             }
 
+            // Removing a stale native item after an earlier cleanup failure deletes no media.
+            using (var cleanupScope = scopeFactory.CreateScope())
+                await cleanupScope.ServiceProvider.GetRequiredService<RetentionExecutor>()
+                    .RetryNativeCleanupAsync(cancellationToken).ConfigureAwait(false);
+
             if (!await IsEnabledAsync(cancellationToken).ConfigureAwait(false))
             {
                 await FinishAsync(run, RetentionRunStatuses.Disabled,

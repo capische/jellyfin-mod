@@ -290,8 +290,17 @@ public sealed class RetentionExecutor(
                 remaining.FirstOrDefault()?.JellyfinItemId;
             episode.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
             if (remaining.Length == 0)
+            {
                 await RetentionTargetReset.ResetAsync(database, entryId, episode.Id,
                     clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
+                // The series itself is reclaimed once no episode of it has media left (P3.T14).
+                var seriesEpisodeIds = await database.Episodes.AsNoTracking().Where(candidate => candidate.EntryId == entryId)
+                    .Select(candidate => candidate.Id).ToArrayAsync(cancellationToken).ConfigureAwait(false);
+                if (!await database.EpisodeBindings.AnyAsync(candidate => seriesEpisodeIds.Contains(candidate.EpisodeId) &&
+                        candidate.Id != operation.BindingId, cancellationToken).ConfigureAwait(false))
+                    (await database.Entries.SingleAsync(candidate => candidate.Id == entryId, cancellationToken)
+                        .ConfigureAwait(false)).State = FileState.Reclaimed;
+            }
         }
         else
         {
@@ -354,22 +363,45 @@ public sealed class RetentionExecutor(
         return RetentionExecutionResult.From(operation);
     }
 
-    private void TryRemoveNative(RetentionOperation operation)
+    /// <summary>Retries native item removal for reclaimed media whose cleanup failed earlier (P3.T14).</summary>
+    public async Task<int> RetryNativeCleanupAsync(CancellationToken cancellationToken)
+    {
+        await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        var pending = await database.RetentionOperations
+            .Where(operation => operation.State == RetentionOperationStates.Completed &&
+                operation.Reason == RetentionExecutionReasons.ReclaimedNativeCleanupFailed)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var cleaned = 0;
+        foreach (var operation in pending)
+        {
+            if (!TryRemoveNative(operation)) continue;
+            operation.Reason = RetentionExecutionReasons.Reclaimed;
+            operation.Error = null;
+            cleaned++;
+        }
+
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return cleaned;
+    }
+
+    private bool TryRemoveNative(RetentionOperation operation)
     {
         try
         {
             var native = library.GetItemById(operation.JellyfinItemId);
-            if (native is null) return;
+            if (native is null) return true;
             library.DeleteItem(native, new DeleteOptions
             {
                 DeleteFileLocation = false,
                 DeleteFromExternalProvider = false
             }, notifyParentItem: true);
+            return true;
         }
         catch (Exception error)
         {
             operation.Error = Bound(error.Message);
             logger.LogWarning(error, "Media was unlinked but native item {ItemId} could not be removed", operation.JellyfinItemId);
+            return false;
         }
     }
 
