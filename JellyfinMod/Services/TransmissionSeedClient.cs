@@ -17,10 +17,11 @@ public sealed class TransmissionSeedClient(
 {
     private const string SessionHeader = "X-Transmission-Session-Id";
     private static readonly string[] SessionFields =
-        ["version", "seedRatioLimited", "seedRatioLimit", "idle-seeding-limit-enabled", "idle-seeding-limit"];
+        ["version", "seedRatioLimited", "seedRatioLimit", "idle-seeding-limit-enabled", "idle-seeding-limit",
+            "incomplete-dir", "incomplete-dir-enabled", "rename-partial-files"];
     private static readonly string[] TorrentFields =
     [
-        "id", "hashString", "downloadDir", "files", "leftUntilDone", "percentDone", "status", "uploadRatio",
+        "id", "hashString", "downloadDir", "files", "fileStats", "leftUntilDone", "percentDone", "status", "uploadRatio",
         "secondsSeeding", "seedRatioMode", "seedRatioLimit", "seedIdleMode", "seedIdleLimit", "etaIdle", "isFinished"
     ];
 
@@ -59,6 +60,7 @@ public sealed class TransmissionSeedClient(
             var session = ParseSession(sessionArguments);
             var indexedFiles = new Dictionary<string, List<TransmissionFileProtection>>(StringComparer.Ordinal);
             var completeIndex = true;
+            var unresolvedFiles = 0;
             foreach (var torrent in torrents.EnumerateArray())
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -71,21 +73,25 @@ public sealed class TransmissionSeedClient(
 
                 foreach (var file in torrentFiles)
                 {
-                    var path = Path.GetFullPath(file.Name, downloadDirectory);
-                    if (!files.TryInspect(path, out var observed))
+                    if (!TryInspectTorrentFile(file, downloadDirectory, session, out var observed))
                     {
+                        // Unwanted or not-yet-started files have no data on disk to protect. Only a wanted
+                        // file with downloaded data that cannot be found leaves the index incomplete (P3.T17).
+                        if (!file.Wanted || file.BytesCompleted == 0) continue;
                         completeIndex = false;
+                        unresolvedFiles++;
                         continue;
                     }
 
-                    var state = protection with { FileComplete = file.BytesCompleted >= file.Length };
+                    // A file only counts as complete when its whole torrent is complete as well.
+                    var state = protection with { FileComplete = protection.FileComplete && file.BytesCompleted >= file.Length };
                     if (!indexedFiles.TryGetValue(observed.PhysicalIdentity, out var matches))
                         indexedFiles[observed.PhysicalIdentity] = matches = [];
                     matches.Add(state);
                 }
             }
 
-            return new TransmissionSeedSnapshot(true, completeIndex, null, indexedFiles);
+            return new TransmissionSeedSnapshot(true, completeIndex, null, indexedFiles, unresolvedFiles);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -146,7 +152,29 @@ public sealed class TransmissionSeedClient(
         arguments.TryGetProperty("seedRatioLimited", out var ratioEnabled) && ratioEnabled.GetBoolean(),
         arguments.TryGetProperty("seedRatioLimit", out var ratioLimit) ? ratioLimit.GetDouble() : 0,
         arguments.TryGetProperty("idle-seeding-limit-enabled", out var idleEnabled) && idleEnabled.GetBoolean(),
-        arguments.TryGetProperty("idle-seeding-limit", out var idleLimit) ? idleLimit.GetInt32() : 0);
+        arguments.TryGetProperty("idle-seeding-limit", out var idleLimit) ? idleLimit.GetInt32() : 0,
+        arguments.TryGetProperty("incomplete-dir-enabled", out var incompleteEnabled) && incompleteEnabled.GetBoolean() &&
+            arguments.TryGetProperty("incomplete-dir", out var incompleteDir) && !string.IsNullOrWhiteSpace(incompleteDir.GetString())
+            ? Path.GetFullPath(incompleteDir.GetString()!) : null,
+        arguments.TryGetProperty("rename-partial-files", out var renamePartial) && renamePartial.GetBoolean());
+
+    /// <summary>
+    /// Finds a torrent file where Transmission keeps it: the download directory or, while downloading,
+    /// the incomplete directory, under its own name or with the partial-file suffix.
+    /// </summary>
+    private bool TryInspectTorrentFile(TransmissionFile file, string downloadDirectory, TransmissionSession session,
+        out UnixFileSnapshot observed)
+    {
+        foreach (var directory in session.IncompleteDirectory is { } incomplete ? [downloadDirectory, incomplete] : new[] { downloadDirectory })
+        {
+            var path = Path.GetFullPath(file.Name, directory);
+            if (files.TryInspect(path, out observed)) return true;
+            if (session.RenamePartialFiles && files.TryInspect(path + ".part", out observed)) return true;
+        }
+
+        observed = default;
+        return false;
+    }
 
     private static bool TryParseTorrent(
         JsonElement torrent,
@@ -162,9 +190,14 @@ public sealed class TransmissionSeedClient(
             !torrent.TryGetProperty("files", out var files) || files.ValueKind != JsonValueKind.Array)
             return false;
         downloadDirectory = Path.GetFullPath(download.GetString()!);
-        torrentFiles = files.EnumerateArray().Select(file => new TransmissionFile(
+        // fileStats carries each file's wanted flag in the same order as files; absent means wanted.
+        var wanted = torrent.TryGetProperty("fileStats", out var stats) && stats.ValueKind == JsonValueKind.Array
+            ? stats.EnumerateArray().Select(stat => !stat.TryGetProperty("wanted", out var flag) || flag.ValueKind != JsonValueKind.False)
+                .ToArray()
+            : [];
+        torrentFiles = files.EnumerateArray().Select((file, index) => new TransmissionFile(
             file.GetProperty("name").GetString()!, file.GetProperty("length").GetUInt64(),
-            file.GetProperty("bytesCompleted").GetUInt64())).ToArray();
+            file.GetProperty("bytesCompleted").GetUInt64(), index >= wanted.Length || wanted[index])).ToArray();
 
         var ratioMode = torrent.GetProperty("seedRatioMode").GetInt32();
         var ratioGoal = ratioMode switch
@@ -198,8 +231,9 @@ public sealed class TransmissionSeedClient(
         return true;
     }
 
-    private sealed record TransmissionSession(bool RatioLimited, double RatioLimit, bool IdleLimited, int IdleLimitMinutes);
-    private sealed record TransmissionFile(string Name, ulong Length, ulong BytesCompleted);
+    private sealed record TransmissionSession(bool RatioLimited, double RatioLimit, bool IdleLimited, int IdleLimitMinutes,
+        string? IncompleteDirectory, bool RenamePartialFiles);
+    private sealed record TransmissionFile(string Name, ulong Length, ulong BytesCompleted, bool Wanted);
 }
 
 /// <summary>A complete Transmission read or a conservative unavailable result.</summary>
@@ -207,11 +241,13 @@ public sealed class TransmissionSeedClient(
 /// <param name="CompleteFileIndex">Whether every reported torrent file could be identified on disk.</param>
 /// <param name="UnavailableReason">A stable reason when the snapshot is unavailable.</param>
 /// <param name="FilesByPhysicalIdentity">Torrent protection states keyed by device and inode.</param>
+/// <param name="UnresolvedFiles">Wanted files with downloaded data that could not be found on disk.</param>
 public sealed record TransmissionSeedSnapshot(
     bool Available,
     bool CompleteFileIndex,
     string? UnavailableReason,
-    IReadOnlyDictionary<string, List<TransmissionFileProtection>> FilesByPhysicalIdentity)
+    IReadOnlyDictionary<string, List<TransmissionFileProtection>> FilesByPhysicalIdentity,
+    int UnresolvedFiles = 0)
 {
     /// <summary>Creates a deletion-blocking unavailable snapshot.</summary>
     public static TransmissionSeedSnapshot Unavailable(string reason) =>

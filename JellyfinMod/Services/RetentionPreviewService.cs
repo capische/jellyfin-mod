@@ -91,9 +91,11 @@ public sealed class RetentionPreviewService(
 
         var seedCandidates = inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection)
             .ToArray();
+        var unresolvedSeedFiles = 0;
         if (seedCandidates.Length > 0)
         {
             var seedSnapshot = await transmission.GetSnapshotAsync(cancellationToken).ConfigureAwait(false);
+            unresolvedSeedFiles = seedSnapshot.UnresolvedFiles;
             foreach (var candidate in seedCandidates)
             {
                 if (!seedSnapshot.Available)
@@ -106,7 +108,7 @@ public sealed class RetentionPreviewService(
                 {
                     if (!seedSnapshot.CompleteFileIndex)
                     {
-                        candidate.Block(RetentionPreviewReasons.SeedStateUnknown);
+                        candidate.Block(RetentionPreviewReasons.SeedIndexIncomplete);
                         continue;
                     }
 
@@ -161,7 +163,7 @@ public sealed class RetentionPreviewService(
             items.Count(item => item.State == RetentionPreviewStates.Blocked),
             items.Count(item => item.State == RetentionPreviewStates.Scheduled),
             items.Count(item => item.State == RetentionEvaluationStates.Waiting),
-            items.Count(item => item.State == RetentionEvaluationStates.Disabled), items);
+            items.Count(item => item.State == RetentionEvaluationStates.Disabled), items, unresolvedSeedFiles);
     }
 
     private async Task<PreviewTarget[]> LoadTargetsAsync(
@@ -360,6 +362,7 @@ internal static class RetentionPreviewReasons
     public const string ActiveSessionUnknown = "active_session_unknown";
     public const string FavoriteSeries = "favorite_series";
     public const string SeedStateUnknown = "seed_state_unknown";
+    public const string SeedIndexIncomplete = "seed_index_incomplete";
     public const string SeedingIncomplete = "seeding_incomplete";
     public const string SeedGoalUnbounded = "seed_goal_unbounded";
     public const string SeedGoalUnmet = "seed_goal_unmet";

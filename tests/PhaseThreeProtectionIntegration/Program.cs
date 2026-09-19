@@ -50,6 +50,9 @@ var ratio = 2.5;
 var completed = 4096UL;
 var seedScenario = SeedScenario.Ratio;
 var sawSessionToken = false;
+// P3.T17: an optional second, still-downloading multi-file torrent using the incomplete dir.
+var multiFile = false;
+var incomplete = Path.Combine(folder, "incomplete");
 app.MapPost("/transmission/rpc", async context =>
 {
     if (context.Request.Headers["X-Transmission-Session-Id"] != "fixture-session")
@@ -74,7 +77,10 @@ app.MapPost("/transmission/rpc", async context =>
                 ["seedRatioLimited"] = true,
                 ["seedRatioLimit"] = 2.0,
                 ["idle-seeding-limit-enabled"] = false,
-                ["idle-seeding-limit"] = 1440
+                ["idle-seeding-limit"] = 1440,
+                ["incomplete-dir-enabled"] = multiFile,
+                ["incomplete-dir"] = incomplete,
+                ["rename-partial-files"] = true
             }
         });
         return;
@@ -85,7 +91,7 @@ app.MapPost("/transmission/rpc", async context =>
         result = "success",
         arguments = new
         {
-            torrents = new[]
+            torrents = new object[]
             {
                 new
                 {
@@ -106,7 +112,35 @@ app.MapPost("/transmission/rpc", async context =>
                     isFinished = seedScenario == SeedScenario.IdleSatisfied ||
                         seedScenario == SeedScenario.Ratio && ratio >= 2
                 }
-            }
+            }.Concat(multiFile
+                ? new object[]
+                {
+                    new
+                    {
+                        id = 2,
+                        hashString = "multi",
+                        downloadDir = downloads,
+                        files = new[]
+                        {
+                            new { name = "multi/done.mkv", length = 1024UL, bytesCompleted = 1024UL },
+                            new { name = "multi/partial.mkv", length = 2048UL, bytesCompleted = 512UL },
+                            new { name = "multi/unwanted.mkv", length = 4096UL, bytesCompleted = 0UL }
+                        },
+                        fileStats = new[] { new { wanted = true }, new { wanted = true }, new { wanted = false } },
+                        leftUntilDone = 1536UL,
+                        percentDone = 0.25,
+                        status = 4,
+                        uploadRatio = 3.0,
+                        secondsSeeding = 0,
+                        seedRatioMode = 1,
+                        seedRatioLimit = 1.0,
+                        seedIdleMode = 2,
+                        seedIdleLimit = 30,
+                        etaIdle = -1,
+                        isFinished = false
+                    }
+                }
+                : []).ToArray()
         }
     });
 });
@@ -135,6 +169,25 @@ try
     var seeded = snapshot.FilesByPhysicalIdentity[mediaFile.PhysicalIdentity].Single();
     Assert(seeded.FileComplete && seeded.HasFiniteSeedGoal && seeded.SeedGoalSatisfied && seeded.RatioGoal == 2 &&
         seeded.UploadRatio == ratio, "A hardlinked library path inherits its completed Transmission ratio goal");
+
+    // P3.T17: normal downloading must not make the index incomplete. The finished file of an unfinished
+    // torrent stays protected even though its ratio already meets the goal.
+    Directory.CreateDirectory(Path.Combine(downloads, "multi"));
+    Directory.CreateDirectory(Path.Combine(incomplete, "multi"));
+    var done = Path.Combine(downloads, "multi", "done.mkv");
+    await File.WriteAllBytesAsync(done, new byte[1024]);
+    var partial = Path.Combine(incomplete, "multi", "partial.mkv.part");
+    await File.WriteAllBytesAsync(partial, new byte[512]);
+    multiFile = true;
+    var downloading = await client.GetSnapshotAsync(default);
+    Assert(inspector.TryInspect(done, out var doneFile) && downloading.CompleteFileIndex && downloading.UnresolvedFiles == 0 &&
+        !downloading.FilesByPhysicalIdentity[doneFile.PhysicalIdentity].Single().FileComplete,
+        "A .part file in the incomplete dir and an unwanted missing file keep the index complete, and a finished file of an unfinished torrent is not complete");
+    File.Delete(partial);
+    var lost = await client.GetSnapshotAsync(default);
+    Assert(!lost.CompleteFileIndex && lost.UnresolvedFiles == 1,
+        "A wanted, partly downloaded file that cannot be found makes the index incomplete with a count");
+    multiFile = false;
 
     ratio = 1.5;
     seeded = (await client.GetSnapshotAsync(default)).FilesByPhysicalIdentity[mediaFile.PhysicalIdentity].Single();

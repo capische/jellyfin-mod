@@ -12,6 +12,7 @@ namespace JellyfinMod.Api.Contracts;
 /// <param name="Waiting">Number of representations waiting for completion evidence.</param>
 /// <param name="Disabled">Number of representations excluded by disabled retention policy.</param>
 /// <param name="Items">Per-representation diagnostics, including admin-only paths.</param>
+/// <param name="SeedIndexUnresolvedFiles">Wanted torrent files with data that could not be found, which block non-torrent candidates.</param>
 public sealed record RetentionPreviewDto(
     [property: JsonPropertyName("generatedAt")] DateTime GeneratedAt,
     [property: JsonPropertyName("inspected")] int Inspected,
@@ -20,7 +21,8 @@ public sealed record RetentionPreviewDto(
     [property: JsonPropertyName("scheduled")] int Scheduled,
     [property: JsonPropertyName("waiting")] int Waiting,
     [property: JsonPropertyName("disabled")] int Disabled,
-    [property: JsonPropertyName("items")] IReadOnlyList<RetentionRepresentationDto> Items);
+    [property: JsonPropertyName("items")] IReadOnlyList<RetentionRepresentationDto> Items,
+    [property: JsonPropertyName("seedIndexUnresolvedFiles")] int SeedIndexUnresolvedFiles = 0);
 
 /// <summary>One physical media representation in an admin retention preview.</summary>
 /// <param name="BindingId">The durable binding identity.</param>
