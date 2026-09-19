@@ -44,6 +44,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets durable scheduled/manual retention run summaries.</summary>
     public DbSet<RetentionRun> RetentionRuns => Set<RetentionRun>();
 
+    /// <summary>Gets bound native episodes whose provider identity disagrees with their tracked episode.</summary>
+    public DbSet<EpisodeConflict> EpisodeConflicts => Set<EpisodeConflict>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -74,6 +77,14 @@ public class ModDbContext : DbContext
         b.Entity<EpisodeBinding>(e =>
         {
             e.HasIndex(x => x.JellyfinItemId).IsUnique();
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<EpisodeConflict>(e =>
+        {
+            e.HasIndex(x => x.JellyfinItemId).IsUnique();
+            e.HasIndex(x => x.EntryId);
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
         });
 

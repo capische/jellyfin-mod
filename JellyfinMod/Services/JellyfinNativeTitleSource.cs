@@ -246,7 +246,8 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
 
                 episodes.Add(new(episode.Id, episode.SeriesId, ProviderTmdbId(episode), episode.ParentIndexNumber.Value,
                     episode.IndexNumber.Value, IsPlayable(episode), episode.Name, episode.Overview, null,
-                    episode.PremiereDate, RuntimeMinutes(episode), episode.Path, mounts.Capture(episode.Path)));
+                    episode.PremiereDate, RuntimeMinutes(episode), episode.Path, mounts.Capture(episode.Path),
+                    episode.IndexNumberEnd));
             }
         }
 

@@ -72,6 +72,8 @@ public sealed class CatalogBackfillRunner(
                         if (result.Outcome is ReconciliationOutcome.Unmatched or ReconciliationOutcome.Conflict or
                             ReconciliationOutcome.Overlap)
                             AddDiagnostic(diagnostics, observation, result.Detail ?? result.Outcome.ToString());
+                        foreach (var episodeDetail in result.EpisodeDiagnostics)
+                            AddDiagnostic(diagnostics, observation, episodeDetail);
                     }
                     else
                     {

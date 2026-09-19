@@ -41,3 +41,16 @@ public sealed record OrphanedEntryDto(
     [property: JsonPropertyName("tmdbId")] int TmdbId,
     [property: JsonPropertyName("targetLibraryId")] Guid? TargetLibraryId,
     [property: JsonPropertyName("state")] string State);
+
+/// <summary>An open episode identity conflict shown to administrators (P2.R9).</summary>
+public sealed record EpisodeConflictDto(
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("entryId")] Guid EntryId,
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("jellyfinItemId")] Guid JellyfinItemId,
+    [property: JsonPropertyName("trackedTmdbId")] int TrackedTmdbId,
+    [property: JsonPropertyName("trackedSeasonNumber")] int TrackedSeasonNumber,
+    [property: JsonPropertyName("trackedEpisodeNumber")] int TrackedEpisodeNumber,
+    [property: JsonPropertyName("observedTmdbId")] int ObservedTmdbId,
+    [property: JsonPropertyName("observedSeasonNumber")] int ObservedSeasonNumber,
+    [property: JsonPropertyName("observedEpisodeNumber")] int ObservedEpisodeNumber);

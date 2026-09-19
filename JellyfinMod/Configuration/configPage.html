@@ -70,6 +70,7 @@
         <div id="ReconciliationSummary" class="fieldDescription">No reconciliation run has been recorded.</div>
         <ul id="ReconciliationLibraryReasons" class="fieldDescription"></ul>
         <div id="OrphanedEntries" class="fieldDescription"></div>
+        <div id="EpisodeConflicts" class="fieldDescription"></div>
 
         <div>
           <button is="emby-button" type="submit" class="raised button-submit block">
@@ -156,6 +157,39 @@
               reasons.appendChild(item);
             });
           }, function () {});
+          // Episodes whose identity Jellyfin now reports differently wait for an administrator (P2.R9).
+          function loadConflicts() {
+            ApiClient.ajax({
+              type: 'GET',
+              url: ApiClient.getUrl('JellyfinMod/Reconciliation/Conflicts'),
+              dataType: 'json'
+            }).then(function (conflicts) {
+              var container = document.querySelector('#EpisodeConflicts');
+              container.innerHTML = '';
+              conflicts.forEach(function (conflict) {
+                var row = document.createElement('div');
+                var pad = function (value) { return (value < 10 ? '0' : '') + value; };
+                row.textContent = conflict.title + ': tracked S' + pad(conflict.trackedSeasonNumber) + 'E' +
+                  pad(conflict.trackedEpisodeNumber) + ', Jellyfin reports S' + pad(conflict.observedSeasonNumber) +
+                  'E' + pad(conflict.observedEpisodeNumber) + ' ';
+                ['Rebind', 'Keep'].forEach(function (action) {
+                  var button = document.createElement('button');
+                  button.type = 'button';
+                  button.className = 'raised button-cancel emby-button';
+                  button.textContent = action;
+                  button.addEventListener('click', function () {
+                    ApiClient.ajax({
+                      type: 'POST',
+                      url: ApiClient.getUrl('JellyfinMod/Reconciliation/Conflicts/' + conflict.id + '/' + action)
+                    }).then(loadConflicts, loadConflicts);
+                  });
+                  row.appendChild(button);
+                });
+                container.appendChild(row);
+              });
+            }, function () {});
+          }
+          loadConflicts();
           // Entries whose library was removed stay hidden from users until their media reappears (P2.R7).
           ApiClient.ajax({
             type: 'GET',

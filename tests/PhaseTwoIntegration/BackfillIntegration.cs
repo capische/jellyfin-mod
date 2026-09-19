@@ -248,7 +248,11 @@ internal static class BackfillIntegration
         services.AddTransient<JellyfinItemReconciliationRunner>();
         services.AddTransient<CatalogBackfillRunner>();
         services.AddTransient<CatalogPostScanTask>();
-        services.AddSingleton<LibraryEventListener>();
+        // A short debounce keeps the 5-second event waits meaningful; the burst below is raised in a tight loop.
+        services.AddSingleton(provider => new LibraryEventListener(library,
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<LibraryEventListener>>(),
+            TimeSpan.FromMilliseconds(300)));
         await using var provider = services.BuildServiceProvider();
         await using (var setup = new ModDbContext(dbPath)) await setup.Database.MigrateAsync();
         var listener = provider.GetRequiredService<LibraryEventListener>();

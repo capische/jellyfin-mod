@@ -203,6 +203,11 @@ public sealed class ReconciliationService(
                 var selectedEpisode = playableEpisodeBindings
                     .FirstOrDefault(binding => binding.JellyfinItemId == episode.JellyfinItemId) ??
                     playableEpisodeBindings.FirstOrDefault();
+                // An episode covered by another episode's multi-episode file has no binding of its own (P2.R9).
+                if (selectedEpisode is null && episode.JellyfinItemId is { } coveringId &&
+                    observation.PlayableEpisodeIds.Contains(coveringId) &&
+                    episodeBindings.All(binding => binding.EpisodeId != episode.Id))
+                    continue;
                 var becameMissing = selectedEpisode is null &&
                     (episode.State == FileState.OnDisk || episode.JellyfinItemId.HasValue);
                 episode.JellyfinItemId = selectedEpisode?.JellyfinItemId;
@@ -265,9 +270,11 @@ public sealed class ReconciliationService(
         if (snapshot.Episodes.Select(episode => episode.JellyfinItemId).Distinct().Count() != snapshot.Episodes.Count)
             throw new ArgumentException("Native episode identities must be unique within an observation.", nameof(snapshot));
 
-        var observationConflict = FindObservationConflict(snapshot.Episodes);
-        if (observationConflict is not null)
-            return new(ReconciliationOutcome.Conflict, null, 0, observationConflict);
+        // One disagreeing episode is skipped with a diagnostic; the rest of the series still reconciles (P2.R9).
+        var skipped = new Dictionary<Guid, string>();
+        var rebindable = new Dictionary<Guid, (Guid EpisodeId, NativeEpisodeSnapshot Observation)>();
+        foreach (var (observation, detail) in FindObservationConflicts(snapshot.Episodes))
+            skipped.TryAdd(observation.JellyfinItemId, detail);
 
         await RehomeOrphanedEntryAsync(snapshot, representationIds, cancellationToken).ConfigureAwait(false);
 
@@ -300,18 +307,21 @@ public sealed class ReconciliationService(
             where episodeIds.Contains(binding.JellyfinItemId)
             select new ExistingEpisodeBinding(binding.JellyfinItemId, binding.SeriesItemId, binding.TargetLibraryId,
                 episode.TmdbId, episode.SeasonNumber, episode.EpisodeNumber, owner.Id, owner.MediaType,
-                owner.TmdbId, owner.TargetLibraryId))
+                owner.TmdbId, owner.TargetLibraryId, episode.Id))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         var canonicalEpisodes = await (from episode in database.Episodes.AsNoTracking()
             join owner in database.Entries.AsNoTracking() on episode.EntryId equals owner.Id
             where episode.JellyfinItemId != null && episodeIds.Contains(episode.JellyfinItemId.Value)
             select new ExistingEpisodeBinding(episode.JellyfinItemId.GetValueOrDefault(), Guid.Empty, Guid.Empty,
                 episode.TmdbId, episode.SeasonNumber, episode.EpisodeNumber, owner.Id, owner.MediaType,
-                owner.TmdbId, owner.TargetLibraryId))
+                owner.TmdbId, owner.TargetLibraryId, episode.Id))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
-        var durableEpisodeConflict = FindDurableEpisodeConflict(snapshot, boundEpisodes.Concat(canonicalEpisodes));
-        if (durableEpisodeConflict is not null)
-            return new(ReconciliationOutcome.Conflict, durableEpisodeConflict.EntryId, 0, durableEpisodeConflict.Detail);
+        foreach (var conflict in FindDurableEpisodeConflicts(snapshot, boundEpisodes.Concat(canonicalEpisodes)))
+        {
+            skipped.TryAdd(conflict.Observation.JellyfinItemId, conflict.Detail);
+            if (conflict.RebindableEpisodeId is { } trackedId)
+                rebindable.TryAdd(conflict.Observation.JellyfinItemId, (trackedId, conflict.Observation));
+        }
 
         var entry = await database.Entries.SingleOrDefaultAsync(candidate => candidate.MediaType == snapshot.MediaType &&
             candidate.TmdbId == snapshot.TmdbId && candidate.TargetLibraryId == snapshot.TargetLibraryId,
@@ -402,15 +412,18 @@ public sealed class ReconciliationService(
                 ? []
                 : await database.EpisodeBindings.Where(binding => trackedEpisodeIds.Contains(binding.EpisodeId))
                     .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var conflict = FindEpisodeConflict(episodes, snapshot.Episodes);
-            if (conflict is not null)
+            foreach (var (observation, trackedId) in FindEpisodeConflicts(episodes, snapshot.Episodes))
             {
-                database.ChangeTracker.Clear();
-                return new(ReconciliationOutcome.Conflict, entry.Id, 0, conflict);
+                skipped.TryAdd(observation.JellyfinItemId,
+                    "A native episode is already bound to a different provider identity.");
+                rebindable.TryAdd(observation.JellyfinItemId, (trackedId, observation));
             }
 
+            var usable = snapshot.Episodes.Where(observation => !skipped.ContainsKey(observation.JellyfinItemId)).ToArray();
             episodeChanges = ReconcileEpisodes(entry.Id, snapshot.TargetLibraryId, episodes, episodeBindings,
-                snapshot.Episodes, created);
+                usable, created);
+            await RecordEpisodeConflictsAsync(entry.Id, usable, rebindable, skipped, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         if (created)
@@ -464,7 +477,68 @@ public sealed class ReconciliationService(
         }
 
         return new(created ? ReconciliationOutcome.Created : entryChanged || entryBindingChanges > 0 || episodeChanges > 0
-            ? ReconciliationOutcome.Updated : ReconciliationOutcome.Unchanged, entry.Id, episodeChanges, null);
+            ? ReconciliationOutcome.Updated : ReconciliationOutcome.Unchanged, entry.Id, episodeChanges, null)
+        {
+            EpisodeDiagnostics = snapshot.Episodes.Where(observation => skipped.ContainsKey(observation.JellyfinItemId))
+                .Select(observation => $"S{observation.SeasonNumber:00}E{observation.EpisodeNumber:00}: " +
+                    skipped[observation.JellyfinItemId]).ToArray()
+        };
+    }
+
+    /// <summary>
+    /// Keeps one durable row per bound native episode whose provider identity disagrees with its tracked
+    /// episode, so an administrator can rebind or keep it (P2.R9). A kept identity stops being reported
+    /// until Jellyfin reports yet another identity; an agreeing observation resolves the row.
+    /// </summary>
+    private async Task RecordEpisodeConflictsAsync(
+        Guid entryId,
+        IReadOnlyList<NativeEpisodeSnapshot> usable,
+        IReadOnlyDictionary<Guid, (Guid EpisodeId, NativeEpisodeSnapshot Observation)> rebindable,
+        IDictionary<Guid, string> skipped,
+        CancellationToken cancellationToken)
+    {
+        var nativeIds = usable.Select(observation => observation.JellyfinItemId).Concat(rebindable.Keys).ToHashSet();
+        var existing = await database.EpisodeConflicts.Where(conflict => nativeIds.Contains(conflict.JellyfinItemId))
+            .ToDictionaryAsync(conflict => conflict.JellyfinItemId, cancellationToken).ConfigureAwait(false);
+        foreach (var observation in usable)
+            if (existing.Remove(observation.JellyfinItemId, out var resolved))
+                database.EpisodeConflicts.Remove(resolved);
+        foreach (var (nativeId, (trackedId, observation)) in rebindable)
+        {
+            var observedTmdbId = observation.TmdbId.GetValueOrDefault();
+            if (existing.TryGetValue(nativeId, out var row))
+            {
+                if (row.State == EpisodeConflictStates.Kept && row.ObservedTmdbId == observedTmdbId &&
+                    row.EpisodeId == trackedId)
+                {
+                    // The administrator kept this identity; the binding stays and nothing is reported.
+                    skipped[nativeId] = "kept";
+                    continue;
+                }
+
+                row.EntryId = entryId;
+                row.EpisodeId = trackedId;
+                row.ObservedTmdbId = observedTmdbId;
+                row.ObservedSeasonNumber = observation.SeasonNumber;
+                row.ObservedEpisodeNumber = observation.EpisodeNumber;
+                row.State = EpisodeConflictStates.Open;
+                continue;
+            }
+
+            database.EpisodeConflicts.Add(new EpisodeConflict
+            {
+                EntryId = entryId,
+                EpisodeId = trackedId,
+                JellyfinItemId = nativeId,
+                ObservedTmdbId = observedTmdbId,
+                ObservedSeasonNumber = observation.SeasonNumber,
+                ObservedEpisodeNumber = observation.EpisodeNumber,
+                DetectedAt = _clock.GetUtcNow().UtcDateTime
+            });
+        }
+
+        foreach (var kept in skipped.Where(pair => pair.Value == "kept").Select(pair => pair.Key).ToArray())
+            skipped.Remove(kept);
     }
 
     /// <summary>
@@ -573,68 +647,60 @@ public sealed class ReconciliationService(
                 .ThenBy(candidate => candidate.VersionGroupId ?? candidate.JellyfinItemId)
                 .ThenBy(candidate => candidate.JellyfinItemId).FirstOrDefault();
 
-    private static string? FindObservationConflict(IReadOnlyList<NativeEpisodeSnapshot> observations)
+    private static IEnumerable<(NativeEpisodeSnapshot Observation, string Detail)> FindObservationConflicts(
+        IReadOnlyList<NativeEpisodeSnapshot> observations)
     {
-        var conflictingPosition = observations.Where(observation => observation.TmdbId is > 0)
-            .GroupBy(observation => (observation.SeasonNumber, observation.EpisodeNumber))
-            .FirstOrDefault(group => group.Select(observation => observation.TmdbId).Distinct().Skip(1).Any());
-        if (conflictingPosition is not null)
-            return "Explicit episode provider identities conflict at the same season and episode position.";
-        var conflictingProvider = observations.Where(observation => observation.TmdbId is > 0)
-            .GroupBy(observation => observation.TmdbId)
-            .FirstOrDefault(group => group.Select(observation => (observation.SeasonNumber, observation.EpisodeNumber))
-                .Distinct().Skip(1).Any());
-        return conflictingProvider is null
-            ? null
-            : "Copies of one episode provider identity disagree about its season and episode position.";
+        foreach (var group in observations.Where(observation => observation.TmdbId is > 0)
+                     .GroupBy(observation => (observation.SeasonNumber, observation.EpisodeNumber))
+                     .Where(group => group.Select(observation => observation.TmdbId).Distinct().Skip(1).Any()))
+            foreach (var observation in group)
+                yield return (observation,
+                    "Explicit episode provider identities conflict at the same season and episode position.");
+        foreach (var group in observations.Where(observation => observation.TmdbId is > 0)
+                     .GroupBy(observation => observation.TmdbId)
+                     .Where(group => group.Select(observation => (observation.SeasonNumber, observation.EpisodeNumber))
+                         .Distinct().Skip(1).Any()))
+            foreach (var observation in group)
+                yield return (observation,
+                    "Copies of one episode provider identity disagree about its season and episode position.");
     }
 
-    private static DurableEpisodeConflict? FindDurableEpisodeConflict(
+    private static IEnumerable<DurableEpisodeConflict> FindDurableEpisodeConflicts(
         NativeTitleSnapshot snapshot,
         IEnumerable<ExistingEpisodeBinding> bindings)
     {
+        var byNativeId = bindings.GroupBy(binding => binding.JellyfinItemId).ToDictionary(group => group.Key, group => group.First());
         foreach (var observation in snapshot.Episodes)
         {
-            var binding = bindings.FirstOrDefault(candidate => candidate.JellyfinItemId == observation.JellyfinItemId);
-            if (binding is null)
+            if (!byNativeId.TryGetValue(observation.JellyfinItemId, out var binding))
                 continue;
             if (binding.MediaType != snapshot.MediaType || binding.EntryTmdbId != snapshot.TmdbId ||
                 binding.EntryLibraryId != snapshot.TargetLibraryId ||
                 binding.BindingLibraryId != Guid.Empty && binding.BindingLibraryId != snapshot.TargetLibraryId ||
                 binding.SeriesItemId != Guid.Empty && binding.SeriesItemId != observation.SeriesItemId)
             {
-                return new(binding.EntryId, "A native episode is already bound to a different catalog identity.");
+                yield return new(observation, "A native episode is already bound to a different catalog identity.", null);
+                continue;
             }
 
-            if (observation.TmdbId is > 0 && binding.EpisodeTmdbId != observation.TmdbId ||
-                observation.TmdbId is not > 0 &&
-                (binding.SeasonNumber != observation.SeasonNumber || binding.EpisodeNumber != observation.EpisodeNumber))
-            {
-                return new(binding.EntryId, "A native episode is already bound to a different episode identity.");
-            }
+            // TMDB is identity: a changed position with the same provider id is renumbering, not a conflict.
+            if (observation.TmdbId is > 0 && binding.EpisodeTmdbId != observation.TmdbId)
+                yield return new(observation, "A native episode is already bound to a different provider identity.",
+                    binding.EpisodeId);
+            else if (observation.TmdbId is not > 0 &&
+                     (binding.SeasonNumber != observation.SeasonNumber || binding.EpisodeNumber != observation.EpisodeNumber))
+                yield return new(observation, "A native episode without a provider identity changed position.", null);
         }
-
-        return null;
     }
 
-    private static string? FindEpisodeConflict(IReadOnlyList<Episode> episodes, IReadOnlyList<NativeEpisodeSnapshot> observations)
+    private static IEnumerable<(NativeEpisodeSnapshot Observation, Guid TrackedEpisodeId)> FindEpisodeConflicts(
+        IReadOnlyList<Episode> episodes, IReadOnlyList<NativeEpisodeSnapshot> observations)
     {
         var trackedByNativeId = episodes.Where(episode => episode.JellyfinItemId.HasValue)
-            .ToDictionary(episode => episode.JellyfinItemId!.Value);
-        var observedProviderIds = observations.Where(observation => observation.TmdbId is > 0)
-            .Select(observation => observation.TmdbId!.Value).ToHashSet();
+            .GroupBy(episode => episode.JellyfinItemId!.Value).ToDictionary(group => group.Key, group => group.First());
         foreach (var observation in observations.Where(observation => observation.TmdbId is > 0))
-        {
             if (trackedByNativeId.TryGetValue(observation.JellyfinItemId, out var bound) && bound.TmdbId != observation.TmdbId)
-                return "A native episode is already bound to a different provider identity.";
-            var samePosition = episodes.FirstOrDefault(episode => episode.SeasonNumber == observation.SeasonNumber &&
-                episode.EpisodeNumber == observation.EpisodeNumber);
-            if (samePosition is not null && samePosition.TmdbId != observation.TmdbId &&
-                !observedProviderIds.Contains(samePosition.TmdbId))
-                return "An explicit episode provider identity conflicts with the tracked episode position.";
-        }
-
-        return null;
+                yield return (observation, bound.Id);
     }
 
     private int ReconcileEpisodes(
@@ -720,6 +786,33 @@ public sealed class ReconciliationService(
                 .OrderBy(candidate => candidate.JellyfinItemId).FirstOrDefault();
             if (providerCandidate is not null && UpdateEpisodeMetadata(episode, providerCandidate))
                 changedEpisodeIds.Add(episode.Id);
+        }
+
+        // An S01E01-E02 file also makes the following tracked episodes available. They have no binding of
+        // their own, because one native item binds one episode; retention blocks such files (P3.T16).
+        foreach (var observation in observations.Where(observation => observation.IsPlayable &&
+                     observation.EpisodeNumberEnd > observation.EpisodeNumber))
+        {
+            for (var number = observation.EpisodeNumber + 1; number <= observation.EpisodeNumberEnd; number++)
+            {
+                var covered = episodes.FirstOrDefault(episode => episode.SeasonNumber == observation.SeasonNumber &&
+                    episode.EpisodeNumber == number);
+                if (covered is null || covered.JellyfinItemId == observation.JellyfinItemId ||
+                    knownBindings.Values.Any(binding => binding.EpisodeId == covered.Id)) continue;
+                var becameAvailable = covered.State != FileState.OnDisk || !covered.JellyfinItemId.HasValue;
+                covered.JellyfinItemId = observation.JellyfinItemId;
+                covered.State = FileState.OnDisk;
+                changedEpisodeIds.Add(covered.Id);
+                if (!backfilled && becameAvailable)
+                    database.History.Add(new HistoryRecord
+                    {
+                        EntryId = entryId,
+                        EventType = "episode_media_available",
+                        Summary = $"S{covered.SeasonNumber:00}E{covered.EpisodeNumber:00} is part of a multi-episode file in Jellyfin",
+                        Data = JsonSerializer.Serialize(new { episodeId = covered.Id, tmdbId = covered.TmdbId,
+                            covered.SeasonNumber, covered.EpisodeNumber, jellyfinItemId = observation.JellyfinItemId })
+                    });
+            }
         }
 
         var trackedProviderIds = episodes.Select(episode => episode.TmdbId).ToHashSet();
@@ -831,7 +924,7 @@ public sealed record NativeRepresentation(Guid JellyfinItemId, Guid TargetLibrar
 public sealed record NativeEpisodeSnapshot(Guid JellyfinItemId, Guid SeriesItemId, int? TmdbId,
     int SeasonNumber, int EpisodeNumber, bool IsPlayable, string? Title = null, string? Overview = null,
     string? StillPath = null, DateTime? AirDate = null, int? RuntimeMinutes = null,
-    string? MediaPath = null, string? StorageIdentity = null);
+    string? MediaPath = null, string? StorageIdentity = null, int? EpisodeNumberEnd = null);
 
 /// <summary>A complete successful observation used to remove stale native bindings for one available library.</summary>
 /// <remarks>Protected identities belong to titles that failed, conflicted or lost their provider identity.</remarks>
@@ -847,7 +940,11 @@ internal sealed record AbsenceConfirmationResult(int MissingItems, bool IsComple
 internal sealed record ExcludedTitle(Guid EntryId, string Title, string Detail);
 
 /// <summary>The durable effect of one reconciliation operation.</summary>
-public sealed record ReconciliationResult(ReconciliationOutcome Outcome, Guid? EntryId, int ChangedEpisodes, string? Detail);
+public sealed record ReconciliationResult(ReconciliationOutcome Outcome, Guid? EntryId, int ChangedEpisodes, string? Detail)
+{
+    /// <summary>Episodes skipped because their identity disagrees, one line each (P2.R9).</summary>
+    public IReadOnlyList<string> EpisodeDiagnostics { get; init; } = [];
+}
 
 /// <summary>Stable reconciliation outcomes used by backfill progress reporting.</summary>
 public enum ReconciliationOutcome
@@ -868,9 +965,9 @@ public enum ReconciliationOutcome
 
 internal sealed record ExistingEpisodeBinding(Guid JellyfinItemId, Guid SeriesItemId, Guid BindingLibraryId,
     int EpisodeTmdbId, int SeasonNumber, int EpisodeNumber, Guid EntryId, string MediaType, int EntryTmdbId,
-    Guid? EntryLibraryId);
+    Guid? EntryLibraryId, Guid EpisodeId);
 
-internal sealed record DurableEpisodeConflict(Guid EntryId, string Detail);
+internal sealed record DurableEpisodeConflict(NativeEpisodeSnapshot Observation, string Detail, Guid? RebindableEpisodeId);
 
 /// <summary>How long an Add or Refresh waits for a library that reconciliation is checking (P2.R8).</summary>
 public sealed record LibraryWriteBudget(TimeSpan Wait)

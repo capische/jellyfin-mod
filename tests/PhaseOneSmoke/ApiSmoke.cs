@@ -490,13 +490,14 @@ internal static class ApiSmoke
         var renumberedEpisodes = renumberedJson.RootElement.GetProperty("episodes").EnumerateArray().ToArray();
         Assert(renumberedEpisodes.Length == refreshedEpisodes.Length && renumberedEpisodes.All(episode =>
                 episode.GetProperty("id").GetString() == refreshedEpisodes.Single(previous => previous.GetProperty("tmdbId").GetInt32() == episode.GetProperty("tmdbId").GetInt32()).GetProperty("id").GetString()) &&
-            renumberedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9001).GetProperty("episodeNumber").GetInt32() == 2 &&
+            // P2.R9: the bound pilot keeps Jellyfin's display numbering; the unbound episode follows TMDB.
+            renumberedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9001).GetProperty("episodeNumber").GetInt32() == 1 &&
             renumberedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9002).GetProperty("episodeNumber").GetInt32() == 1 &&
             !renumberedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9001).GetProperty("monitored").GetBoolean() &&
             renumberedJson.RootElement.GetProperty("history").GetRawText() == refreshedJson.RootElement.GetProperty("history").GetRawText(),
             "Renumbering preserves every durable episode ID, monitoring choice and history in the HTTP response");
         await using (var database = new ModDbContext(dbPath))
-            Assert((await database.Episodes.SingleAsync(episode => episode.Id == Guid.Parse(episodeId))).EpisodeNumber == 2 &&
+            Assert((await database.Episodes.SingleAsync(episode => episode.Id == Guid.Parse(episodeId))).EpisodeNumber == 1 &&
                 !await database.Episodes.AnyAsync(episode => episode.SeasonNumber < 0), "Only final episode positions persist in SQLite after refresh");
         http.Response = completeSnapshot;
         Assert((await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null)).IsSuccessStatusCode,
@@ -661,6 +662,7 @@ internal static class ApiSmoke
         Assert((await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie", targetLibraryId = libraryFolder.Id })).StatusCode == HttpStatusCode.NotFound,
             "Combined browse does not disclose an inaccessible library");
         await VerifyStaleAndOrphanedEntriesAsync(client, dbPath, user, libraryFolder.Id);
+        await VerifyEpisodeConflictsAsync(client, dbPath, user, tvLibrary.Id);
         // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
         http.Response = null;
         http.BeforeResponse = null;
@@ -678,6 +680,72 @@ internal static class ApiSmoke
         }
         await app.StopAsync();
         Console.WriteLine("PASS: HTTP auth/access/CRUD, duplicate history, wire-state filter binding, unknown fields and no media deletion");
+    }
+
+    /// <summary>P2.R9: administrators rebind or keep a disagreeing episode through real HTTP.</summary>
+    private static async Task VerifyEpisodeConflictsAsync(HttpClient client, string dbPath, User user, Guid libraryId)
+    {
+        var series = new Entry { MediaType = "series", TmdbId = 88200, TargetLibraryId = libraryId, Title = "Conflicted" };
+        var pilot = new Episode { EntryId = series.Id, TmdbId = 88201, SeasonNumber = 1, EpisodeNumber = 1, Title = "Pilot",
+            State = FileState.OnDisk };
+        var second = new Episode { EntryId = series.Id, TmdbId = 88203, SeasonNumber = 1, EpisodeNumber = 3, Title = "Third",
+            State = FileState.OnDisk };
+        var pilotNative = Guid.NewGuid();
+        var secondNative = Guid.NewGuid();
+        pilot.JellyfinItemId = pilotNative;
+        second.JellyfinItemId = secondNative;
+        var rebind = new EpisodeConflict { EntryId = series.Id, EpisodeId = pilot.Id, JellyfinItemId = pilotNative,
+            ObservedTmdbId = 88202, ObservedSeasonNumber = 1, ObservedEpisodeNumber = 2 };
+        var keep = new EpisodeConflict { EntryId = series.Id, EpisodeId = second.Id, JellyfinItemId = secondNative,
+            ObservedTmdbId = 88204, ObservedSeasonNumber = 1, ObservedEpisodeNumber = 4 };
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.Add(series);
+            database.Episodes.AddRange(pilot, second);
+            database.EpisodeBindings.AddRange(
+                new EpisodeBinding { EpisodeId = pilot.Id, JellyfinItemId = pilotNative, TargetLibraryId = libraryId },
+                new EpisodeBinding { EpisodeId = second.Id, JellyfinItemId = secondNative, TargetLibraryId = libraryId });
+            database.EpisodeConflicts.AddRange(rebind, keep);
+            await database.SaveChangesAsync();
+        }
+
+        client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+        Assert((await client.PostAsync($"/JellyfinMod/Reconciliation/Conflicts/{rebind.Id}/Rebind", null)).StatusCode ==
+            HttpStatusCode.Forbidden, "Ordinary users cannot resolve episode conflicts");
+        client.DefaultRequestHeaders.Add("X-Smoke-Role", "admin");
+        using var listed = await client.GetAsync("/JellyfinMod/Reconciliation/Conflicts");
+        using var listedJson = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Assert(listed.StatusCode == HttpStatusCode.OK && listedJson.RootElement.GetArrayLength() == 2,
+            "The admin conflict view lists every open episode conflict");
+        Assert((await client.PostAsync($"/JellyfinMod/Reconciliation/Conflicts/{rebind.Id}/Rebind", null)).StatusCode ==
+                HttpStatusCode.NoContent &&
+            (await client.PostAsync($"/JellyfinMod/Reconciliation/Conflicts/{keep.Id}/Keep", null)).StatusCode ==
+                HttpStatusCode.NoContent,
+            "An administrator can rebind one conflict and keep another");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var target = await database.Episodes.SingleAsync(episode => episode.EntryId == series.Id && episode.TmdbId == 88202);
+            var oldPilot = await database.Episodes.SingleAsync(episode => episode.Id == pilot.Id);
+            Assert(target.JellyfinItemId == pilotNative && target.State == FileState.OnDisk &&
+                oldPilot.JellyfinItemId is null && oldPilot.State == FileState.None &&
+                await database.EpisodeBindings.AnyAsync(binding => binding.JellyfinItemId == pilotNative &&
+                    binding.EpisodeId == target.Id) &&
+                await database.History.CountAsync(history => history.EntryId == series.Id &&
+                    history.EventType == "episode_conflict_rebound") == 1 &&
+                !await database.EpisodeConflicts.AnyAsync(conflict => conflict.Id == rebind.Id),
+                "Rebind moves the native episode to the reported identity with one history event");
+            Assert(await database.EpisodeConflicts.AnyAsync(conflict => conflict.Id == keep.Id &&
+                    conflict.State == EpisodeConflictStates.Kept) &&
+                (await database.Episodes.SingleAsync(episode => episode.Id == second.Id)).JellyfinItemId == secondNative &&
+                await database.History.CountAsync(history => history.EntryId == series.Id &&
+                    history.EventType == "episode_conflict_kept") == 1,
+                "Keep leaves the binding in place and writes one history event");
+        }
+
+        using var afterwards = await client.GetAsync("/JellyfinMod/Reconciliation/Conflicts");
+        using var afterwardsJson = JsonDocument.Parse(await afterwards.Content.ReadAsStringAsync());
+        Assert(afterwardsJson.RootElement.GetArrayLength() == 0, "Resolved conflicts leave the admin view");
+        client.DefaultRequestHeaders.Remove("X-Smoke-Role");
     }
 
     /// <summary>P2.R7: stale and orphaned entries stay manageable by administrators.</summary>

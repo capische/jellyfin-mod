@@ -152,6 +152,10 @@ public sealed class EntriesController(
                 await using var transaction = await database.Database.BeginTransactionAsync(timeout.Token);
                 var existing = await database.Episodes.Where(episode => episode.EntryId == entry.Id).ToListAsync(timeout.Token);
                 var byTmdbId = existing.ToDictionary(episode => episode.TmdbId);
+                // TMDB is identity; a bound episode keeps Jellyfin's display numbering, so Refresh and
+                // reconciliation stop overwriting each other (P2.R9). Unmatched episodes keep theirs too.
+                var originalPositions = existing.ToDictionary(episode => episode.Id,
+                    episode => (episode.SeasonNumber, episode.EpisodeNumber));
                 if (snapshot.Any(remote => byTmdbId.TryGetValue(remote.TmdbId, out var local) &&
                     (local.SeasonNumber != remote.SeasonNumber || local.EpisodeNumber != remote.EpisodeNumber)))
                 {
@@ -169,8 +173,9 @@ public sealed class EntriesController(
                 {
                     if (byTmdbId.Remove(remote.TmdbId, out var local))
                     {
-                        local.SeasonNumber = remote.SeasonNumber;
-                        local.EpisodeNumber = remote.EpisodeNumber;
+                        (local.SeasonNumber, local.EpisodeNumber) = local.JellyfinItemId.HasValue
+                            ? originalPositions[local.Id]
+                            : (remote.SeasonNumber, remote.EpisodeNumber);
                         local.Title = remote.Title;
                         local.Overview = remote.Overview;
                         local.StillPath = remote.StillPath;
@@ -186,6 +191,8 @@ public sealed class EntriesController(
 
                 // TMDB's series and season endpoints can briefly disagree for airing shows.
                 // Preserve unmatched local episodes so a partial snapshot is never interpreted as deletion.
+                foreach (var unmatched in byTmdbId.Values)
+                    (unmatched.SeasonNumber, unmatched.EpisodeNumber) = originalPositions[unmatched.Id];
                 entry.Title = metadata.Title;
                 entry.Year = metadata.PremiereDate?.Year;
                 entry.ImdbId = metadata.ImdbId;

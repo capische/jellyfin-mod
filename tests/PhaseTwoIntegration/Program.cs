@@ -113,12 +113,78 @@ try
             "Repeated episode observations are idempotent");
 
         var conflictHistory = await database.History.CountAsync(history => history.EntryId == series.Id);
-        var episodeConflict = await service.ReconcileAsync(new NativeTitleSnapshot("series", 123, tvLibrary, "Series sharing 123", 2020,
-            null, null, null, null, [new(seriesCopyC, tvLibrary, false)],
-            [new(episodeCopyC, seriesCopyC, 9999, 1, 1, true)]), default);
-        Assert(episodeConflict.Outcome == ReconciliationOutcome.Conflict && trackedEpisode.JellyfinItemId == episodeId &&
-            await database.History.CountAsync(history => history.EntryId == series.Id) == conflictHistory,
-            "A non-canonical episode copy cannot silently change provider identity");
+        var laterEpisode = Guid.Parse("52000000-0000-0000-0000-000000000001");
+        NativeTitleSnapshot ConflictSnapshot() => new("series", 123, tvLibrary, "Series sharing 123", 2020,
+            null, null, null, null, [new(seriesCopyC, tvLibrary, false), new(seriesCopy, tvLibrary, false, seriesId),
+                new(seriesId, tvLibrary, false, seriesId)],
+            [new(episodeCopyC, seriesCopyC, 9999, 1, 1, true),
+                new(episodeCopy, seriesCopy, 9001, 1, 2, true, "Pilot renamed"),
+                new(episodeId, seriesId, 9001, 1, 2, true, "Pilot renamed"),
+                new(specialId, seriesId, 9002, 0, 1, false, "Special"),
+                new(laterEpisode, seriesId, 9003, 1, 3, true, "Later")]);
+        var episodeConflict = await service.ReconcileAsync(ConflictSnapshot(), default);
+        database.ChangeTracker.Clear();
+        var conflictRow = await database.EpisodeConflicts.SingleOrDefaultAsync(conflict => conflict.JellyfinItemId == episodeCopyC);
+        Assert(episodeConflict.Outcome == ReconciliationOutcome.Updated && episodeConflict.EpisodeDiagnostics.Count == 1 &&
+            (await database.Episodes.SingleAsync(episode => episode.Id == trackedEpisodeId)).JellyfinItemId == episodeId &&
+            await database.EpisodeBindings.AnyAsync(binding => binding.JellyfinItemId == episodeCopyC &&
+                binding.EpisodeId == trackedEpisodeId) &&
+            conflictRow is { State: EpisodeConflictStates.Open, ObservedTmdbId: 9999 } &&
+            conflictRow.EpisodeId == trackedEpisodeId,
+            "A non-canonical episode copy cannot silently change provider identity; only it is skipped and recorded");
+        Assert(await database.Episodes.AnyAsync(episode => episode.EntryId == series.Id && episode.TmdbId == 9003 &&
+                episode.JellyfinItemId == laterEpisode && episode.State == FileState.OnDisk),
+            "Other episodes of a series with one conflicting episode still bind (P2.R9)");
+        conflictRow!.State = EpisodeConflictStates.Kept;
+        database.EpisodeConflicts.Update(conflictRow);
+        await database.SaveChangesAsync();
+        database.ChangeTracker.Clear();
+        var keptRun = await service.ReconcileAsync(ConflictSnapshot(), default);
+        Assert(keptRun.Outcome == ReconciliationOutcome.Unchanged && keptRun.EpisodeDiagnostics.Count == 0 &&
+            await database.EpisodeConflicts.AnyAsync(conflict => conflict.JellyfinItemId == episodeCopyC &&
+                conflict.State == EpisodeConflictStates.Kept),
+            "A kept identity is no longer reported while Jellyfin keeps reporting the same identity");
+        trackedEpisode = await database.Episodes.SingleAsync(episode => episode.Id == trackedEpisodeId);
+
+        // P2.R9: an S01E01-E02 file makes the tracked E02 available.
+        var multiSeries = Guid.NewGuid();
+        var firstEpisode = Guid.NewGuid();
+        var multiResult = await service.ReconcileAsync(new NativeTitleSnapshot("series", 5550, tvLibrary, "Multi", 2020,
+            null, null, null, null, [new(multiSeries, tvLibrary, false)],
+            [new(firstEpisode, multiSeries, 5551, 1, 1, true, "One")]), default);
+        database.Episodes.Add(new JellyfinMod.Data.Episode
+        {
+            EntryId = multiResult.EntryId!.Value, TmdbId = 5552, SeasonNumber = 1, EpisodeNumber = 2, Title = "Two"
+        });
+        await database.SaveChangesAsync();
+        var doubleEpisode = Guid.NewGuid();
+        await service.ReconcileAsync(new NativeTitleSnapshot("series", 5550, tvLibrary, "Multi", 2020,
+            null, null, null, null, [new(multiSeries, tvLibrary, false)],
+            [new(firstEpisode, multiSeries, 5551, 1, 1, true, "One"),
+                new(doubleEpisode, multiSeries, null, 1, 3, true, "Three-Four", EpisodeNumberEnd: 4)]), default);
+        database.ChangeTracker.Clear();
+        database.Episodes.Add(new JellyfinMod.Data.Episode
+        {
+            EntryId = multiResult.EntryId!.Value, TmdbId = 5553, SeasonNumber = 1, EpisodeNumber = 3, Title = "Three"
+        });
+        database.Episodes.Add(new JellyfinMod.Data.Episode
+        {
+            EntryId = multiResult.EntryId!.Value, TmdbId = 5554, SeasonNumber = 1, EpisodeNumber = 4, Title = "Four"
+        });
+        await database.SaveChangesAsync();
+        var combined = Guid.NewGuid();
+        await service.ReconcileAsync(new NativeTitleSnapshot("series", 5550, tvLibrary, "Multi", 2020,
+            null, null, null, null, [new(multiSeries, tvLibrary, false)],
+            [new(combined, multiSeries, 5551, 1, 1, true, "One", EpisodeNumberEnd: 2),
+                new(doubleEpisode, multiSeries, null, 1, 3, true, "Three-Four", EpisodeNumberEnd: 4)]), default);
+        database.ChangeTracker.Clear();
+        Assert(await database.Episodes.AnyAsync(episode => episode.TmdbId == 5552 && episode.JellyfinItemId == combined &&
+                episode.State == FileState.OnDisk) &&
+            await database.Episodes.AnyAsync(episode => episode.TmdbId == 5553 && episode.JellyfinItemId == doubleEpisode &&
+                episode.State == FileState.OnDisk) &&
+            await database.Episodes.AnyAsync(episode => episode.TmdbId == 5554 && episode.JellyfinItemId == doubleEpisode &&
+                episode.State == FileState.OnDisk),
+            "A multi-episode file reports every episode in its IndexNumberEnd range on disk");
 
         await AssertThrowsAsync<ArgumentException>(() => service.ReconcileAsync(new NativeTitleSnapshot(
             "series", 123, tvLibrary, "Series sharing 123", 2020, null, null, null, null,
@@ -130,7 +196,8 @@ try
             "Every native representation must prove membership in the reconciled library");
 
         var unmatched = await service.ReconcileAsync(Snapshot("movie", null, movieLibrary, "No provider id", Guid.NewGuid()), default);
-        Assert(unmatched.Outcome == ReconciliationOutcome.Unmatched && await database.Entries.CountAsync() == 3,
+        // The P2.R9 multi-episode series adds the fourth entry.
+        Assert(unmatched.Outcome == ReconciliationOutcome.Unmatched && await database.Entries.CountAsync() == 4,
             "Native items without TMDB identity are reported unmatched without title guessing");
 
         var concurrentLibrary = Guid.NewGuid();
@@ -161,10 +228,11 @@ try
     await using (var restarted = new ModDbContext(dbPath))
     {
         await restarted.Database.MigrateAsync();
-        Assert(await restarted.Entries.CountAsync() == 4 && await restarted.Episodes.CountAsync() == 2 &&
-            await restarted.EntryBindings.CountAsync() == 7 && await restarted.EpisodeBindings.CountAsync() == 4 &&
-            await restarted.History.CountAsync() == 6,
-            "Reconciled identities, every observed copy and exact transition history persist after a real SQLite restart");
+        var persisted = (await restarted.Entries.CountAsync(), await restarted.Episodes.CountAsync(),
+            await restarted.EntryBindings.CountAsync(), await restarted.EpisodeBindings.CountAsync(),
+            await restarted.History.CountAsync());
+        Assert(persisted == (5, 7, 8, 8, 12),
+            $"Reconciled identities, every observed copy and exact transition history persist after a real SQLite restart {persisted}");
     }
 
     await BackfillIntegration.RunAsync(folder);
