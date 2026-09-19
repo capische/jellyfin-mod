@@ -27,6 +27,39 @@ public sealed record DownloadClientTorrent(
     IReadOnlyList<string> Labels,
     bool SeedLimitsUnlimited);
 
+/// <summary>One file inside a torrent as the client reports it (P5.I1).</summary>
+/// <param name="Name">The path relative to the torrent's download directory, with forward slashes.</param>
+/// <param name="Length">The file's full length.</param>
+/// <param name="BytesCompleted">The bytes the client holds.</param>
+/// <param name="Wanted">Whether the client downloads this file.</param>
+public sealed record ClientTorrentFile(string Name, long Length, long BytesCompleted, bool Wanted);
+
+/// <summary>A full status read of one torrent, used by the import monitor and the seed release (P5.I1/I3/I6).</summary>
+/// <remarks>Built from one client read per monitor tick; it never carries credentials.</remarks>
+public sealed record ClientTorrentStatus(
+    string InfoHash,
+    string Name,
+    string? DownloadDirectory,
+    IReadOnlyList<string> Labels,
+    double PercentDone,
+    long SizeWhenDone,
+    long LeftUntilDone,
+    long RateDownload,
+    long? EtaSeconds,
+    string Status,
+    bool IsFinished,
+    double UploadRatio,
+    long SecondsSeeding,
+    double? RatioLimit,
+    long? IdleLimitSeconds,
+    bool HasClientError,
+    IReadOnlyList<ClientTorrentFile> Files)
+{
+    /// <summary>Gets a value indicating whether every wanted byte is downloaded.</summary>
+    public bool Complete => LeftUntilDone == 0 && PercentDone >= 1 && Files.Where(file => file.Wanted)
+        .All(file => file.BytesCompleted >= file.Length);
+}
+
 /// <summary>How a submission ended from the client's point of view.</summary>
 public enum SubmissionResult
 {
@@ -78,6 +111,18 @@ public interface IDownloadClientDriver
     /// recorded seed requirement.
     /// </summary>
     Task ApplySeedSettingsAsync(DownloadClientConnection connection, string infoHash, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads progress, files, ratio and seeding time for the given torrents in one call. Torrents the client does not
+    /// hold are absent from the result.
+    /// </summary>
+    /// <exception cref="DownloadClientUnavailableException">The client could not answer; absence is unknown.</exception>
+    /// <exception cref="DownloadClientRejectedException">The client refused the credentials or the connection.</exception>
+    Task<IReadOnlyList<ClientTorrentStatus>> GetStatusAsync(DownloadClientConnection connection, IReadOnlyCollection<string> infoHashes,
+        CancellationToken cancellationToken);
+
+    /// <summary>Removes one torrent, with its data when asked. Callers prove ownership first.</summary>
+    Task RemoveAsync(DownloadClientConnection connection, string infoHash, bool deleteData, CancellationToken cancellationToken);
 }
 
 /// <summary>Resolves registered drivers by kind.</summary>

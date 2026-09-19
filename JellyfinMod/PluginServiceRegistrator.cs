@@ -1,6 +1,7 @@
 using JellyfinMod.Data;
 using JellyfinMod.Services;
 using JellyfinMod.Services.Acquisition;
+using JellyfinMod.Services.Import;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
@@ -52,9 +53,11 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
             () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>(),
             provider.GetRequiredService<AcquisitionSecretStore>()));
         AcquisitionServices.Add(services, () => Plugin.Instance!.DataPath);
+        ImportServices.Add(services);
         services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<DatabaseInitializer>());
         AcquisitionServices.AddHostedServices(services);
+        ImportServices.AddHostedServices(services);
         services.AddSingleton<LibraryEventListener>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<LibraryEventListener>());
         services.AddSingleton<RetentionEventListener>();

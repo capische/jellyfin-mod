@@ -91,6 +91,26 @@ public sealed class RetentionPreviewService(
 
         var seedCandidates = inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection)
             .ToArray();
+        if (seedCandidates.Length > 0)
+        {
+            // A library file that shares its inode with a seeding copy the plugin owns follows the plugin's effective seed
+            // goal (P5.I6): blocked until the goal is met, then due. The client's per-torrent mode is unlimited by design
+            // (P4.A5), so the Transmission reader alone would report an unbounded goal forever.
+            var pluginSeeds = await database.SeedReleaseOperations.AsNoTracking()
+                .Where(seed => SeedReleaseStates.Open.Contains(seed.State) && seed.SeedingPhysicalIdentity != string.Empty)
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var byIdentity = pluginSeeds.GroupBy(seed => seed.SeedingPhysicalIdentity, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
+            foreach (var candidate in seedCandidates)
+            {
+                if (!byIdentity.TryGetValue(candidate.File!.Value.PhysicalIdentity, out var owned)) continue;
+                if (owned.Any(seed => seed.GoalMetAt is null)) candidate.Block(RetentionPreviewReasons.SeedGoalUnmet, true);
+                else candidate.MarkDue(torrentManaged: true, []);
+            }
+
+            seedCandidates = seedCandidates.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection).ToArray();
+        }
+
         var unresolvedSeedFiles = 0;
         if (seedCandidates.Length > 0)
         {

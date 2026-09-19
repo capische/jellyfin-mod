@@ -78,7 +78,8 @@ public sealed class GrabService(
     GrabHoldOptions hold,
     ReconciliationLibraryLock libraryLock,
     TimeProvider time,
-    ILogger<GrabService> logger)
+    ILogger<GrabService> logger,
+    Import.ImportMonitor? importMonitor = null)
 {
     /// <summary>How long after submission an absent torrent still counts as possibly in flight.</summary>
     public static readonly TimeSpan AbsentGrace = TimeSpan.FromMinutes(2);
@@ -420,8 +421,12 @@ public sealed class GrabService(
         operation.FailureCode = null;
         operation.AcceptedAt = operation.UpdatedAt = Now;
         AddHistory(operation, "grabbed", "Grabbed " + Describe(operation) + " from " + operation.IndexerName);
+        // Phase 5 owns the download from acceptance on; its import operation is created in the same commit (P5.I3).
+        if (!await database.ImportOperations.AnyAsync(value => value.GrabId == operation.Id, CancellationToken.None).ConfigureAwait(false))
+            await Import.ImportService.CreateForGrabAsync(database, operation, Now, CancellationToken.None).ConfigureAwait(false);
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         logger.LogInformation("Grab {Operation} accepted by the download client", operation.Id);
+        importMonitor?.Wake();
     }
 
     private async Task FailAsync(GrabOperation operation, string code, bool attempted)
