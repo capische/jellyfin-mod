@@ -29,8 +29,11 @@ public sealed class ReleasesController(
     /// <summary>Searches enabled indexers for one movie entry or one episode. Never submits anything.</summary>
     [HttpGet("Releases")]
     public async Task<ActionResult<ReleaseSearchDto>> Search([FromQuery] Guid entryId, [FromQuery] Guid? episodeId,
-        [FromQuery] Guid? profileId, CancellationToken cancellationToken)
+        [FromQuery] Guid? profileId, [FromQuery] string? intent, CancellationToken cancellationToken)
     {
+        intent ??= GrabIntents.Acquire;
+        if (intent is not (GrabIntents.Acquire or GrabIntents.AddVersion))
+            return Error(400, "invalid_intent", "The intent must be acquire or addVersion.");
         if (!readiness.IsReady) return StatusCode(503);
         var user = access.GetUser(User);
         if (user is null) return Unauthorized();
@@ -47,6 +50,18 @@ public sealed class ReleasesController(
         else if (episodeId is not null) return Error(400, "episode_not_applicable", "Movies have no episodes.");
 
         var state = await configuration.GetStateAsync(database, cancellationToken);
+        // Another quality is only for a title that already plays (P6.M6); episodes need the host to group versions.
+        var held = new HashSet<string>(StringComparer.Ordinal);
+        if (intent == GrabIntents.AddVersion)
+        {
+            var playable = episode is null ? entry.State == FileState.OnDisk : episode.State == FileState.OnDisk;
+            if (!playable) return Error(409, "no_playable_version", "Another quality can only be added to a title that has a file.");
+            if (episode is not null && !state.Settings.EpisodeUpgradesEnabled)
+                return Error(409, "episode_versions_unsupported", "Episodes do not take a second version until episode upgrades are enabled.");
+            held = (await JellyfinMod.Services.Automation.VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken))
+                .Select(version => version.Quality).OfType<string>().ToHashSet(StringComparer.Ordinal);
+        }
+
         var inherited = profileId is null && entry.QualityProfileId is null;
         var chosenId = profileId ?? entry.QualityProfileId ?? state.Settings.DefaultQualityProfileId;
         if (chosenId is null) return Error(409, "no_quality_profile", "Choose a default quality profile in the plugin settings.");
@@ -55,11 +70,11 @@ public sealed class ReleasesController(
         if (!await database.AcquisitionIndexers.AnyAsync(value => value.Enabled, cancellationToken))
             return Error(409, "no_indexers", "No indexer is enabled in the plugin settings.");
 
-        var snapshot = await search.SearchAsync(user.Id, Target(entry, episode),
+        var snapshot = await search.SearchAsync(user.Id, ReleaseTargets.For(entry, episode),
             new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
                 profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
-            inherited, state.Settings.Revision, cancellationToken);
-        var targetKey = GrabService.TargetKey(entry.Id, episode?.Id);
+            inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(intent, held));
+        var targetKey = GrabService.TargetKey(entry.Id, episode?.Id) + (intent == GrabIntents.AddVersion ? "+add" : string.Empty);
         var active = await database.GrabOperations.AsNoTracking()
             .FirstOrDefaultAsync(value => value.ActiveTarget == targetKey, cancellationToken);
         var reason = !state.Settings.Enabled ? "acquisition_disabled"
@@ -173,15 +188,6 @@ public sealed class ReleasesController(
         await database.AcquisitionDownloadClients.AsNoTracking().Where(value => value.Id == operation.DownloadClientId)
             .Select(value => value.OpenUrl).SingleOrDefaultAsync(cancellationToken);
 
-    private static ReleaseTarget Target(Entry entry, Episode? episode)
-    {
-        var metadata = entry.MetadataJson is { } json ? JsonSerializer.Deserialize<TmdbMetadata>(json) : null;
-        return new ReleaseTarget(entry.Id, episode?.Id, entry.MediaType, entry.Title, metadata?.OriginalTitle, entry.Year,
-            episode?.SeasonNumber, episode?.EpisodeNumber,
-            // An episode's own runtime only: a series average would be a guessed duration (P4.A4).
-            entry.MediaType == "series" ? episode?.RuntimeMinutes : metadata?.RuntimeMinutes,
-            entry.ImdbId ?? metadata?.ImdbId, entry.TmdbId, metadata?.TvdbId);
-    }
 
     private ObjectResult Error(int status, string code, string title, Guid? operationId = null)
     {

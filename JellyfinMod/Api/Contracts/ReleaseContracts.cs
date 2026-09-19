@@ -67,7 +67,8 @@ public sealed record ReleaseCandidateDto(
     [property: JsonPropertyName("eligible")] bool Eligible,
     [property: JsonPropertyName("rejections")] IReadOnlyList<ReleaseRejection> Rejections,
     [property: JsonPropertyName("seedRatio"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? SeedRatio,
-    [property: JsonPropertyName("seedMinutes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeedMinutes);
+    [property: JsonPropertyName("seedMinutes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeedMinutes,
+    [property: JsonPropertyName("heldQuality")] bool HeldQuality = false);
 
 /// <summary>The response of <c>GET /JellyfinMod/Releases</c>.</summary>
 public sealed record ReleaseSearchDto(
@@ -82,7 +83,8 @@ public sealed record ReleaseSearchDto(
     [property: JsonPropertyName("rejectedCount")] int RejectedCount,
     [property: JsonPropertyName("indexers")] IReadOnlyList<IndexerOutcomeDto> Indexers,
     [property: JsonPropertyName("partial")] bool Partial,
-    [property: JsonPropertyName("truncated")] bool Truncated)
+    [property: JsonPropertyName("truncated")] bool Truncated,
+    [property: JsonPropertyName("intent")] string Intent = "acquire")
 {
     /// <summary>Builds the public view of a snapshot.</summary>
     public static ReleaseSearchDto From(ReleaseSearchSnapshot snapshot, GrabAvailabilityDto grab)
@@ -102,13 +104,14 @@ public sealed record ReleaseSearchDto(
                 candidate.Parsed.Proper, candidate.Parsed.Repack, candidate.InfoHash,
                 candidate.InfoHash is { } hash ? byHash[hash].Where(id => id != candidate.ReleaseId).ToArray() : [],
                 candidate.Evaluation.Score, candidate.Evaluation.Contributions, candidate.Evaluation.Eligible,
-                candidate.Evaluation.Rejections, candidate.SeedRatio, candidate.SeedMinutes)).ToArray(),
+                candidate.Evaluation.Rejections, candidate.SeedRatio, candidate.SeedMinutes,
+                candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality))).ToArray(),
             snapshot.Candidates.Count(candidate => candidate.Evaluation.Eligible),
             snapshot.Candidates.Count(candidate => !candidate.Evaluation.Eligible),
             snapshot.Indexers.Select(outcome => new IndexerOutcomeDto(outcome.IndexerId, outcome.Name, outcome.Status,
                 outcome.Message, outcome.ResultCount, outcome.Truncated, outcome.RetryAfterSeconds)).ToArray(),
             snapshot.Indexers.Any(outcome => outcome.Status is not ("ok" or "no_results")),
-            snapshot.Indexers.Any(outcome => outcome.Truncated));
+            snapshot.Indexers.Any(outcome => outcome.Truncated), snapshot.Intent);
     }
 
     private static DateTime Utc(DateTime value) => DateTime.SpecifyKind(value, DateTimeKind.Utc);

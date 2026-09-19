@@ -109,7 +109,16 @@ public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto 
     [property: JsonPropertyName("history")] IReadOnlyList<HistoryDto> History,
     [property: JsonPropertyName("episodes")] IReadOnlyList<EpisodeDto> Episodes,
     [property: JsonPropertyName("retention")] RetentionSummaryDto Retention,
-    [property: JsonPropertyName("acquisition"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] AcquisitionSummaryDto? Acquisition = null);
+    [property: JsonPropertyName("acquisition"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] AcquisitionSummaryDto? Acquisition = null)
+{
+    /// <summary>Gets a movie's held versions for the version selector (P6.M8); empty for series and file-less titles.</summary>
+    [JsonPropertyName("versions")]
+    public IReadOnlyList<VersionDto> Versions { get; init; } = [];
+
+    /// <summary>Gets a movie's upgrade state; administrators only, null otherwise.</summary>
+    [JsonPropertyName("upgrade"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public UpgradeStateDto? Upgrade { get; init; }
+}
 
 /// <summary>Filtered remote page with an explicit continuation, not a misleading remote total.</summary>
 public sealed record DiscoveryResult([property: JsonPropertyName("items")] IReadOnlyList<TmdbMetadata> Items,
@@ -156,6 +165,10 @@ public sealed class PatchEntryRequest
     /// <summary>Gets a value indicating whether the request named a quality profile, including an explicit null.</summary>
     [JsonIgnore]
     public bool QualityProfileIdSpecified { get; private set; }
+
+    /// <summary>Gets or sets a request to search on the next automation run, resetting backoff (P6.M3).</summary>
+    [JsonPropertyName("searchNow")]
+    public bool? SearchNow { get; set; }
 }
 
 /// <summary>Explicit stable file-state names; integer serialization is never exposed.</summary>

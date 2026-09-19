@@ -9,6 +9,16 @@ using Microsoft.Extensions.Logging;
 
 namespace JellyfinMod.Services.Acquisition;
 
+/// <summary>Stable grab intents (P6.M6).</summary>
+public static class GrabIntents
+{
+    /// <summary>Acquire a title that has no file, or replace one through an upgrade.</summary>
+    public const string Acquire = "acquire";
+
+    /// <summary>Add another version beside a playable one.</summary>
+    public const string AddVersion = "addVersion";
+}
+
 /// <summary>A stable grab failure mapped to an HTTP status by the API.</summary>
 public sealed class GrabException(int status, string code, string message, Guid? operationId = null) : Exception(message)
 {
@@ -60,7 +70,13 @@ public sealed class GrabLocks
 }
 
 /// <summary>The request after API validation.</summary>
-public sealed record GrabRequest(Guid SearchId, string ReleaseId, string IdempotencyKey);
+/// <param name="SearchId">The search the release came from.</param>
+/// <param name="ReleaseId">The release within that search.</param>
+/// <param name="IdempotencyKey">The caller's idempotency key.</param>
+/// <param name="Automatic">Whether automation makes the grab (P6.M3).</param>
+/// <param name="UpgradeOperationId">The upgrade the grab belongs to (P6.M5).</param>
+public sealed record GrabRequest(Guid SearchId, string ReleaseId, string IdempotencyKey, bool Automatic = false,
+    Guid? UpgradeOperationId = null);
 
 /// <summary>
 /// The client-agnostic acquisition engine (P4.A5): persist intent, hold, submit once through the configured
@@ -105,6 +121,10 @@ public sealed class GrabService(
             ?? throw new GrabException(404, "release_not_found", "This release is not part of the search.");
         if (!candidate.Evaluation.Eligible)
             throw new GrabException(409, "release_rejected", "Rejected releases cannot be grabbed.");
+        var addVersion = snapshot.Intent == GrabIntents.AddVersion;
+        // Another quality must be another quality: a held one is refused (P6.M6).
+        if (addVersion && candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality))
+            throw new GrabException(409, "held_quality", "This quality is already in the library.");
 
         var target = snapshot.Target;
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == target.EntryId, cancellationToken)
@@ -157,7 +177,10 @@ public sealed class GrabService(
         var operation = new GrabOperation
         {
             RequestedBy = userId, IdempotencyKey = request.IdempotencyKey, RequestFingerprint = fingerprint,
-            EntryId = entry.Id, EpisodeId = episode?.Id, ActiveTarget = TargetKey(entry.Id, episode?.Id),
+            EntryId = entry.Id, EpisodeId = episode?.Id,
+            // An added version relaxes the one-active-grab rule for its own snapshot only: it owns a separate key.
+            ActiveTarget = TargetKey(entry.Id, episode?.Id) + (addVersion ? "+add" : string.Empty),
+            Intent = snapshot.Intent, Automatic = request.Automatic, UpgradeOperationId = request.UpgradeOperationId,
             ActiveHash = HashKey(client.Id, locator.InfoHash), SearchId = snapshot.SearchId, ReleaseId = candidate.ReleaseId,
             IndexerId = candidate.IndexerId, IndexerName = candidate.IndexerName, SourceGuid = candidate.SourceGuid,
             RawTitle = candidate.RawTitle, ParsedJson = JsonSerializer.Serialize(candidate.Parsed), Size = candidate.Size ?? locator.Size,
@@ -420,7 +443,8 @@ public sealed class GrabService(
         operation.State = GrabStates.Accepted;
         operation.FailureCode = null;
         operation.AcceptedAt = operation.UpdatedAt = Now;
-        AddHistory(operation, "grabbed", "Grabbed " + Describe(operation) + " from " + operation.IndexerName);
+        AddHistory(operation, operation.Automatic ? "auto_grabbed" : "grabbed",
+            (operation.Automatic ? "Automatically grabbed " : "Grabbed ") + Describe(operation) + " from " + operation.IndexerName);
         // Phase 5 owns the download from acceptance on; its import operation is created in the same commit (P5.I3).
         if (!await database.ImportOperations.AnyAsync(value => value.GrabId == operation.Id, CancellationToken.None).ConfigureAwait(false))
             await Import.ImportService.CreateForGrabAsync(database, operation, Now, CancellationToken.None).ConfigureAwait(false);
@@ -510,6 +534,9 @@ public sealed class GrabService(
 
     /// <summary>The durable target ownership key.</summary>
     public static string TargetKey(Guid entryId, Guid? episodeId) => (episodeId ?? entryId).ToString("N");
+
+    /// <summary>The system identity automatic grabs are made under; it is never a Jellyfin user.</summary>
+    public static readonly Guid AutomationUserId = Guid.Parse("00000000-0000-4000-8000-00000000a07a");
 
     private static string HashKey(Guid clientId, string infoHash) => clientId.ToString("N") + ":" + infoHash;
 }

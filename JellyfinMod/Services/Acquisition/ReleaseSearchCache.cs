@@ -48,7 +48,29 @@ public sealed record ReleaseSearchSnapshot(
     DateTime CreatedAt,
     DateTime ExpiresAt,
     IReadOnlyList<ReleaseCandidate> Candidates,
-    IReadOnlyList<IndexerOutcome> Indexers);
+    IReadOnlyList<IndexerOutcome> Indexers)
+{
+    /// <summary>Gets <c>acquire</c> or <c>addVersion</c> (P6.M6); a grab inherits it.</summary>
+    public string Intent { get; init; } = "acquire";
+
+    /// <summary>Gets the qualities the target already holds, for <c>addVersion</c> searches.</summary>
+    public IReadOnlySet<string> HeldQualities { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>Gets the queries each indexer answered for this search (P6.M3).</summary>
+    public IReadOnlyDictionary<Guid, int> QueriesByIndexer { get; init; } = new Dictionary<Guid, int>();
+
+    /// <summary>Gets the indexers whose breaker this search opened.</summary>
+    public IReadOnlyList<Guid> BreakersOpened { get; init; } = [];
+}
+
+/// <summary>Options of one search beyond its target and profile.</summary>
+/// <param name="Intent"><c>acquire</c> or <c>addVersion</c>.</param>
+/// <param name="HeldQualities">Qualities already held, marked on candidates of an <c>addVersion</c> search.</param>
+public sealed record ReleaseSearchOptions(string Intent = "acquire", IReadOnlySet<string>? HeldQualities = null)
+{
+    /// <summary>A plain acquisition search.</summary>
+    public static ReleaseSearchOptions Default { get; } = new();
+}
 
 /// <summary>
 /// A bounded in-memory store of search snapshots (P4.A1). Expiry or restart requires a new search; configuration

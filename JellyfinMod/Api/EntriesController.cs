@@ -24,7 +24,10 @@ public sealed class EntriesController(
     JellyfinItemReconciliationRunner? reconciliation = null,
     IAuthorizationService? authorization = null,
     LibraryWriteBudget? writeBudget = null,
-    JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null) : ControllerBase
+    JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null,
+    MediaBrowser.Controller.Library.IMediaSourceManager? mediaSources = null,
+    UnixFileInspector? files = null,
+    TimeProvider? clock = null) : ControllerBase
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
@@ -155,78 +158,10 @@ public sealed class EntriesController(
         timeout.CancelAfter(TimeSpan.FromSeconds(60));
         try
         {
-            // Both remote snapshots are fully validated before any lock is taken or entity changed.
-            var metadata = await tmdb.GetDetailsAsync(visible.MediaType, visible.TmdbId, timeout.Token);
-            var snapshot = await tmdb.GetEpisodesAsync(metadata, timeout.Token);
-
-            // Refresh changes metadata only. Availability, bindings and retention state belong to
-            // reconciliation and retention, so it serializes with both and never sets them (P3.T10).
-            Guid? nativeSeriesId;
-            await using (await retentionGate.AcquireAsync(timeout.Token))
-            await using (var libraryLease = await libraryLock.TryAcquireAsync(libraryId, LibraryWait, timeout.Token))
-            {
-                if (libraryLease is null) return LibraryBusy();
-                database.ChangeTracker.Clear();
-                var entry = await database.Entries.SingleOrDefaultAsync(e => e.Id == id, timeout.Token);
-                if (entry is null) return NotFound();
-                await using var transaction = await database.Database.BeginTransactionAsync(timeout.Token);
-                var existing = await database.Episodes.Where(episode => episode.EntryId == entry.Id).ToListAsync(timeout.Token);
-                var byTmdbId = existing.ToDictionary(episode => episode.TmdbId);
-                // TMDB is identity; a bound episode keeps Jellyfin's display numbering, so Refresh and
-                // reconciliation stop overwriting each other (P2.R9). Unmatched episodes keep theirs too.
-                var originalPositions = existing.ToDictionary(episode => episode.Id,
-                    episode => (episode.SeasonNumber, episode.EpisodeNumber));
-                if (snapshot.Any(remote => byTmdbId.TryGetValue(remote.TmdbId, out var local) &&
-                    (local.SeasonNumber != remote.SeasonNumber || local.EpisodeNumber != remote.EpisodeNumber)))
-                {
-                    // Free the unique display positions before applying swaps. Negative seasons
-                    // cannot come from TMDB, and the transaction hides these temporary positions.
-                    for (var index = 0; index < existing.Count; index++)
-                    {
-                        existing[index].SeasonNumber = -1;
-                        existing[index].EpisodeNumber = index + 1;
-                    }
-                    await database.SaveChangesAsync(timeout.Token);
-                }
-
-                foreach (var remote in snapshot)
-                {
-                    if (byTmdbId.Remove(remote.TmdbId, out var local))
-                    {
-                        (local.SeasonNumber, local.EpisodeNumber) = local.JellyfinItemId.HasValue
-                            ? originalPositions[local.Id]
-                            : (remote.SeasonNumber, remote.EpisodeNumber);
-                        local.Title = remote.Title;
-                        local.Overview = remote.Overview;
-                        local.StillPath = remote.StillPath;
-                        local.AirDate = remote.AirDate;
-                        local.RuntimeMinutes = remote.RuntimeMinutes;
-                    }
-                    else
-                    {
-                        remote.EntryId = entry.Id;
-                        database.Episodes.Add(remote);
-                    }
-                }
-
-                // TMDB's series and season endpoints can briefly disagree for airing shows.
-                // Preserve unmatched local episodes so a partial snapshot is never interpreted as deletion.
-                foreach (var unmatched in byTmdbId.Values)
-                    (unmatched.SeasonNumber, unmatched.EpisodeNumber) = originalPositions[unmatched.Id];
-                entry.Title = metadata.Title;
-                entry.Year = metadata.PremiereDate?.Year;
-                entry.ImdbId = metadata.ImdbId;
-                entry.Overview = metadata.Overview;
-                entry.PosterPath = metadata.PosterPath;
-                entry.MetadataJson = JsonSerializer.Serialize(metadata);
-                await database.SaveChangesAsync(timeout.Token);
-                await transaction.CommitAsync(timeout.Token);
-                nativeSeriesId = entry.JellyfinItemId;
-            }
-
-            // New episodes bind through the one Phase 2 matcher, never a second one here.
-            if (nativeSeriesId is { } seriesId && reconciliation is not null)
-                await reconciliation.ReconcileAsync(seriesId, timeout.Token);
+            var outcome = await new SeriesMetadataRefresher(database, tmdb, libraryLock, retentionGate, reconciliation, writeBudget)
+                .RefreshAsync(id, timeout.Token);
+            if (outcome == SeriesRefreshOutcome.LibraryBusy) return LibraryBusy();
+            if (outcome == SeriesRefreshOutcome.NotFound) return NotFound();
             database.ChangeTracker.Clear();
             var refreshed = await database.Entries.AsNoTracking().SingleAsync(e => e.Id == id, cancellationToken);
             return await BuildDetail(refreshed, cancellationToken);
@@ -264,15 +199,42 @@ public sealed class EntriesController(
         if (user is null) return Unauthorized();
         var entry = await database.Entries.SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
         if (entry is null || !access.CanRead(user, entry)) return NotFound();
-        if (!request.Monitored.HasValue && !request.QualityProfileIdSpecified) return BadRequest();
+        if (!request.Monitored.HasValue && !request.QualityProfileIdSpecified && request.SearchNow != true) return BadRequest();
         if (request.QualityProfileId is { } profileId &&
             !await database.AcquisitionQualityProfiles.AnyAsync(profile => profile.Id == profileId, cancellationToken))
             return BadRequest(new ProblemDetails { Status = 400, Type = "invalid_quality_profile", Title = "The quality profile does not exist." });
         if (request.Monitored.HasValue) entry.Monitored = request.Monitored.Value;
         // Saving a profile is a separate administrator action; searches never change it (P4.A1).
         if (request.QualityProfileIdSpecified) entry.QualityProfileId = request.QualityProfileId;
+        if (request.SearchNow == true)
+        {
+            // A series asks for each of its episodes that still lacks a file.
+            List<(Guid TargetId, Guid? EpisodeId)> targets = entry.MediaType == "movie"
+                ? [(entry.Id, null)]
+                : (await database.Episodes.AsNoTracking().Where(episode => episode.EntryId == entry.Id && episode.State != FileState.OnDisk)
+                    .Select(episode => episode.Id).ToListAsync(cancellationToken)).Select(episodeId => (episodeId, (Guid?)episodeId)).ToList();
+            foreach (var (targetId, episodeId) in targets)
+                await RequestSearchAsync(entry.Id, targetId, episodeId, cancellationToken);
+        }
+
         await database.SaveChangesAsync(cancellationToken);
         return new EntryDto(entry);
+    }
+
+    /// <summary>Resets a target's backoff and asks the next automation run to search it (P6.M3).</summary>
+    private async Task RequestSearchAsync(Guid entryId, Guid targetId, Guid? episodeId, CancellationToken cancellationToken)
+    {
+        var now = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
+        var row = await database.AutomationTargets.SingleOrDefaultAsync(value => value.TargetId == targetId, cancellationToken);
+        if (row is null)
+        {
+            row = new AutomationTargetState { TargetId = targetId, EntryId = entryId, EpisodeId = episodeId };
+            database.AutomationTargets.Add(row);
+        }
+
+        row.SearchNowRequestedAt = now;
+        row.NextSearchAt = now;
+        row.ConsecutiveEmpty = 0;
     }
 
     /// <summary>Exempts an entry, including every episode in a series, from automatic retention.</summary>
@@ -321,9 +283,10 @@ public sealed class EntriesController(
         if (entry is null || !access.CanRead(user, entry)) return NotFound();
         var episode = await database.Episodes.SingleOrDefaultAsync(e => e.EntryId == id && e.Id == episodeId, cancellationToken);
         if (episode is null || !access.CanReadEpisode(user, episode)) return NotFound();
-        // Episodes inherit their series profile; only monitoring is an episode setting.
-        if (!request.Monitored.HasValue || request.QualityProfileIdSpecified) return BadRequest();
-        episode.Monitored = request.Monitored.Value;
+        // Episodes inherit their series profile; monitoring and a search request are the episode settings.
+        if (!request.Monitored.HasValue && request.SearchNow != true || request.QualityProfileIdSpecified) return BadRequest();
+        if (request.Monitored.HasValue) episode.Monitored = request.Monitored.Value;
+        if (request.SearchNow == true) await RequestSearchAsync(id, episode.Id, episode.Id, cancellationToken);
         await database.SaveChangesAsync(cancellationToken);
         return new EpisodeDto(episode);
     }
@@ -475,15 +438,28 @@ public sealed class EntriesController(
             ? AcquisitionSummaryDto.From(operation, isAdmin) : null;
         var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots, [entry.Id], cancellationToken)
             .ConfigureAwait(false);
-        var episodeDtos = readableEpisodes
-            .Select(e => new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,
-                evaluations.GetValueOrDefault(e.Id)), isAdmin), Summary(e.Id), projections.GetValueOrDefault(e.Id))).ToArray();
+        var versions = new JellyfinMod.Services.Automation.VersionReader(database, mediaSources, files ?? new UnixFileInspector());
+        var episodeDtos = new List<EpisodeDto>();
+        foreach (var e in readableEpisodes)
+            episodeDtos.Add(new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,
+                evaluations.GetValueOrDefault(e.Id)), isAdmin), Summary(e.Id), projections.GetValueOrDefault(e.Id))
+            {
+                Versions = e.State == FileState.OnDisk
+                    ? await versions.ForAsync(entry.Id, e.Id, evaluations.GetValueOrDefault(e.Id), isAdmin, cancellationToken)
+                    : []
+            });
         // A series aggregate is built only from episodes this requester may read (P3.T15).
         var readableTargets = readableEpisodes.Select(e => e.Id).Append(entry.Id).ToHashSet();
         var entryRetention = RetentionSummaries.ForViewer(RetentionSummaries.ForEntry(entry, policy,
             evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
         return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id)), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
             DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodeDtos, entryRetention,
-            entry.MediaType == "movie" ? Summary(null) : null);
+            entry.MediaType == "movie" ? Summary(null) : null)
+        {
+            Versions = entry.MediaType == "movie" && entry.State == FileState.OnDisk
+                ? await versions.ForAsync(entry.Id, null, evaluations.GetValueOrDefault(entry.Id), isAdmin, cancellationToken)
+                : [],
+            Upgrade = isAdmin && entry.MediaType == "movie" ? await versions.UpgradeAsync(entry, cancellationToken) : null
+        };
     }
 }

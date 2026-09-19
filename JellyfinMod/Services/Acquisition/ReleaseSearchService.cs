@@ -58,12 +58,42 @@ public sealed class ReleaseSearchService(
         }
     }
 
+    /// <summary>Indexer outcomes that count towards an indexer's circuit breaker (P6.M3).</summary>
+    public static readonly IReadOnlySet<string> BreakerFailures =
+        new HashSet<string>(["timeout", "rate_limited", "unavailable", "malformed_response", "indexer_error", "response_too_large"],
+            StringComparer.Ordinal);
+
+    /// <summary>Consecutive failures that open an indexer's breaker.</summary>
+    public const int BreakerThreshold = 5;
+
+    /// <summary>How long an open breaker keeps an indexer out of searches.</summary>
+    public static readonly TimeSpan BreakerDuration = TimeSpan.FromHours(1);
+
     /// <summary>Searches every enabled indexer and stores the evaluated snapshot.</summary>
     public async Task<ReleaseSearchSnapshot> SearchAsync(Guid userId, ReleaseTarget target, EvaluationProfile profile,
-        bool profileInherited, int settingsRevision, CancellationToken cancellationToken)
+        bool profileInherited, int settingsRevision, CancellationToken cancellationToken, ReleaseSearchOptions? searchOptions = null)
     {
+        searchOptions ??= ReleaseSearchOptions.Default;
         var indexers = await database.AcquisitionIndexers.Where(indexer => indexer.Enabled)
             .OrderBy(indexer => indexer.Priority).ThenBy(indexer => indexer.Name).ToListAsync(cancellationToken).ConfigureAwait(false);
+        // Per-indexer budgets and breakers apply to every search, manual ones included (P6.M3).
+        var now = cache.UtcNow;
+        var budgets = await IndexerBudgetsAsync(indexers, now, cancellationToken).ConfigureAwait(false);
+        var blocked = new Dictionary<Guid, IndexerOutcome>();
+        var waits = new Dictionary<Guid, TimeSpan>();
+        foreach (var indexer in indexers)
+        {
+            var budget = budgets[indexer.Id];
+            if (budget.BreakerOpenUntil is { } open && open > now)
+                blocked[indexer.Id] = new(indexer.Id, indexer.Name, "breaker_open",
+                    "The indexer failed repeatedly; it is paused until " + open.ToString("u", CultureInfo.InvariantCulture) + ".", 0, false,
+                    (int)Math.Ceiling((open - now).TotalSeconds));
+            else if (budget.QueriesUsed >= Math.Max(0, indexer.DailyQueryBudget))
+                blocked[indexer.Id] = new(indexer.Id, indexer.Name, "budget_exhausted", "The indexer's daily query budget is used up.", 0,
+                    false, null);
+            else if (budget.LastQueryAt is { } last && last + TimeSpan.FromSeconds(Math.Max(0, indexer.MinIntervalSeconds)) > now)
+                waits[indexer.Id] = last + TimeSpan.FromSeconds(indexer.MinIntervalSeconds) - now;
+        }
         // Capabilities first: anything unverified at its current revision is checked before it is searched.
         var capabilities = new Dictionary<Guid, (TorznabCapabilities? Value, string? Error)>();
         foreach (var indexer in indexers)
@@ -101,6 +131,9 @@ public sealed class ReleaseSearchService(
         using var gate = new SemaphoreSlim(options.MaxParallel);
         var results = await Task.WhenAll(indexers.Select(async indexer =>
         {
+            if (blocked.TryGetValue(indexer.Id, out var refused)) return (Candidates: (IReadOnlyList<ReleaseCandidate>)[], Outcome: refused, Queries: 0);
+            // The minimum interval between searches of one indexer is waited out, never skipped.
+            if (waits.TryGetValue(indexer.Id, out var wait)) await Task.Delay(wait, cancellationToken).ConfigureAwait(false);
             await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
@@ -112,6 +145,35 @@ public sealed class ReleaseSearchService(
                 gate.Release();
             }
         })).ConfigureAwait(false);
+
+        var queries = new Dictionary<Guid, int>();
+        var breakersOpened = new List<Guid>();
+        var finished = cache.UtcNow;
+        foreach (var (indexer, result) in indexers.Zip(results))
+        {
+            if (blocked.ContainsKey(indexer.Id)) continue;
+            var budget = budgets[indexer.Id];
+            budget.QueriesUsed += result.Queries;
+            queries[indexer.Id] = result.Queries;
+            if (result.Queries > 0) budget.LastQueryAt = finished;
+            if (BreakerFailures.Contains(result.Outcome.Status))
+            {
+                budget.ConsecutiveFailures++;
+                if (budget.ConsecutiveFailures >= BreakerThreshold)
+                {
+                    budget.BreakerOpenUntil = finished + BreakerDuration;
+                    budget.ConsecutiveFailures = 0;
+                    breakersOpened.Add(indexer.Id);
+                    logger.LogWarning("Indexer {Indexer} failed {Count} times in a row; paused for an hour", indexer.Name, BreakerThreshold);
+                }
+            }
+            else if (result.Outcome.Status is "ok" or "no_results")
+            {
+                budget.ConsecutiveFailures = 0;
+            }
+        }
+
+        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
 
         // A release an administrator blocklisted from the queue is rejected with a visible reason (P5.I7).
         var blocklist = await database.ReleaseBlocklist.AsNoTracking().ToListAsync(cancellationToken).ConfigureAwait(false);
@@ -140,34 +202,66 @@ public sealed class ReleaseSearchService(
             .ThenByDescending(candidate => candidate.PublishedAt ?? DateTime.MinValue)
             .ThenBy(candidate => candidate.ReleaseId, StringComparer.Ordinal)
             .ToArray();
-        var now = cache.UtcNow;
+        var created = cache.UtcNow;
         var snapshot = new ReleaseSearchSnapshot(Guid.NewGuid(), userId, target, profile, profileInherited, settingsRevision,
-            now, now + ReleaseSearchCache.Lifetime, candidates, results.Select(result => result.Outcome).ToArray());
+            created, created + ReleaseSearchCache.Lifetime, candidates, results.Select(result => result.Outcome).ToArray())
+        {
+            Intent = searchOptions.Intent,
+            HeldQualities = searchOptions.HeldQualities ?? new HashSet<string>(StringComparer.Ordinal),
+            QueriesByIndexer = queries,
+            BreakersOpened = breakersOpened
+        };
         cache.Add(snapshot);
         return snapshot;
     }
 
-    private async Task<(IReadOnlyList<ReleaseCandidate> Candidates, IndexerOutcome Outcome)> SearchIndexerAsync(
+    /// <summary>Loads (and creates) today's budget rows, tracked by this context.</summary>
+    private async Task<Dictionary<Guid, IndexerBudgetState>> IndexerBudgetsAsync(IReadOnlyList<AcquisitionIndexer> indexers, DateTime now,
+        CancellationToken cancellationToken)
+    {
+        var ids = indexers.Select(indexer => indexer.Id).ToArray();
+        var rows = await database.IndexerBudgets.Where(budget => ids.Contains(budget.IndexerId))
+            .ToDictionaryAsync(budget => budget.IndexerId, cancellationToken).ConfigureAwait(false);
+        foreach (var indexer in indexers)
+        {
+            if (!rows.TryGetValue(indexer.Id, out var budget))
+            {
+                budget = new IndexerBudgetState { IndexerId = indexer.Id, Day = now.Date };
+                database.IndexerBudgets.Add(budget);
+                rows[indexer.Id] = budget;
+            }
+
+            if (budget.Day != now.Date)
+            {
+                budget.Day = now.Date;
+                budget.QueriesUsed = 0;
+            }
+        }
+
+        return rows;
+    }
+
+    private async Task<(IReadOnlyList<ReleaseCandidate> Candidates, IndexerOutcome Outcome, int Queries)> SearchIndexerAsync(
         AcquisitionIndexer indexer, (TorznabCapabilities? Value, string? Error) capabilities, TorznabEndpoint? endpoint,
         ReleaseTarget target, EvaluationProfile profile, CancellationToken cancellationToken)
     {
         IndexerOutcome Outcome(string status, string? message, int count = 0, bool truncated = false, int? retry = null) =>
             new(indexer.Id, indexer.Name, status, message, count, truncated, retry);
         if (endpoint is null)
-            return ([], Outcome("secret_unavailable", "The saved API key is no longer available; enter it again."));
+            return ([], Outcome("secret_unavailable", "The saved API key is no longer available; enter it again."), 0);
         if (capabilities.Value is not { } caps)
-            return ([], Outcome(capabilities.Error ?? "capabilities_unavailable", "The indexer's capabilities could not be verified."));
+            return ([], Outcome(capabilities.Error ?? "capabilities_unavailable", "The indexer's capabilities could not be verified."), 0);
         if (cache.RemainingBackOff(indexer.Id) is { } wait)
-            return ([], Outcome("rate_limited", "The indexer asked to wait before searching again.", retry: (int)Math.Ceiling(wait.TotalSeconds)));
+            return ([], Outcome("rate_limited", "The indexer asked to wait before searching again.", retry: (int)Math.Ceiling(wait.TotalSeconds)), 0);
 
         var (parameters, identity, method) = BuildQuery(caps, target);
         if (parameters is null)
-            return ([], Outcome("unsupported_search", "The indexer does not advertise a search this title can use."));
+            return ([], Outcome("unsupported_search", "The indexer does not advertise a search this title can use."), 0);
         var configured = indexer.Categories.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(value => int.Parse(value, CultureInfo.InvariantCulture)).ToArray();
         var categories = caps.Categories.Count == 0 ? configured : configured.Where(caps.Categories.Contains).ToArray();
         if (configured.Length > 0 && categories.Length == 0)
-            return ([], Outcome("unsupported_search", "None of the configured categories is advertised by the indexer."));
+            return ([], Outcome("unsupported_search", "None of the configured categories is advertised by the indexer."), 0);
         if (categories.Length > 0) parameters.Add(("cat", string.Join(',', categories)));
         var limit = Math.Min(caps.LimitMax ?? MaxLimit, MaxLimit);
         parameters.Add(("limit", limit.ToString(CultureInfo.InvariantCulture)));
@@ -175,6 +269,7 @@ public sealed class ReleaseSearchService(
         var allowedHosts = AcquisitionConfiguration.AllowedHosts(indexer);
         var items = new List<TorznabItem>();
         var truncated = false;
+        var pages = 0;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(options.Timeout);
         try
@@ -183,6 +278,7 @@ public sealed class ReleaseSearchService(
             {
                 var offset = items.Count;
                 var pageParameters = parameters.Append(("offset", offset.ToString(CultureInfo.InvariantCulture))).ToArray();
+                pages++;
                 var result = await torznab.SearchAsync(endpoint, pageParameters, timeout.Token).ConfigureAwait(false);
                 items.AddRange(result.Items);
                 // The feed's own offset/total decides; without a total, a full page means there may be more.
@@ -204,16 +300,16 @@ public sealed class ReleaseSearchService(
             // Rows from pages already read are kept, but the source is reported as failed, never as complete.
             return (Evaluate(indexer, items, target, profile, identity, method, allowedHosts),
                 Outcome(error.Code, error.Message, items.Count, items.Count > 0,
-                    error.RetryAfter is { } retryAfter ? (int)Math.Ceiling(retryAfter.TotalSeconds) : null));
+                    error.RetryAfter is { } retryAfter ? (int)Math.Ceiling(retryAfter.TotalSeconds) : null), pages);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             return (Evaluate(indexer, items, target, profile, identity, method, allowedHosts),
-                Outcome("timeout", "The indexer did not answer in time.", items.Count, items.Count > 0));
+                Outcome("timeout", "The indexer did not answer in time.", items.Count, items.Count > 0), pages);
         }
 
         var candidates = Evaluate(indexer, items, target, profile, identity, method, allowedHosts);
-        return (candidates, Outcome(candidates.Count == 0 ? "no_results" : "ok", null, candidates.Count, truncated));
+        return (candidates, Outcome(candidates.Count == 0 ? "no_results" : "ok", null, candidates.Count, truncated), pages);
     }
 
     private static (List<(string, string)>? Parameters, SearchIdentity Identity, string Method) BuildQuery(

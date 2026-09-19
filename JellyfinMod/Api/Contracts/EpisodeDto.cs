@@ -61,6 +61,10 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     /// <summary>Gets the privacy-safe automatic retention state on entry detail responses.</summary>
     [JsonPropertyName("retention")]
     public RetentionSummaryDto? Retention { get; } = retention;
+    /// <summary>Gets the episode's held versions on entry detail responses (P6.M8).</summary>
+    [JsonPropertyName("versions")]
+    public IReadOnlyList<VersionDto> Versions { get; init; } = [];
+
     /// <summary>Gets the newest grab for this episode on entry detail responses (P4.A6); null when none.</summary>
     [JsonPropertyName("acquisition"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public AcquisitionSummaryDto? Acquisition { get; } = acquisition;
