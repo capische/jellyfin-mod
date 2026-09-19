@@ -78,6 +78,81 @@
           </button>
         </div>
       </form>
+
+      <div id="JellyfinModAcquisition" class="verticalSection">
+        <h2 class="sectionTitle">Manual acquisition</h2>
+        <div id="AcquisitionStatus" class="fieldDescription">Acquisition settings have not loaded.</div>
+        <label class="checkboxContainer">
+          <input is="emby-checkbox" type="checkbox" id="AcquisitionEnabled" />
+          <span>Let administrators grab releases</span>
+        </label>
+        <div class="selectContainer">
+          <select is="emby-select" id="AcquisitionClient" label="Download client"></select>
+        </div>
+        <div class="selectContainer">
+          <select is="emby-select" id="AcquisitionProfile" label="Default quality profile"></select>
+          <div class="fieldDescription">Titles without their own profile use this one. Changing it never rewrites titles.</div>
+        </div>
+        <button is="emby-button" type="button" id="SaveAcquisitionDefaults" class="raised button-submit block">
+          <span>Save acquisition settings</span>
+        </button>
+
+        <h3 class="sectionTitle verticalSection">Torznab indexers</h3>
+        <div id="IndexerList" class="fieldDescription"></div>
+        <div class="inputContainer"><input is="emby-input" type="text" id="IndexerName" label="Name" /></div>
+        <div class="inputContainer"><input is="emby-input" type="url" id="IndexerUrl" autocomplete="off" label="Torznab API URL" /></div>
+        <div class="inputContainer">
+          <input is="emby-input" type="password" id="IndexerApiKey" autocomplete="new-password" label="API key" />
+          <div class="fieldDescription">Saved keys are never shown. Leave blank to keep the saved key.</div>
+        </div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="IndexerClearKey" /><span>Remove the saved API key</span></label>
+        <div class="inputContainer"><input is="emby-input" type="text" id="IndexerCategories" label="Category IDs, comma-separated" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="IndexerPriority" min="0" max="1000" label="Priority (lower first)" /></div>
+        <div class="inputContainer">
+          <input is="emby-input" type="text" id="IndexerHosts" label="Extra download hosts, comma-separated" />
+          <div class="fieldDescription">Torrent links may only come from the indexer's own host and these hosts.</div>
+        </div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="IndexerSeedRatio" min="0" max="100" step="0.1" label="Minimum seed ratio (optional)" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="IndexerSeedMinutes" min="0" label="Minimum seeding minutes (optional)" /></div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="IndexerEnabled" /><span>Search this indexer</span></label>
+        <button is="emby-button" type="button" id="SaveIndexer" class="raised block"><span>Save indexer</span></button>
+        <button is="emby-button" type="button" id="NewIndexer" class="raised button-cancel block"><span>New indexer</span></button>
+
+        <h3 class="sectionTitle verticalSection">Download client</h3>
+        <div id="ClientList" class="fieldDescription"></div>
+        <div class="inputContainer"><input is="emby-input" type="text" id="ClientName" label="Name" /></div>
+        <div class="inputContainer"><input is="emby-input" type="url" id="ClientUrl" autocomplete="off" label="Transmission RPC URL" /></div>
+        <div class="inputContainer"><input is="emby-input" type="text" id="ClientUsername" autocomplete="off" label="Username" /></div>
+        <div class="inputContainer">
+          <input is="emby-input" type="password" id="ClientPassword" autocomplete="new-password" label="Password" />
+          <div class="fieldDescription">Saved passwords are never shown. Leave blank to keep the saved password.</div>
+        </div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="ClientClearPassword" /><span>Remove the saved password</span></label>
+        <div class="inputContainer"><input is="emby-input" type="text" id="ClientLabel" label="Label" /></div>
+        <div class="inputContainer">
+          <input is="emby-input" type="text" id="ClientDownloadDirectory" label="Download folder as Transmission sees it" />
+        </div>
+        <div class="inputContainer">
+          <input is="emby-input" type="text" id="ClientLocalDirectory" label="The same folder as Jellyfin sees it" />
+          <div class="fieldDescription">
+            Must be on the same filesystem and mount as the library folders, and outside every library folder, so imports can use hardlinks.
+          </div>
+        </div>
+        <div class="inputContainer"><input is="emby-input" type="url" id="ClientOpenUrl" autocomplete="off" label="Web interface link (optional, no credentials)" /></div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="ClientEnabled" /><span>Send grabs to this client</span></label>
+        <button is="emby-button" type="button" id="SaveClient" class="raised block"><span>Save download client</span></button>
+        <button is="emby-button" type="button" id="NewClient" class="raised button-cancel block"><span>New download client</span></button>
+
+        <h3 class="sectionTitle verticalSection">Quality profiles</h3>
+        <div id="ProfileList" class="fieldDescription"></div>
+        <div class="inputContainer"><input is="emby-input" type="text" id="ProfileName" label="Name" /></div>
+        <div class="fieldDescription">Tick allowed qualities; the order is the preference, best first.</div>
+        <div id="ProfileQualities"></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="ProfileMinimum" min="0" step="0.1" label="Minimum GB per hour (optional)" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="ProfileMaximum" min="0" step="0.1" label="Maximum GB per hour (optional)" /></div>
+        <button is="emby-button" type="button" id="SaveProfile" class="raised block"><span>Save quality profile</span></button>
+        <button is="emby-button" type="button" id="NewProfile" class="raised button-cancel block"><span>New quality profile</span></button>
+      </div>
     </div>
   </div>
 
@@ -101,6 +176,294 @@
       }
 
       watchedUserMode.addEventListener('change', updateSelectedUserVisibility);
+
+      // Manual acquisition (P4.A2). Secrets are write-only: the page sends replacements but never receives values.
+      var acquisition = { settings: null, indexers: [], clients: [], profiles: [], indexer: null, client: null, profile: null, order: [] };
+      var field = function (id) { return document.querySelector('#' + id); };
+
+      function settingsRequest(method, path, data) {
+        return ApiClient.ajax({
+          type: method,
+          url: ApiClient.getUrl('JellyfinMod/Settings/' + path),
+          contentType: data ? 'application/json' : undefined,
+          dataType: method === 'DELETE' ? undefined : 'json',
+          data: data ? JSON.stringify(data) : undefined
+        });
+      }
+
+      function problem(error) {
+        if (error && typeof error.json === 'function') {
+          return error.json().then(function (body) {
+            return (body.title || 'The request failed.') + (body.type ? ' (' + body.type + ')' : '');
+          }, function () { return 'The request failed (' + error.status + ').'; });
+        }
+        return Promise.resolve('The request failed.');
+      }
+
+      function report(title) {
+        return function (error) {
+          Dashboard.hideLoadingMsg();
+          return problem(error).then(function (message) { Dashboard.alert({ title: title, message: message }); });
+        };
+      }
+
+      function listNumbers(value) {
+        return value.split(',').map(function (part) { return parseInt(part.trim(), 10); }).filter(function (part) { return part > 0; });
+      }
+
+      function listText(value) {
+        return value.split(',').map(function (part) { return part.trim(); }).filter(Boolean);
+      }
+
+      function optionalNumber(value, scale) {
+        var parsed = parseFloat(value);
+        if (isNaN(parsed)) return null;
+        return scale ? Math.round(parsed * scale) : parsed;
+      }
+
+      function secretChange(inputId, clearId, creating) {
+        var value = field(inputId).value;
+        if (value) return { action: 'replace', value: value };
+        if (!creating && field(clearId).checked) return { action: 'clear', value: null };
+        return { action: 'unchanged', value: null };
+      }
+
+      function button(text, handler) {
+        var element = document.createElement('button');
+        element.type = 'button';
+        element.className = 'raised button-cancel emby-button';
+        element.textContent = text;
+        element.addEventListener('click', handler);
+        return element;
+      }
+
+      function renderList(containerId, items, describe, actions) {
+        var container = field(containerId);
+        container.innerHTML = '';
+        if (items.length === 0) container.textContent = 'None configured.';
+        items.forEach(function (item) {
+          var row = document.createElement('div');
+          row.textContent = describe(item) + ' ';
+          actions(item).forEach(function (action) { row.appendChild(action); });
+          container.appendChild(row);
+        });
+      }
+
+      function fillSelect(id, items, selected) {
+        var select = field(id);
+        select.innerHTML = '';
+        var none = document.createElement('option');
+        none.value = '';
+        none.textContent = 'None';
+        select.appendChild(none);
+        items.forEach(function (item) {
+          var option = document.createElement('option');
+          option.value = item.id;
+          option.textContent = item.name;
+          option.selected = item.id === selected;
+          select.appendChild(option);
+        });
+      }
+
+      function editIndexer(indexer) {
+        acquisition.indexer = indexer;
+        field('IndexerName').value = indexer ? indexer.name : '';
+        field('IndexerUrl').value = indexer ? indexer.baseUrl : '';
+        field('IndexerApiKey').value = '';
+        field('IndexerApiKey').placeholder = indexer && indexer.apiKeyConfigured ? 'Saved' : '';
+        field('IndexerClearKey').checked = false;
+        field('IndexerCategories').value = indexer ? indexer.categories.join(', ') : '2000, 5000';
+        field('IndexerPriority').value = indexer ? indexer.priority : 0;
+        field('IndexerHosts').value = indexer ? indexer.downloadHosts.join(', ') : '';
+        field('IndexerSeedRatio').value = indexer && indexer.minimumSeedRatio !== null ? indexer.minimumSeedRatio : '';
+        field('IndexerSeedMinutes').value = indexer && indexer.minimumSeedMinutes !== null ? indexer.minimumSeedMinutes : '';
+        field('IndexerEnabled').checked = indexer ? indexer.enabled : true;
+      }
+
+      function editClient(client) {
+        acquisition.client = client;
+        field('ClientName').value = client ? client.name : '';
+        field('ClientUrl').value = client ? client.baseUrl : '';
+        field('ClientUsername').value = client ? client.username : '';
+        field('ClientPassword').value = '';
+        field('ClientPassword').placeholder = client && client.passwordConfigured ? 'Saved' : '';
+        field('ClientClearPassword').checked = false;
+        field('ClientLabel').value = client ? client.label : 'jellyfinmod';
+        field('ClientDownloadDirectory').value = client ? client.downloadDirectory : '';
+        field('ClientLocalDirectory').value = client ? client.localDirectory : '';
+        field('ClientOpenUrl').value = client && client.openUrl ? client.openUrl : '';
+        field('ClientEnabled').checked = client ? client.enabled : true;
+      }
+
+      function renderQualities() {
+        var container = field('ProfileQualities');
+        container.innerHTML = '';
+        acquisition.order.forEach(function (entry, index) {
+          var row = document.createElement('div');
+          var label = document.createElement('label');
+          label.className = 'checkboxContainer';
+          var checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.checked = entry.allowed;
+          checkbox.addEventListener('change', function () { entry.allowed = checkbox.checked; });
+          var text = document.createElement('span');
+          text.textContent = entry.id;
+          label.appendChild(checkbox);
+          label.appendChild(text);
+          row.appendChild(label);
+          row.appendChild(button('Up', function () { move(index, -1); }));
+          row.appendChild(button('Down', function () { move(index, 1); }));
+          container.appendChild(row);
+        });
+      }
+
+      function move(index, offset) {
+        var target = index + offset;
+        if (target < 0 || target >= acquisition.order.length) return;
+        var item = acquisition.order.splice(index, 1)[0];
+        acquisition.order.splice(target, 0, item);
+        renderQualities();
+      }
+
+      function editProfile(profile) {
+        acquisition.profile = profile;
+        field('ProfileName').value = profile ? profile.name : '';
+        var allowed = profile ? profile.qualities : [];
+        var known = (acquisition.settings ? acquisition.settings.qualities : []).map(function (quality) { return quality.id; });
+        acquisition.order = allowed.concat(known.filter(function (id) { return allowed.indexOf(id) < 0; }))
+          .map(function (id) { return { id: id, allowed: allowed.indexOf(id) >= 0 }; });
+        field('ProfileMinimum').value = profile && profile.minimumBytesPerHour ? profile.minimumBytesPerHour / 1e9 : '';
+        field('ProfileMaximum').value = profile && profile.maximumBytesPerHour ? profile.maximumBytesPerHour / 1e9 : '';
+        renderQualities();
+      }
+
+      function testResource(path, name) {
+        Dashboard.showLoadingMsg();
+        settingsRequest('POST', path).then(function (result) {
+          Dashboard.hideLoadingMsg();
+          Dashboard.alert({ title: name, message: result.ok ? result.message : result.message + ' (' + result.code + ')' });
+          return loadAcquisition();
+        }, report(name));
+      }
+
+      function deleteResource(path, name) {
+        Dashboard.showLoadingMsg();
+        settingsRequest('DELETE', path).then(function () {
+          Dashboard.hideLoadingMsg();
+          return loadAcquisition();
+        }, report(name));
+      }
+
+      function loadAcquisition() {
+        return Promise.all([
+          settingsRequest('GET', 'Acquisition'), settingsRequest('GET', 'Indexers'),
+          settingsRequest('GET', 'DownloadClients'), settingsRequest('GET', 'QualityProfiles')
+        ]).then(function (values) {
+          acquisition.settings = values[0];
+          acquisition.indexers = values[1];
+          acquisition.clients = values[2];
+          acquisition.profiles = values[3];
+          var settings = acquisition.settings;
+          field('AcquisitionEnabled').checked = settings.enabled;
+          field('AcquisitionStatus').textContent = (settings.enabled ? 'Grabbing is on. ' : 'Grabbing is off. ') +
+            (settings.ready ? 'Ready.' : 'Not ready: ' + settings.blockers.join(', ') + '.') +
+            ' Grabs are held for ' + settings.holdSeconds + ' seconds before they are sent, so they can be cancelled.' +
+            (settings.downloadClientId && !settings.seedProtectionMatchesClient
+              ? ' Seed protection reads a different Transmission RPC URL; grabbed torrents are not protected until it matches.' : '');
+          fillSelect('AcquisitionClient', acquisition.clients, settings.downloadClientId);
+          fillSelect('AcquisitionProfile', acquisition.profiles, settings.defaultQualityProfileId);
+          renderList('IndexerList', acquisition.indexers, function (indexer) {
+            return indexer.name + (indexer.enabled ? '' : ' (off)') + ' · ' + (indexer.verified ? 'verified' : 'not verified') +
+              (indexer.lastError ? ' · last error ' + indexer.lastError : '') + ' ·';
+          }, function (indexer) {
+            return [
+              button('Edit', function () { editIndexer(indexer); }),
+              button('Test', function () { testResource('Indexers/' + indexer.id + '/Test', 'Indexer'); }),
+              button('Delete', function () { deleteResource('Indexers/' + indexer.id, 'Indexer'); })
+            ];
+          });
+          renderList('ClientList', acquisition.clients, function (client) {
+            return client.name + (client.enabled ? '' : ' (off)') + ' · ' +
+              (client.verified ? 'verified ' + client.clientVersion : 'not verified') +
+              (client.lastError ? ' · last error ' + client.lastError : '') + ' ·';
+          }, function (client) {
+            return [
+              button('Edit', function () { editClient(client); }),
+              button('Test', function () { testResource('DownloadClients/' + client.id + '/Test', 'Download client'); }),
+              button('Delete', function () { deleteResource('DownloadClients/' + client.id, 'Download client'); })
+            ];
+          });
+          renderList('ProfileList', acquisition.profiles, function (profile) {
+            return profile.name + (profile.isDefault ? ' (default)' : '') + ': ' + profile.qualities.join(' > ') + ' ·';
+          }, function (profile) {
+            return [
+              button('Edit', function () { editProfile(profile); }),
+              button('Delete', function () { deleteResource('QualityProfiles/' + profile.id, 'Quality profile'); })
+            ];
+          });
+          if (!acquisition.profile) editProfile(null);
+        }, function () {
+          field('AcquisitionStatus').textContent = 'Acquisition settings are unavailable in this plugin build.';
+        });
+      }
+
+      function saveResource(path, current, body, name, after) {
+        Dashboard.showLoadingMsg();
+        if (current) body.revision = current.revision;
+        settingsRequest(current ? 'PATCH' : 'POST', path + (current ? '/' + current.id : ''), body).then(function (saved) {
+          Dashboard.hideLoadingMsg();
+          after(saved);
+          return loadAcquisition();
+        }, report(name));
+      }
+
+      field('SaveAcquisitionDefaults').addEventListener('click', function () {
+        Dashboard.showLoadingMsg();
+        settingsRequest('PATCH', 'Acquisition', {
+          enabled: field('AcquisitionEnabled').checked,
+          downloadClientId: field('AcquisitionClient').value || null,
+          defaultQualityProfileId: field('AcquisitionProfile').value || null,
+          revision: acquisition.settings ? acquisition.settings.revision : null
+        }).then(function () {
+          Dashboard.hideLoadingMsg();
+          return loadAcquisition();
+        }, report('Manual acquisition'));
+      });
+
+      field('SaveIndexer').addEventListener('click', function () {
+        var current = acquisition.indexer;
+        saveResource('Indexers', current, {
+          name: field('IndexerName').value.trim(), baseUrl: field('IndexerUrl').value.trim(),
+          apiKey: secretChange('IndexerApiKey', 'IndexerClearKey', !current), enabled: field('IndexerEnabled').checked,
+          categories: listNumbers(field('IndexerCategories').value), priority: parseInt(field('IndexerPriority').value, 10) || 0,
+          downloadHosts: listText(field('IndexerHosts').value), minimumSeedRatio: optionalNumber(field('IndexerSeedRatio').value),
+          minimumSeedMinutes: optionalNumber(field('IndexerSeedMinutes').value)
+        }, 'Indexer', editIndexer);
+      });
+      field('NewIndexer').addEventListener('click', function () { editIndexer(null); });
+
+      field('SaveClient').addEventListener('click', function () {
+        var current = acquisition.client;
+        saveResource('DownloadClients', current, {
+          name: field('ClientName').value.trim(), kind: 'transmission', baseUrl: field('ClientUrl').value.trim(),
+          username: field('ClientUsername').value, password: secretChange('ClientPassword', 'ClientClearPassword', !current),
+          enabled: field('ClientEnabled').checked, label: field('ClientLabel').value.trim(),
+          downloadDirectory: field('ClientDownloadDirectory').value.trim(), localDirectory: field('ClientLocalDirectory').value.trim(),
+          openUrl: field('ClientOpenUrl').value.trim() || null
+        }, 'Download client', editClient);
+      });
+      field('NewClient').addEventListener('click', function () { editClient(null); });
+
+      field('SaveProfile').addEventListener('click', function () {
+        saveResource('QualityProfiles', acquisition.profile, {
+          name: field('ProfileName').value.trim(),
+          qualities: acquisition.order.filter(function (entry) { return entry.allowed; }).map(function (entry) { return entry.id; }),
+          minimumBytesPerHour: optionalNumber(field('ProfileMinimum').value, 1e9),
+          maximumBytesPerHour: optionalNumber(field('ProfileMaximum').value, 1e9)
+        }, 'Quality profile', editProfile);
+      });
+      field('NewProfile').addEventListener('click', function () { editProfile(null); });
+
 
       // A disabled or deleted Selected user stays stored until an administrator picks another user; the
       // select never falls back to the first enabled user (P3.T13). The placeholder cannot be chosen.
@@ -173,6 +536,9 @@
               reasons.appendChild(item);
             });
           }, function () {});
+          loadAcquisition();
+          editIndexer(null);
+          editClient(null);
           // Episodes whose identity Jellyfin now reports differently wait for an administrator (P2.R9).
           function loadConflicts() {
             ApiClient.ajax({
