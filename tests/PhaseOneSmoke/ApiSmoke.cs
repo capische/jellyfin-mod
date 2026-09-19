@@ -667,7 +667,7 @@ internal static class ApiSmoke
         await VerifyEpisodeConflictsAsync(client, dbPath, user, tvLibrary.Id);
         await VerifyReclaimedVisibilityAsync(client, dbPath, user, libraryFolder.Id);
         await VerifyDiscoveryBudgetAsync(client, http, user);
-        await VerifyContractHygieneAsync(client, dbPath, user, libraryFolder.Id);
+        await VerifyContractHygieneAsync(client, dbPath, user, libraryFolder.Id, tvLibrary.Id);
         await VerifyBoundCopyPreferenceAsync(client, dbPath, libraryFolder, secondLibrary, raceLibrary, nativeById);
         // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
         http.Response = null;
@@ -738,7 +738,7 @@ internal static class ApiSmoke
     }
 
     /// <summary>P1.P11: API keys get 401 on user-scoped endpoints, and any bound copy finds its entry.</summary>
-    private static async Task VerifyContractHygieneAsync(HttpClient client, string dbPath, User user, Guid libraryId)
+    private static async Task VerifyContractHygieneAsync(HttpClient client, string dbPath, User user, Guid libraryId, Guid tvLibraryId)
     {
         var entry = new Entry
         {
@@ -764,6 +764,42 @@ internal static class ApiSmoke
             Assert(byCopy.IsSuccessStatusCode && json.RootElement.GetProperty("items").EnumerateArray()
                     .Any(row => Guid.Parse(row.GetProperty("id").GetString()!) == entry.Id),
                 "A non-primary bound native copy finds its entry through its binding");
+        }
+
+        // P3.T14: a native episode finds its series, and a reclaimed native item finds its former entry.
+        var reclaimedNative = Guid.NewGuid();
+        var nativeEpisode = Guid.NewGuid();
+        var series = new Entry
+        {
+            MediaType = "series", TmdbId = 88510, TargetLibraryId = tvLibraryId, Title = "Episode lookup",
+            MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("series", 88510, "Episode lookup",
+                null, null, null, null, null, null, false, null, null, [], [], []))
+        };
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var episode = new Episode { EntryId = series.Id, TmdbId = 88511, SeasonNumber = 1, EpisodeNumber = 1, Title = "One" };
+            database.Entries.Add(series);
+            database.Episodes.Add(episode);
+            database.EpisodeBindings.Add(new EpisodeBinding { EpisodeId = episode.Id, JellyfinItemId = nativeEpisode, TargetLibraryId = tvLibraryId });
+            database.RetentionOperations.Add(new RetentionOperation
+            {
+                ActionId = Guid.NewGuid(), BindingId = Guid.NewGuid(), EntryId = entry.Id, JellyfinItemId = reclaimedNative,
+                TargetLibraryId = libraryId, MediaPath = "/gone.mkv", StorageIdentity = "x", PhysicalIdentity = "y",
+                State = "completed", PreparedAt = DateTime.UtcNow
+            });
+            await database.SaveChangesAsync();
+        }
+
+        foreach (var (nativeId, expected, message) in new[]
+                 {
+                     (nativeEpisode, series.Id, "A native episode id finds its series entry"),
+                     (reclaimedNative, entry.Id, "A reclaimed native id finds the entry it belonged to")
+                 })
+        {
+            using var lookup = await client.GetAsync($"/JellyfinMod/Entries?jellyfinItemId={nativeId}");
+            using var json = JsonDocument.Parse(await lookup.Content.ReadAsStringAsync());
+            Assert(lookup.IsSuccessStatusCode && json.RootElement.GetProperty("items").EnumerateArray()
+                .Any(row => Guid.Parse(row.GetProperty("id").GetString()!) == expected), message);
         }
 
         client.DefaultRequestHeaders.Remove("X-Smoke-User");

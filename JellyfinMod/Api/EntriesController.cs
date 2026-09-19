@@ -43,10 +43,15 @@ public sealed class EntriesController(
         var candidates = database.Entries.AsNoTracking().AsQueryable();
         if (mediaType is not null) candidates = candidates.Where(entry => entry.MediaType == mediaType);
         if (targetLibraryId.HasValue) candidates = candidates.Where(entry => entry.TargetLibraryId == targetLibraryId);
-        // Any bound native copy finds its entry, not only the selected one (P1.P11).
+        // Any bound native copy finds its entry, not only the selected one (P1.P11); a native episode finds its
+        // series, and a reclaimed native item finds the entry it belonged to through the reclaim audit (P3.T14).
         if (jellyfinItemId.HasValue)
             candidates = candidates.Where(entry => entry.JellyfinItemId == jellyfinItemId ||
-                database.EntryBindings.Any(binding => binding.EntryId == entry.Id && binding.JellyfinItemId == jellyfinItemId));
+                database.EntryBindings.Any(binding => binding.EntryId == entry.Id && binding.JellyfinItemId == jellyfinItemId) ||
+                database.Episodes.Any(episode => episode.EntryId == entry.Id && (episode.JellyfinItemId == jellyfinItemId ||
+                    database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id && binding.JellyfinItemId == jellyfinItemId))) ||
+                database.RetentionOperations.Any(operation => operation.EntryId == entry.Id &&
+                    operation.JellyfinItemId == jellyfinItemId && operation.State == RetentionOperationStates.Completed));
         var candidateRows = await candidates.ToListAsync(cancellationToken);
         var nativeIds = candidateRows.Where(entry => entry.JellyfinItemId.HasValue).Select(entry => entry.MediaType).Distinct()
             .ToDictionary(type => type, type => (IReadOnlySet<Guid>)access.GetNativeItems(user, type, targetLibraryId).Select(item => item.Id).ToHashSet());
