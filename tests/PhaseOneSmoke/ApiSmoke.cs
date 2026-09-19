@@ -666,6 +666,7 @@ internal static class ApiSmoke
         await VerifyStaleAndOrphanedEntriesAsync(client, dbPath, user, libraryFolder.Id);
         await VerifyEpisodeConflictsAsync(client, dbPath, user, tvLibrary.Id);
         await VerifyReclaimedVisibilityAsync(client, dbPath, user, libraryFolder.Id);
+        await VerifyDiscoveryBudgetAsync(client, http, user);
         // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
         http.Response = null;
         http.BeforeResponse = null;
@@ -683,6 +684,48 @@ internal static class ApiSmoke
         }
         await app.StopAsync();
         Console.WriteLine("PASS: HTTP auth/access/CRUD, duplicate history, wire-state filter binding, unknown fields and no media deletion");
+    }
+
+    /// <summary>P1.P8: discovery never walks pages it cannot show, and one failed candidate is skipped.</summary>
+    private static async Task VerifyDiscoveryBudgetAsync(HttpClient client, BoundaryHttpFactory http, User user)
+    {
+        client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+        var upstreamCalls = 0;
+        http.BeforeResponse = _ =>
+        {
+            Interlocked.Increment(ref upstreamCalls);
+            return Task.CompletedTask;
+        };
+        http.Status = HttpStatusCode.OK;
+        http.Response = uri => uri.AbsolutePath.Contains("search/movie", StringComparison.Ordinal)
+            ? Json("{\"results\":[{\"id\":88401,\"title\":\"One\"},{\"id\":88402,\"title\":\"Broken\"},{\"id\":88403,\"title\":\"Three\"}],\"total_pages\":3}")
+            : uri.AbsolutePath.EndsWith("/88402", StringComparison.Ordinal)
+                ? new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                : Json("{\"id\":" + uri.AbsolutePath[(uri.AbsolutePath.LastIndexOf('/') + 1)..] + ",\"title\":\"Candidate\"}");
+
+        user.SetPreference(PreferenceKind.AllowedTags, ["kids"]);
+        using (var allowlisted = await client.GetAsync("/JellyfinMod/Discover/Search?q=title&type=movie"))
+        {
+            using var json = JsonDocument.Parse(await allowlisted.Content.ReadAsStringAsync());
+            Assert(allowlisted.IsSuccessStatusCode && json.RootElement.GetProperty("items").GetArrayLength() == 0 &&
+                (!json.RootElement.TryGetProperty("nextPage", out var nextPage) || nextPage.ValueKind == JsonValueKind.Null) &&
+                upstreamCalls == 0,
+                $"An allowlisted user's search returns no items and no next page without calling TMDB ({upstreamCalls} calls)");
+        }
+
+        user.SetPreference(PreferenceKind.AllowedTags, []);
+        using (var partial = await client.GetAsync("/JellyfinMod/Discover/Search?q=title&type=movie"))
+        {
+            using var json = JsonDocument.Parse(await partial.Content.ReadAsStringAsync());
+            Assert(partial.IsSuccessStatusCode && json.RootElement.GetProperty("items").GetArrayLength() == 2 &&
+                json.RootElement.GetProperty("skipped").GetInt32() == 1 &&
+                json.RootElement.GetProperty("nextPage").GetInt32() == 2 && upstreamCalls <= 1 + DiscoverController.MaxDetailCalls,
+                "One failed detail call is skipped and counted while the other candidates and the next page survive: " +
+                json.RootElement.GetRawText());
+        }
+
+        http.BeforeResponse = null;
+        http.Response = null;
     }
 
     /// <summary>P3.T15: a reclaimed title keeps the native tag and rating rules Jellyfin applied to it.</summary>

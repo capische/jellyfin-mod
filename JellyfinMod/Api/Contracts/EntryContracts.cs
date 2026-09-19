@@ -105,7 +105,8 @@ public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto 
 
 /// <summary>Filtered remote page with an explicit continuation, not a misleading remote total.</summary>
 public sealed record DiscoveryResult([property: JsonPropertyName("items")] IReadOnlyList<TmdbMetadata> Items,
-    [property: JsonPropertyName("nextPage")] int? NextPage);
+    [property: JsonPropertyName("nextPage")] int? NextPage,
+    [property: JsonPropertyName("skipped")] int Skipped = 0);
 
 /// <summary>Only these fields may be supplied when adding a title.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
