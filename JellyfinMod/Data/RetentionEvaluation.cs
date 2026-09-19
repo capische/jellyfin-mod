@@ -75,6 +75,8 @@ internal static class RetentionEvaluationReasons
     public const string CompletionEvidenceMissing = "completion_evidence_missing";
     public const string ActiveResume = "active_resume";
     public const string Favorite = "favorite";
+    public const string FavoriteSeries = "favorite_series";
+    public const string SeriesUnavailable = "series_unavailable";
     public const string WaitingForCompletion = "waiting_for_completion";
     public const string CompletionPolicySatisfied = "completion_policy_satisfied";
     public const string RepresentationReset = "representation_reset";

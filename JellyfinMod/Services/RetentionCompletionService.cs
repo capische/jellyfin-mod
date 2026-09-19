@@ -16,27 +16,45 @@ public sealed class RetentionCompletionService(
     TimeProvider clock,
     ILogger<RetentionCompletionService> logger)
 {
-    /// <summary>Refreshes one native movie or episode for one user.</summary>
-    public async Task RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason, CancellationToken cancellationToken)
+    /// <summary>
+    /// Refreshes one native movie or episode for one user. Returns false when a playback-progress update
+    /// changed nothing but the position, which is then not written (P3.T11).
+    /// </summary>
+    public async Task<bool> RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException error) when (error.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 })
+        {
+            // A concurrent writer (listener, repair, evaluation) created the row first; re-read it once.
+            database.ChangeTracker.Clear();
+            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<bool> RefreshCoreAsync(Guid userId, Guid jellyfinItemId, string sourceReason, CancellationToken cancellationToken)
     {
         var user = users.GetUserById(userId);
         if (user is null)
         {
             logger.LogDebug("Retention evidence skipped unknown user {UserId}", userId);
-            return;
+            return false;
         }
 
         var target = await ResolveTargetAsync(jellyfinItemId, cancellationToken).ConfigureAwait(false);
         if (target is null)
         {
             logger.LogDebug("Retention evidence skipped unbound native item {ItemId}", jellyfinItemId);
-            return;
+            return false;
         }
 
         var now = clock.GetUtcNow().UtcDateTime;
         var observation = await database.CompletionObservations.SingleOrDefaultAsync(
             candidate => candidate.TargetId == target.TargetId && candidate.UserId == userId,
             cancellationToken).ConfigureAwait(false);
+        var existing = observation is not null;
         if (observation is null)
         {
             observation = new CompletionObservation
@@ -64,7 +82,7 @@ public sealed class RetentionCompletionService(
         {
             observation.CompletedAt = null;
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            return;
+            return true;
         }
 
         var current = states.OfType<UserItemData>().ToArray();
@@ -73,6 +91,16 @@ public sealed class RetentionCompletionService(
         var finished = current.Any(state => state.Played && state.PlaybackPositionTicks == 0);
         var resume = current.Max(state => state.PlaybackPositionTicks);
         var isCompleted = finished && resume == 0;
+        // Sustained playback only moves the position: once resume protection exists, nothing that
+        // retention reads changes, so the row is left as it is (P3.T11).
+        if (existing && sourceReason == "PlaybackProgress" && observation.PlaybackPositionTicks > 0 && resume > 0 &&
+            observation.Played == finished && observation.IsFavorite == current.Any(state => state.IsFavorite) &&
+            !observation.CompletedAt.HasValue)
+        {
+            database.ChangeTracker.Clear();
+            return false;
+        }
+
         observation.Played = finished;
         observation.IsFavorite = current.Any(state => state.IsFavorite);
         observation.PlaybackPositionTicks = resume;
@@ -81,6 +109,7 @@ public sealed class RetentionCompletionService(
             ? wasCompleted ? observation.CompletedAt : CompletionTime(observation.LastPlayedAt, now)
             : null;
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return true;
     }
 
     private async Task<Guid[]> BoundItemIdsAsync(RetentionTarget target, CancellationToken cancellationToken) =>

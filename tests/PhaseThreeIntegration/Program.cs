@@ -161,7 +161,11 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     services.AddTransient<RetentionPolicyService>();
     services.AddTransient<RetentionCompletionService>();
     services.AddTransient<RetentionEvaluator>();
-    services.AddSingleton<RetentionEventListener>();
+    // A short access poll keeps the P3.T11 user-change check within the test's wait budget.
+    services.AddSingleton(provider => new RetentionEventListener(userData, users,
+        provider.GetRequiredService<IServiceScopeFactory>(),
+        provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RetentionEventListener>>(),
+        TimeSpan.FromMilliseconds(200)));
     await using var provider = services.BuildServiceProvider();
     var listener = provider.GetRequiredService<RetentionEventListener>();
     await listener.StartAsync(default);
@@ -378,6 +382,123 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "scheduled" &&
             evaluation.EligibleAt == clock.GetUtcNow().UtcDateTime && evaluation.Deadline == clock.GetUtcNow().UtcDateTime.AddDays(3),
             "Re-enable did not start a fresh full per-entry grace period");
+
+        // P3.T11: a favourite series is persisted as blocked/favorite_series, and an unresolvable series blocks.
+        states[(firstUser.Id, nativeEpisode.Id)] = State(true, 0, clock.GetUtcNow().UtcDateTime);
+        Raise(firstUser.Id, nativeEpisode, UserDataSaveReason.TogglePlayed);
+        await WaitForObservationAsync(path, firstUser.Id, nativeEpisode.Id, observation => observation.EvidenceAvailable);
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            RetentionEnabled = true,
+            RetentionWatchedUserMode = WatchedUserMode.AnyUser,
+            ReclaimAfterDays = 14,
+            ExemptFavourites = true
+        });
+        try
+        {
+            await WaitForEvaluationAsync(path, episodeRecordId, evaluation => evaluation.State == "blocked" &&
+                evaluation.Reason == "series_unavailable", "An episode whose series cannot be resolved did not block");
+        }
+        catch (InvalidOperationException)
+        {
+            await using var debug = new ModDbContext(path);
+            var actual = await debug.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == episodeRecordId);
+            throw new InvalidOperationException($"series_unavailable expected, got {actual.State}/{actual.Reason} policy {actual.PolicyVersion}");
+        }
+        Guid seriesItemId;
+        await using (var bindings = new ModDbContext(path))
+            seriesItemId = (await bindings.EpisodeBindings.SingleAsync()).SeriesItemId;
+        var nativeSeries = new MediaBrowser.Controller.Entities.TV.Series { Id = seriesItemId, Name = "Series" };
+        items[seriesItemId] = nativeSeries;
+        states[(firstUser.Id, seriesItemId)] = State(false, 0, null, favorite: true);
+        Raise(firstUser.Id, nativeSeries, UserDataSaveReason.UpdateUserRating);
+        await WaitForEvaluationAsync(path, episodeRecordId, evaluation => evaluation.State == "blocked" &&
+            evaluation.Reason == "favorite_series",
+            "A favourite series save did not persist blocked/favorite_series for its episodes");
+
+        // Sustained playback progress after the first resume update writes nothing.
+        states[(firstUser.Id, movie.Id)] = State(true, 500, clock.GetUtcNow().UtcDateTime);
+        Raise(firstUser.Id, movie, UserDataSaveReason.PlaybackProgress);
+        await WaitForObservationAsync(path, firstUser.Id, movie.Id, observation => observation.PlaybackPositionTicks == 500);
+        DateTime observedAt;
+        DateTime evaluatedAt;
+        await using (var before = new ModDbContext(path))
+        {
+            observedAt = (await before.CompletionObservations.SingleAsync(observation =>
+                observation.UserId == firstUser.Id && observation.TargetId == movieEntryId)).ObservedAt;
+            evaluatedAt = (await before.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == movieEntryId)).EvaluatedAt;
+        }
+
+        clock.Advance(TimeSpan.FromMinutes(5));
+        for (var position = 600; position < 900; position += 100)
+        {
+            states[(firstUser.Id, movie.Id)] = State(true, position, clock.GetUtcNow().UtcDateTime);
+            Raise(firstUser.Id, movie, UserDataSaveReason.PlaybackProgress);
+        }
+
+        // The listener is first in, first out; a later episode event proves the progress events were handled.
+        states[(firstUser.Id, nativeEpisode.Id)] = State(true, 0, clock.GetUtcNow().UtcDateTime);
+        Raise(firstUser.Id, nativeEpisode, UserDataSaveReason.TogglePlayed);
+        await WaitForObservationAsync(path, firstUser.Id, nativeEpisode.Id,
+            observation => observation.ObservedAt == clock.GetUtcNow().UtcDateTime);
+        await using (var after = new ModDbContext(path))
+            Assert((await after.CompletionObservations.SingleAsync(observation =>
+                    observation.UserId == firstUser.Id && observation.TargetId == movieEntryId)) is { PlaybackPositionTicks: 500 } quiet &&
+                quiet.ObservedAt == observedAt &&
+                (await after.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == movieEntryId)).EvaluatedAt == evaluatedAt,
+                "Position-only playback progress leaves observation and evaluation rows unchanged");
+
+        // A user created without any event is noticed by the periodic access fingerprint.
+        string accessBefore;
+        await using (var before = new ModDbContext(path))
+            accessBefore = (await before.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == movieEntryId)).AccessFingerprint;
+        var thirdUser = new User("third", "auth", "reset") { Id = Guid.NewGuid() };
+        accessibleLibraries[thirdUser.Id] = [movieLibrary, tvLibrary];
+        allUsers.Add(thirdUser);
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.AccessFingerprint != accessBefore,
+            "Creating a user without an event did not re-evaluate affected targets");
+        allUsers.Remove(thirdUser);
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.AccessFingerprint == accessBefore,
+            "Deleting a user without an event did not re-evaluate affected targets");
+        await using (var cleanup = new ModDbContext(path))
+        {
+            cleanup.CompletionObservations.RemoveRange(cleanup.CompletionObservations.Where(observation => observation.UserId == thirdUser.Id));
+            await cleanup.SaveChangesAsync();
+        }
+
+        // Concurrent first evaluations of one target do not fail on the unique target row.
+        var raceMovie = new Movie { Id = Guid.NewGuid(), Name = "Race", Path = "/fixture/race.mkv" };
+        items[raceMovie.Id] = raceMovie;
+        var raceEntry = new Entry
+        {
+            MediaType = "movie", TmdbId = 30, Title = "Race", State = FileState.OnDisk, TargetLibraryId = movieLibrary.Id
+        };
+        await using (var race = new ModDbContext(path))
+        {
+            race.Entries.Add(raceEntry);
+            race.EntryBindings.Add(new EntryBinding
+            {
+                EntryId = raceEntry.Id, JellyfinItemId = raceMovie.Id, TargetLibraryId = movieLibrary.Id, VersionGroupId = raceMovie.Id
+            });
+            await race.SaveChangesAsync();
+        }
+
+        async Task EvaluateRaceAsync()
+        {
+            using var scope = provider.CreateScope();
+            await scope.ServiceProvider.GetRequiredService<RetentionEvaluator>().EvaluateNativeItemAsync(raceMovie.Id, default);
+        }
+
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => EvaluateRaceAsync()));
+        await using (var race = new ModDbContext(path))
+        {
+            Assert(await race.RetentionEvaluations.CountAsync(evaluation => evaluation.TargetId == raceEntry.Id) == 1,
+                "Concurrent evaluations of a new target produce one row and no UNIQUE failure");
+            race.CompletionObservations.RemoveRange(race.CompletionObservations.Where(observation => observation.EntryId == raceEntry.Id));
+            race.Entries.Remove(await race.Entries.SingleAsync(entry => entry.Id == raceEntry.Id));
+            await race.SaveChangesAsync();
+        }
+
         plugin.UpdateConfiguration(new PluginConfiguration
         {
             RetentionEnabled = false,

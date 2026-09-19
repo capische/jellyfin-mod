@@ -14,8 +14,26 @@ public sealed class RetentionEvaluator(
     IUserManager users,
     LibraryAccess access,
     TimeProvider clock,
-    RetentionCompletionService? completion = null)
+    RetentionCompletionService? completion = null,
+    ILibraryManager? library = null,
+    IUserDataManager? userData = null)
 {
+    /// <summary>Re-evaluates every episode target that belongs to one native series (P3.T11).</summary>
+    public async Task EvaluateSeriesAsync(Guid seriesItemId, CancellationToken cancellationToken)
+    {
+        database.ChangeTracker.Clear();
+        var targets = await database.EpisodeBindings.AsNoTracking()
+            .Where(binding => binding.SeriesItemId == seriesItemId)
+            .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id,
+                (_, episode) => episode)
+            .Join(database.Entries.AsNoTracking(), episode => episode.EntryId, entry => entry.Id,
+                (episode, entry) => new Target(entry, episode.Id))
+            .Distinct()
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var target in targets)
+            await EvaluateAsync(target, cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>Re-evaluates every bound movie and episode.</summary>
     public async Task EvaluateAllAsync(CancellationToken cancellationToken)
     {
@@ -64,7 +82,24 @@ public sealed class RetentionEvaluator(
         if (movie is not null) await EvaluateAsync(new Target(movie, null), cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Evaluates one target. Listener, repair and Keep can evaluate the same new target at once; the loser of
+    /// the insert re-reads the winner's row instead of failing (P3.T11).
+    /// </summary>
     private async Task EvaluateAsync(Target target, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await EvaluateCoreAsync(target, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException error) when (error.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 })
+        {
+            database.ChangeTracker.Clear();
+            await EvaluateCoreAsync(target, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task EvaluateCoreAsync(Target target, CancellationToken cancellationToken)
     {
         var now = clock.GetUtcNow().UtcDateTime;
         var targetId = target.EpisodeId ?? target.Entry.Id;
@@ -94,14 +129,14 @@ public sealed class RetentionEvaluator(
         if (policy is null || !policy.Enabled)
         {
             Set(result, RetentionEvaluationStates.Disabled, RetentionEvaluationReasons.RetentionDisabled);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (target.Entry.RetentionPolicy == RetentionPolicy.Never)
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.Kept);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -120,7 +155,7 @@ public sealed class RetentionEvaluator(
         catch
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.AccessUnavailable);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -130,7 +165,7 @@ public sealed class RetentionEvaluator(
         if (accessibleUsers.Length == 0)
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.NoAccessibleUsers);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -139,14 +174,14 @@ public sealed class RetentionEvaluator(
             if (!policy.SelectedUserId.HasValue)
             {
                 Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.SelectedUserMissing);
-                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                await SaveAsync(result, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
             if (accessibleUsers.All(user => user.Id != policy.SelectedUserId.Value))
             {
                 Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.SelectedUserInaccessible);
-                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                await SaveAsync(result, cancellationToken).ConfigureAwait(false);
                 return;
             }
         }
@@ -172,22 +207,45 @@ public sealed class RetentionEvaluator(
         if (userIds.Any(userId => !observations.TryGetValue(userId, out var observation) || !observation.EvidenceAvailable))
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.CompletionEvidenceMissing);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (observations.Values.Any(observation => observation.PlaybackPositionTicks > 0))
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.ActiveResume);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (policy.ExemptFavourites && observations.Values.Any(observation => observation.IsFavorite))
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.Favorite);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
             return;
+        }
+
+        // A favourite series protects its episodes. The state is persisted, so Details and "Due within 7 days"
+        // agree with the executor instead of learning it only at unlink time (P3.T11).
+        if (policy.ExemptFavourites && target.EpisodeId is { } favouriteEpisodeId && library is not null && userData is not null)
+        {
+            var seriesIds = await database.EpisodeBindings.AsNoTracking()
+                .Where(binding => binding.EpisodeId == favouriteEpisodeId).Select(binding => binding.SeriesItemId)
+                .Distinct().ToArrayAsync(cancellationToken).ConfigureAwait(false);
+            var seriesItems = seriesIds.Select(id => library.GetItemById(id)).ToArray();
+            if (seriesItems.Any(series => series is null))
+            {
+                Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.SeriesUnavailable);
+                await SaveAsync(result, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            if (seriesItems.Any(series => accessibleUsers.Any(user => userData.GetUserData(user, series!)?.IsFavorite == true)))
+            {
+                Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.FavoriteSeries);
+                await SaveAsync(result, cancellationToken).ConfigureAwait(false);
+                return;
+            }
         }
 
         var completed = observations.Values
@@ -204,7 +262,7 @@ public sealed class RetentionEvaluator(
         if (!completionBasis.HasValue)
         {
             Set(result, RetentionEvaluationStates.Waiting, RetentionEvaluationReasons.WaitingForCompletion);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -225,6 +283,17 @@ public sealed class RetentionEvaluator(
         result.CompletionBasisAt = completionBasis;
         result.EligibleAt = eligibleAt;
         result.Deadline = deadline;
+        await SaveAsync(result, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Writes an evaluation only when something other than its evaluation time changed (P3.T11).</summary>
+    private async Task SaveAsync(RetentionEvaluation result, CancellationToken cancellationToken)
+    {
+        var tracked = database.Entry(result);
+        if (tracked.State == EntityState.Modified && tracked.Properties
+                .Where(property => property.IsModified && !Equals(property.OriginalValue, property.CurrentValue))
+                .All(property => property.Metadata.Name == nameof(RetentionEvaluation.EvaluatedAt)))
+            tracked.State = EntityState.Unchanged;
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
