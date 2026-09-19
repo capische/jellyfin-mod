@@ -48,5 +48,15 @@ public class PluginConfiguration : BasePluginConfiguration
     public string TransmissionUsername { get; set; } = string.Empty;
 
     /// <summary>Gets or sets the optional Transmission RPC password.</summary>
+    /// <remarks>Write-only: a submitted value moves to the secret store and this field is saved empty.</remarks>
     public string TransmissionPassword { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the secret-store reference for the TMDB Read Access Token (user decision 3).</summary>
+    public string? TmdbReadAccessTokenRef { get; set; }
+
+    /// <summary>Gets or sets the secret-store reference for the TMDB API key.</summary>
+    public string? TmdbApiKeyRef { get; set; }
+
+    /// <summary>Gets or sets the secret-store reference for the Transmission RPC password.</summary>
+    public string? TransmissionPasswordRef { get; set; }
 }

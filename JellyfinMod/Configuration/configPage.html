@@ -11,11 +11,13 @@
         <div class="inputContainer">
           <input is="emby-input" type="password" id="TmdbReadAccessToken" autocomplete="off"
                  label="TMDB API Read Access Token" />
-          <div class="fieldDescription">Recommended. Used to search TMDB and kept on the server.</div>
+          <div class="fieldDescription">Recommended. Stored on the server and never shown again; leave blank to keep it.</div>
+          <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="ClearTmdbReadAccessToken" /><span>Remove the stored token</span></label>
         </div>
         <div class="inputContainer">
           <input is="emby-input" type="password" id="TmdbApiKey" autocomplete="off" label="TMDB API key" />
-          <div class="fieldDescription">Optional v3 API key for existing configurations.</div>
+          <div class="fieldDescription">Optional v3 API key. Stored on the server and never shown again.</div>
+          <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="ClearTmdbApiKey" /><span>Remove the stored key</span></label>
         </div>
 
         <h2 class="sectionTitle verticalSection">Retention</h2>
@@ -62,7 +64,8 @@
         <div class="inputContainer">
           <input is="emby-input" type="password" id="TransmissionPassword" autocomplete="off"
                  label="Transmission password" />
-          <div class="fieldDescription">Credentials stay in the server-side plugin configuration and never appear in preview diagnostics.</div>
+          <div class="fieldDescription">Stored on the server outside the configuration file and never shown again; leave blank to keep it.</div>
+          <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="ClearTransmissionPassword" /><span>Remove the stored password</span></label>
         </div>
 
         <h2 class="sectionTitle verticalSection">Library reconciliation</h2>
@@ -480,15 +483,20 @@
         .addEventListener('pageshow', function () {
           Dashboard.showLoadingMsg();
           ApiClient.getPluginConfiguration(pluginId).then(function (config) {
-            document.querySelector('#TmdbReadAccessToken').value = config.TmdbReadAccessToken || '';
-            document.querySelector('#TmdbApiKey').value = config.TmdbApiKey || '';
+            // Secrets are write-only (user decision 3): the page learns only whether one is stored.
+            [['TmdbReadAccessToken', config.TmdbReadAccessTokenRef], ['TmdbApiKey', config.TmdbApiKeyRef],
+              ['TransmissionPassword', config.TransmissionPasswordRef]].forEach(function (secret) {
+              var input = document.querySelector('#' + secret[0]);
+              input.value = '';
+              input.setAttribute('placeholder', secret[1] ? 'Stored' : '');
+              document.querySelector('#Clear' + secret[0]).checked = false;
+            });
             document.querySelector('#RetentionEnabled').checked = !!config.RetentionEnabled;
             document.querySelector('#ReclaimAfterDays').value = config.ReclaimAfterDays;
             watchedUserMode.value = watchedUserModeValue(config.RetentionWatchedUserMode);
             document.querySelector('#ExemptFavourites').checked = !!config.ExemptFavourites;
             document.querySelector('#TransmissionRpcUrl').value = config.TransmissionRpcUrl || '';
             document.querySelector('#TransmissionUsername').value = config.TransmissionUsername || '';
-            document.querySelector('#TransmissionPassword').value = config.TransmissionPassword || '';
             return ApiClient.getUsers().then(function (users) {
               var configuredUserId = (config.RetentionSelectedUserId || '').replace(/-/g, '').toLowerCase();
               selectedUser.innerHTML = '';
@@ -594,8 +602,12 @@
           }
           Dashboard.showLoadingMsg();
           ApiClient.getPluginConfiguration(pluginId).then(function (config) {
-            config.TmdbReadAccessToken = document.querySelector('#TmdbReadAccessToken').value;
-            config.TmdbApiKey = document.querySelector('#TmdbApiKey').value;
+            // An empty field keeps the stored secret; the server moves any value out of the configuration file.
+            var secretValue = function (id) {
+              return document.querySelector('#Clear' + id).checked ? '__clear__' : document.querySelector('#' + id).value;
+            };
+            config.TmdbReadAccessToken = secretValue('TmdbReadAccessToken');
+            config.TmdbApiKey = secretValue('TmdbApiKey');
             config.RetentionEnabled = document.querySelector('#RetentionEnabled').checked;
             config.ReclaimAfterDays = parseInt(document.querySelector('#ReclaimAfterDays').value, 10);
             config.RetentionWatchedUserMode = parseInt(watchedUserMode.value, 10);
@@ -603,7 +615,7 @@
             config.ExemptFavourites = document.querySelector('#ExemptFavourites').checked;
             config.TransmissionRpcUrl = document.querySelector('#TransmissionRpcUrl').value.trim();
             config.TransmissionUsername = document.querySelector('#TransmissionUsername').value;
-            config.TransmissionPassword = document.querySelector('#TransmissionPassword').value;
+            config.TransmissionPassword = secretValue('TransmissionPassword');
             ApiClient.updatePluginConfiguration(pluginId, config)
               .then(Dashboard.processPluginConfigurationUpdateResult);
           });

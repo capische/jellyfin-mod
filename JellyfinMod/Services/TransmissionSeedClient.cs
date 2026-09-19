@@ -9,7 +9,8 @@ public sealed class TransmissionSeedClient(
     IHttpClientFactory httpClientFactory,
     Func<PluginConfiguration> configuration,
     UnixFileInspector files,
-    ILogger<TransmissionSeedClient> logger)
+    ILogger<TransmissionSeedClient> logger,
+    AcquisitionSecretStore? secrets = null)
 {
     private static readonly string[] SessionFields =
         ["version", "seedRatioLimited", "seedRatioLimit", "idle-seeding-limit-enabled", "idle-seeding-limit",
@@ -30,9 +31,13 @@ public sealed class TransmissionSeedClient(
 
         try
         {
+            // The saved password lives in the secret store (user decision 3); a value on the object is used as given.
+            var password = settings.TransmissionPassword.Length > 0 || secrets is null
+                ? settings.TransmissionPassword
+                : await secrets.GetAsync(settings.TransmissionPasswordRef, cancellationToken).ConfigureAwait(false) ?? string.Empty;
             using var client = httpClientFactory.CreateClient(NamedClient.Default);
             using var sessionResponse = await SendAsync(client, endpoint, "session-get",
-                new { fields = SessionFields }, settings, cancellationToken).ConfigureAwait(false);
+                new { fields = SessionFields }, settings, password, cancellationToken).ConfigureAwait(false);
             if (!sessionResponse.IsSuccessStatusCode)
                 return TransmissionSeedSnapshot.Unavailable("transmission_unreachable");
             using var sessionDocument = await JsonDocument.ParseAsync(
@@ -42,7 +47,7 @@ public sealed class TransmissionSeedClient(
                 return TransmissionSeedSnapshot.Unavailable("transmission_invalid_response");
 
             using var torrentResponse = await SendAsync(client, endpoint, "torrent-get",
-                new { fields = TorrentFields }, settings, cancellationToken).ConfigureAwait(false);
+                new { fields = TorrentFields }, settings, password, cancellationToken).ConfigureAwait(false);
             if (!torrentResponse.IsSuccessStatusCode)
                 return TransmissionSeedSnapshot.Unavailable("transmission_unreachable");
             using var torrentDocument = await JsonDocument.ParseAsync(
@@ -106,8 +111,9 @@ public sealed class TransmissionSeedClient(
         string method,
         object arguments,
         PluginConfiguration settings,
+        string password,
         CancellationToken cancellationToken) => TransmissionRpc.SendAsync(client, endpoint, method, arguments,
-        settings.TransmissionUsername, settings.TransmissionPassword, cancellationToken);
+        settings.TransmissionUsername, password, cancellationToken);
 
     private static bool Success(JsonElement root, out JsonElement arguments) => TransmissionRpc.Success(root, out arguments);
 

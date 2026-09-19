@@ -45,10 +45,12 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<RetentionRunner>();
         services.AddTransient(provider => new TransmissionSeedClient(
             provider.GetRequiredService<IHttpClientFactory>(), () => Plugin.Instance!.Configuration,
-            provider.GetRequiredService<UnixFileInspector>(), provider.GetRequiredService<ILogger<TransmissionSeedClient>>()));
+            provider.GetRequiredService<UnixFileInspector>(), provider.GetRequiredService<ILogger<TransmissionSeedClient>>(),
+            provider.GetRequiredService<AcquisitionSecretStore>()));
         services.AddSingleton(TimeProvider.System);
         services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
-            () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>()));
+            () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>(),
+            provider.GetRequiredService<AcquisitionSecretStore>()));
         AcquisitionServices.Add(services, () => Plugin.Instance!.DataPath);
         services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<DatabaseInitializer>());

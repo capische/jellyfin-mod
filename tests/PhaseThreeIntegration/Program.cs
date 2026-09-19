@@ -114,6 +114,24 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         _ => null
     });
     var plugin = new Plugin(applicationPaths, serializer);
+
+    // User decision 3: saved secrets leave the XML file for the 0600 store, references are server-owned,
+    // an empty field keeps a secret and the clear marker removes it.
+    plugin.UpdateConfiguration(new PluginConfiguration { TmdbReadAccessToken = "tmdb-secret-value", TransmissionPassword = "rpc-secret-value" });
+    var secretsPath = Path.Combine(folder, "jellyfinmod", "acquisition-secrets.json");
+    var saved = persistedConfiguration;
+    Assert(saved.TmdbReadAccessToken.Length == 0 && saved.TransmissionPassword.Length == 0 &&
+        saved.TmdbReadAccessTokenRef is not null && saved.TransmissionPasswordRef is not null &&
+        File.ReadAllText(secretsPath).Contains("tmdb-secret-value", StringComparison.Ordinal) &&
+        (OperatingSystem.IsWindows() || File.GetUnixFileMode(secretsPath) == (UnixFileMode.UserRead | UnixFileMode.UserWrite)),
+        "Saved credentials move to the 0600 secret store and the configuration keeps only references");
+    var tokenReference = saved.TmdbReadAccessTokenRef;
+    plugin.UpdateConfiguration(new PluginConfiguration { TmdbReadAccessTokenRef = "sec_forged", TransmissionPassword = Plugin.ClearSecret });
+    Assert(persistedConfiguration.TmdbReadAccessTokenRef == tokenReference && persistedConfiguration.TransmissionPasswordRef is null &&
+        !File.ReadAllText(secretsPath).Contains("rpc-secret-value", StringComparison.Ordinal) &&
+        File.ReadAllText(secretsPath).Contains("tmdb-secret-value", StringComparison.Ordinal),
+        "An empty field keeps its secret, submitted references are ignored and the clear marker removes one");
+    plugin.UpdateConfiguration(new PluginConfiguration { TmdbReadAccessToken = Plugin.ClearSecret });
     var clock = new MutableTimeProvider(new DateTimeOffset(2026, 9, 16, 0, 0, 0, TimeSpan.Zero));
     var movieEntryId = Guid.NewGuid();
     var seriesEntryId = Guid.NewGuid();

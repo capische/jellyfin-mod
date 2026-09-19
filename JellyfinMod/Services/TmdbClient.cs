@@ -11,7 +11,8 @@ using Microsoft.Extensions.Logging;
 namespace JellyfinMod.Services;
 
 /// <summary>Fetches metadata from TMDB without exposing credentials or remote response bodies.</summary>
-public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfiguration> configuration, ILogger<TmdbClient> logger)
+public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfiguration> configuration, ILogger<TmdbClient> logger,
+    AcquisitionSecretStore? secrets = null)
 {
     /// <summary>Fetches a movie or series and its regional content certifications.</summary>
     public async Task<TmdbMetadata> GetDetailsAsync(string mediaType, int id, CancellationToken cancellationToken)
@@ -83,11 +84,17 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         return episodes.OrderBy(episode => episode.SeasonNumber).ThenBy(episode => episode.EpisodeNumber).ToArray();
     }
 
+    private async Task<string> ReadSecretAsync(string? reference, CancellationToken cancellationToken) =>
+        secrets is null ? string.Empty : await secrets.GetAsync(reference, cancellationToken).ConfigureAwait(false) ?? string.Empty;
+
     private async Task<JsonDocument> GetAsync(string path, CancellationToken cancellationToken)
     {
         var config = configuration();
-        var token = config.TmdbReadAccessToken.Trim();
-        var key = config.TmdbApiKey.Trim();
+        // Saved credentials live in the secret store; a value on the configuration object is used as given.
+        var token = (config.TmdbReadAccessToken.Length > 0 ? config.TmdbReadAccessToken
+            : await ReadSecretAsync(config.TmdbReadAccessTokenRef, cancellationToken).ConfigureAwait(false)).Trim();
+        var key = (config.TmdbApiKey.Length > 0 ? config.TmdbApiKey
+            : await ReadSecretAsync(config.TmdbApiKeyRef, cancellationToken).ConfigureAwait(false)).Trim();
         if (token.Length == 0 && key.Length == 0)
             throw new TmdbException("An administrator must configure a TMDB API Read Access Token or API key.", HttpStatusCode.ServiceUnavailable);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

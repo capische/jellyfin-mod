@@ -15,11 +15,17 @@ public sealed class AcquisitionSecretStore
 {
     private const string Prefix = "sec_";
     private readonly string _path;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    // One gate per store file, so the plugin's own instance and the DI singleton never interleave writes.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> Gates = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _gate;
 
     /// <summary>Initializes a new instance of the <see cref="AcquisitionSecretStore"/> class.</summary>
     /// <param name="dataPath">The plugin data directory.</param>
-    public AcquisitionSecretStore(string dataPath) => _path = Path.Combine(dataPath, "acquisition-secrets.json");
+    public AcquisitionSecretStore(string dataPath)
+    {
+        _path = Path.GetFullPath(Path.Combine(dataPath, "acquisition-secrets.json"));
+        _gate = Gates.GetOrAdd(_path, static _ => new SemaphoreSlim(1, 1));
+    }
 
     /// <summary>Stores a new value and returns its opaque reference.</summary>
     public async Task<string> AddAsync(string value, CancellationToken cancellationToken)
