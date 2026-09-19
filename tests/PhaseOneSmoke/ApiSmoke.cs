@@ -495,6 +495,30 @@ internal static class ApiSmoke
                 !(await database.Episodes.SingleAsync(episode => episode.Id == Guid.Parse(episodeId))).Monitored &&
                 await database.History.CountAsync(history => history.EntryId == Guid.Parse(seriesId)) == 1,
                 "Partial refresh causes no episode deletion, settings reset, or history loss in SQLite");
+
+        // P3.T10: Refresh is metadata-only. Availability, bindings and reclaimed states belong to
+        // reconciliation and retention and survive a refresh unchanged.
+        FileState seriesStateBefore;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var reclaimed = await database.Episodes.SingleAsync(episode => episode.EntryId == Guid.Parse(seriesId) && episode.TmdbId == 9002);
+            reclaimed.State = FileState.Reclaimed;
+            reclaimed.JellyfinItemId = null;
+            seriesStateBefore = (await database.Entries.SingleAsync(entry => entry.Id == Guid.Parse(seriesId))).State;
+            await database.SaveChangesAsync();
+        }
+        http.Response = completeSnapshot;
+        using (var keptStates = await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null))
+            Assert(keptStates.IsSuccessStatusCode, "Admin refresh succeeds with a reclaimed episode present");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var reclaimed = await database.Episodes.SingleAsync(episode => episode.EntryId == Guid.Parse(seriesId) && episode.TmdbId == 9002);
+            var boundPilot = await database.Episodes.SingleAsync(episode => episode.Id == Guid.Parse(episodeId));
+            var series = await database.Entries.SingleAsync(entry => entry.Id == Guid.Parse(seriesId));
+            Assert(reclaimed.State == FileState.Reclaimed && reclaimed.JellyfinItemId is null &&
+                boundPilot.State == FileState.OnDisk && boundPilot.JellyfinItemId is not null && series.State == seriesStateBefore,
+                $"Refresh keeps reclaimed and bound states and never resets availability: {reclaimed.State}/{boundPilot.State}/{series.State}");
+        }
         foreach (var malformed in new[] { "{}", "{\"episodes\":{}}", "{\"season_number\":2,\"episodes\":[]}" })
         {
             http.Response = uri => uri.AbsolutePath.Contains("/season/", StringComparison.Ordinal) ? Json(malformed)

@@ -264,6 +264,17 @@ public sealed class RetentionExecutor(
     {
         await using var transaction = await database.Database.BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
+        if (operation.EntryId is not { } entryId)
+        {
+            // Removal is refused while an operation is open, so this only happens to legacy rows.
+            operation.State = RetentionOperationStates.Completed;
+            operation.Reason = RetentionExecutionReasons.Reclaimed;
+            operation.CompletedAt = clock.GetUtcNow().UtcDateTime;
+            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return RetentionExecutionResult.From(operation);
+        }
+
         if (operation.EpisodeId.HasValue)
         {
             var binding = await database.EpisodeBindings.SingleOrDefaultAsync(
@@ -279,7 +290,7 @@ public sealed class RetentionExecutor(
                 remaining.FirstOrDefault()?.JellyfinItemId;
             episode.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
             if (remaining.Length == 0)
-                await RetentionTargetReset.ResetAsync(database, operation.EntryId, episode.Id,
+                await RetentionTargetReset.ResetAsync(database, entryId, episode.Id,
                     clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
         }
         else
@@ -314,7 +325,7 @@ public sealed class RetentionExecutor(
             database.History.Add(new HistoryRecord
             {
                 Id = operation.Id,
-                EntryId = operation.EntryId,
+                EntryId = entryId,
                 EventType = "reclaimed",
                 Summary = operation.EpisodeId.HasValue
                     ? "Episode media reclaimed after its retention window"

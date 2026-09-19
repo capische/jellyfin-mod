@@ -106,8 +106,10 @@ public class ModDbContext : DbContext
             e.HasIndex(x => new { x.BindingId, x.State });
             e.HasIndex(x => x.PhysicalIdentity);
             e.HasIndex(x => x.PreparedAt);
-            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
-            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+            // Reclamation operations are the audit trail of deleted media; removing an entry or episode
+            // must detach them, never cascade them away (P3.T10).
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.SetNull);
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.SetNull);
         });
 
         b.Entity<RetentionRun>(e =>

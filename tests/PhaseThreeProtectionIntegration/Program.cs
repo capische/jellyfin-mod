@@ -610,6 +610,8 @@ static async Task VerifyPreviewHttpAsync(
             user.Id, libraryFolder.Id, liveStates, sessionRows, sessionManager);
         await VerifyHonestRecoveryAsync(api.Services, databasePath, libraryPath, storage, clock, items,
             user.Id, libraryFolder.Id);
+        await VerifyRemoveGuardsAsync(api.Services, http, databasePath, libraryPath, storage, clock, items,
+            user.Id, libraryFolder.Id, entry.Id);
     }
     finally
     {
@@ -930,6 +932,81 @@ static void Assert(bool condition, string message)
     if (!condition) throw new InvalidOperationException(message);
 }
 
+// P3.T10: removing an entry can never race an unlink, erase the reclaim audit, or drop Keep.
+static async Task VerifyRemoveGuardsAsync(
+    IServiceProvider services,
+    HttpClient http,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    IDictionary<Guid, BaseItem> nativeItems,
+    Guid userId,
+    Guid libraryId,
+    Guid boundEntryId)
+{
+    // Still bound to native media: reconciliation would recreate it without its settings.
+    using (var bound = await http.DeleteAsync($"/JellyfinMod/Entries/{boundEntryId}"))
+        Assert(bound.StatusCode == HttpStatusCode.Conflict,
+            $"Removing an entry whose media is still bound is refused: {bound.StatusCode}");
+
+    // An open retention operation on the same entry is reported before the binding check.
+    var openOperation = new RetentionOperation
+    {
+        ActionId = Guid.NewGuid(), BindingId = Guid.NewGuid(), EntryId = boundEntryId, JellyfinItemId = Guid.NewGuid(),
+        TargetLibraryId = libraryId, PolicyVersion = 1, MediaPath = "/fixture/t10-open.mkv", StorageIdentity = "fixture",
+        PhysicalIdentity = "fixture", LogicalBytes = 1, HardlinkCountBefore = 1,
+        State = RetentionOperationStatesForTest.Prepared, Reason = "eligible", PreparedAt = clock.GetUtcNow().UtcDateTime
+    };
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.RetentionOperations.Add(openOperation);
+        await database.SaveChangesAsync();
+    }
+
+    using (var inProgress = await http.DeleteAsync($"/JellyfinMod/Entries/{boundEntryId}"))
+    {
+        var body = await inProgress.Content.ReadAsStringAsync();
+        Assert(inProgress.StatusCode == HttpStatusCode.Conflict && body.Contains("in progress", StringComparison.Ordinal),
+            $"Removing an entry with an open retention operation is refused: {inProgress.StatusCode} {body}");
+    }
+
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.RetentionOperations.Remove(await database.RetentionOperations.SingleAsync(operation => operation.Id == openOperation.Id));
+        await database.SaveChangesAsync();
+    }
+
+    // Fully reclaimed: removal is allowed and the reclaim audit survives with a detached entry.
+    var reclaimed = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900402, "t10-reclaimed", RetentionOperationStatesForTest.Unlinked, keep: false);
+    File.Delete(reclaimed.MediaPath);
+    var result = (await services.GetRequiredService<RetentionExecutor>().RecoverAsync(default))
+        .Single(candidate => candidate.OperationId == reclaimed.OperationId);
+    Guid reclaimedEntryId;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        reclaimedEntryId = (await database.RetentionOperations.SingleAsync(operation => operation.Id == reclaimed.OperationId)).EntryId!.Value;
+        // A real entry always carries its TMDB snapshot, which is what file-less visibility is checked against.
+        (await database.Entries.SingleAsync(entry => entry.Id == reclaimedEntryId)).MetadataJson = JsonSerializer.Serialize(
+            new TmdbMetadata("movie", 900402, "t10-reclaimed", null, null, null, null, null, null, false, null, null, [], [], []));
+        await database.SaveChangesAsync();
+    }
+    using (var removed = await http.DeleteAsync($"/JellyfinMod/Entries/{reclaimedEntryId}"))
+        Assert(result.State == "completed" && removed.StatusCode == HttpStatusCode.NoContent,
+            $"A fully reclaimed entry can be removed: {result.State} {removed.StatusCode}");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var audit = await database.RetentionOperations.SingleAsync(operation => operation.Id == reclaimed.OperationId);
+        Assert(audit.EntryId is null && audit.State == "completed" && audit.LogicalBytes > 0 &&
+            !await database.Entries.AnyAsync(entry => entry.Id == reclaimedEntryId),
+            "Removing an entry detaches its reclaim operations instead of cascading the audit away");
+
+    }
+
+    File.Delete(reclaimed.SidecarPath);
+}
+
 // P3.T9: the runner recovers interrupted work first and records only what it can prove.
 static async Task VerifyHonestRecoveryAsync(
     IServiceProvider services,
@@ -1054,7 +1131,7 @@ static async Task VerifyLiveStateRevalidationAsync(
         (await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == operation.EntryId))
             .PolicyVersion = policy.Version;
         await database.SaveChangesAsync();
-        return (fixture, operation.JellyfinItemId, operation.EntryId);
+        return (fixture, operation.JellyfinItemId, operation.EntryId!.Value);
     }
 
     async Task<RetentionExecutionResult> RecoverAsync(RecoveryFixture fixture) =>

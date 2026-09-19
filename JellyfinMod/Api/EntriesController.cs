@@ -20,7 +20,8 @@ public sealed class EntriesController(
     ReconciliationLibraryLock libraryLock,
     RetentionExecutionGate retentionGate,
     RetentionEvaluator retentionEvaluator,
-    CatalogSortName sortNames) : ControllerBase
+    CatalogSortName sortNames,
+    JellyfinItemReconciliationRunner? reconciliation = null) : ControllerBase
 {
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
@@ -123,69 +124,81 @@ public sealed class EntriesController(
         if (!readiness.IsReady) return StatusCode(503);
         var user = access.GetUser(User);
         if (user is null) return Unauthorized();
-        var entry = await database.Entries.SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
-        if (entry is null || !access.CanRead(user, entry)) return NotFound();
-        if (entry.MediaType != "series" || entry.TargetLibraryId is not { } libraryId) return BadRequest();
+        var visible = await database.Entries.AsNoTracking().SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
+        if (visible is null || !access.CanRead(user, visible)) return NotFound();
+        if (visible.MediaType != "series" || visible.TargetLibraryId is not { } libraryId) return BadRequest();
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(60));
         try
         {
-            // Both remote snapshots are fully validated before any tracked entity is changed.
-            var metadata = await tmdb.GetDetailsAsync(entry.MediaType, entry.TmdbId, timeout.Token);
+            // Both remote snapshots are fully validated before any lock is taken or entity changed.
+            var metadata = await tmdb.GetDetailsAsync(visible.MediaType, visible.TmdbId, timeout.Token);
             var snapshot = await tmdb.GetEpisodesAsync(metadata, timeout.Token);
-            await using var transaction = await database.Database.BeginTransactionAsync(timeout.Token);
-            var existing = await database.Episodes.Where(episode => episode.EntryId == entry.Id).ToListAsync(timeout.Token);
-            var byTmdbId = existing.ToDictionary(episode => episode.TmdbId);
-            if (snapshot.Any(remote => byTmdbId.TryGetValue(remote.TmdbId, out var local) &&
-                (local.SeasonNumber != remote.SeasonNumber || local.EpisodeNumber != remote.EpisodeNumber)))
+
+            // Refresh changes metadata only. Availability, bindings and retention state belong to
+            // reconciliation and retention, so it serializes with both and never sets them (P3.T10).
+            Guid? nativeSeriesId;
+            await using (await retentionGate.AcquireAsync(timeout.Token))
+            await using (await libraryLock.AcquireAsync(libraryId, timeout.Token))
             {
-                // Free the unique display positions before applying swaps. Negative seasons
-                // cannot come from TMDB, and the transaction hides these temporary positions.
-                for (var index = 0; index < existing.Count; index++)
+                database.ChangeTracker.Clear();
+                var entry = await database.Entries.SingleOrDefaultAsync(e => e.Id == id, timeout.Token);
+                if (entry is null) return NotFound();
+                await using var transaction = await database.Database.BeginTransactionAsync(timeout.Token);
+                var existing = await database.Episodes.Where(episode => episode.EntryId == entry.Id).ToListAsync(timeout.Token);
+                var byTmdbId = existing.ToDictionary(episode => episode.TmdbId);
+                if (snapshot.Any(remote => byTmdbId.TryGetValue(remote.TmdbId, out var local) &&
+                    (local.SeasonNumber != remote.SeasonNumber || local.EpisodeNumber != remote.EpisodeNumber)))
                 {
-                    existing[index].SeasonNumber = -1;
-                    existing[index].EpisodeNumber = index + 1;
+                    // Free the unique display positions before applying swaps. Negative seasons
+                    // cannot come from TMDB, and the transaction hides these temporary positions.
+                    for (var index = 0; index < existing.Count; index++)
+                    {
+                        existing[index].SeasonNumber = -1;
+                        existing[index].EpisodeNumber = index + 1;
+                    }
+                    await database.SaveChangesAsync(timeout.Token);
                 }
+
+                foreach (var remote in snapshot)
+                {
+                    if (byTmdbId.Remove(remote.TmdbId, out var local))
+                    {
+                        local.SeasonNumber = remote.SeasonNumber;
+                        local.EpisodeNumber = remote.EpisodeNumber;
+                        local.Title = remote.Title;
+                        local.Overview = remote.Overview;
+                        local.StillPath = remote.StillPath;
+                        local.AirDate = remote.AirDate;
+                        local.RuntimeMinutes = remote.RuntimeMinutes;
+                    }
+                    else
+                    {
+                        remote.EntryId = entry.Id;
+                        database.Episodes.Add(remote);
+                    }
+                }
+
+                // TMDB's series and season endpoints can briefly disagree for airing shows.
+                // Preserve unmatched local episodes so a partial snapshot is never interpreted as deletion.
+                entry.Title = metadata.Title;
+                entry.Year = metadata.PremiereDate?.Year;
+                entry.ImdbId = metadata.ImdbId;
+                entry.Overview = metadata.Overview;
+                entry.PosterPath = metadata.PosterPath;
+                entry.MetadataJson = JsonSerializer.Serialize(metadata);
                 await database.SaveChangesAsync(timeout.Token);
-            }
-            foreach (var remote in snapshot)
-            {
-                if (byTmdbId.Remove(remote.TmdbId, out var local))
-                {
-                    local.SeasonNumber = remote.SeasonNumber;
-                    local.EpisodeNumber = remote.EpisodeNumber;
-                    local.Title = remote.Title;
-                    local.Overview = remote.Overview;
-                    local.StillPath = remote.StillPath;
-                    local.AirDate = remote.AirDate;
-                    local.RuntimeMinutes = remote.RuntimeMinutes;
-                    local.JellyfinItemId = null;
-                    if (local.State == FileState.OnDisk) local.State = FileState.None;
-                }
-                else
-                {
-                    remote.EntryId = entry.Id;
-                    database.Episodes.Add(remote);
-                }
+                await transaction.CommitAsync(timeout.Token);
+                nativeSeriesId = entry.JellyfinItemId;
             }
 
-            // TMDB's series and season endpoints can briefly disagree for airing shows.
-            // Preserve unmatched local episodes so a partial snapshot is never interpreted as deletion.
-            entry.Title = metadata.Title;
-            entry.Year = metadata.PremiereDate?.Year;
-            entry.ImdbId = metadata.ImdbId;
-            entry.Overview = metadata.Overview;
-            entry.PosterPath = metadata.PosterPath;
-            entry.MetadataJson = JsonSerializer.Serialize(metadata);
-            var owned = access.FindOwned(user, metadata, libraryId);
-            entry.JellyfinItemId = owned?.Id;
-            entry.State = owned is null ? FileState.None : FileState.OnDisk;
-            access.BindEpisodes(user, owned, existing.Where(episode => !byTmdbId.ContainsKey(episode.TmdbId))
-                .Concat(snapshot.Where(remote => !existing.Any(local => local.TmdbId == remote.TmdbId))).ToArray());
-            await database.SaveChangesAsync(timeout.Token);
-            await transaction.CommitAsync(timeout.Token);
-            return await BuildDetail(entry, cancellationToken);
+            // New episodes bind through the one Phase 2 matcher, never a second one here.
+            if (nativeSeriesId is { } seriesId && reconciliation is not null)
+                await reconciliation.ReconcileAsync(seriesId, timeout.Token);
+            database.ChangeTracker.Clear();
+            var refreshed = await database.Entries.AsNoTracking().SingleAsync(e => e.Id == id, cancellationToken);
+            return await BuildDetail(refreshed, cancellationToken);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -276,7 +289,11 @@ public sealed class EntriesController(
         return new EpisodeDto(episode);
     }
 
-    /// <summary>Removes only a catalog entry and its dependent records. File deletion is unavailable.</summary>
+    /// <summary>
+    /// Removes only a catalog entry and its dependent records. File deletion is unavailable. Removal is
+    /// refused while a retention operation is open or native media is still bound, because reconciliation
+    /// would recreate the entry without its Keep or retention settings (P3.T10).
+    /// </summary>
     [HttpDelete("{id:guid}"), Authorize(Policy = Policies.RequiresElevation)]
     public async Task<IActionResult> Remove(Guid id, [FromQuery] bool deleteFiles = false, CancellationToken cancellationToken = default)
     {
@@ -284,8 +301,33 @@ public sealed class EntriesController(
         var user = access.GetUser(User);
         if (user is null) return Unauthorized();
         if (deleteFiles) return BadRequest("File deletion is not available in Phase 1.");
+        var visible = await database.Entries.AsNoTracking().SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
+        if (visible is null || !access.CanRead(user, visible) || visible.TargetLibraryId is not { } libraryId) return NotFound();
+
+        // Serialized with retention and reconciliation, so a Remove can never race an unlink.
+        await using var executionLease = await retentionGate.AcquireAsync(cancellationToken);
+        await using var libraryLease = await libraryLock.AcquireAsync(libraryId, cancellationToken);
+        database.ChangeTracker.Clear();
         var entry = await database.Entries.SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
-        if (entry is null || !access.CanRead(user, entry)) return NotFound();
+        if (entry is null) return NotFound();
+        if (await database.RetentionOperations.AnyAsync(operation => operation.EntryId == id &&
+                (operation.State == RetentionOperationStates.Prepared || operation.State == RetentionOperationStates.Unlinked),
+                cancellationToken))
+            return Conflict(new ProblemDetails
+            {
+                Status = 409, Title = "Automatic removal of this title's media is still in progress. Try again later."
+            });
+        var episodeIds = await database.Episodes.Where(episode => episode.EntryId == id).Select(episode => episode.Id)
+            .ToArrayAsync(cancellationToken);
+        if (await database.EntryBindings.AnyAsync(binding => binding.EntryId == id, cancellationToken) ||
+            await database.EpisodeBindings.AnyAsync(binding => episodeIds.Contains(binding.EpisodeId), cancellationToken))
+            return Conflict(new ProblemDetails
+            {
+                Status = 409,
+                Title = "This title still has media in the library. It would be added back without its settings, " +
+                    "so it cannot be removed while the media exists."
+            });
+
         database.Entries.Remove(entry);
         database.History.RemoveRange(database.History.Where(h => h.EntryId == id));
         await database.SaveChangesAsync(cancellationToken);

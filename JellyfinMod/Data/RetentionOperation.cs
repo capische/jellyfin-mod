@@ -14,8 +14,9 @@ public sealed class RetentionOperation
     /// <summary>Gets or sets the representation binding selected for reclamation.</summary>
     public Guid BindingId { get; set; }
 
-    /// <summary>Gets or sets the owning catalog entry.</summary>
-    public Guid EntryId { get; set; }
+    /// <summary>Gets or sets the owning catalog entry, or null after the entry was removed.</summary>
+    /// <remarks>Operations are kept as an audit trail; removing an entry detaches them (P3.T10).</remarks>
+    public Guid? EntryId { get; set; }
 
     /// <summary>Gets or sets the episode identity, or null for a movie.</summary>
     public Guid? EpisodeId { get; set; }
