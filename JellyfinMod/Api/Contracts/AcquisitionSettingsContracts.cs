@@ -32,7 +32,9 @@ public sealed record IndexerSettingsDto(
     [property: JsonPropertyName("verified")] bool Verified,
     [property: JsonPropertyName("capabilities"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] IndexerCapabilitiesDto? Capabilities,
     [property: JsonPropertyName("capabilitiesFetchedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? CapabilitiesFetchedAt,
-    [property: JsonPropertyName("lastError"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? LastError);
+    [property: JsonPropertyName("lastError"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? LastError,
+    [property: JsonPropertyName("minIntervalSeconds")] int MinIntervalSeconds = 10,
+    [property: JsonPropertyName("dailyQueryBudget")] int DailyQueryBudget = 200);
 
 /// <summary>The safe subset of a verified Torznab capability document.</summary>
 public sealed record IndexerCapabilitiesDto(
@@ -82,6 +84,14 @@ public sealed class IndexerSettingsRequest
     /// <summary>Gets or sets the tracker's minimum seeding time in minutes.</summary>
     [Range(0, 525600), JsonPropertyName("minimumSeedMinutes")]
     public int? MinimumSeedMinutes { get; set; }
+
+    /// <summary>Gets or sets the minimum seconds between two searches of this indexer (P6.M2); null keeps the saved value.</summary>
+    [Range(0, 3600), JsonPropertyName("minIntervalSeconds")]
+    public int? MinIntervalSeconds { get; set; }
+
+    /// <summary>Gets or sets the daily query budget (P6.M2); null keeps the saved value.</summary>
+    [Range(0, 100000), JsonPropertyName("dailyQueryBudget")]
+    public int? DailyQueryBudget { get; set; }
 
     /// <summary>Gets or sets the revision being replaced; required by PATCH.</summary>
     [JsonPropertyName("revision")]
@@ -171,7 +181,12 @@ public sealed record QualityProfileDto(
     [property: JsonPropertyName("minimumBytesPerHour"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? MinimumBytesPerHour,
     [property: JsonPropertyName("maximumBytesPerHour"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? MaximumBytesPerHour,
     [property: JsonPropertyName("revision")] int Revision,
-    [property: JsonPropertyName("isDefault")] bool IsDefault);
+    [property: JsonPropertyName("isDefault")] bool IsDefault,
+    [property: JsonPropertyName("cutoff"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Cutoff = null,
+    [property: JsonPropertyName("upgradeAllowed")] bool UpgradeAllowed = false,
+    [property: JsonPropertyName("upgradeMode")] string UpgradeMode = "replace",
+    [property: JsonPropertyName("minimumAutoScore"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumAutoScore = null,
+    [property: JsonPropertyName("minimumSeeders"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumSeeders = null);
 
 /// <summary>Quality profile write contract. PATCH must echo the current revision.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -192,6 +207,26 @@ public sealed class QualityProfileRequest
     /// <summary>Gets or sets the optional maximum size per runtime hour.</summary>
     [Range(1, long.MaxValue), JsonPropertyName("maximumBytesPerHour")]
     public long? MaximumBytesPerHour { get; set; }
+
+    /// <summary>Gets or sets the quality where upgrades stop; must be one of the allowed qualities (P6.M2).</summary>
+    [MaxLength(32), JsonPropertyName("cutoff")]
+    public string? Cutoff { get; set; }
+
+    /// <summary>Gets or sets whether automation upgrades titles below the cutoff.</summary>
+    [JsonPropertyName("upgradeAllowed")]
+    public bool UpgradeAllowed { get; set; }
+
+    /// <summary>Gets or sets <c>replace</c> or <c>add</c>.</summary>
+    [JsonPropertyName("upgradeMode")]
+    public string UpgradeMode { get; set; } = "replace";
+
+    /// <summary>Gets or sets the minimum score an automatic grab needs.</summary>
+    [Range(0, 100000), JsonPropertyName("minimumAutoScore")]
+    public int? MinimumAutoScore { get; set; }
+
+    /// <summary>Gets or sets the minimum seeders an automatic grab needs.</summary>
+    [Range(0, 100000), JsonPropertyName("minimumSeeders")]
+    public int? MinimumSeeders { get; set; }
 
     /// <summary>Gets or sets the revision being replaced; required by PATCH.</summary>
     [JsonPropertyName("revision")]

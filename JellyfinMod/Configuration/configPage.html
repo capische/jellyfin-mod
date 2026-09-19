@@ -117,6 +117,11 @@
         </div>
         <div class="inputContainer"><input is="emby-input" type="number" id="IndexerSeedRatio" min="0" max="100" step="0.1" label="Minimum seed ratio (optional)" /></div>
         <div class="inputContainer"><input is="emby-input" type="number" id="IndexerSeedMinutes" min="0" label="Minimum seeding minutes (optional)" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="IndexerMinInterval" min="0" max="3600" label="Seconds between searches of this indexer" /></div>
+        <div class="inputContainer">
+          <input is="emby-input" type="number" id="IndexerDailyBudget" min="0" max="100000" label="Searches per day" />
+          <div class="fieldDescription">Manual and automatic searches both count. Five failures in a row pause the indexer for an hour.</div>
+        </div>
         <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="IndexerEnabled" /><span>Search this indexer</span></label>
         <button is="emby-button" type="button" id="SaveIndexer" class="raised block"><span>Save indexer</span></button>
         <button is="emby-button" type="button" id="NewIndexer" class="raised button-cancel block"><span>New indexer</span></button>
@@ -170,6 +175,18 @@
         <div id="ProfileQualities"></div>
         <div class="inputContainer"><input is="emby-input" type="number" id="ProfileMinimum" min="0" step="0.1" label="Minimum GB per hour (optional)" /></div>
         <div class="inputContainer"><input is="emby-input" type="number" id="ProfileMaximum" min="0" step="0.1" label="Maximum GB per hour (optional)" /></div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="ProfileUpgradeAllowed" /><span>Upgrade titles below the cutoff automatically</span></label>
+        <div class="selectContainer">
+          <select is="emby-select" id="ProfileCutoff" label="Cutoff (upgrades stop at this quality)"></select>
+        </div>
+        <div class="selectContainer">
+          <select is="emby-select" id="ProfileUpgradeMode" label="When a better version arrives">
+            <option value="replace">Replace the old version once the new one plays</option>
+            <option value="add">Keep both versions</option>
+          </select>
+        </div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="ProfileMinimumScore" min="0" label="Minimum score for automatic grabs (optional)" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="ProfileMinimumSeeders" min="0" label="Minimum seeders for automatic grabs (optional)" /></div>
         <button is="emby-button" type="button" id="SaveProfile" class="raised block"><span>Save quality profile</span></button>
         <button is="emby-button" type="button" id="NewProfile" class="raised button-cancel block"><span>New quality profile</span></button>
       </div>
@@ -194,6 +211,34 @@
         <div class="inputContainer"><input is="emby-input" type="number" id="ScanTimeoutMinutes" min="1" max="1440" label="Wait for Jellyfin to add an import (minutes)" /></div>
         <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="QueueVisibleToUsers" /><span>Let every user see the download queue for libraries they can access</span></label>
         <button is="emby-button" type="button" id="SaveImport" class="raised button-submit block"><span>Save import settings</span></button>
+      </div>
+
+      <div id="JellyfinModAutomation" class="verticalSection">
+        <h2 class="sectionTitle">Automation</h2>
+        <div id="AutomationStatus" class="fieldDescription">Automation settings have not loaded.</div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="AutomationEnabled" /><span>Search monitored titles and grab automatically</span></label>
+        <div class="fieldDescription">
+          Off by default. When on, monitored titles without a file and aired monitored episodes are searched on a schedule,
+          and titles below their profile's cutoff are upgraded when the profile allows it. Manual grabs work either way.
+        </div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="AutomationIntervalHours" min="1" max="168" label="Hours between runs" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="AutomationBatchSize" min="1" max="500" label="Titles searched per run" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="NewEpisodeDelayMinutes" min="0" max="10080" label="Minutes after air time before an episode is searched" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="DailyAutoGrabBudget" min="0" max="200" label="Automatic grabs per day" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="MaxConcurrentImports" min="0" max="100" label="Open imports before automatic grabs pause" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="FreeSpaceFloorPercent" min="0" max="90" label="Keep at least this percentage of the library disk free" /></div>
+        <div class="inputContainer">
+          <input is="emby-input" type="number" id="FreeSpaceFloorGb" min="0" step="1" label="Keep at least this many GB free" />
+          <div class="fieldDescription">The larger of the two floors applies.</div>
+        </div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="DecisionLogCap" min="100" max="100000" label="Decisions kept in the log" /></div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="ReacquireReclaimed" /><span>Search again for monitored titles that retention reclaimed</span></label>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="EpisodeUpgradesEnabled" /><span>Allow episode upgrades and extra episode versions</span></label>
+        <div class="fieldDescription">Leave off until the server is shown to group two files of one episode as versions.</div>
+        <button is="emby-button" type="button" id="SaveAutomation" class="raised button-submit block"><span>Save automation settings</span></button>
+        <button is="emby-button" type="button" id="RunAutomation" class="raised button-cancel block"><span>Run now</span></button>
+        <h3 class="sectionTitle verticalSection">Recent decisions</h3>
+        <div id="AutomationDecisions" class="fieldDescription">No decisions yet.</div>
       </div>
     </div>
   </div>
@@ -320,6 +365,8 @@
         field('IndexerSeedRatio').value = indexer && indexer.minimumSeedRatio !== null ? indexer.minimumSeedRatio : '';
         field('IndexerSeedMinutes').value = indexer && indexer.minimumSeedMinutes !== null ? indexer.minimumSeedMinutes : '';
         field('IndexerEnabled').checked = indexer ? indexer.enabled : true;
+        field('IndexerMinInterval').value = indexer && indexer.minIntervalSeconds !== undefined ? indexer.minIntervalSeconds : 10;
+        field('IndexerDailyBudget').value = indexer && indexer.dailyQueryBudget !== undefined ? indexer.dailyQueryBudget : 200;
       }
 
       // Import settings and path mappings (P5.I2).
@@ -434,6 +481,90 @@
         }, report('Import path test'));
       });
 
+      // Automation (P6.M2/M8): settings, status, a manual run and the recent decision log.
+      var automationState = { settings: null };
+
+      function automationRequest(method, path, data) {
+        return ApiClient.ajax({
+          type: method,
+          url: ApiClient.getUrl('JellyfinMod/' + path),
+          contentType: data ? 'application/json' : undefined,
+          dataType: 'json',
+          data: data ? JSON.stringify(data) : undefined
+        });
+      }
+
+      function loadAutomation() {
+        return Promise.all([settingsRequest('GET', 'Automation'), automationRequest('GET', 'Automation/Status'),
+          automationRequest('GET', 'Automation/Decisions?limit=20')]).then(function (values) {
+          var settings = automationState.settings = values[0];
+          var status = values[1];
+          field('AutomationEnabled').checked = settings.automationEnabled;
+          field('AutomationIntervalHours').value = settings.automationIntervalHours;
+          field('AutomationBatchSize').value = settings.automationBatchSize;
+          field('NewEpisodeDelayMinutes').value = settings.newEpisodeDelayMinutes;
+          field('DailyAutoGrabBudget').value = settings.dailyAutoGrabBudget;
+          field('MaxConcurrentImports').value = settings.maxConcurrentImports;
+          field('FreeSpaceFloorPercent').value = settings.freeSpaceFloorPercent;
+          field('FreeSpaceFloorGb').value = Math.round(settings.freeSpaceFloorBytes / 1e9);
+          field('DecisionLogCap').value = settings.decisionLogCap;
+          field('ReacquireReclaimed').checked = settings.reacquireReclaimed;
+          field('EpisodeUpgradesEnabled').checked = settings.episodeUpgradesEnabled;
+          var last = status.lastRun;
+          field('AutomationStatus').textContent = (status.enabled ? 'Automation is on.' : 'Automation is off.') +
+            (status.pausedReasons.length ? ' Paused: ' + status.pausedReasons.join(', ') + '.' : '') +
+            (status.running ? ' A run is in progress.' : '') +
+            (last ? ' Last run ' + new Date(last.startedAt).toLocaleString() + ': ' + last.status + ', searched ' + last.searched +
+              ', grabbed ' + last.grabbed + ', upgrades ' + last.upgradesPlanned + ', skipped ' + last.skipped + '.' : ' No run yet.') +
+            ' Automatic grabs today ' + status.budgets.autoGrabsUsedToday + '/' + status.budgets.autoGrabBudget +
+            ', open imports ' + status.budgets.openImports + '/' + status.budgets.maxConcurrentImports + '.' +
+            status.indexers.map(function (indexer) {
+              return ' ' + indexer.name + ': ' + indexer.queriesUsedToday + '/' + indexer.dailyQueryBudget + ' searches' +
+                (indexer.breakerOpenUntil ? ', paused until ' + new Date(indexer.breakerOpenUntil).toLocaleTimeString() : '') + '.';
+            }).join('');
+          var container = field('AutomationDecisions');
+          container.innerHTML = '';
+          if (!values[2].items.length) container.textContent = 'No decisions yet.';
+          values[2].items.forEach(function (decision) {
+            var row = document.createElement('div');
+            row.textContent = new Date(decision.createdAt).toLocaleString() + ' · ' + (decision.title || decision.targetId) + ' · ' +
+              decision.kind + ' · ' + decision.reason + (decision.detail ? ' · ' + decision.detail : '');
+            container.appendChild(row);
+          });
+        }, function () {
+          field('AutomationStatus').textContent = 'Automation is unavailable in this plugin build.';
+        });
+      }
+
+      field('SaveAutomation').addEventListener('click', function () {
+        Dashboard.showLoadingMsg();
+        settingsRequest('PATCH', 'Automation', {
+          automationEnabled: field('AutomationEnabled').checked,
+          automationIntervalHours: parseInt(field('AutomationIntervalHours').value, 10) || 6,
+          automationBatchSize: parseInt(field('AutomationBatchSize').value, 10) || 40,
+          newEpisodeDelayMinutes: parseInt(field('NewEpisodeDelayMinutes').value, 10) || 0,
+          dailyAutoGrabBudget: parseInt(field('DailyAutoGrabBudget').value, 10) || 0,
+          maxConcurrentImports: parseInt(field('MaxConcurrentImports').value, 10) || 0,
+          freeSpaceFloorPercent: parseInt(field('FreeSpaceFloorPercent').value, 10) || 0,
+          freeSpaceFloorBytes: Math.round((parseFloat(field('FreeSpaceFloorGb').value) || 0) * 1e9),
+          decisionLogCap: parseInt(field('DecisionLogCap').value, 10) || 2000,
+          reacquireReclaimed: field('ReacquireReclaimed').checked,
+          episodeUpgradesEnabled: field('EpisodeUpgradesEnabled').checked,
+          revision: automationState.settings ? automationState.settings.revision : null
+        }).then(function () {
+          Dashboard.hideLoadingMsg();
+          return loadAutomation();
+        }, report('Automation'));
+      });
+
+      field('RunAutomation').addEventListener('click', function () {
+        Dashboard.showLoadingMsg();
+        ApiClient.ajax({ type: 'POST', url: ApiClient.getUrl('JellyfinMod/Automation/Run') }).then(function () {
+          Dashboard.hideLoadingMsg();
+          setTimeout(loadAutomation, 3000);
+        }, report('Automation'));
+      });
+
       function editClient(client) {
         acquisition.client = client;
         importState.mappings = client && client.pathMappings ? client.pathMappings.slice() : [];
@@ -470,7 +601,10 @@
           row.appendChild(button('Up', function () { move(index, -1); }));
           row.appendChild(button('Down', function () { move(index, 1); }));
           container.appendChild(row);
+          checkbox.addEventListener('change', function () { renderCutoff(); });
         });
+        renderCutoff(acquisition.pendingCutoff);
+        acquisition.pendingCutoff = undefined;
       }
 
       function move(index, offset) {
@@ -490,7 +624,29 @@
           .map(function (id) { return { id: id, allowed: allowed.indexOf(id) >= 0 }; });
         field('ProfileMinimum').value = profile && profile.minimumBytesPerHour ? profile.minimumBytesPerHour / 1e9 : '';
         field('ProfileMaximum').value = profile && profile.maximumBytesPerHour ? profile.maximumBytesPerHour / 1e9 : '';
+        field('ProfileUpgradeAllowed').checked = !!(profile && profile.upgradeAllowed);
+        field('ProfileUpgradeMode').value = profile && profile.upgradeMode ? profile.upgradeMode : 'replace';
+        field('ProfileMinimumScore').value = profile && profile.minimumAutoScore !== null && profile.minimumAutoScore !== undefined ? profile.minimumAutoScore : '';
+        field('ProfileMinimumSeeders').value = profile && profile.minimumSeeders !== null && profile.minimumSeeders !== undefined ? profile.minimumSeeders : '';
+        acquisition.pendingCutoff = profile && profile.cutoff ? profile.cutoff : '';
         renderQualities();
+      }
+
+      function renderCutoff(selected) {
+        var select = field('ProfileCutoff');
+        var current = selected !== undefined ? selected : select.value;
+        select.innerHTML = '';
+        var none = document.createElement('option');
+        none.value = '';
+        none.textContent = 'None';
+        select.appendChild(none);
+        acquisition.order.filter(function (entry) { return entry.allowed; }).forEach(function (entry) {
+          var option = document.createElement('option');
+          option.value = entry.id;
+          option.textContent = entry.id;
+          option.selected = entry.id === current;
+          select.appendChild(option);
+        });
       }
 
       function testResource(path, name) {
@@ -593,7 +749,9 @@
           apiKey: secretChange('IndexerApiKey', 'IndexerClearKey', !current), enabled: field('IndexerEnabled').checked,
           categories: listNumbers(field('IndexerCategories').value), priority: parseInt(field('IndexerPriority').value, 10) || 0,
           downloadHosts: listText(field('IndexerHosts').value), minimumSeedRatio: optionalNumber(field('IndexerSeedRatio').value),
-          minimumSeedMinutes: optionalNumber(field('IndexerSeedMinutes').value)
+          minimumSeedMinutes: optionalNumber(field('IndexerSeedMinutes').value),
+          minIntervalSeconds: optionalNumber(field('IndexerMinInterval').value),
+          dailyQueryBudget: optionalNumber(field('IndexerDailyBudget').value)
         }, 'Indexer', editIndexer);
       });
       field('NewIndexer').addEventListener('click', function () { editIndexer(null); });
@@ -615,7 +773,12 @@
           name: field('ProfileName').value.trim(),
           qualities: acquisition.order.filter(function (entry) { return entry.allowed; }).map(function (entry) { return entry.id; }),
           minimumBytesPerHour: optionalNumber(field('ProfileMinimum').value, 1e9),
-          maximumBytesPerHour: optionalNumber(field('ProfileMaximum').value, 1e9)
+          maximumBytesPerHour: optionalNumber(field('ProfileMaximum').value, 1e9),
+          cutoff: field('ProfileCutoff').value || null,
+          upgradeAllowed: field('ProfileUpgradeAllowed').checked,
+          upgradeMode: field('ProfileUpgradeMode').value,
+          minimumAutoScore: optionalNumber(field('ProfileMinimumScore').value),
+          minimumSeeders: optionalNumber(field('ProfileMinimumSeeders').value)
         }, 'Quality profile', editProfile);
       });
       field('NewProfile').addEventListener('click', function () { editProfile(null); });
@@ -699,6 +862,7 @@
           }, function () {});
           loadAcquisition();
           loadImport();
+          loadAutomation();
           editIndexer(null);
           editClient(null);
           // Episodes whose identity Jellyfin now reports differently wait for an administrator (P2.R9).

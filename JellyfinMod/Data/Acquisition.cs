@@ -48,6 +48,12 @@ public sealed class AcquisitionIndexer
     /// <summary>Gets or sets the configuration revision; any change invalidates capabilities and searches.</summary>
     public int Revision { get; set; } = 1;
 
+    /// <summary>Gets or sets the minimum seconds between two searches of this indexer, manual ones included (P6.M2).</summary>
+    public int MinIntervalSeconds { get; set; } = 10;
+
+    /// <summary>Gets or sets the daily query budget, manual searches included (P6.M2).</summary>
+    public int DailyQueryBudget { get; set; } = 200;
+
     /// <summary>Gets or sets the last verified capability snapshot as JSON.</summary>
     public string? CapabilitiesJson { get; set; }
 
@@ -157,6 +163,23 @@ public sealed class AcquisitionQualityProfile
 
     /// <summary>Gets or sets the profile revision; searches evaluated under an older revision cannot grab.</summary>
     public int Revision { get; set; } = 1;
+
+    /// <summary>Gets or sets the quality at which upgrades stop; one of the allowed qualities (P6.M2).</summary>
+    [MaxLength(32)]
+    public string? Cutoff { get; set; }
+
+    /// <summary>Gets or sets a value indicating whether automation upgrades titles below the cutoff.</summary>
+    public bool UpgradeAllowed { get; set; }
+
+    /// <summary>Gets or sets <c>replace</c> (the new version replaces the old) or <c>add</c> (both are kept).</summary>
+    [MaxLength(8)]
+    public string UpgradeMode { get; set; } = "replace";
+
+    /// <summary>Gets or sets the minimum score an automatic grab needs.</summary>
+    public int? MinimumAutoScore { get; set; }
+
+    /// <summary>Gets or sets the minimum seeders an automatic grab needs.</summary>
+    public int? MinimumSeeders { get; set; }
 }
 
 /// <summary>Singleton acquisition enablement and defaults (P4.A2).</summary>
@@ -216,6 +239,48 @@ public sealed class AcquisitionSettings
 
     /// <summary>Gets or sets the import settings revision.</summary>
     public int ImportRevision { get; set; } = 1;
+
+    /// <summary>Gets or sets the automation master switch (P6.M2). Off after migration regardless of earlier state.</summary>
+    public bool AutomationEnabled { get; set; }
+
+    /// <summary>Gets or sets the hours between scheduled automation runs.</summary>
+    public int AutomationIntervalHours { get; set; } = 6;
+
+    /// <summary>Gets or sets how many due targets one run processes.</summary>
+    public int AutomationBatchSize { get; set; } = 40;
+
+    /// <summary>Gets or sets how long after air time an episode is first searched.</summary>
+    public int NewEpisodeDelayMinutes { get; set; } = 120;
+
+    /// <summary>Gets or sets the daily automatic grab budget.</summary>
+    public int DailyAutoGrabBudget { get; set; } = 6;
+
+    /// <summary>Gets or sets the most imports that may be open before automation stops grabbing.</summary>
+    public int MaxConcurrentImports { get; set; } = 3;
+
+    /// <summary>Gets or sets the free-space floor as a percentage of the library mount.</summary>
+    public int FreeSpaceFloorPercent { get; set; } = 10;
+
+    /// <summary>Gets or sets the free-space floor in bytes; the larger floor applies.</summary>
+    public long FreeSpaceFloorBytes { get; set; } = 25_000_000_000;
+
+    /// <summary>Gets or sets how many decisions the log keeps.</summary>
+    public int DecisionLogCap { get; set; } = 2000;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether episodes may be upgraded or gain versions. Off until the host is shown to
+    /// group episode versions (PHASE6 M1 / open question 5).
+    /// </summary>
+    public bool EpisodeUpgradesEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether automation searches again for a monitored title after retention reclaimed
+    /// it. Off by default, so a watched and reclaimed title is not downloaded again unasked (PHASE6 open question 4).
+    /// </summary>
+    public bool ReacquireReclaimed { get; set; }
+
+    /// <summary>Gets or sets the automation settings revision.</summary>
+    public int AutomationRevision { get; set; } = 1;
 }
 
 /// <summary>Documented import defaults.</summary>
@@ -385,4 +450,14 @@ public sealed class GrabOperation
 
     /// <summary>Gets or sets when the client acceptance was verified.</summary>
     public DateTime? AcceptedAt { get; set; }
+
+    /// <summary>Gets or sets <c>acquire</c> or <c>addVersion</c> (P6.M6).</summary>
+    [MaxLength(16)]
+    public string Intent { get; set; } = "acquire";
+
+    /// <summary>Gets or sets a value indicating whether automation made this grab (P6.M3).</summary>
+    public bool Automatic { get; set; }
+
+    /// <summary>Gets or sets the upgrade this grab belongs to.</summary>
+    public Guid? UpgradeOperationId { get; set; }
 }

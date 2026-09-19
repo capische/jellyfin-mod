@@ -74,6 +74,21 @@ public class ModDbContext : DbContext
     /// <summary>Gets releases an administrator blocked (P5.I7).</summary>
     public DbSet<ReleaseBlocklistEntry> ReleaseBlocklist => Set<ReleaseBlocklistEntry>();
 
+    /// <summary>Gets per-target automation schedules (P6.M2).</summary>
+    public DbSet<AutomationTargetState> AutomationTargets => Set<AutomationTargetState>();
+
+    /// <summary>Gets the automation decision log (P6.M2).</summary>
+    public DbSet<AutomationDecision> AutomationDecisions => Set<AutomationDecision>();
+
+    /// <summary>Gets automation run summaries (P6.M2).</summary>
+    public DbSet<AutomationRun> AutomationRuns => Set<AutomationRun>();
+
+    /// <summary>Gets per-indexer budgets and breakers (P6.M2).</summary>
+    public DbSet<IndexerBudgetState> IndexerBudgets => Set<IndexerBudgetState>();
+
+    /// <summary>Gets upgrade operations (P6.M5).</summary>
+    public DbSet<UpgradeOperation> UpgradeOperations => Set<UpgradeOperation>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -217,5 +232,32 @@ public class ModDbContext : DbContext
             e.HasIndex(x => x.InfoHash);
             e.HasIndex(x => new { x.IndexerId, x.SourceGuid });
         });
+        b.Entity<AutomationTargetState>(e =>
+        {
+            e.HasIndex(x => x.NextSearchAt);
+            e.HasIndex(x => x.EntryId);
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
+        });
+        b.Entity<AutomationDecision>(e =>
+        {
+            e.HasIndex(x => x.CreatedAt);
+            e.HasIndex(x => x.EntryId);
+            e.HasIndex(x => x.RunId);
+        });
+        b.Entity<AutomationRun>(e =>
+        {
+            e.Property(x => x.Status).HasMaxLength(16);
+            e.HasIndex(x => x.StartedAt);
+        });
+        b.Entity<IndexerBudgetState>(e =>
+            e.HasOne<AcquisitionIndexer>().WithMany().HasForeignKey(x => x.IndexerId).OnDelete(DeleteBehavior.Cascade));
+        b.Entity<UpgradeOperation>(e =>
+        {
+            e.HasIndex(x => x.OpenTargetKey).IsUnique();
+            e.HasIndex(x => x.State);
+            e.HasIndex(x => x.NewGrabId);
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
+        });
+        b.Entity<GrabOperation>(e => e.HasIndex(x => new { x.Automatic, x.CreatedAt }));
     }
 }

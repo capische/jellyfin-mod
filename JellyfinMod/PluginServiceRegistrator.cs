@@ -1,6 +1,7 @@
 using JellyfinMod.Data;
 using JellyfinMod.Services;
 using JellyfinMod.Services.Acquisition;
+using JellyfinMod.Services.Automation;
 using JellyfinMod.Services.Import;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
@@ -54,6 +55,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
             provider.GetRequiredService<AcquisitionSecretStore>()));
         AcquisitionServices.Add(services, () => Plugin.Instance!.DataPath);
         ImportServices.Add(services);
+        AutomationServices.Add(services);
         services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<DatabaseInitializer>());
         AcquisitionServices.AddHostedServices(services);

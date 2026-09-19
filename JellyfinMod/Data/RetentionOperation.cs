@@ -71,6 +71,13 @@ public sealed class RetentionOperation
     /// Gets or sets physical bytes proven released. Zero means another hardlink remained; null means unknown.
     /// </summary>
     public long? PhysicalBytesReleased { get; set; }
+
+    /// <summary>Gets or sets why the file was removed: <c>retention</c> or <c>upgrade_replaced</c> (P6.M5).</summary>
+    [MaxLength(24)]
+    public string Provenance { get; set; } = RetentionProvenances.Retention;
+
+    /// <summary>Gets or sets the upgrade that replaced this version.</summary>
+    public Guid? UpgradeOperationId { get; set; }
 }
 
 /// <summary>Stable reclamation operation states.</summary>

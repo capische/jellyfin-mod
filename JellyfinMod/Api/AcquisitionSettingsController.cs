@@ -267,7 +267,7 @@ public sealed partial class AcquisitionSettingsController(
     public async Task<ActionResult<QualityProfileDto>> CreateQualityProfile(QualityProfileRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
-        if (ValidateProfile(request) is { } error) return Invalid(error);
+        if (ValidateProfile(request) is { } error) return Invalid(error, ProfileMessage(error));
         var profile = new AcquisitionQualityProfile();
         Apply(profile, request);
         database.AcquisitionQualityProfiles.Add(profile);
@@ -280,7 +280,7 @@ public sealed partial class AcquisitionSettingsController(
     public async Task<ActionResult<QualityProfileDto>> PatchQualityProfile(Guid id, QualityProfileRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
-        if (ValidateProfile(request) is { } error) return Invalid(error);
+        if (ValidateProfile(request) is { } error) return Invalid(error, ProfileMessage(error));
         var profile = await database.AcquisitionQualityProfiles.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (profile is null) return NotFound();
         if (request.Revision != profile.Revision) return RevisionConflict();
@@ -431,8 +431,19 @@ public sealed partial class AcquisitionSettingsController(
             request.Qualities.Any(quality => !QualityCatalog.IsKnown(quality)))
             return "invalid_qualities";
         if (request.MinimumBytesPerHour > request.MaximumBytesPerHour) return "invalid_size_range";
+        // The cutoff is a quality the profile allows, or upgrades could never stop (P6.M2).
+        if (request.Cutoff is { } cutoff && !request.Qualities.Contains(cutoff, StringComparer.Ordinal)) return "invalid_cutoff";
+        if (request.UpgradeAllowed && request.Cutoff is null) return "invalid_cutoff";
+        if (request.UpgradeMode is not ("replace" or "add")) return "invalid_upgrade_mode";
         return null;
     }
+
+    private static string? ProfileMessage(string code) => code switch
+    {
+        "invalid_cutoff" => "The cutoff must be one of the profile's allowed qualities, and upgrades need a cutoff.",
+        "invalid_upgrade_mode" => "The upgrade mode must be replace or add.",
+        _ => null
+    };
 
     private static bool ValidEndpoint(string value) => Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri) &&
         uri.Scheme is "http" or "https" && string.IsNullOrEmpty(uri.UserInfo) && string.IsNullOrEmpty(uri.Query) &&
@@ -451,6 +462,8 @@ public sealed partial class AcquisitionSettingsController(
         indexer.DownloadHosts = string.Join(',', request.DownloadHosts.Select(host => host.Trim().ToLowerInvariant()).Distinct());
         indexer.MinimumSeedRatio = request.MinimumSeedRatio;
         indexer.MinimumSeedMinutes = request.MinimumSeedMinutes;
+        if (request.MinIntervalSeconds is { } interval) indexer.MinIntervalSeconds = interval;
+        if (request.DailyQueryBudget is { } budget) indexer.DailyQueryBudget = budget;
         indexer.LastError = null;
     }
 
@@ -475,6 +488,11 @@ public sealed partial class AcquisitionSettingsController(
         profile.QualitiesJson = JsonSerializer.Serialize(request.Qualities);
         profile.MinimumBytesPerHour = request.MinimumBytesPerHour;
         profile.MaximumBytesPerHour = request.MaximumBytesPerHour;
+        profile.Cutoff = request.Cutoff;
+        profile.UpgradeAllowed = request.UpgradeAllowed;
+        profile.UpgradeMode = request.UpgradeMode;
+        profile.MinimumAutoScore = request.MinimumAutoScore;
+        profile.MinimumSeeders = request.MinimumSeeders;
     }
 
     private static IndexerSettingsDto ToDto(AcquisitionIndexer indexer)
@@ -486,7 +504,8 @@ public sealed partial class AcquisitionSettingsController(
             indexer.Revision, capabilities is not null,
             capabilities is null ? null : new IndexerCapabilitiesDto(capabilities.MovieSearch, capabilities.TvSearch, capabilities.Search,
                 capabilities.Categories, capabilities.LimitMax, capabilities.LimitDefault),
-            indexer.CapabilitiesFetchedAt is { } fetched ? DateTime.SpecifyKind(fetched, DateTimeKind.Utc) : null, indexer.LastError);
+            indexer.CapabilitiesFetchedAt is { } fetched ? DateTime.SpecifyKind(fetched, DateTimeKind.Utc) : null, indexer.LastError,
+            indexer.MinIntervalSeconds, indexer.DailyQueryBudget);
     }
 
     private static DownloadClientSettingsDto ToDto(AcquisitionDownloadClient client, IEnumerable<DownloadClientPathMapping> mappings) =>
@@ -535,7 +554,7 @@ public sealed partial class AcquisitionSettingsController(
 
     private static QualityProfileDto ToDto(AcquisitionQualityProfile profile, Guid? defaultId) => new(profile.Id, profile.Name,
         AcquisitionConfiguration.Qualities(profile), profile.MinimumBytesPerHour, profile.MaximumBytesPerHour, profile.Revision,
-        profile.Id == defaultId);
+        profile.Id == defaultId, profile.Cutoff, profile.UpgradeAllowed, profile.UpgradeMode, profile.MinimumAutoScore, profile.MinimumSeeders);
 
     private BadRequestObjectResult Invalid(string code, string? message = null) =>
         BadRequest(new ProblemDetails { Status = 400, Type = code, Title = message ?? "The configuration is not valid." });
