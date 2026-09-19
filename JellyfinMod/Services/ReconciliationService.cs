@@ -348,6 +348,17 @@ public sealed class ReconciliationService(
             database.Entries.Add(entry);
         }
 
+        // Remember what Jellyfin's own visibility rules saw, for when the file is gone (P3.T15).
+        if (snapshot.NativeTags is { } nativeTags)
+        {
+            var tagsJson = JsonSerializer.Serialize(nativeTags.Order(StringComparer.Ordinal).ToArray());
+            if (entry.NativeRating != snapshot.NativeRating || entry.NativeTagsJson != tagsJson)
+            {
+                entry.NativeRating = snapshot.NativeRating;
+                entry.NativeTagsJson = tagsJson;
+            }
+        }
+
         var entryBindings = created
             ? []
             : await database.EntryBindings.Where(binding => binding.EntryId == entry.Id)
@@ -907,6 +918,12 @@ public sealed record NativeTitleSnapshot(string MediaType, int? TmdbId, Guid Tar
     IReadOnlyList<NativeRepresentation> Representations, IReadOnlyList<NativeEpisodeSnapshot> Episodes,
     DateTime? DateCreated = null)
 {
+    /// <summary>The effective native parental rating of the representative item (P3.T15).</summary>
+    public string? NativeRating { get; init; }
+
+    /// <summary>The native tags of the representative item (P3.T15).</summary>
+    public IReadOnlyList<string>? NativeTags { get; init; }
+
     /// <summary>Native episodes left out of matching because they have no season and episode number (P2.R6).</summary>
     public IReadOnlyList<SkippedNativeEpisode> SkippedEpisodes { get; init; } = [];
 

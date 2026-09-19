@@ -88,7 +88,10 @@ public sealed class EntriesController(
                 MediaType = request.MediaType, TmdbId = request.TmdbId, TargetLibraryId = request.TargetLibraryId,
                 Title = metadata.Title, Year = metadata.PremiereDate?.Year, ImdbId = metadata.ImdbId,
                 Overview = metadata.Overview, PosterPath = metadata.PosterPath, MetadataJson = JsonSerializer.Serialize(metadata),
-                JellyfinItemId = owned?.Id, State = owned is null ? FileState.None : FileState.OnDisk
+                JellyfinItemId = owned?.Id, State = owned is null ? FileState.None : FileState.OnDisk,
+                NativeRating = owned is null ? null : owned.CustomRating ?? owned.OfficialRating,
+                NativeTagsJson = owned is null ? null
+                    : JsonSerializer.Serialize((owned.Tags ?? []).Order(StringComparer.Ordinal).ToArray())
             };
             database.Entries.Add(entry);
             foreach (var episode in episodes) episode.EntryId = entry.Id;

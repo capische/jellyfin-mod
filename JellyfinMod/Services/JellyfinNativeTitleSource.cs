@@ -210,7 +210,11 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             copies.Select(copy => new NativeRepresentation(copy.Id, libraryId, IsPlayable(copy),
                 mediaType == "movie" ? VersionGroup((Movie)copy, movieIds!) : copy.Id, copy.Path,
                 mounts.Capture(copy.Path))).ToArray(), episodes,
-            copies.Min(copy => copy.DateCreated));
+            copies.Min(copy => copy.DateCreated))
+        {
+            NativeRating = representative.CustomRating ?? representative.OfficialRating,
+            NativeTags = representative.Tags ?? []
+        };
     }
 
     private NativeEpisodeSnapshot[] GetEpisodes(

@@ -64,7 +64,30 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
             if (!IsStaleBinding(nativeId, entry.TargetLibraryId)) return false;
         }
 
+        // A title Jellyfin once served keeps Jellyfin's own rating and tag rules after its file is gone (P3.T15).
+        if (entry.NativeTagsJson is { } tagsJson)
+            return CanReadNativeSnapshot(user, entry.MediaType, entry.NativeRating,
+                JsonSerializer.Deserialize<string[]>(tagsJson) ?? []);
         return entry.MetadataJson is { } json && CanReadMetadata(user, JsonSerializer.Deserialize<TmdbMetadata>(json)!);
+    }
+
+    /// <summary>Applies BlockedTags, AllowedTags and the parental rating to a recorded native snapshot.</summary>
+    public bool CanReadNativeSnapshot(User user, string mediaType, string? rating, IReadOnlyList<string> tags)
+    {
+        var blocked = user.GetPreference(PreferenceKind.BlockedTags);
+        if (tags.Any(tag => blocked.Contains(tag, StringComparer.OrdinalIgnoreCase))) return false;
+        var allowed = user.GetPreference(PreferenceKind.AllowedTags);
+        if (allowed.Length > 0 && !tags.Any(tag => allowed.Contains(tag, StringComparer.OrdinalIgnoreCase))) return false;
+        var score = string.IsNullOrWhiteSpace(rating) ? null : localization.GetRatingScore(rating);
+        // Like Jellyfin, an unrated item is hidden only when unrated items of its type are blocked.
+        if (score is null)
+            return !user.GetPreferenceValues<UnratedItem>(PreferenceKind.BlockUnratedItems)
+                .Contains(mediaType == "movie" ? UnratedItem.Movie : UnratedItem.Series);
+
+        if (!user.MaxParentalRatingScore.HasValue) return true;
+        return score.Score < user.MaxParentalRatingScore.Value ||
+            score.Score == user.MaxParentalRatingScore.Value && (!user.MaxParentalRatingSubScore.HasValue ||
+                (score.SubScore ?? 0) <= user.MaxParentalRatingSubScore.Value);
     }
 
     /// <summary>

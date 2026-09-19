@@ -2,7 +2,9 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text.Encodings.Web;
+using Jellyfin.Data;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Enums;
 using JellyfinMod;
 using JellyfinMod.Api;
 using JellyfinMod.Data;
@@ -663,6 +665,7 @@ internal static class ApiSmoke
             "Combined browse does not disclose an inaccessible library");
         await VerifyStaleAndOrphanedEntriesAsync(client, dbPath, user, libraryFolder.Id);
         await VerifyEpisodeConflictsAsync(client, dbPath, user, tvLibrary.Id);
+        await VerifyReclaimedVisibilityAsync(client, dbPath, user, libraryFolder.Id);
         // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
         http.Response = null;
         http.BeforeResponse = null;
@@ -680,6 +683,39 @@ internal static class ApiSmoke
         }
         await app.StopAsync();
         Console.WriteLine("PASS: HTTP auth/access/CRUD, duplicate history, wire-state filter binding, unknown fields and no media deletion");
+    }
+
+    /// <summary>P3.T15: a reclaimed title keeps the native tag and rating rules Jellyfin applied to it.</summary>
+    private static async Task VerifyReclaimedVisibilityAsync(HttpClient client, string dbPath, User user, Guid libraryId)
+    {
+        var reclaimed = new Entry
+        {
+            MediaType = "movie", TmdbId = 88300, TargetLibraryId = libraryId, Title = "Reclaimed and restricted",
+            State = FileState.Reclaimed, NativeRating = "R", NativeTagsJson = """["Blocked-Tag"]""",
+            MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("movie", 88300, "Reclaimed and restricted",
+                null, null, null, null, null, null, false, null, null, [], [], []))
+        };
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.Add(reclaimed);
+            await database.SaveChangesAsync();
+        }
+
+        client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+        Assert((await client.GetAsync($"/JellyfinMod/Entries/{reclaimed.Id}")).StatusCode == HttpStatusCode.OK,
+            "An unrestricted user can open a reclaimed title");
+        user.SetPreference(PreferenceKind.BlockedTags, ["blocked-tag"]);
+        Assert((await client.GetAsync($"/JellyfinMod/Entries/{reclaimed.Id}")).StatusCode == HttpStatusCode.NotFound,
+            "A reclaimed title carrying a blocked native tag stays hidden");
+        user.SetPreference(PreferenceKind.BlockedTags, []);
+        user.MaxParentalRatingScore = 13;
+        Assert((await client.GetAsync($"/JellyfinMod/Entries/{reclaimed.Id}")).StatusCode == HttpStatusCode.NotFound,
+            "A reclaimed title above the user's maximum native rating stays hidden");
+        user.MaxParentalRatingScore = null;
+        user.SetPreference(PreferenceKind.AllowedTags, ["kids"]);
+        Assert((await client.GetAsync($"/JellyfinMod/Entries/{reclaimed.Id}")).StatusCode == HttpStatusCode.NotFound,
+            "A reclaimed title without an allowed native tag stays hidden");
+        user.SetPreference(PreferenceKind.AllowedTags, []);
     }
 
     /// <summary>P2.R9: administrators rebind or keep a disagreeing episode through real HTTP.</summary>

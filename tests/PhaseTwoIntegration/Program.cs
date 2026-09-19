@@ -195,9 +195,15 @@ try
             [new(Guid.NewGuid(), secondLibrary, true)], []), default),
             "Every native representation must prove membership in the reconciled library");
 
+        // P3.T15: reconciliation records the native rating and tags for when the file is gone.
+        var rated = await service.ReconcileAsync(Snapshot("movie", 7700, secondLibrary, "Rated", Guid.NewGuid())
+            with { NativeRating = "TV-MA", NativeTags = ["Zeta", "Alpha"] }, default);
+        var ratedEntry = await database.Entries.AsNoTracking().SingleAsync(entry => entry.Id == rated.EntryId);
+        Assert(ratedEntry.NativeRating == "TV-MA" && ratedEntry.NativeTagsJson == """["Alpha","Zeta"]""",
+            "Reconciliation records the effective native rating and sorted tags");
         var unmatched = await service.ReconcileAsync(Snapshot("movie", null, movieLibrary, "No provider id", Guid.NewGuid()), default);
-        // The P2.R9 multi-episode series adds the fourth entry.
-        Assert(unmatched.Outcome == ReconciliationOutcome.Unmatched && await database.Entries.CountAsync() == 4,
+        // The P2.R9 multi-episode series and the P3.T15 rated movie add the fourth and fifth entries.
+        Assert(unmatched.Outcome == ReconciliationOutcome.Unmatched && await database.Entries.CountAsync() == 5,
             "Native items without TMDB identity are reported unmatched without title guessing");
 
         var concurrentLibrary = Guid.NewGuid();
@@ -231,7 +237,7 @@ try
         var persisted = (await restarted.Entries.CountAsync(), await restarted.Episodes.CountAsync(),
             await restarted.EntryBindings.CountAsync(), await restarted.EpisodeBindings.CountAsync(),
             await restarted.History.CountAsync());
-        Assert(persisted == (5, 7, 8, 8, 12),
+        Assert(persisted == (6, 7, 9, 8, 13),
             $"Reconciled identities, every observed copy and exact transition history persist after a real SQLite restart {persisted}");
     }
 

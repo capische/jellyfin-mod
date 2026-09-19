@@ -105,4 +105,13 @@ public class Entry
 
     /// <summary>Gets or sets how this entry overrides the global retention policy.</summary>
     public RetentionPolicy RetentionPolicy { get; set; }
+
+    /// <summary>
+    /// Gets or sets the effective native parental rating last seen on the bound item, so a reclaimed title
+    /// stays hidden from users that Jellyfin hid it from (P3.T15).
+    /// </summary>
+    public string? NativeRating { get; set; }
+
+    /// <summary>Gets or sets the native tags last seen on the bound item as a JSON array (P3.T15).</summary>
+    public string? NativeTagsJson { get; set; }
 }
