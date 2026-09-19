@@ -3,6 +3,7 @@ using System;
 using JellyfinMod.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -10,223 +11,14 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace JellyfinMod.Data.Migrations
 {
     [DbContext(typeof(ModDbContext))]
-    partial class ModDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260919104238_PhaseThreeTestWindow")]
+    partial class PhaseThreeTestWindow
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.11");
-
-            modelBuilder.Entity("JellyfinMod.Data.AcquisitionDownloadClient", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ApiVersion")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("BaseUrl")
-                        .IsRequired()
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ClientVersion")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("DownloadDirectory")
-                        .IsRequired()
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("Enabled")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("Kind")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Label")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("LastError")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("LocalDirectory")
-                        .IsRequired()
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Name")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("OpenUrl")
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("PasswordSecretRef")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("Revision")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("Username")
-                        .IsRequired()
-                        .HasMaxLength(256)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("VerifiedAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("VerifiedLibraryIds")
-                        .IsRequired()
-                        .HasMaxLength(4096)
-                        .HasColumnType("TEXT");
-
-                    b.Property<int?>("VerifiedRevision")
-                        .HasColumnType("INTEGER");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Name")
-                        .IsUnique();
-
-                    b.ToTable("AcquisitionDownloadClients");
-                });
-
-            modelBuilder.Entity("JellyfinMod.Data.AcquisitionIndexer", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ApiKeySecretRef")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("BaseUrl")
-                        .IsRequired()
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("CapabilitiesFetchedAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CapabilitiesJson")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Categories")
-                        .IsRequired()
-                        .HasMaxLength(512)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("DownloadHosts")
-                        .IsRequired()
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("Enabled")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("LastError")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<int?>("MinimumSeedMinutes")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<double?>("MinimumSeedRatio")
-                        .HasColumnType("REAL");
-
-                    b.Property<string>("Name")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("Priority")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("Revision")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int?>("VerifiedRevision")
-                        .HasColumnType("INTEGER");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Name")
-                        .IsUnique();
-
-                    b.ToTable("AcquisitionIndexers");
-                });
-
-            modelBuilder.Entity("JellyfinMod.Data.AcquisitionQualityProfile", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("TEXT");
-
-                    b.Property<long?>("MaximumBytesPerHour")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<long?>("MinimumBytesPerHour")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("Name")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("QualitiesJson")
-                        .IsRequired()
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("Revision")
-                        .HasColumnType("INTEGER");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Name")
-                        .IsUnique();
-
-                    b.ToTable("AcquisitionQualityProfiles");
-                });
-
-            modelBuilder.Entity("JellyfinMod.Data.AcquisitionSettings", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid?>("DefaultQualityProfileId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid?>("DownloadClientId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("Enabled")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("Revision")
-                        .HasColumnType("INTEGER");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("DefaultQualityProfileId");
-
-                    b.HasIndex("DownloadClientId");
-
-                    b.ToTable("AcquisitionSettings");
-                });
 
             modelBuilder.Entity("JellyfinMod.Data.CompletionObservation", b =>
                 {
@@ -330,9 +122,6 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<int?>("Progress")
                         .HasColumnType("INTEGER");
 
-                    b.Property<Guid?>("QualityProfileId")
-                        .HasColumnType("TEXT");
-
                     b.Property<int?>("ReclaimAfterDays")
                         .HasColumnType("INTEGER");
 
@@ -365,8 +154,6 @@ namespace JellyfinMod.Data.Migrations
                     b.HasKey("Id");
 
                     b.HasIndex("JellyfinItemId");
-
-                    b.HasIndex("QualityProfileId");
 
                     b.HasIndex("State");
 
@@ -538,162 +325,6 @@ namespace JellyfinMod.Data.Migrations
                         .IsUnique();
 
                     b.ToTable("EpisodeConflicts");
-                });
-
-            modelBuilder.Entity("JellyfinMod.Data.GrabOperation", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("AcceptedAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ActiveHash")
-                        .HasMaxLength(96)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ActiveTarget")
-                        .HasMaxLength(40)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("CancelledAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid?>("CancelledBy")
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid>("DownloadClientId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("DownloadClientRevision")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("DownloadDirectory")
-                        .IsRequired()
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid?>("EntryId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid?>("EpisodeId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("FailureCode")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("HoldUntil")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("IdempotencyKey")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid>("IndexerId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("IndexerName")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("InfoHash")
-                        .HasMaxLength(40)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Label")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ParsedJson")
-                        .IsRequired()
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid>("ProfileId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("ProfileRevision")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("RawTitle")
-                        .IsRequired()
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ReleaseId")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("RequestFingerprint")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid>("RequestedBy")
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("Score")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("ScoringVersion")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid>("SearchId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<int?>("SeedMinutes")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<double?>("SeedRatio")
-                        .HasColumnType("REAL");
-
-                    b.Property<long?>("Size")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("SourceGuid")
-                        .IsRequired()
-                        .HasMaxLength(1024)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("State")
-                        .IsRequired()
-                        .HasMaxLength(16)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("SubmittedAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("UpdatedAt")
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("ActiveHash")
-                        .IsUnique();
-
-                    b.HasIndex("ActiveTarget")
-                        .IsUnique();
-
-                    b.HasIndex("EntryId");
-
-                    b.HasIndex("EpisodeId");
-
-                    b.HasIndex("State");
-
-                    b.HasIndex("RequestedBy", "IdempotencyKey")
-                        .IsUnique();
-
-                    b.ToTable("GrabOperations");
                 });
 
             modelBuilder.Entity("JellyfinMod.Data.HistoryRecord", b =>
@@ -1031,19 +662,6 @@ namespace JellyfinMod.Data.Migrations
                     b.ToTable("RetentionRuns");
                 });
 
-            modelBuilder.Entity("JellyfinMod.Data.AcquisitionSettings", b =>
-                {
-                    b.HasOne("JellyfinMod.Data.AcquisitionQualityProfile", null)
-                        .WithMany()
-                        .HasForeignKey("DefaultQualityProfileId")
-                        .OnDelete(DeleteBehavior.Restrict);
-
-                    b.HasOne("JellyfinMod.Data.AcquisitionDownloadClient", null)
-                        .WithMany()
-                        .HasForeignKey("DownloadClientId")
-                        .OnDelete(DeleteBehavior.Restrict);
-                });
-
             modelBuilder.Entity("JellyfinMod.Data.CompletionObservation", b =>
                 {
                     b.HasOne("JellyfinMod.Data.Entry", null)
@@ -1093,19 +711,6 @@ namespace JellyfinMod.Data.Migrations
                         .HasForeignKey("EpisodeId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
-                });
-
-            modelBuilder.Entity("JellyfinMod.Data.GrabOperation", b =>
-                {
-                    b.HasOne("JellyfinMod.Data.Entry", null)
-                        .WithMany()
-                        .HasForeignKey("EntryId")
-                        .OnDelete(DeleteBehavior.SetNull);
-
-                    b.HasOne("JellyfinMod.Data.Episode", null)
-                        .WithMany()
-                        .HasForeignKey("EpisodeId")
-                        .OnDelete(DeleteBehavior.SetNull);
                 });
 
             modelBuilder.Entity("JellyfinMod.Data.RetentionEvaluation", b =>

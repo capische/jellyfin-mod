@@ -32,6 +32,12 @@ public class PluginConfiguration : BasePluginConfiguration
     /// <summary>Gets or sets how many days after finishing a title its file is reclaimed.</summary>
     public int ReclaimAfterDays { get; set; } = 14;
 
+    /// <summary>
+    /// Gets or sets a test-only retention window in minutes that replaces every day window when above zero.
+    /// </summary>
+    /// <remarks>Not shown in the Dashboard; set it in the XML of an isolated test instance only.</remarks>
+    public int RetentionTestWindowMinutes { get; set; }
+
     /// <summary>Gets or sets whose watched state starts the retention window.</summary>
     public WatchedUserMode RetentionWatchedUserMode { get; set; } = WatchedUserMode.AllUsers;
 
