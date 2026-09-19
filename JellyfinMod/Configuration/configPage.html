@@ -102,6 +102,17 @@
 
       watchedUserMode.addEventListener('change', updateSelectedUserVisibility);
 
+      // A disabled or deleted Selected user stays stored until an administrator picks another user; the
+      // select never falls back to the first enabled user (P3.T13). The placeholder cannot be chosen.
+      function addUnavailableUser(userId) {
+        var option = document.createElement('option');
+        option.value = userId;
+        option.textContent = 'Unavailable user';
+        option.disabled = true;
+        option.selected = true;
+        selectedUser.appendChild(option);
+      }
+
       document.querySelector('#JellyfinModConfigPage')
         .addEventListener('pageshow', function () {
           Dashboard.showLoadingMsg();
@@ -118,7 +129,11 @@
             return ApiClient.getUsers().then(function (users) {
               var configuredUserId = (config.RetentionSelectedUserId || '').replace(/-/g, '').toLowerCase();
               selectedUser.innerHTML = '';
-              users.filter(function (user) { return !user.Policy || !user.Policy.IsDisabled; })
+              var enabledUsers = users.filter(function (user) { return !user.Policy || !user.Policy.IsDisabled; });
+              if (configuredUserId && !enabledUsers.some(function (user) {
+                return user.Id.replace(/-/g, '').toLowerCase() === configuredUserId;
+              })) addUnavailableUser(config.RetentionSelectedUserId);
+              enabledUsers
                 .sort(function (left, right) { return left.Name.localeCompare(right.Name); })
                 .forEach(function (user) {
                   var option = document.createElement('option');
@@ -129,6 +144,7 @@
                 });
             }, function () {
               selectedUser.innerHTML = '';
+              if (config.RetentionSelectedUserId) addUnavailableUser(config.RetentionSelectedUserId);
             }).then(function () {
               updateSelectedUserVisibility();
               Dashboard.hideLoadingMsg();
