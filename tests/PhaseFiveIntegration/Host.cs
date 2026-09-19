@@ -144,7 +144,9 @@ internal sealed partial class NativeWorld
         };
         if (tmdb is not null) movie.ProviderIds["Tmdb"] = tmdb;
         // Jellyfin groups files that start with their folder's name as alternate versions of the first one.
-        if (sibling is not null) movie.PrimaryVersionId = (sibling.PrimaryVersionId is { Length: > 0 } primary ? primary : sibling.Id.ToString("N"));
+        if (sibling is not null)
+            movie.PrimaryVersionId = sibling.PrimaryVersionId is { Length: > 0 } primary && _items.ContainsKey(Guid.Parse(primary))
+                ? primary : sibling.Id.ToString("N");
         Add(library, movie);
         return movie;
     }
@@ -186,6 +188,15 @@ internal sealed partial class NativeWorld
     public void Remove(BaseItem item)
     {
         _items.TryRemove(item.Id, out _);
+        // Removing a primary version promotes the oldest remaining alternate, as a rescan of the folder would.
+        var orphans = _items.Values.OfType<Movie>().Where(movie => movie.PrimaryVersionId == item.Id.ToString("N"))
+            .OrderBy(movie => movie.DateCreated).ToArray();
+        if (orphans.Length > 0)
+        {
+            orphans[0].PrimaryVersionId = null;
+            foreach (var alternate in orphans.Skip(1)) alternate.PrimaryVersionId = orphans[0].Id.ToString("N");
+        }
+
         foreach (var library in Libraries) lock (library.Items) library.Items.Remove(item);
         foreach (var series in _items.Values.OfType<TestSeries>()) lock (series.Items) series.Items.Remove(item);
         _removed?.Invoke(this, new ItemChangeEventArgs { Item = item });
@@ -374,6 +385,7 @@ internal sealed class PluginHost : IAsyncDisposable
         AcquisitionServices.AddHostedServices(builder.Services);
         ImportServices.Add(builder.Services);
         ImportServices.AddHostedServices(builder.Services);
+        JellyfinMod.Services.Automation.AutomationServices.Add(builder.Services);
         builder.Services.AddSingleton(new GrabHoldOptions(TimeSpan.FromMilliseconds(300)));
         builder.Services.AddSingleton(new TorznabOptions(TimeSpan.FromSeconds(5), 3, 4));
 

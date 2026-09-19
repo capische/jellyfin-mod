@@ -98,7 +98,9 @@ internal static partial class Phase5
                 INSERT INTO AcquisitionSettings (Id, Enabled, Revision) VALUES ({AcquisitionSettings.SingletonId}, 0, 1)
                 """);
             await database.Database.MigrateAsync();
-            Assert((await database.Database.GetAppliedMigrationsAsync()).Last().EndsWith("_PhaseFiveImport", StringComparison.Ordinal),
+            var applied = (await database.Database.GetAppliedMigrationsAsync()).ToList();
+            Assert(applied.FindIndex(name => name.EndsWith("_PhaseFiveImport", StringComparison.Ordinal)) >
+                applied.IndexOf("20260919071544_PhaseFourAcquisition") && applied.Contains("20260919071544_PhaseFourAcquisition"),
                 "The Phase 5 migration applies after the Phase 4 migration");
             var upgraded = await database.AcquisitionSettings.AsNoTracking().SingleAsync();
             Assert(upgraded.ImportEnabled && !upgraded.SeedReleaseEnabled && upgraded.ImportPollSeconds == 15 && upgraded.SeedFloorRatio == 1.0 &&

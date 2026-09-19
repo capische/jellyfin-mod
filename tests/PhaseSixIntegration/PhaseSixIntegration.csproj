@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../JellyfinMod/JellyfinMod.csproj" /></ItemGroup>
+  <!-- The Phase 5 host and boundaries are shared: the same real Kestrel host and HTTP boundary servers. -->
+  <ItemGroup>
+    <Compile Include="../PhaseFiveIntegration/Host.cs" Link="Host.cs" />
+    <Compile Include="../PhaseFiveIntegration/Boundaries.cs" Link="Boundaries.cs" />
+  </ItemGroup>
+</Project>

@@ -70,6 +70,9 @@ internal sealed class TorznabBoundary : IAsyncDisposable
     public ConcurrentDictionary<string, byte[]> Torrents { get; } = new(StringComparer.Ordinal);
     public ConcurrentQueue<string> Queries { get; } = new();
     public Uri Address { get; private set; } = null!;
+    /// <summary>Answers every search (not caps) with this HTTP status when set, as an overloaded indexer would.</summary>
+    public int? FailSearchesWith { get; set; }
+    public int SearchQueries;
 
     public string Download(string id) => new Uri(Address, $"/dl/{id}").ToString();
 
@@ -92,6 +95,13 @@ internal sealed class TorznabBoundary : IAsyncDisposable
 
             var mode = context.Request.Query["t"].ToString();
             if (mode == "caps") { await context.Response.WriteAsync(Caps); return; }
+            Interlocked.Increment(ref SearchQueries);
+            if (FailSearchesWith is { } status)
+            {
+                context.Response.StatusCode = status;
+                return;
+            }
+
             List<FeedItem> items;
             lock (MovieItems) items = (mode == "tvsearch" ? TvItems : MovieItems).ToList();
             if (mode == "tvsearch" && int.TryParse(context.Request.Query["ep"], out var episode))
