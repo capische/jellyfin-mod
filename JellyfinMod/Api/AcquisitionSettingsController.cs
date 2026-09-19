@@ -27,7 +27,8 @@ public sealed partial class AcquisitionSettingsController(
     ReleaseSearchService search,
     ReleaseSearchCache cache,
     GrabHoldOptions hold,
-    RetentionConfigurationSource pluginConfiguration) : ControllerBase
+    RetentionConfigurationSource pluginConfiguration,
+    JellyfinMod.Services.Import.ImportPathProbe? pathProbe = null) : ControllerBase
 {
     /// <summary>Lists indexers.</summary>
     [HttpGet("Indexers")]
@@ -123,7 +124,8 @@ public sealed partial class AcquisitionSettingsController(
     {
         if (!readiness.IsReady) return StatusCode(503);
         var clients = await database.AcquisitionDownloadClients.AsNoTracking().OrderBy(value => value.Name).ToListAsync(cancellationToken);
-        return clients.Select(ToDto).ToArray();
+        var mappings = await database.DownloadClientPathMappings.AsNoTracking().ToListAsync(cancellationToken);
+        return clients.Select(client => ToDto(client, mappings)).ToArray();
     }
 
     /// <summary>Creates a download client after checking its destination filesystem.</summary>
@@ -133,6 +135,7 @@ public sealed partial class AcquisitionSettingsController(
     {
         if (!readiness.IsReady) return StatusCode(503);
         if (ValidateClient(request, creating: true) is { } error) return Invalid(error);
+        if (ValidateMappings(request.PathMappings) is { } mappingError) return Invalid(mappingError.Code, mappingError.Message);
         var destination = destinations.Check(request.LocalDirectory.Trim());
         if (!destination.Ok) return Invalid(destination.Code, destination.Message);
         var client = new AcquisitionDownloadClient();
@@ -140,13 +143,14 @@ public sealed partial class AcquisitionSettingsController(
         client.PasswordSecretRef = request.Password.Action == "replace"
             ? await secrets.AddAsync(request.Password.Value!, cancellationToken) : null;
         database.AcquisitionDownloadClients.Add(client);
+        if (request.PathMappings is { } created) ReplaceMappings(client.Id, created, []);
         if (await SaveAsync(cancellationToken) is { } conflict)
         {
             await secrets.RemoveAsync(client.PasswordSecretRef, CancellationToken.None);
             return conflict;
         }
 
-        return StatusCode(201, ToDto(client));
+        return StatusCode(201, ToDto(client, await MappingsAsync(client.Id, cancellationToken)));
     }
 
     /// <summary>Replaces a download client; it must be tested again before grabs use it.</summary>
@@ -156,6 +160,7 @@ public sealed partial class AcquisitionSettingsController(
     {
         if (!readiness.IsReady) return StatusCode(503);
         if (ValidateClient(request, creating: false) is { } error) return Invalid(error);
+        if (ValidateMappings(request.PathMappings) is { } mappingError) return Invalid(mappingError.Code, mappingError.Message);
         var client = await database.AcquisitionDownloadClients.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (client is null) return NotFound();
         if (request.Revision != client.Revision) return RevisionConflict();
@@ -167,9 +172,12 @@ public sealed partial class AcquisitionSettingsController(
         client.Revision++;
         client.VerifiedRevision = null;
         client.VerifiedAt = null;
+        if (request.PathMappings is { } replaced)
+            ReplaceMappings(client.Id, replaced, await database.DownloadClientPathMappings
+                .Where(mapping => mapping.DownloadClientId == client.Id).ToListAsync(cancellationToken));
         if (await SaveAsync(cancellationToken) is { } conflict) return conflict;
         if (previous != client.PasswordSecretRef) await secrets.RemoveAsync(previous, CancellationToken.None);
-        return ToDto(client);
+        return ToDto(client, await MappingsAsync(client.Id, cancellationToken));
     }
 
     /// <summary>Deletes a download client that is neither selected nor owning an active grab.</summary>
@@ -481,11 +489,49 @@ public sealed partial class AcquisitionSettingsController(
             indexer.CapabilitiesFetchedAt is { } fetched ? DateTime.SpecifyKind(fetched, DateTimeKind.Utc) : null, indexer.LastError);
     }
 
-    private static DownloadClientSettingsDto ToDto(AcquisitionDownloadClient client) => new(client.Id, client.Name, client.Kind,
+    private static DownloadClientSettingsDto ToDto(AcquisitionDownloadClient client, IEnumerable<DownloadClientPathMapping> mappings) =>
+        new(client.Id, client.Name, client.Kind,
         client.BaseUrl, client.Username, client.PasswordSecretRef is not null, client.Enabled, client.Label, client.DownloadDirectory,
         client.LocalDirectory, client.VerifiedLibraryIds.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(Guid.Parse).ToArray(),
         client.OpenUrl, client.Revision, client.VerifiedRevision == client.Revision, client.ClientVersion, client.ApiVersion,
-        client.VerifiedAt is { } verified ? DateTime.SpecifyKind(verified, DateTimeKind.Utc) : null, client.LastError);
+        client.VerifiedAt is { } verified ? DateTime.SpecifyKind(verified, DateTimeKind.Utc) : null, client.LastError,
+        mappings.Where(mapping => mapping.DownloadClientId == client.Id).OrderBy(mapping => mapping.Order).Select(MappingDto).ToArray());
+
+    private static PathMappingDto MappingDto(DownloadClientPathMapping mapping) => new(mapping.Id, mapping.Order,
+        mapping.ClientPathPrefix, mapping.LocalPathPrefix,
+        mapping.VerifiedAt is { } verified ? DateTime.SpecifyKind(verified, DateTimeKind.Utc) : null, mapping.VerificationReason);
+
+    private async Task<List<DownloadClientPathMapping>> MappingsAsync(Guid clientId, CancellationToken cancellationToken) =>
+        await database.DownloadClientPathMappings.AsNoTracking().Where(mapping => mapping.DownloadClientId == clientId)
+            .ToListAsync(cancellationToken);
+
+    private (string Code, string Message)? ValidateMappings(PathMappingRequest[]? mappings)
+    {
+        if (mappings is null) return null;
+        if (pathProbe is null) return ("path_mappings_unavailable", "Path mappings are not available in this build.");
+        return pathProbe.Validate(mappings);
+    }
+
+    /// <summary>
+    /// Replaces a client's mappings in the given order. Each is probed; an unverified mapping is saved but blocks imports
+    /// through it as <c>path_unmapped</c> (P5.I2).
+    /// </summary>
+    private void ReplaceMappings(Guid clientId, IReadOnlyList<PathMappingRequest> requested, IEnumerable<DownloadClientPathMapping> existing)
+    {
+        database.DownloadClientPathMappings.RemoveRange(existing);
+        var now = DateTime.UtcNow;
+        for (var index = 0; index < requested.Count; index++)
+        {
+            var local = JellyfinMod.Services.Import.ImportPaths.Normalize(requested[index].LocalPathPrefix)!;
+            var probe = pathProbe!.Probe(local);
+            database.DownloadClientPathMappings.Add(new DownloadClientPathMapping
+            {
+                DownloadClientId = clientId, Order = index,
+                ClientPathPrefix = JellyfinMod.Services.Import.ImportPaths.Normalize(requested[index].ClientPathPrefix)!,
+                LocalPathPrefix = local, VerifiedAt = probe.Ok ? now : null, VerificationReason = probe.Ok ? null : probe.Code
+            });
+        }
+    }
 
     private static QualityProfileDto ToDto(AcquisitionQualityProfile profile, Guid? defaultId) => new(profile.Id, profile.Name,
         AcquisitionConfiguration.Qualities(profile), profile.MinimumBytesPerHour, profile.MaximumBytesPerHour, profile.Revision,

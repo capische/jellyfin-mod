@@ -179,6 +179,54 @@ public sealed class AcquisitionSettings
 
     /// <summary>Gets or sets the settings revision.</summary>
     public int Revision { get; set; } = 1;
+
+    /// <summary>Gets or sets a value indicating whether completed downloads are imported (P5.I2).</summary>
+    public bool ImportEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the plugin removes a seeding copy once its goals are met (P5.I6).
+    /// Off by default until the isolated acceptance run passes (PHASE5 open question 3).
+    /// </summary>
+    public bool SeedReleaseEnabled { get; set; }
+
+    /// <summary>Gets or sets the global ratio floor; met when either floor component is reached.</summary>
+    public double? SeedFloorRatio { get; set; } = 1.0;
+
+    /// <summary>Gets or sets the global seeding-time floor in hours.</summary>
+    public int? SeedFloorHours { get; set; } = 168;
+
+    /// <summary>Gets or sets how often the import monitor polls the client while work is open.</summary>
+    public int ImportPollSeconds { get; set; } = 15;
+
+    /// <summary>Gets or sets the comma-separated allow-listed video file extensions.</summary>
+    [MaxLength(256)]
+    public string VideoExtensions { get; set; } = ImportDefaults.VideoExtensions;
+
+    /// <summary>Gets or sets after how many hours without progress a download shows as stalled.</summary>
+    public int StalledAfterHours { get; set; } = 24;
+
+    /// <summary>Gets or sets how long a targeted scan may take before it is requested again.</summary>
+    public int ScanTimeoutMinutes { get; set; } = 10;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether ordinary users see queue rows for libraries they can access
+    /// (PHASE5 open question 2). Off by default: the queue is administrator-only like search and grab.
+    /// </summary>
+    public bool QueueVisibleToUsers { get; set; }
+
+    /// <summary>Gets or sets the import settings revision.</summary>
+    public int ImportRevision { get; set; } = 1;
+}
+
+/// <summary>Documented import defaults.</summary>
+public static class ImportDefaults
+{
+    /// <summary>The default allow-listed video extensions.</summary>
+    public const string VideoExtensions = "mkv,mp4,m4v,avi,mov,ts,m2ts,webm,wmv,mpg,mpeg";
+
+    /// <summary>Archive extensions that are never extracted.</summary>
+    public static IReadOnlySet<string> ArchiveExtensions { get; } =
+        new HashSet<string>(["rar", "zip", "7z", "tar", "gz", "bz2", "xz", "iso", "img"], StringComparer.OrdinalIgnoreCase);
 }
 
 /// <summary>Stable grab operation states (P4.A1).</summary>

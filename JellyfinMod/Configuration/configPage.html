@@ -146,6 +146,23 @@
         <button is="emby-button" type="button" id="SaveClient" class="raised block"><span>Save download client</span></button>
         <button is="emby-button" type="button" id="NewClient" class="raised button-cancel block"><span>New download client</span></button>
 
+        <h3 class="sectionTitle verticalSection">Path mappings</h3>
+        <div class="fieldDescription">
+          Only needed when Transmission reports paths Jellyfin sees differently (for example another container's mount).
+          The longest matching client prefix wins; the download folder pair above is always used last. Each mapping is
+          probed with a real hardlink when saved; an unverified mapping stops imports through it instead of guessing.
+        </div>
+        <div id="MappingClient" class="fieldDescription">Edit a download client to change its mappings.</div>
+        <div id="MappingRows"></div>
+        <button is="emby-button" type="button" id="AddMapping" class="raised button-cancel block"><span>Add mapping</span></button>
+        <button is="emby-button" type="button" id="SaveMappings" class="raised block"><span>Save path mappings</span></button>
+        <div class="inputContainer">
+          <input is="emby-input" type="text" id="TestImportClientPath" label="Test a path as Transmission reports it" />
+          <div class="fieldDescription">Maps the path, checks it exists and tries a hardlink into each library on the same mount. Nothing is added to the client.</div>
+        </div>
+        <button is="emby-button" type="button" id="TestImportPath" class="raised button-cancel block"><span>Test import path</span></button>
+        <div id="TestImportResult" class="fieldDescription"></div>
+
         <h3 class="sectionTitle verticalSection">Quality profiles</h3>
         <div id="ProfileList" class="fieldDescription"></div>
         <div class="inputContainer"><input is="emby-input" type="text" id="ProfileName" label="Name" /></div>
@@ -155,6 +172,28 @@
         <div class="inputContainer"><input is="emby-input" type="number" id="ProfileMaximum" min="0" step="0.1" label="Maximum GB per hour (optional)" /></div>
         <button is="emby-button" type="button" id="SaveProfile" class="raised block"><span>Save quality profile</span></button>
         <button is="emby-button" type="button" id="NewProfile" class="raised button-cancel block"><span>New quality profile</span></button>
+      </div>
+
+      <div id="JellyfinModImport" class="verticalSection">
+        <h2 class="sectionTitle">Import and seeding</h2>
+        <div id="ImportStatus" class="fieldDescription">Import settings have not loaded.</div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="ImportEnabled" /><span>Import finished downloads into the library by hardlink</span></label>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="SeedReleaseEnabled" /><span>Remove a seeding copy once its seed goals are met</span></label>
+        <div class="fieldDescription">
+          Imports never copy: a download on a different mount stops with a reason. The library keeps its own hardlink, so
+          removing the seeding copy frees disk only after the library file is reclaimed as well.
+        </div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="SeedFloorRatio" min="0" max="100" step="0.1" label="Minimum ratio before release (blank for none)" /></div>
+        <div class="inputContainer">
+          <input is="emby-input" type="number" id="SeedFloorHours" min="0" max="8760" label="Minimum seeding hours before release (blank for none)" />
+          <div class="fieldDescription">The floor is met by whichever comes first. Tracker requirements recorded on the grab always apply in full on top.</div>
+        </div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="ImportPollSeconds" min="1" max="3600" label="Check downloads every (seconds)" /></div>
+        <div class="inputContainer"><input is="emby-input" type="text" id="VideoExtensions" label="Video file extensions, comma-separated" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="StalledAfterHours" min="1" max="8760" label="Show a download as stalled after (hours without progress)" /></div>
+        <div class="inputContainer"><input is="emby-input" type="number" id="ScanTimeoutMinutes" min="1" max="1440" label="Wait for Jellyfin to add an import (minutes)" /></div>
+        <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="QueueVisibleToUsers" /><span>Let every user see the download queue for libraries they can access</span></label>
+        <button is="emby-button" type="button" id="SaveImport" class="raised button-submit block"><span>Save import settings</span></button>
       </div>
     </div>
   </div>
@@ -283,8 +322,122 @@
         field('IndexerEnabled').checked = indexer ? indexer.enabled : true;
       }
 
+      // Import settings and path mappings (P5.I2).
+      var importState = { settings: null, mappings: [] };
+
+      function renderMappings() {
+        var container = field('MappingRows');
+        container.innerHTML = '';
+        field('MappingClient').textContent = acquisition.client
+          ? 'Mappings for ' + acquisition.client.name + ':' : 'Edit a download client to change its mappings.';
+        importState.mappings.forEach(function (mapping, index) {
+          var row = document.createElement('div');
+          ['clientPathPrefix', 'localPathPrefix'].forEach(function (key) {
+            var input = document.createElement('input');
+            input.type = 'text';
+            input.setAttribute('is', 'emby-input');
+            input.placeholder = key === 'clientPathPrefix' ? 'Client prefix' : 'Jellyfin prefix';
+            input.value = mapping[key] || '';
+            input.addEventListener('change', function () { mapping[key] = input.value.trim(); });
+            row.appendChild(input);
+          });
+          var status = document.createElement('span');
+          status.textContent = ' ' + (mapping.verifiedAt ? 'verified' : mapping.verificationReason ? 'not verified: ' + mapping.verificationReason : 'not saved') + ' ';
+          row.appendChild(status);
+          row.appendChild(button('Up', function () { moveMapping(index, -1); }));
+          row.appendChild(button('Down', function () { moveMapping(index, 1); }));
+          row.appendChild(button('Remove', function () { importState.mappings.splice(index, 1); renderMappings(); }));
+          container.appendChild(row);
+        });
+      }
+
+      function moveMapping(index, offset) {
+        var target = index + offset;
+        if (target < 0 || target >= importState.mappings.length) return;
+        var item = importState.mappings.splice(index, 1)[0];
+        importState.mappings.splice(target, 0, item);
+        renderMappings();
+      }
+
+      function loadImport() {
+        return settingsRequest('GET', 'Import').then(function (settings) {
+          importState.settings = settings;
+          field('ImportEnabled').checked = settings.importEnabled;
+          field('SeedReleaseEnabled').checked = settings.seedReleaseEnabled;
+          field('SeedFloorRatio').value = settings.seedFloorRatio === null ? '' : settings.seedFloorRatio;
+          field('SeedFloorHours').value = settings.seedFloorHours === null ? '' : settings.seedFloorHours;
+          field('ImportPollSeconds').value = settings.importPollSeconds;
+          field('VideoExtensions').value = settings.videoExtensions.join(', ');
+          field('StalledAfterHours').value = settings.stalledAfterHours;
+          field('ScanTimeoutMinutes').value = settings.scanTimeoutMinutes;
+          field('QueueVisibleToUsers').checked = settings.queueVisibleToUsers;
+          field('ImportStatus').textContent = (settings.importEnabled ? 'Importing is on. ' : 'Importing is off. ') +
+            (settings.seedReleaseEnabled ? 'Seeding copies are released after their goals.' : 'Seeding copies are kept until removed by hand.');
+        }, function () {
+          field('ImportStatus').textContent = 'Import settings are unavailable in this plugin build.';
+        });
+      }
+
+      field('SaveImport').addEventListener('click', function () {
+        Dashboard.showLoadingMsg();
+        settingsRequest('PATCH', 'Import', {
+          importEnabled: field('ImportEnabled').checked,
+          seedReleaseEnabled: field('SeedReleaseEnabled').checked,
+          seedFloorRatio: optionalNumber(field('SeedFloorRatio').value),
+          seedFloorHours: optionalNumber(field('SeedFloorHours').value),
+          importPollSeconds: parseInt(field('ImportPollSeconds').value, 10) || 15,
+          videoExtensions: listText(field('VideoExtensions').value),
+          stalledAfterHours: parseInt(field('StalledAfterHours').value, 10) || 24,
+          scanTimeoutMinutes: parseInt(field('ScanTimeoutMinutes').value, 10) || 10,
+          queueVisibleToUsers: field('QueueVisibleToUsers').checked,
+          revision: importState.settings ? importState.settings.revision : null
+        }).then(function () {
+          Dashboard.hideLoadingMsg();
+          return loadImport();
+        }, report('Import settings'));
+      });
+
+      field('AddMapping').addEventListener('click', function () {
+        if (!acquisition.client) return;
+        importState.mappings.push({ clientPathPrefix: '', localPathPrefix: '', verifiedAt: null, verificationReason: null });
+        renderMappings();
+      });
+
+      field('SaveMappings').addEventListener('click', function () {
+        var client = acquisition.client;
+        if (!client) return;
+        Dashboard.showLoadingMsg();
+        settingsRequest('PUT', 'DownloadClients/' + client.id + '/PathMappings', {
+          pathMappings: importState.mappings.map(function (mapping) {
+            return { clientPathPrefix: mapping.clientPathPrefix, localPathPrefix: mapping.localPathPrefix };
+          }),
+          revision: client.revision
+        }).then(function (saved) {
+          Dashboard.hideLoadingMsg();
+          importState.mappings = saved;
+          renderMappings();
+          return loadAcquisition();
+        }, report('Path mappings'));
+      });
+
+      field('TestImportPath').addEventListener('click', function () {
+        var client = acquisition.client;
+        if (!client) return;
+        Dashboard.showLoadingMsg();
+        settingsRequest('POST', 'DownloadClients/' + client.id + '/TestImportPath', {
+          clientPath: field('TestImportClientPath').value.trim()
+        }).then(function (result) {
+          Dashboard.hideLoadingMsg();
+          field('TestImportResult').textContent = result.message + ' (' + result.code + ')' +
+            (result.localPath ? ' · maps to ' + result.localPath : '') +
+            result.libraries.map(function (library) { return ' · ' + library.name + ': ' + library.linkProbe; }).join('');
+        }, report('Import path test'));
+      });
+
       function editClient(client) {
         acquisition.client = client;
+        importState.mappings = client && client.pathMappings ? client.pathMappings.slice() : [];
+        renderMappings();
         field('ClientName').value = client ? client.name : '';
         field('ClientUrl').value = client ? client.baseUrl : '';
         field('ClientUsername').value = client ? client.username : '';
@@ -545,6 +698,7 @@
             });
           }, function () {});
           loadAcquisition();
+          loadImport();
           editIndexer(null);
           editClient(null);
           // Episodes whose identity Jellyfin now reports differently wait for an administrator (P2.R9).

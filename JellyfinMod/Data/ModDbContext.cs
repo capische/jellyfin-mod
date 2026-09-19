@@ -62,6 +62,18 @@ public class ModDbContext : DbContext
     /// <summary>Gets durable manual grab operations (P4.A5).</summary>
     public DbSet<GrabOperation> GrabOperations => Set<GrabOperation>();
 
+    /// <summary>Gets durable imports of accepted grabs (P5.I2).</summary>
+    public DbSet<ImportOperation> ImportOperations => Set<ImportOperation>();
+
+    /// <summary>Gets the plugin's ownership of seeding copies after import (P5.I6).</summary>
+    public DbSet<SeedReleaseOperation> SeedReleaseOperations => Set<SeedReleaseOperation>();
+
+    /// <summary>Gets ordered client-to-local path mappings (P5.I2).</summary>
+    public DbSet<DownloadClientPathMapping> DownloadClientPathMappings => Set<DownloadClientPathMapping>();
+
+    /// <summary>Gets releases an administrator blocked (P5.I7).</summary>
+    public DbSet<ReleaseBlocklistEntry> ReleaseBlocklist => Set<ReleaseBlocklistEntry>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -172,6 +184,38 @@ public class ModDbContext : DbContext
             // Grab operations are the audit of client handoffs; an entry removal detaches, never erases them.
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.SetNull);
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.SetNull);
+        });
+        b.Entity<ImportOperation>(e =>
+        {
+            e.Property(x => x.State).HasMaxLength(16);
+            // One open import per grab; terminal operations release the key (P5.I2).
+            e.HasIndex(x => x.OpenGrabKey).IsUnique();
+            e.HasIndex(x => x.GrabId);
+            e.HasIndex(x => x.State);
+            e.HasIndex(x => x.EntryId);
+            e.HasIndex(x => x.InfoHash);
+            // Imports are the audit of library files the plugin created; an entry removal detaches them.
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.SetNull);
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.SetNull);
+            e.HasOne<GrabOperation>().WithMany().HasForeignKey(x => x.GrabId).OnDelete(DeleteBehavior.Restrict);
+        });
+        b.Entity<SeedReleaseOperation>(e =>
+        {
+            e.Property(x => x.State).HasMaxLength(16);
+            e.HasIndex(x => x.ImportOperationId).IsUnique();
+            e.HasIndex(x => x.State);
+            e.HasIndex(x => x.SeedingPhysicalIdentity);
+            e.HasOne<ImportOperation>().WithMany().HasForeignKey(x => x.ImportOperationId).OnDelete(DeleteBehavior.Restrict);
+        });
+        b.Entity<DownloadClientPathMapping>(e =>
+        {
+            e.HasIndex(x => new { x.DownloadClientId, x.Order }).IsUnique();
+            e.HasOne<AcquisitionDownloadClient>().WithMany().HasForeignKey(x => x.DownloadClientId).OnDelete(DeleteBehavior.Cascade);
+        });
+        b.Entity<ReleaseBlocklistEntry>(e =>
+        {
+            e.HasIndex(x => x.InfoHash);
+            e.HasIndex(x => new { x.IndexerId, x.SourceGuid });
         });
     }
 }

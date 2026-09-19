@@ -137,6 +137,50 @@ public sealed partial class UnixFileInspector
         return !string.IsNullOrEmpty(directory) && NativeMethods.Access(directory, AccessWrite | AccessExecute) == 0;
     }
 
+    /// <summary>
+    /// Creates a hardlink with <c>link(2)</c> (P5.I4). Never copies: a failure is reported with its errno and nothing
+    /// else is attempted.
+    /// </summary>
+    public HardlinkResult Link(string source, string destination)
+    {
+        if (!OperatingSystem.IsLinux()) return new(false, -1);
+        return NativeMethods.Link(source, destination) == 0
+            ? new(true, 0)
+            : new(false, Marshal.GetLastPInvokeError());
+    }
+
+    /// <summary>Reads free and total bytes of the filesystem holding <paramref name="path"/> with <c>statvfs</c> (P6.M1).</summary>
+    public bool TryGetFreeSpace(string path, out ulong freeBytes, out ulong totalBytes)
+    {
+        freeBytes = totalBytes = 0;
+        if (!OperatingSystem.IsLinux() || string.IsNullOrWhiteSpace(path)) return false;
+        // struct statvfs on 64-bit Linux: f_bsize, f_frsize, f_blocks, f_bfree, f_bavail, ... (all 8 bytes wide).
+        var buffer = Marshal.AllocHGlobal(256);
+        try
+        {
+            for (var offset = 0; offset < 256; offset += sizeof(long)) Marshal.WriteInt64(buffer, offset, 0);
+            if (NativeMethods.StatVfs(path, buffer) != 0) return false;
+            var fragment = unchecked((ulong)Marshal.ReadInt64(buffer, 8));
+            if (fragment == 0) fragment = unchecked((ulong)Marshal.ReadInt64(buffer, 0));
+            var blocks = unchecked((ulong)Marshal.ReadInt64(buffer, 16));
+            var available = unchecked((ulong)Marshal.ReadInt64(buffer, 32));
+            totalBytes = blocks * fragment;
+            freeBytes = available * fragment;
+            return totalBytes > 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    /// <summary>Removes one empty directory the caller created; anything else is left alone.</summary>
+    public bool RemoveEmptyDirectory(string path)
+    {
+        if (!OperatingSystem.IsLinux()) return false;
+        return NativeMethods.RemoveDirectory(path) == 0;
+    }
+
     private const int AccessWrite = 2;
     private const int AccessExecute = 1;
     private const int AtSymlinkNoFollow = 0x100;
@@ -270,7 +314,28 @@ public sealed partial class UnixFileInspector
 
         [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
         internal static partial int Close(int fileDescriptor);
+
+        [LibraryImport("libc", EntryPoint = "link", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int Link(string existing, string created);
+
+        [LibraryImport("libc", EntryPoint = "statvfs", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int StatVfs(string path, IntPtr buffer);
+
+        [LibraryImport("libc", EntryPoint = "rmdir", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int RemoveDirectory(string path);
     }
+}
+
+/// <summary>The outcome of one <c>link(2)</c> call.</summary>
+/// <param name="Linked">True when the new name was created.</param>
+/// <param name="Errno">The errno when it was not.</param>
+public readonly record struct HardlinkResult(bool Linked, int Errno)
+{
+    /// <summary>EXDEV: the two paths are on different mounts.</summary>
+    public bool CrossDevice => Errno == 18;
+
+    /// <summary>EEXIST: the destination name already exists.</summary>
+    public bool Exists => Errno == 17;
 }
 
 /// <summary>The outcome of a pinned unlink.</summary>

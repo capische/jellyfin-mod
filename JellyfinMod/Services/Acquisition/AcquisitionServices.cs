@@ -32,6 +32,8 @@ public static class AcquisitionServices
         services.AddTransient<ReleaseSearchService>();
         services.AddTransient<GrabService>();
         services.AddSingleton<GrabDispatcher>();
+        // Path mappings and their probe belong to the download-client configuration (P5.I2).
+        services.AddTransient<Import.ImportPathProbe>();
     }
 
     /// <summary>Registers the dispatcher that submits held grabs and recovers unresolved ones after a restart.</summary>

@@ -107,7 +107,8 @@ public sealed record DownloadClientSettingsDto(
     [property: JsonPropertyName("clientVersion"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ClientVersion,
     [property: JsonPropertyName("apiVersion"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ApiVersion,
     [property: JsonPropertyName("verifiedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? VerifiedAt,
-    [property: JsonPropertyName("lastError"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? LastError);
+    [property: JsonPropertyName("lastError"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? LastError,
+    [property: JsonPropertyName("pathMappings")] IReadOnlyList<PathMappingDto> PathMappings);
 
 /// <summary>Download client write contract. PATCH must echo the current revision.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -152,6 +153,10 @@ public sealed class DownloadClientSettingsRequest
     /// <summary>Gets or sets an optional credential-free web interface link.</summary>
     [MaxLength(1024), JsonPropertyName("openUrl")]
     public string? OpenUrl { get; set; }
+
+    /// <summary>Gets or sets the ordered path mappings (P5.I2); null keeps the saved mappings.</summary>
+    [JsonPropertyName("pathMappings")]
+    public PathMappingRequest[]? PathMappings { get; set; }
 
     /// <summary>Gets or sets the revision being replaced; required by PATCH.</summary>
     [JsonPropertyName("revision")]
