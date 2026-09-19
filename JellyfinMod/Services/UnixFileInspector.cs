@@ -7,6 +7,7 @@ public sealed partial class UnixFileInspector
 {
     private const int AtFileDescriptorCurrentWorkingDirectory = -100;
     private const uint StatxBasicStats = 0x7ff;
+    private const uint StatxBirthTime = 0x800;
     private const uint StatxRequiredStats = 0x304;
 
     /// <summary>Inspects an existing regular file and resolves its final canonical path.</summary>
@@ -25,17 +26,13 @@ public sealed partial class UnixFileInspector
             {
                 for (var offset = 0; offset < 256; offset += sizeof(long)) Marshal.WriteInt64(buffer, offset, 0);
                 if (NativeMethods.Statx(AtFileDescriptorCurrentWorkingDirectory, resolved, 0,
-                        StatxBasicStats, buffer) != 0)
+                        StatxBasicStats | StatxBirthTime, buffer) != 0)
                     return false;
                 var mask = unchecked((uint)Marshal.ReadInt32(buffer, 0));
                 if ((mask & StatxRequiredStats) != StatxRequiredStats) return false;
                 var linkCount = unchecked((uint)Marshal.ReadInt32(buffer, 16));
-                var inode = unchecked((ulong)Marshal.ReadInt64(buffer, 32));
                 var size = unchecked((ulong)Marshal.ReadInt64(buffer, 40));
-                var deviceMajor = unchecked((uint)Marshal.ReadInt32(buffer, 136));
-                var deviceMinor = unchecked((uint)Marshal.ReadInt32(buffer, 140));
-                snapshot = new UnixFileSnapshot(resolved,
-                    $"{deviceMajor:x8}:{deviceMinor:x8}:{inode:x16}", linkCount, size);
+                snapshot = new UnixFileSnapshot(resolved, Identity(buffer), linkCount, size);
                 return true;
             }
             finally
@@ -102,6 +99,97 @@ public sealed partial class UnixFileInspector
 
     private const int AccessWrite = 2;
     private const int AccessExecute = 1;
+    private const int AtSymlinkNoFollow = 0x100;
+    private const int OpenPath = 0x200000;
+    private const int ErrorNoEntry = 2;
+
+    // O_DIRECTORY, O_NOFOLLOW and O_CLOEXEC differ between x86-64 and the generic (ARM) Linux ABI.
+    private static int DirectoryFlags => RuntimeInformation.ProcessArchitecture is Architecture.X64 or Architecture.X86
+        ? OpenPath | 0x10000 | 0x20000 | 0x80000
+        : OpenPath | 0x4000 | 0x8000 | 0x80000;
+
+    /// <summary>
+    /// Unlinks exactly the verified file (P3.T12). Every directory from <c>/</c> down is opened relative to its
+    /// parent without following symbolic links, so a directory swapped for a symlink after the check cannot
+    /// redirect the unlink; the final name must still be the same device and inode, so a same-name
+    /// replacement is detected instead of deleted.
+    /// </summary>
+    public PinnedUnlinkResult UnlinkPinned(string canonicalPath, string expectedPhysicalIdentity)
+    {
+        if (!OperatingSystem.IsLinux() || !Path.IsPathFullyQualified(canonicalPath))
+            return PinnedUnlinkResult.Failed("Pinned unlink needs Linux and a canonical path.");
+        var segments = canonicalPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0 || segments.Any(segment => segment is "." or ".."))
+            return PinnedUnlinkResult.Failed("The canonical path is not a file path.");
+        var directory = NativeMethods.Open("/", DirectoryFlags, 0);
+        if (directory < 0) return PinnedUnlinkResult.Failed($"Opening / failed ({Marshal.GetLastPInvokeError()}).");
+        try
+        {
+            foreach (var segment in segments[..^1])
+            {
+                var next = NativeMethods.OpenAt(directory, segment, DirectoryFlags, 0);
+                var error = Marshal.GetLastPInvokeError();
+                NativeMethods.Close(directory);
+                directory = next;
+                if (directory < 0)
+                    return error == ErrorNoEntry
+                        ? PinnedUnlinkResult.Replaced("A parent directory of the media file is gone.")
+                        : PinnedUnlinkResult.Replaced($"A parent directory changed or became a link ({error}).");
+            }
+
+            var name = segments[^1];
+            if (!TryReadIdentity(directory, name, out var identity, out var isRegular))
+                return PinnedUnlinkResult.Replaced("The media file is gone or unreadable at unlink time.");
+            if (!isRegular || !string.Equals(identity, expectedPhysicalIdentity, StringComparison.Ordinal))
+                return PinnedUnlinkResult.Replaced("A different file now has the media file's name.");
+            if (NativeMethods.UnlinkAt(directory, name, 0) != 0)
+                return PinnedUnlinkResult.Failed($"unlinkat failed ({Marshal.GetLastPInvokeError()}).");
+            return PinnedUnlinkResult.Unlinked;
+        }
+        finally
+        {
+            if (directory >= 0) NativeMethods.Close(directory);
+        }
+    }
+
+    /// <summary>
+    /// Device and inode, plus the birth time where the filesystem records one (else the modification time):
+    /// a freed inode number is often reused at once, so device and inode alone cannot tell a same-name
+    /// replacement from the original (P3.T12).
+    /// </summary>
+    private static string Identity(IntPtr statx)
+    {
+        var mask = unchecked((uint)Marshal.ReadInt32(statx, 0));
+        var inode = unchecked((ulong)Marshal.ReadInt64(statx, 32));
+        var deviceMajor = unchecked((uint)Marshal.ReadInt32(statx, 136));
+        var deviceMinor = unchecked((uint)Marshal.ReadInt32(statx, 140));
+        var hasBirth = (mask & StatxBirthTime) != 0;
+        var timeOffset = hasBirth ? 80 : 112;
+        var seconds = Marshal.ReadInt64(statx, timeOffset);
+        var nanoseconds = unchecked((uint)Marshal.ReadInt32(statx, timeOffset + 8));
+        return $"{deviceMajor:x8}:{deviceMinor:x8}:{inode:x16}:{(hasBirth ? 'b' : 'm')}{seconds:x}.{nanoseconds:x8}";
+    }
+
+    private static bool TryReadIdentity(int directory, string name, out string identity, out bool isRegular)
+    {
+        identity = string.Empty;
+        isRegular = false;
+        var buffer = Marshal.AllocHGlobal(256);
+        try
+        {
+            for (var offset = 0; offset < 256; offset += sizeof(long)) Marshal.WriteInt64(buffer, offset, 0);
+            if (NativeMethods.Statx(directory, name, AtSymlinkNoFollow, StatxBasicStats | StatxBirthTime, buffer) != 0)
+                return false;
+            var mode = unchecked((ushort)Marshal.ReadInt16(buffer, 28));
+            isRegular = (mode & 0xF000) == 0x8000;
+            identity = Identity(buffer);
+            return true;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
 
     private static string? RealPath(string path)
     {
@@ -130,7 +218,35 @@ public sealed partial class UnixFileInspector
 
         [LibraryImport("libc", EntryPoint = "access", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
         internal static partial int Access(string path, int mode);
+
+        [LibraryImport("libc", EntryPoint = "open", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int Open(string path, int flags, uint mode);
+
+        [LibraryImport("libc", EntryPoint = "openat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int OpenAt(int directoryFileDescriptor, string path, int flags, uint mode);
+
+        [LibraryImport("libc", EntryPoint = "unlinkat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial int UnlinkAt(int directoryFileDescriptor, string path, int flags);
+
+        [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
+        internal static partial int Close(int fileDescriptor);
     }
+}
+
+/// <summary>The outcome of a pinned unlink.</summary>
+/// <param name="Removed">True when exactly the verified file was unlinked.</param>
+/// <param name="IsReplacement">True when the path now leads to a different file or directory chain.</param>
+/// <param name="Detail">Why nothing was removed.</param>
+public readonly record struct PinnedUnlinkResult(bool Removed, bool IsReplacement, string? Detail)
+{
+    /// <summary>The verified file was unlinked.</summary>
+    public static PinnedUnlinkResult Unlinked => new(true, false, null);
+
+    /// <summary>The path leads somewhere else now; nothing was removed.</summary>
+    public static PinnedUnlinkResult Replaced(string detail) => new(false, true, detail);
+
+    /// <summary>The unlink could not be attempted or failed; nothing was removed.</summary>
+    public static PinnedUnlinkResult Failed(string detail) => new(false, false, detail);
 }
 
 /// <summary>Whether a path exists, is gone, or could not be determined.</summary>

@@ -39,7 +39,8 @@ public sealed class RetentionExecutor(
         {
             var interrupted = await LoadOpenActionAsync(existing.ActionId, cancellationToken).ConfigureAwait(false);
             await using var recoveryLease = await AcquireLibrariesAsync(
-                interrupted.Select(operation => operation.TargetLibraryId), cancellationToken).ConfigureAwait(false);
+                interrupted.Select(operation => operation.TargetLibraryId)
+                    .Concat(LibrariesContaining(interrupted[0].MediaPath)), cancellationToken).ConfigureAwait(false);
             return await RecoverUnderLeaseAsync(interrupted, bindingId, cancellationToken).ConfigureAwait(false);
         }
 
@@ -53,6 +54,7 @@ public sealed class RetentionExecutor(
 
         var initialGroup = SamePathGroup(initialPreview, initial);
         var lockedLibraryIds = initialGroup.Select(candidate => candidate.TargetLibraryId).ToHashSet();
+        lockedLibraryIds.UnionWith(LibrariesContaining(initial.CanonicalPath));
         await using var libraryLease = await AcquireLibrariesAsync(
             lockedLibraryIds, cancellationToken).ConfigureAwait(false);
         var currentPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
@@ -120,7 +122,8 @@ public sealed class RetentionExecutor(
             cancellationToken.ThrowIfCancellationRequested();
             var operations = await LoadOpenActionAsync(actionId, cancellationToken).ConfigureAwait(false);
             await using var libraryLease = await AcquireLibrariesAsync(
-                operations.Select(operation => operation.TargetLibraryId), cancellationToken).ConfigureAwait(false);
+                operations.Select(operation => operation.TargetLibraryId)
+                    .Concat(LibrariesContaining(operations[0].MediaPath)), cancellationToken).ConfigureAwait(false);
             await RecoverUnderLeaseAsync(operations, null, cancellationToken).ConfigureAwait(false);
             results.AddRange(operations.Select(RetentionExecutionResult.From));
         }
@@ -217,18 +220,21 @@ public sealed class RetentionExecutor(
                     liveReason, null, cancellationToken).ConfigureAwait(false);
         }
 
+        // A binding added since prepare (for example from an overlapping library) shares the file but was
+        // never checked; the whole action stops rather than unlinking media it protects (P3.T12).
+        if (!(await CurrentBindingSetAsync(operations[0].MediaPath, cancellationToken).ConfigureAwait(false))
+                .SetEquals(operations.Select(operation => operation.BindingId)))
+            return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                RetentionExecutionReasons.BindingSetChanged, null, cancellationToken).ConfigureAwait(false);
+
         // The last point at which cancellation is honoured; everything after the unlink must finish.
         cancellationToken.ThrowIfCancellationRequested();
-        try
-        {
-            File.Delete(operations[0].MediaPath);
-            if (File.Exists(operations[0].MediaPath)) throw new IOException("The media path still exists after unlink.");
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException)
-        {
-            return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Failed,
-                RetentionExecutionReasons.UnlinkFailed, error, cancellationToken).ConfigureAwait(false);
-        }
+        var unlink = files.UnlinkPinned(operations[0].MediaPath, operations[0].PhysicalIdentity);
+        if (!unlink.Removed)
+            return await FinishAsync(operations, requestedBindingId,
+                unlink.IsReplacement ? RetentionOperationStates.Blocked : RetentionOperationStates.Failed,
+                unlink.IsReplacement ? RetentionPreviewReasons.MediaIdentityChanged : RetentionExecutionReasons.UnlinkFailed,
+                new IOException(unlink.Detail), cancellationToken).ConfigureAwait(false);
 
         var unlinkedAt = clock.GetUtcNow().UtcDateTime;
         foreach (var operation in operations)
@@ -512,6 +518,32 @@ public sealed class RetentionExecutor(
         result.Items.Where(candidate => string.Equals(candidate.CanonicalPath, selected.CanonicalPath,
                 StringComparison.Ordinal))
             .OrderBy(candidate => candidate.BindingId).ToArray();
+
+    /// <summary>Every movie or episode binding whose configured media path resolves to this canonical file.</summary>
+    private async Task<HashSet<Guid>> CurrentBindingSetAsync(string canonicalPath, CancellationToken cancellationToken)
+    {
+        var fileName = Path.GetFileName(canonicalPath);
+        var candidates = await database.EntryBindings.AsNoTracking()
+            .Where(binding => binding.MediaPath != null && binding.MediaPath.EndsWith(fileName))
+            .Select(binding => new { binding.Id, binding.MediaPath })
+            .Concat(database.EpisodeBindings.AsNoTracking()
+                .Where(binding => binding.MediaPath != null && binding.MediaPath.EndsWith(fileName))
+                .Select(binding => new { binding.Id, binding.MediaPath }))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return candidates.Where(candidate => string.Equals(candidate.MediaPath, canonicalPath, StringComparison.Ordinal) ||
+                files.TryCanonicalize(candidate.MediaPath!, out var resolved) &&
+                string.Equals(resolved, canonicalPath, StringComparison.Ordinal))
+            .Select(candidate => candidate.Id).ToHashSet();
+    }
+
+    /// <summary>Libraries whose configured roots contain the path, which must all be locked around its unlink.</summary>
+    private IEnumerable<Guid> LibrariesContaining(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) yield break;
+        foreach (var folder in library.GetVirtualFolders() ?? [])
+            if (Guid.TryParse(folder.ItemId, out var id) && MediaStorageIdentity.IsWithin(path, folder.Locations ?? []))
+                yield return id;
+    }
 
     private async ValueTask<IAsyncDisposable> AcquireLibrariesAsync(
         IEnumerable<Guid> libraryIds,

@@ -668,6 +668,8 @@ static async Task VerifyPreviewHttpAsync(
             user.Id, libraryFolder.Id);
         await VerifyRemoveGuardsAsync(api.Services, http, databasePath, libraryPath, storage, clock, items,
             user.Id, libraryFolder.Id, entry.Id);
+        await VerifyPinnedExecutionAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
+            user.Id, libraryFolder.Id);
     }
     finally
     {
@@ -1123,6 +1125,107 @@ static async Task VerifyHonestRecoveryAsync(
 
     File.Delete(unlinked.SidecarPath);
     File.Delete(vanished.SidecarPath);
+}
+
+// P3.T12: the unlink is pinned to the verified file, and a binding added after prepare stops the action.
+static async Task VerifyPinnedExecutionAsync(
+    IServiceProvider services,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    PluginConfiguration settings,
+    IDictionary<Guid, BaseItem> nativeItems,
+    Guid userId,
+    Guid libraryId)
+{
+    // Re-enabling starts a fresh grace period, so let it elapse (as the live-state scenario does).
+    settings.RetentionEnabled = true;
+    var policy = await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
+    clock.Advance(TimeSpan.FromDays(2));
+    var prepared = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900401, "t12-binding-set", RetentionOperationStatesForTest.Prepared, keep: false);
+    // An overlapping library now lists the same file, and its binding is due as well.
+    var overlap = new Movie { Id = Guid.NewGuid(), Name = "t12-overlap", Path = prepared.MediaPath };
+    nativeItems[overlap.Id] = overlap;
+    var overlapEntry = new Entry
+    {
+        MediaType = "movie", TmdbId = 900402, Title = "t12-overlap", State = FileState.OnDisk,
+        TargetLibraryId = libraryId, JellyfinItemId = overlap.Id
+    };
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.Entries.Add(overlapEntry);
+        database.EntryBindings.Add(new EntryBinding
+        {
+            EntryId = overlapEntry.Id, JellyfinItemId = overlap.Id, TargetLibraryId = libraryId,
+            VersionGroupId = overlap.Id, MediaPath = prepared.MediaPath, StorageIdentity = storage.Capture(prepared.MediaPath)
+        });
+        database.CompletionObservations.Add(new CompletionObservation
+        {
+            EntryId = overlapEntry.Id, TargetId = overlapEntry.Id, UserId = userId, JellyfinItemId = overlap.Id,
+            EvidenceAvailable = true, Played = true, CompletedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
+            LastPlayedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3), ObservedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
+        });
+        database.RetentionEvaluations.Add(new RetentionEvaluation
+        {
+            EntryId = overlapEntry.Id, TargetId = overlapEntry.Id, State = "disabled", Reason = "retention_disabled",
+            PolicyVersion = policy.Version, EvaluatedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
+            BaselineAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
+        });
+        var preparedOperation = await database.RetentionOperations.SingleAsync(candidate => candidate.Id == prepared.OperationId);
+        preparedOperation.PolicyVersion = policy.Version;
+        (await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == preparedOperation.EntryId))
+            .PolicyVersion = policy.Version;
+        await database.SaveChangesAsync();
+    }
+
+    await services.GetRequiredService<RetentionExecutor>().RecoverAsync(default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var operation = await database.RetentionOperations.SingleAsync(candidate => candidate.Id == prepared.OperationId);
+        Assert(operation.State == "blocked" && operation.Reason == "binding_set_changed" && File.Exists(prepared.MediaPath),
+            $"A binding added after prepare blocks the action with binding_set_changed: {operation.State}/{operation.Reason}");
+        settings.RetentionEnabled = false;
+        foreach (var entryId in new[] { operation.EntryId, overlapEntry.Id })
+            database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == entryId));
+        await database.SaveChangesAsync();
+    }
+
+    File.Delete(prepared.MediaPath);
+    File.Delete(prepared.SidecarPath);
+
+    // A parent directory swapped for a symlink after the check cannot redirect the unlink.
+    var inspector = new UnixFileInspector();
+    var season = Path.Combine(libraryPath, "t12-show", "season");
+    var decoy = Path.Combine(libraryPath, "t12-decoy");
+    Directory.CreateDirectory(season);
+    Directory.CreateDirectory(decoy);
+    var episode = Path.Combine(season, "episode.mkv");
+    await File.WriteAllBytesAsync(episode, new byte[512]);
+    await File.WriteAllBytesAsync(Path.Combine(decoy, "episode.mkv"), new byte[512]);
+    Assert(inspector.TryInspect(episode, out var verified), "The pinned-unlink fixture has inode evidence");
+    Directory.Move(season, season + ".moved");
+    Directory.CreateSymbolicLink(season, decoy);
+    var swapped = inspector.UnlinkPinned(verified.CanonicalPath, verified.PhysicalIdentity);
+    Assert(!swapped.Removed && swapped.IsReplacement && File.Exists(Path.Combine(decoy, "episode.mkv")) &&
+        File.Exists(Path.Combine(season + ".moved", "episode.mkv")),
+        $"A parent directory swapped for a symlink cannot redirect the unlink: {swapped.Detail}");
+    File.Delete(season);
+    Directory.Move(season + ".moved", season);
+
+    // A same-name replacement is a different inode and is not deleted.
+    File.Delete(episode);
+    await File.WriteAllBytesAsync(episode, new byte[512]);
+    var replaced = inspector.UnlinkPinned(verified.CanonicalPath, verified.PhysicalIdentity);
+    Assert(!replaced.Removed && replaced.IsReplacement && File.Exists(episode),
+        $"A same-name replacement is detected by inode and kept: {replaced.Detail}");
+
+    Assert(inspector.TryInspect(episode, out var current) &&
+        inspector.UnlinkPinned(current.CanonicalPath, current.PhysicalIdentity).Removed && !File.Exists(episode),
+        "The pinned unlink removes exactly the verified file");
+    Directory.Delete(Path.Combine(libraryPath, "t12-show"), true);
+    Directory.Delete(decoy, true);
 }
 
 static async Task<Guid?> LatestRunIdAsync(HttpClient http)
