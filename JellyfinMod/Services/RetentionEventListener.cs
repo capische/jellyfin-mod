@@ -57,20 +57,28 @@ public sealed class RetentionEventListener(
         users.OnUserUpdated -= OnUserUpdated;
         if (Plugin.Instance is not null) Plugin.Instance.ConfigurationChanged -= OnConfigurationChanged;
         queue.Writer.TryComplete();
-        if (stopping is not null) await stopping.CancelAsync().ConfigureAwait(false);
-        foreach (var task in new[] { worker, accessPoller })
+        // Only the first stop owns the cancellation source; a repeated stop is a no-op instead of touching a disposed one.
+        var source = Interlocked.Exchange(ref stopping, null);
+        if (source is null) return;
+        try
         {
-            if (task is null) continue;
-            try
+            await source.CancelAsync().ConfigureAwait(false);
+            foreach (var task in new[] { worker, accessPoller })
             {
-                await task.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
+                if (task is null) continue;
+                try
+                {
+                    await task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
             }
         }
-
-        stopping?.Dispose();
+        finally
+        {
+            source.Dispose();
+        }
     }
 
     private void OnConfigurationChanged(object? sender, BasePluginConfiguration configuration) =>

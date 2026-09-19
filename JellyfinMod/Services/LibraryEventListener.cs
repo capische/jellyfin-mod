@@ -48,19 +48,28 @@ public sealed class LibraryEventListener(
         library.ItemUpdated -= OnItemUpdated;
         library.ItemRemoved -= OnItemChanged;
         queue.Writer.TryComplete();
-        if (stopping is not null) await stopping.CancelAsync().ConfigureAwait(false);
-        if (worker is not null)
+        // The host may stop a service more than once (a failed start, then shutdown); only the first call owns the
+        // cancellation source, so a later call neither cancels nor disposes it again.
+        var source = Interlocked.Exchange(ref stopping, null);
+        if (source is null) return;
+        try
         {
-            try
+            await source.CancelAsync().ConfigureAwait(false);
+            if (worker is not null)
             {
-                await worker.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
+                try
+                {
+                    await worker.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
             }
         }
-
-        stopping?.Dispose();
+        finally
+        {
+            source.Dispose();
+        }
     }
 
     private void OnItemChanged(object? sender, ItemChangeEventArgs eventArgs)

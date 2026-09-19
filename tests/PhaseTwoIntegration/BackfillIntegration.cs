@@ -350,6 +350,8 @@ internal static class BackfillIntegration
         finally
         {
             await listener.StopAsync(default);
+            // A host may stop a hosted service twice (failed start, then shutdown); the second stop is a no-op.
+            await listener.StopAsync(default);
         }
     }
 

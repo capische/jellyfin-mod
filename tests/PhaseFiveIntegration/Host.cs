@@ -406,6 +406,8 @@ internal sealed class PluginHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // The listener is stopped once by hand and again by the host, as a failed start followed by shutdown would.
+        await App.Services.GetRequiredService<LibraryEventListener>().StopAsync(CancellationToken.None);
         await App.StopAsync();
         await App.DisposeAsync();
     }

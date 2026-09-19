@@ -531,6 +531,8 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     finally
     {
         await listener.StopAsync(default);
+        // Stopping twice is a no-op, not an ObjectDisposedException from the disposed cancellation source.
+        await listener.StopAsync(default);
     }
 
     await using var restarted = new ModDbContext(path);
