@@ -453,6 +453,61 @@ internal static class AbsenceIntegration
             "Overlapping libraries follow one rule: the first library by name owns the title and the other reports an overlap");
         Assert((await database.Entries.SingleAsync(entry => entry.Id == losingEntry.Id)).TargetLibraryId == oldTvLibraryId,
             "An unmatched title is not re-homed and stays listed as an orphan");
+
+        // P2.R10: a post-scan absence pass skipped behind an active run runs right after it.
+        var deferredMovie = pagedMovies[1];
+        var deferredEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 9601);
+        movies.Remove(deferredMovie);
+        File.Delete(deferredMovie.Path);
+        var gate = provider.GetRequiredService<ReconciliationRunGate>();
+        await using (await gate.TryAcquireAsync(default))
+            await task.Run(new InlineProgress(), default);
+        database.ChangeTracker.Clear();
+        Assert((await database.Entries.SingleAsync(entry => entry.Id == deferredEntry.Id)).State == FileState.OnDisk,
+            "A post-scan pass that finds a run active changes nothing itself");
+        using (var manualScope = provider.CreateScope())
+            await manualScope.ServiceProvider.GetRequiredService<CatalogBackfillRunner>()
+                .RunAsync(new InlineProgress(), default);
+        database.ChangeTracker.Clear();
+        Assert((await database.Entries.SingleAsync(entry => entry.Id == deferredEntry.Id)).State == FileState.None &&
+            await database.History.CountAsync(history => history.EntryId == deferredEntry.Id &&
+                history.EventType == "media_missing") == 1,
+            "The deferred absence pass runs as soon as the active run finishes");
+
+        // Run rows are pruned to the most recent 50, and a row left running by a stopped process is interrupted.
+        for (var index = 0; index < 60; index++)
+            database.ReconciliationRuns.Add(new ReconciliationRun
+            {
+                StartedAt = DateTime.UtcNow.AddDays(-30).AddMinutes(index), Status = "completed"
+            });
+        var stranded = new ReconciliationRun { StartedAt = DateTime.UtcNow };
+        database.ReconciliationRuns.Add(stranded);
+        await database.SaveChangesAsync();
+        var initializer = new DatabaseInitializer(provider.GetRequiredService<IServiceScopeFactory>(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DatabaseInitializer>.Instance);
+        var notReady = new CatalogBackfillRunner(database, provider.GetRequiredService<IServiceScopeFactory>(),
+            provider.GetRequiredService<JellyfinNativeTitleSource>(), gate,
+            provider.GetRequiredService<ReconciliationLibraryLock>(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<CatalogBackfillRunner>.Instance, initializer);
+        var runsBefore = await database.ReconciliationRuns.CountAsync();
+        var refused = false;
+        try
+        {
+            await notReady.RunAsync(new InlineProgress(), default);
+        }
+        catch (InvalidOperationException error) when (error.Message.Contains("not ready", StringComparison.Ordinal))
+        {
+            refused = true;
+        }
+
+        Assert(refused && await database.ReconciliationRuns.CountAsync() == runsBefore,
+            "Reconciliation performs no writes while the plugin database is not ready");
+        await initializer.StartAsync(default);
+        database.ChangeTracker.Clear();
+        Assert(initializer.IsReady &&
+            (await database.ReconciliationRuns.SingleAsync(run => run.Id == stranded.Id)).Status == "interrupted" &&
+            await database.ReconciliationRuns.CountAsync() == 50,
+            "Startup marks a stranded running row interrupted and keeps only the most recent 50 runs");
     }
 
     private static Movie Movie(int tmdbId, string name, string root)

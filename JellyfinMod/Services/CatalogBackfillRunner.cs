@@ -13,15 +13,36 @@ public sealed class CatalogBackfillRunner(
     JellyfinNativeTitleSource source,
     ReconciliationRunGate runGate,
     ReconciliationLibraryLock libraryLock,
-    ILogger<CatalogBackfillRunner> logger)
+    ILogger<CatalogBackfillRunner> logger,
+    DatabaseInitializer? readiness = null)
 {
     private const int MaxDiagnostics = 100;
 
-    /// <summary>Runs every current movie and series observation once.</summary>
+    /// <summary>
+    /// Runs every current movie and series observation once. When a post-scan absence pass was skipped
+    /// because this run held the gate, it runs right afterwards (P2.R10).
+    /// </summary>
     public async Task<ReconciliationRun> RunAsync(
         IProgress<double> progress,
         CancellationToken cancellationToken,
         bool confirmAbsence = false)
+    {
+        if (readiness is { IsReady: false })
+            throw new InvalidOperationException("The JellyfinMod database is not ready; reconciliation made no changes.");
+        var run = await RunOnceAsync(progress, cancellationToken, confirmAbsence).ConfigureAwait(false);
+        if (runGate.TakeAbsenceRequest())
+        {
+            logger.LogInformation("JellyfinMod is running the post-scan absence check that an earlier run deferred");
+            await RunOnceAsync(new Progress<double>(), cancellationToken, true).ConfigureAwait(false);
+        }
+
+        return run;
+    }
+
+    private async Task<ReconciliationRun> RunOnceAsync(
+        IProgress<double> progress,
+        CancellationToken cancellationToken,
+        bool confirmAbsence)
     {
         await using var lease = await runGate.TryAcquireAsync(cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException("A JellyfinMod reconciliation run is already active.");
@@ -99,7 +120,16 @@ public sealed class CatalogBackfillRunner(
                 // The initial native count includes copies; finish with the exact logical-title count.
                 run.TotalItems = Math.Max(run.TotalItems, run.ScannedItems);
                 run.DiagnosticsJson = SerializeDiagnostics(diagnostics);
-                await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception error) when (error is not OperationCanceledException)
+                {
+                    // A busy database must not fail the run; the next checkpoint writes the summary (P2.R10).
+                    logger.LogWarning(error, "JellyfinMod could not checkpoint reconciliation run {RunId}", run.Id);
+                }
+
                 progress.Report(Math.Min(99, 100d * run.ScannedItems / Math.Max(1, run.TotalItems)));
             }
 
@@ -112,6 +142,7 @@ public sealed class CatalogBackfillRunner(
             run.CompletedAt = DateTime.UtcNow;
             run.DiagnosticsJson = SerializeDiagnostics(diagnostics);
             await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+            await ReconciliationRunHistory.PruneAsync(database, CancellationToken.None).ConfigureAwait(false);
             progress.Report(100);
             return run;
         }
@@ -389,6 +420,14 @@ internal static class LibraryStorageProbe
 public sealed class ReconciliationRunGate
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
+
+    private int _absenceRequested;
+
+    /// <summary>Remembers that a post-scan absence pass was skipped while another run held the gate.</summary>
+    public void RequestAbsencePass() => Interlocked.Exchange(ref _absenceRequested, 1);
+
+    /// <summary>Returns true once for each deferred absence pass.</summary>
+    public bool TakeAbsenceRequest() => Interlocked.Exchange(ref _absenceRequested, 0) == 1;
 
     /// <summary>Acquires the full-run lease without waiting when no other run is active.</summary>
     public async ValueTask<IAsyncDisposable?> TryAcquireAsync(CancellationToken cancellationToken)

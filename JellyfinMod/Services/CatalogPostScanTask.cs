@@ -7,7 +7,8 @@ namespace JellyfinMod.Services;
 /// <summary>Repairs bindings after Jellyfin has completed a successful full library scan.</summary>
 public sealed class CatalogPostScanTask(
     IServiceScopeFactory scopeFactory,
-    ILogger<CatalogPostScanTask> logger) : ILibraryPostScanTask
+    ILogger<CatalogPostScanTask> logger,
+    ReconciliationRunGate? runGate = null) : ILibraryPostScanTask
 {
     /// <inheritdoc />
     public async Task Run(IProgress<double> progress, CancellationToken cancellationToken)
@@ -20,7 +21,9 @@ public sealed class CatalogPostScanTask(
         }
         catch (InvalidOperationException error) when (error.Message.Contains("already active", StringComparison.Ordinal))
         {
-            logger.LogInformation("JellyfinMod skipped post-scan reconciliation because a full run is already active");
+            // The active run confirms absence for this scan as soon as it finishes (P2.R10).
+            runGate?.RequestAbsencePass();
+            logger.LogInformation("JellyfinMod deferred post-scan absence checking until the active run finishes");
         }
     }
 }

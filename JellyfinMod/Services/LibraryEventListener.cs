@@ -14,7 +14,8 @@ public sealed class LibraryEventListener(
     ILibraryManager library,
     IServiceScopeFactory scopeFactory,
     ILogger<LibraryEventListener> logger,
-    TimeSpan? debounce = null) : IHostedService
+    TimeSpan? debounce = null,
+    JellyfinMod.Data.DatabaseInitializer? readiness = null) : IHostedService
 {
     private readonly TimeSpan _debounce = debounce ?? TimeSpan.FromSeconds(1);
     // The last identity, path and playability seen per native item; an update that changes none of them
@@ -106,6 +107,9 @@ public sealed class LibraryEventListener(
                        Environment.TickCount64 - lastEvent < (long)_debounce.TotalMilliseconds)
                     await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(1,
                         _debounce.TotalMilliseconds - (Environment.TickCount64 - lastEvent))), cancellationToken).ConfigureAwait(false);
+                // Nothing is written until the plugin database is migrated (P2.R10).
+                while (readiness is { IsReady: false })
+                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
                 pending.TryRemove(itemId, out _);
                 try
                 {

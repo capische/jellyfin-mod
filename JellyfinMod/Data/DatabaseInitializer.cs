@@ -21,6 +21,14 @@ public sealed class DatabaseInitializer(
             using var scope = scopeFactory.CreateScope();
             var database = scope.ServiceProvider.GetRequiredService<ModDbContext>();
             await database.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
+            // Only this process runs reconciliation, so a row still "running" belongs to a process that
+            // stopped before finishing it (P2.R10).
+            var interrupted = await database.ReconciliationRuns.Where(run => run.Status == "running")
+                .ExecuteUpdateAsync(setters => setters.SetProperty(run => run.Status, "interrupted")
+                    .SetProperty(run => run.CompletedAt, DateTime.UtcNow), cancellationToken).ConfigureAwait(false);
+            if (interrupted > 0)
+                logger.LogWarning("JellyfinMod marked {Count} unfinished reconciliation runs as interrupted", interrupted);
+            await ReconciliationRunHistory.PruneAsync(database, cancellationToken).ConfigureAwait(false);
             var quarantined = await database.Entries.CountAsync(entry => entry.TargetLibraryId == null ||
                 (entry.MetadataJson == null && entry.JellyfinItemId == null), cancellationToken).ConfigureAwait(false);
             if (quarantined > 0)
@@ -37,4 +45,22 @@ public sealed class DatabaseInitializer(
 
     /// <inheritdoc />
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+}
+
+/// <summary>Keeps the reconciliation run history bounded (P2.R10).</summary>
+internal static class ReconciliationRunHistory
+{
+    /// <summary>The number of most recent runs kept.</summary>
+    public const int Keep = 50;
+
+    /// <summary>Deletes all but the most recent runs.</summary>
+    public static async Task PruneAsync(ModDbContext database, CancellationToken cancellationToken)
+    {
+        var cutoff = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt)
+            .Skip(Keep - 1).Select(run => (DateTime?)run.StartedAt).FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (cutoff is { } oldestKept)
+            await database.ReconciliationRuns.Where(run => run.StartedAt < oldestKept && run.Status != "running")
+                .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+    }
 }
