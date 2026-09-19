@@ -275,7 +275,8 @@ public sealed class RetentionEvaluator(
         var days = target.Entry.RetentionPolicy == RetentionPolicy.Days && target.Entry.ReclaimAfterDays is > 0
             ? Math.Clamp(target.Entry.ReclaimAfterDays.Value, 1, 3650)
             : policy.ReclaimAfterDays;
-        var deadline = eligibleAt.AddDays(days);
+        // An isolated test instance can shorten every window to minutes; production leaves this at zero.
+        var deadline = policy.TestWindowMinutes > 0 ? eligibleAt.AddMinutes(policy.TestWindowMinutes) : eligibleAt.AddDays(days);
         if (priorDeadline > deadline) deadline = priorDeadline.Value;
 
         result.State = RetentionEvaluationStates.Scheduled;
