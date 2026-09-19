@@ -54,6 +54,8 @@ public class HealthController : ControllerBase
         "acquisition.grabHold",
         "queue",
         "import",
-        "seedRelease"
+        "seedRelease",
+        "automation",
+        "versions"
     ];
 }

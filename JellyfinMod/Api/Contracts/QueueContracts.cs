@@ -90,7 +90,12 @@ public sealed record QueueResultDto(
     [property: JsonPropertyName("generatedAt")] DateTime GeneratedAt,
     [property: JsonPropertyName("clientStatus")] QueueClientStatusDto ClientStatus,
     [property: JsonPropertyName("importEnabled")] bool ImportEnabled,
-    [property: JsonPropertyName("seedReleaseEnabled")] bool SeedReleaseEnabled);
+    [property: JsonPropertyName("seedReleaseEnabled")] bool SeedReleaseEnabled)
+{
+    /// <summary>Gets whether automation runs and why not, for the queue banner (P6.M8); null on a host without automation.</summary>
+    [JsonPropertyName("automation"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public QueueAutomationDto? Automation { get; init; }
+}
 
 /// <summary>The body of <c>DELETE /JellyfinMod/Queue/{id}</c>.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]

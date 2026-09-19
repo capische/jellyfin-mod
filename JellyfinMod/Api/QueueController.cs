@@ -32,7 +32,8 @@ public sealed class QueueController(
     UnixFileInspector files,
     ILibraryManager library,
     TimeProvider time,
-    IAuthorizationService authorization) : ControllerBase
+    IAuthorizationService authorization,
+    JellyfinMod.Services.Automation.AutomationStatusService? automation = null) : ControllerBase
 {
     /// <summary>Lists open downloads, imports and seeding copies the caller may see.</summary>
     [HttpGet("Queue")]
@@ -87,7 +88,10 @@ public sealed class QueueController(
         }
 
         return new QueueResultDto(rows, rows.Count, time.GetUtcNow().UtcDateTime, clientStatus, settings.ImportEnabled,
-            settings.SeedReleaseEnabled);
+            settings.SeedReleaseEnabled)
+        {
+            Automation = automation is null ? null : await automation.BannerAsync(cancellationToken)
+        };
     }
 
     /// <summary>Gets one import operation; inaccessible targets answer with the concealed 404.</summary>
