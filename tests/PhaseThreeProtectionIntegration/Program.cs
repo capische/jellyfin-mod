@@ -337,9 +337,9 @@ static async Task VerifyPreviewHttpAsync(
             {
                 try
                 {
-                    using var scope = hostServices!.CreateScope();
-                    await scope.ServiceProvider.GetRequiredService<RetentionRunner>()
-                        .RunAsync(new Progress<double>(), CancellationToken.None);
+                    // The real scheduled-task entry point, as Jellyfin's task manager invokes it (P3.T18).
+                    await new RetentionReclamationTask(hostServices!.GetRequiredService<IServiceScopeFactory>())
+                        .ExecuteAsync(new Progress<double>(), CancellationToken.None);
                 }
                 catch (RetentionRunAlreadyActiveException)
                 {
@@ -1226,6 +1226,46 @@ static async Task VerifyPinnedExecutionAsync(
         "The pinned unlink removes exactly the verified file");
     Directory.Delete(Path.Combine(libraryPath, "t12-show"), true);
     Directory.Delete(decoy, true);
+
+    // P3.T18: an unreadable library root (here a dropped mount leaving an empty directory) blocks the unlink.
+    settings.RetentionEnabled = true;
+    var offlinePolicy = await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
+    var offline = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
+        userId, libraryId, 900403, "t18-offline-root", RetentionOperationStatesForTest.Prepared, keep: false);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var operation = await database.RetentionOperations.SingleAsync(candidate => candidate.Id == offline.OperationId);
+        operation.PolicyVersion = offlinePolicy.Version;
+        (await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == operation.EntryId))
+            .PolicyVersion = offlinePolicy.Version;
+        await database.SaveChangesAsync();
+    }
+
+    var parked = libraryPath + ".offline";
+    Directory.Move(libraryPath, parked);
+    Directory.CreateDirectory(libraryPath);
+    try
+    {
+        await services.GetRequiredService<RetentionExecutor>().RecoverAsync(default);
+    }
+    finally
+    {
+        Directory.Delete(libraryPath);
+        Directory.Move(parked, libraryPath);
+        settings.RetentionEnabled = false;
+    }
+
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var operation = await database.RetentionOperations.SingleAsync(candidate => candidate.Id == offline.OperationId);
+        Assert(operation.State != "completed" && operation.UnlinkedAt is null && File.Exists(offline.MediaPath),
+            $"An unavailable library root never lets retention unlink: {operation.State}/{operation.Reason}");
+        database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == operation.EntryId));
+        await database.SaveChangesAsync();
+    }
+
+    File.Delete(offline.MediaPath);
+    File.Delete(offline.SidecarPath);
 }
 
 static async Task<Guid?> LatestRunIdAsync(HttpClient http)
