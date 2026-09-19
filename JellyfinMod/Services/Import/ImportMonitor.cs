@@ -34,6 +34,9 @@ public sealed class ImportMonitor(
         await using var lease = await gate.AcquireAsync(cancellationToken).ConfigureAwait(false);
         using var scope = scopes.CreateScope();
         var result = await scope.ServiceProvider.GetRequiredService<ImportService>().TickAsync(cancellationToken).ConfigureAwait(false);
+        // Upgrades follow their imports on the same cadence (P6.M5); a host without automation has none.
+        if (scope.ServiceProvider.GetService<Automation.UpgradeService>() is { } upgrades)
+            await upgrades.AdvanceAllAsync(cancellationToken).ConfigureAwait(false);
         var tick = Interlocked.Increment(ref _ticks);
         if (result.OpenImports + result.OpenSeedReleases > 0)
             logger.LogDebug("Import tick {Tick}: {Imports} imports, {Seeds} seed releases, {Reads} client reads, reachable {Reachable}",

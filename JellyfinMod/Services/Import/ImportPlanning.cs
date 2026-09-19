@@ -154,10 +154,14 @@ public static partial class ImportNaming
     public static string MovieFile(string folderName, string label, string extension) =>
         folderName + " - " + Sanitize(label) + "." + extension;
 
-    /// <summary>An episode file: <c>Series (Year) SNNENN.ext</c>, with no version label.</summary>
-    public static string EpisodeFile(string seriesFolderName, int season, int episode, string extension) =>
+    /// <summary>
+    /// An episode file: <c>Series (Year) SNNENN.ext</c>. A version label is added only for an explicit additional version
+    /// (P6.M6), which stays off until the host is shown to group episode versions.
+    /// </summary>
+    public static string EpisodeFile(string seriesFolderName, int season, int episode, string extension, string? label = null) =>
         Trim(StripProviderTag(seriesFolderName)) + " " +
-        string.Create(CultureInfo.InvariantCulture, $"S{season:00}E{episode:00}") + "." + extension;
+        string.Create(CultureInfo.InvariantCulture, $"S{season:00}E{episode:00}") +
+        (label is null ? string.Empty : " - " + Sanitize(label)) + "." + extension;
 
     /// <summary>The season folder name.</summary>
     public static string SeasonFolder(int season) =>

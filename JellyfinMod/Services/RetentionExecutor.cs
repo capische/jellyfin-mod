@@ -107,6 +107,73 @@ public sealed class RetentionExecutor(
         return await ExecutePreparedUnderLeaseAsync(operations, bindingId, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Replaces the superseded version of a completed upgrade (P6.M5) through the same executor, locks and checks as a
+    /// reclaim, except that the watched rule does not apply: storage identity, the shared-inode group, active sessions,
+    /// resume, favourites, Keep and seeding all still protect the file. The operation's provenance is
+    /// <c>upgrade_replaced</c>, so reconciliation attributes the disappearance to the plugin.
+    /// </summary>
+    public async Task<RetentionExecutionResult> ReplaceAsync(Guid bindingId, Guid upgradeOperationId, CancellationToken cancellationToken)
+    {
+        await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        var existing = await database.RetentionOperations
+            .Where(operation => operation.BindingId == bindingId &&
+                (operation.State == RetentionOperationStates.Prepared ||
+                 operation.State == RetentionOperationStates.Unlinked))
+            .OrderByDescending(operation => operation.PreparedAt)
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (existing is not null)
+        {
+            var interrupted = await LoadOpenActionAsync(existing.ActionId, cancellationToken).ConfigureAwait(false);
+            await using var recoveryLease = await AcquireLibrariesAsync(
+                interrupted.Select(operation => operation.TargetLibraryId)
+                    .Concat(LibrariesContaining(interrupted[0].MediaPath)), cancellationToken).ConfigureAwait(false);
+            return await RecoverUnderLeaseAsync(interrupted, bindingId, cancellationToken).ConfigureAwait(false);
+        }
+
+        // A deliberately disabled retention also stops replacements: turning it off must stop every deletion.
+        var policy = await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
+        if (!policy.Enabled)
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionEvaluationReasons.RetentionDisabled);
+        var replacement = new HashSet<Guid> { bindingId };
+        var initialPreview = await preview.PreviewAsync(cancellationToken, replacement).ConfigureAwait(false);
+        var initial = Find(initialPreview, bindingId);
+        if (initial is null)
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
+        if (initial.State != RetentionPreviewStates.Due)
+            return RetentionExecutionResult.NotStarted(bindingId, initial.Reason);
+
+        var lockedLibraryIds = SamePathGroup(initialPreview, initial).Select(candidate => candidate.TargetLibraryId).ToHashSet();
+        lockedLibraryIds.UnionWith(LibrariesContaining(initial.CanonicalPath));
+        await using var libraryLease = await AcquireLibrariesAsync(lockedLibraryIds, cancellationToken).ConfigureAwait(false);
+        var currentPreview = await preview.PreviewAsync(cancellationToken, replacement).ConfigureAwait(false);
+        var candidate = Find(currentPreview, bindingId);
+        if (candidate is null || candidate.State != RetentionPreviewStates.Due)
+            return RetentionExecutionResult.NotStarted(bindingId, candidate?.Reason ?? RetentionExecutionReasons.BindingUnavailable);
+        // A file shared with another binding is replaced only when that binding may lose it too; it never can here.
+        if (SamePathGroup(currentPreview, candidate).Length != 1)
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.SharedPathNotAllEligible);
+        if (!TryInspect(candidate, out var observed, out var inspectionReason))
+            return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
+        if (!files.CanUnlink(observed.CanonicalPath))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.MediaNotWritable);
+        var storageIdentity = await LoadStorageIdentityAsync(candidate, cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(storageIdentity))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.StorageUnavailable);
+        var operation = new RetentionOperation
+        {
+            ActionId = Guid.NewGuid(), BindingId = candidate.BindingId, EntryId = candidate.EntryId, EpisodeId = candidate.EpisodeId,
+            JellyfinItemId = candidate.JellyfinItemId, TargetLibraryId = candidate.TargetLibraryId, PolicyVersion = policy.Version,
+            MediaPath = observed.CanonicalPath, StorageIdentity = storageIdentity, PhysicalIdentity = observed.PhysicalIdentity,
+            LogicalBytes = checked((long)observed.LogicalBytes), HardlinkCountBefore = observed.HardlinkCount,
+            Reason = RetentionPreviewReasons.Eligible, PreparedAt = clock.GetUtcNow().UtcDateTime,
+            Provenance = RetentionProvenances.UpgradeReplaced, UpgradeOperationId = upgradeOperationId
+        };
+        database.RetentionOperations.Add(operation);
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return await ExecutePreparedUnderLeaseAsync([operation], bindingId, cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>Inspects and resolves operations left prepared or unlinked by an interrupted process.</summary>
     public async Task<IReadOnlyList<RetentionExecutionResult>> RecoverAsync(CancellationToken cancellationToken)
     {
@@ -180,7 +247,10 @@ public sealed class RetentionExecutor(
         Guid requestedBindingId,
         CancellationToken cancellationToken)
     {
-        var currentPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
+        // An upgrade replacement skips only the watched-rule schedule; every physical check below still runs (P6.M5).
+        var replacement = operations.All(operation => operation.Provenance == RetentionProvenances.UpgradeReplaced);
+        var currentPreview = await preview.PreviewAsync(cancellationToken,
+            replacement ? operations.Select(operation => operation.BindingId).ToHashSet() : null).ConfigureAwait(false);
         foreach (var operation in operations)
         {
             var candidate = Find(currentPreview, operation.BindingId);
@@ -188,7 +258,9 @@ public sealed class RetentionExecutor(
                 return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
                     candidate?.Reason ?? RetentionExecutionReasons.BindingUnavailable, null, cancellationToken)
                     .ConfigureAwait(false);
-            var evidence = await LoadEvidenceAsync(candidate, cancellationToken).ConfigureAwait(false);
+            var evidence = replacement
+                ? new RetentionEvidence(true, operation.PolicyVersion, RetentionPreviewReasons.Eligible)
+                : await LoadEvidenceAsync(candidate, cancellationToken).ConfigureAwait(false);
             if (!evidence.Valid || evidence.PolicyVersion != operation.PolicyVersion)
                 return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
                     evidence.Valid ? RetentionExecutionReasons.PolicyChanged : evidence.Reason, null, cancellationToken)
@@ -214,7 +286,8 @@ public sealed class RetentionExecutor(
         // playing another version. Re-read live Jellyfin state for every affected target last.
         foreach (var operation in operations)
         {
-            var liveReason = await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken).ConfigureAwait(false);
+            var liveReason = await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken, requireCompletion: !replacement)
+                .ConfigureAwait(false);
             if (liveReason is not null)
                 return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
                     liveReason, null, cancellationToken).ConfigureAwait(false);
@@ -337,14 +410,18 @@ public sealed class RetentionExecutor(
             !await database.History.AnyAsync(history => history.Id == operation.Id, cancellationToken)
                 .ConfigureAwait(false))
         {
+            var replaced = operation.Provenance == RetentionProvenances.UpgradeReplaced;
             database.History.Add(new HistoryRecord
             {
                 Id = operation.Id,
                 EntryId = entryId,
-                EventType = "reclaimed",
-                Summary = operation.EpisodeId.HasValue
-                    ? "Episode media reclaimed after its retention window"
-                    : "Media reclaimed after its retention window",
+                EventType = replaced ? "upgrade_replaced" : "reclaimed",
+                Summary = replaced
+                    ? operation.EpisodeId.HasValue ? "Replaced the episode's older version after an upgrade"
+                        : "Replaced the older version after an upgrade"
+                    : operation.EpisodeId.HasValue
+                        ? "Episode media reclaimed after its retention window"
+                        : "Media reclaimed after its retention window",
                 Data = JsonSerializer.Serialize(new
                 {
                     operationId = operation.Id,
@@ -353,7 +430,9 @@ public sealed class RetentionExecutor(
                     operation.EpisodeId,
                     operation.JellyfinItemId,
                     logicalBytesUnlinked = operation.LogicalBytes,
-                    physicalBytesReleased = operation.PhysicalBytesReleased
+                    physicalBytesReleased = operation.PhysicalBytesReleased,
+                    provenance = operation.Provenance,
+                    operation.UpgradeOperationId
                 }),
                 CreatedAt = operation.UnlinkedAt ?? clock.GetUtcNow().UtcDateTime
             });

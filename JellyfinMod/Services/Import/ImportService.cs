@@ -116,7 +116,9 @@ public sealed class ImportService(
         await database.SeedReleaseOperations.AnyAsync(operation => SeedReleaseStates.Open.Contains(operation.State), cancellationToken)
             .ConfigureAwait(false) ||
         await database.GrabOperations.AnyAsync(grab => grab.State == GrabStates.Accepted && grab.ActiveTarget != null &&
-            !database.ImportOperations.Any(operation => operation.GrabId == grab.Id), cancellationToken).ConfigureAwait(false);
+            !database.ImportOperations.Any(operation => operation.GrabId == grab.Id), cancellationToken).ConfigureAwait(false) ||
+        await database.UpgradeOperations.AnyAsync(upgrade => UpgradeStates.Open.Contains(upgrade.State), cancellationToken)
+            .ConfigureAwait(false);
 
     /// <summary>Reads one client for every hash the plugin tracks there, through the shared cache.</summary>
     public async Task<ClientSnapshot> SnapshotAsync(Guid clientId, TimeSpan maxAge, CancellationToken cancellationToken)
@@ -140,7 +142,7 @@ public sealed class ImportService(
         {
             GrabId = grab.Id, OpenGrabKey = grab.Id.ToString("N"), EntryId = entryId, EpisodeId = grab.EpisodeId,
             TargetLibraryId = libraryId, DownloadClientId = grab.DownloadClientId, InfoHash = grab.InfoHash,
-            ReleaseTitle = grab.RawTitle, Intent = "acquire", State = ImportStates.Waiting, CreatedAt = now, UpdatedAt = now
+            ReleaseTitle = grab.RawTitle, Intent = grab.Intent, State = ImportStates.Waiting, CreatedAt = now, UpdatedAt = now
         };
         database.ImportOperations.Add(operation);
         return operation;
@@ -676,10 +678,12 @@ public sealed class ImportService(
 
         if (episode is not null)
         {
+            var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken).ConfigureAwait(false);
+            var addEpisodeVersion = operation.Intent == GrabIntents.AddVersion && settings.EpisodeUpgradesEnabled;
             if (await database.EpisodeBindings.AsNoTracking().AnyAsync(binding => binding.EpisodeId == episode.Id, cancellationToken)
-                    .ConfigureAwait(false) && operation.Intent != "addVersion")
+                    .ConfigureAwait(false) && !addEpisodeVersion)
                 return DestinationPlan.Blocked(ImportReasons.TargetExists,
-                    "This episode already has a file; episode versions are not imported until Phase 6 decides how they group.");
+                    "This episode already has a file; episode versions are imported only when episode upgrades are enabled.");
             var seriesFolder = await BoundSeriesFolderAsync(entry, roots, cancellationToken).ConfigureAwait(false);
             if (seriesFolder is not null && !SameMount(sourceMount, sourceIdentity, seriesFolder, source))
                 return DestinationPlan.Blocked(ImportReasons.CrossFilesystem,
@@ -699,11 +703,19 @@ public sealed class ImportService(
 
             var seasonFolder = ExistingSeasonFolder(seriesFolder, episode.SeasonNumber) ??
                 Path.Combine(seriesFolder, ImportNaming.SeasonFolder(episode.SeasonNumber));
+            string? episodeLabel = null;
+            if (addEpisodeVersion)
+            {
+                var episodeGrab = await database.GrabOperations.AsNoTracking()
+                    .SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken).ConfigureAwait(false);
+                episodeLabel = ImportNaming.VersionLabel(episodeGrab is null ? null : JsonSerializer.Deserialize<ParsedRelease>(episodeGrab.ParsedJson));
+            }
+
             var path = Path.Combine(seasonFolder, ImportNaming.EpisodeFile(Path.GetFileName(seriesFolder), episode.SeasonNumber,
-                episode.EpisodeNumber, extension));
+                episode.EpisodeNumber, extension, episodeLabel));
             if (files.Probe(path) != PathPresence.Absent)
                 return DestinationPlan.Blocked(ImportReasons.DestinationCollision, "A file already has the episode's destination name.");
-            return new(path, root, null, Missing(seriesFolder, seasonFolder), null, null);
+            return new(path, root, episodeLabel, Missing(seriesFolder, seasonFolder), null, null);
         }
 
         var movieFolder = await BoundMovieFolderAsync(entry, roots, cancellationToken).ConfigureAwait(false);

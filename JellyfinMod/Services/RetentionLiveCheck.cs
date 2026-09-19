@@ -21,10 +21,17 @@ public sealed class RetentionLiveCheck(
     LibraryAccess access)
 {
     /// <summary>Returns a stable blocking reason, or null when live state still permits reclamation.</summary>
+    /// <param name="operation">The prepared operation.</param>
+    /// <param name="policy">The live policy.</param>
+    /// <param name="cancellationToken">Cancels the check.</param>
+    /// <param name="requireCompletion">
+    /// False for an upgrade replacement (P6.M5): the watched rule does not apply, every other live protection does.
+    /// </param>
     public async Task<string?> BlockReasonAsync(
         RetentionOperation operation,
         RetentionPolicySnapshot policy,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool requireCompletion = true)
     {
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(
             candidate => candidate.Id == operation.EntryId, cancellationToken).ConfigureAwait(false);
@@ -83,6 +90,7 @@ public sealed class RetentionLiveCheck(
             if (current.Any(state => state.Played)) completedBy.Add(user.Id);
         }
 
+        if (!requireCompletion) return null;
         var satisfied = policy.WatchedUserMode switch
         {
             WatchedUserMode.AllUsers => eligibleUsers.All(user => completedBy.Contains(user.Id)),

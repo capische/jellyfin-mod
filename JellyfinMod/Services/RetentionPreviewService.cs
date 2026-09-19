@@ -24,7 +24,13 @@ public sealed class RetentionPreviewService(
     TimeProvider clock)
 {
     /// <summary>Builds an admin-only preview without deleting or changing media.</summary>
-    public async Task<RetentionPreviewDto> PreviewAsync(CancellationToken cancellationToken)
+    /// <param name="cancellationToken">Cancels the preview.</param>
+    /// <param name="replacementBindingIds">
+    /// Bindings being replaced by an upgrade (P6.M5): they skip the watched-completion schedule but keep every physical
+    /// protection (storage, native item, path, active session, favourite series, seeding and the shared-inode group).
+    /// </param>
+    public async Task<RetentionPreviewDto> PreviewAsync(CancellationToken cancellationToken,
+        IReadOnlySet<Guid>? replacementBindingIds = null)
     {
         await retention.EvaluateAllAsync(cancellationToken).ConfigureAwait(false);
         var now = clock.GetUtcNow().UtcDateTime;
@@ -67,7 +73,8 @@ public sealed class RetentionPreviewService(
         var activeGroups = activeItemIds is null ? null : targets
             .Where(target => activeItemIds.Contains(target.JellyfinItemId) || activeItemIds.Contains(target.VersionGroupId))
             .Select(target => target.VersionGroupId).ToHashSet();
-        var inspected = targets.Select(target => Inspect(target, libraryRoots, now)).ToArray();
+        var inspected = targets.Select(target => Inspect(target, libraryRoots, now,
+            replacementBindingIds?.Contains(target.BindingId) == true)).ToArray();
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
             if (activeItemIds is null)
@@ -215,26 +222,37 @@ public sealed class RetentionPreviewService(
     private PreviewCandidate Inspect(
         PreviewTarget target,
         IReadOnlyDictionary<Guid, IReadOnlyList<string>> libraryRoots,
-        DateTime now)
+        DateTime now,
+        bool replacement = false)
     {
         var evaluation = target.Evaluation;
-        if (evaluation is null)
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.EvaluationMissing, null);
-        if (evaluation.State != RetentionEvaluationStates.Scheduled)
-            return new(target, evaluation.State, evaluation.Reason, evaluation.Deadline, null);
-        if (!evaluation.Deadline.HasValue || evaluation.Deadline.Value > now)
-            return new(target, RetentionPreviewStates.Scheduled, RetentionPreviewReasons.NotDue,
-                evaluation.Deadline, null);
+        if (replacement)
+        {
+            // An upgrade replacement does not wait for the watched rule; Keep still protects the title (PHASE6 M5).
+            if (target.Entry.RetentionPolicy == RetentionPolicy.Never)
+                return PreviewCandidate.Blocked(target, RetentionEvaluationReasons.Kept, evaluation?.Deadline);
+        }
+        else
+        {
+            if (evaluation is null)
+                return PreviewCandidate.Blocked(target, RetentionPreviewReasons.EvaluationMissing, null);
+            if (evaluation.State != RetentionEvaluationStates.Scheduled)
+                return new(target, evaluation.State, evaluation.Reason, evaluation.Deadline, null);
+            if (!evaluation.Deadline.HasValue || evaluation.Deadline.Value > now)
+                return new(target, RetentionPreviewStates.Scheduled, RetentionPreviewReasons.NotDue,
+                    evaluation.Deadline, null);
+        }
+
         if (!libraryRoots.TryGetValue(target.TargetLibraryId, out var roots) || roots.Count == 0)
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.LibraryRootMissing, evaluation.Deadline);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.LibraryRootMissing, evaluation?.Deadline);
         try
         {
             if (!storage.IsCurrent(target.Path, target.StorageIdentity, roots, out _))
-                return PreviewCandidate.Blocked(target, RetentionPreviewReasons.StorageUnavailable, evaluation.Deadline);
+                return PreviewCandidate.Blocked(target, RetentionPreviewReasons.StorageUnavailable, evaluation?.Deadline);
         }
         catch
         {
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.StorageUnavailable, evaluation.Deadline);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.StorageUnavailable, evaluation?.Deadline);
         }
         BaseItem? native;
         try
@@ -243,35 +261,35 @@ public sealed class RetentionPreviewService(
         }
         catch
         {
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.NativeBindingUnavailable, evaluation.Deadline);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.NativeBindingUnavailable, evaluation?.Deadline);
         }
         if (native is null || string.IsNullOrWhiteSpace(native.Path))
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.NativeBindingMissing, evaluation.Deadline);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.NativeBindingMissing, evaluation?.Deadline);
         // The executor unlinks one exact file. A stacked movie keeps its other parts, and a multi-episode
         // file also holds later episodes that may be unwatched, so neither is reclaimed (P3.T16).
         if (native is Video { AdditionalParts.Length: > 0 })
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiPartUnsupported, evaluation.Deadline);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiPartUnsupported, evaluation?.Deadline);
         if (native is MediaBrowser.Controller.Entities.TV.Episode { IndexNumberEnd: { } lastEpisode } multiEpisode &&
             lastEpisode > (multiEpisode.IndexNumber ?? lastEpisode))
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiEpisodeUnsupported, evaluation.Deadline);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiEpisodeUnsupported, evaluation?.Deadline);
         try
         {
             if (new FileInfo(native.Path).LinkTarget is not null)
-                return PreviewCandidate.Blocked(target, RetentionPreviewReasons.SymlinkRepresentation, evaluation.Deadline);
+                return PreviewCandidate.Blocked(target, RetentionPreviewReasons.SymlinkRepresentation, evaluation?.Deadline);
         }
         catch
         {
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaPathUnavailable, evaluation.Deadline);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaPathUnavailable, evaluation?.Deadline);
         }
         if (!files.TryInspect(native.Path, out var observed))
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaPathUnavailable, evaluation.Deadline);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaPathUnavailable, evaluation?.Deadline);
         if (!roots.Select(root => files.TryCanonicalize(root, out var canonical) ? canonical : null)
                 .OfType<string>().Any(root => Contains(root, observed.CanonicalPath)))
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.SymlinkEscape, evaluation.Deadline, observed);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.SymlinkEscape, evaluation?.Deadline, observed);
         if (!files.TryInspect(target.Path!, out var bound) || bound.PhysicalIdentity != observed.PhysicalIdentity)
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaIdentityChanged, evaluation.Deadline, observed);
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaIdentityChanged, evaluation?.Deadline, observed);
         return new(target, RetentionPreviewStates.PendingProtection, RetentionPreviewReasons.ProtectionPending,
-            evaluation.Deadline, observed);
+            evaluation?.Deadline, observed);
     }
 
     private bool IsSeriesFavorite(PreviewTarget target)
