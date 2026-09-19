@@ -47,15 +47,30 @@ public sealed class SeedReleaseService(
     /// (never lowered) and the global floor. Indexer and client components are all required; the floor is met by its ratio
     /// or its time, whichever comes first. Completion is always required.
     /// </summary>
-    public static SeedGoal Evaluate(ClientTorrentStatus torrent, double? indexerRatio, long? indexerSeconds, AcquisitionSettings settings)
+    public static SeedGoal Evaluate(ClientTorrentStatus torrent, double? indexerRatio, long? indexerSeconds, AcquisitionSettings settings) =>
+        Evaluate(torrent.Complete, torrent.UploadRatio, torrent.SecondsSeeding, torrent.RatioLimit, indexerRatio, indexerSeconds,
+            settings.SeedFloorRatio, settings.SeedFloorHours);
+
+    /// <summary>
+    /// Computes the effective goal from its parts; the Phase 3 seed reader uses the same rule for torrents this plugin
+    /// added, so retention and the seed release agree on when a plugin torrent has seeded enough.
+    /// </summary>
+    /// <param name="complete">Whether every wanted byte is downloaded.</param>
+    /// <param name="ratio">The current upload ratio.</param>
+    /// <param name="seconds">The cumulative seeding time.</param>
+    /// <param name="clientRatioLimit">A finite ratio limit the client applies to the torrent, if any; never lowered.</param>
+    /// <param name="indexerRatio">The indexer's ratio requirement snapshot on the grab.</param>
+    /// <param name="indexerSeconds">The indexer's seeding-time requirement snapshot on the grab.</param>
+    /// <param name="seedFloorRatio">The global floor ratio.</param>
+    /// <param name="seedFloorHours">The global floor seeding time in hours.</param>
+    public static SeedGoal Evaluate(bool complete, double ratio, long seconds, double? clientRatioLimit, double? indexerRatio,
+        long? indexerSeconds, double? seedFloorRatio, int? seedFloorHours)
     {
-        var floorRatio = settings.SeedFloorRatio is > 0 ? settings.SeedFloorRatio : null;
-        long? floorSeconds = settings.SeedFloorHours is > 0 ? settings.SeedFloorHours * 3600L : null;
-        var clientRatio = torrent.RatioLimit is > 0 ? torrent.RatioLimit : null;
-        var ratio = torrent.UploadRatio;
-        var seconds = torrent.SecondsSeeding;
+        var floorRatio = seedFloorRatio is > 0 ? seedFloorRatio : null;
+        long? floorSeconds = seedFloorHours is > 0 ? seedFloorHours * 3600L : null;
+        var clientRatio = clientRatioLimit is > 0 ? clientRatioLimit : null;
         var waiting = new List<string>();
-        if (!torrent.Complete) waiting.Add("complete");
+        if (!complete) waiting.Add("complete");
         var ratioRequired = indexerRatio is > 0 && ratio < indexerRatio || clientRatio is { } limit && ratio < limit;
         var timeRequired = indexerSeconds is > 0 && seconds < indexerSeconds;
         var floorMet = floorRatio is null && floorSeconds is null || floorRatio is { } fr && ratio >= fr ||
@@ -66,7 +81,7 @@ public sealed class SeedReleaseService(
             (floorRatio, "floor"));
         var (goalSeconds, secondsSource) = Strictest((indexerSeconds is > 0 ? indexerSeconds : null, "indexer"), (floorSeconds, "floor"));
         return new SeedGoal(goalRatio, ratioSource, goalSeconds, secondsSource,
-            torrent.Complete && !ratioRequired && !timeRequired && floorMet, waiting.Distinct().ToArray());
+            complete && !ratioRequired && !timeRequired && floorMet, waiting.Distinct().ToArray());
     }
 
     private static (T? Value, string? Source) Strictest<T>(params (T? Value, string Source)[] candidates) where T : struct, IComparable<T>

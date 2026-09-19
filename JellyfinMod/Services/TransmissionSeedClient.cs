@@ -83,7 +83,11 @@ public sealed class TransmissionSeedClient(
                     continue;
                 }
 
-                var paths = context.PathsFor(torrent);
+                // A torrent this plugin added keeps unlimited client modes (P4.A5) so no client stop undercuts a requirement;
+                // its bounded goal is the plugin's effective seed goal instead (P5.I6), never lower than the client's own.
+                var owner = context.OwnerOf(torrent);
+                if (owner is not null) protection = context.PluginGoal(protection, owner);
+                var paths = owner is not null ? context.PathsFor(owner) : context.PathsFor(torrent);
                 foreach (var file in torrentFiles)
                 {
                     if (!TryInspectTorrentFile(file, downloadDirectory, session, paths, out var observed))
@@ -180,17 +184,30 @@ public sealed class TransmissionSeedClient(
         }
     }
 
-    /// <summary>The plugin's own knowledge of the daemon this reader protects: its clients and their path mappings.</summary>
+    /// <summary>A grab whose torrent carries both labels this plugin set.</summary>
+    private sealed record OwnedGrab(Guid Id, string InfoHash, string Label, Guid ClientId, double? SeedRatio, int? SeedMinutes);
+
+    /// <summary>
+    /// The plugin's own knowledge of the daemon this reader protects: its clients, their path mappings, the grabs it added
+    /// and the global seed floor.
+    /// </summary>
     private sealed class SeedContext
     {
-        public static SeedContext Empty { get; } = new([], null);
+        public static SeedContext Empty { get; } = new([], null, new Dictionary<string, OwnedGrab>(), null, null);
 
         private readonly IReadOnlyList<(AcquisitionDownloadClient Client, PathTranslator Paths)> clients;
         private readonly PathTranslator primary;
+        private readonly IReadOnlyDictionary<string, OwnedGrab> grabs;
+        private readonly double? floorRatio;
+        private readonly int? floorHours;
 
-        private SeedContext(IReadOnlyList<(AcquisitionDownloadClient Client, PathTranslator Paths)> clients, Guid? primaryId)
+        private SeedContext(IReadOnlyList<(AcquisitionDownloadClient Client, PathTranslator Paths)> clients, Guid? primaryId,
+            IReadOnlyDictionary<string, OwnedGrab> grabs, double? floorRatio, int? floorHours)
         {
             this.clients = clients;
+            this.grabs = grabs;
+            this.floorRatio = floorRatio;
+            this.floorHours = floorHours;
             primary = clients.OrderBy(entry => entry.Client.Id == primaryId ? 0 : 1).ThenBy(entry => entry.Client.Id)
                 .Select(entry => entry.Paths).FirstOrDefault() ?? PathTranslator.Identity;
         }
@@ -206,11 +223,65 @@ public sealed class TransmissionSeedClient(
             var ids = matching.Select(client => client.Id).ToArray();
             var mappings = await database.DownloadClientPathMappings.AsNoTracking().Where(mapping => ids.Contains(mapping.DownloadClientId))
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var selected = await database.AcquisitionSettings.AsNoTracking().Where(value => value.Id == AcquisitionSettings.SingletonId)
-                .Select(value => value.DownloadClientId).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            var settings = await database.AcquisitionSettings.AsNoTracking()
+                .SingleOrDefaultAsync(value => value.Id == AcquisitionSettings.SingletonId, cancellationToken).ConfigureAwait(false) ??
+                new AcquisitionSettings();
+            var owned = await database.GrabOperations.AsNoTracking()
+                .Where(grab => grab.InfoHash != null && ids.Contains(grab.DownloadClientId))
+                .Select(grab => new OwnedGrab(grab.Id, grab.InfoHash!, grab.Label, grab.DownloadClientId, grab.SeedRatio, grab.SeedMinutes))
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            // One hash can have several grabs over time (a re-grab after removal); the labels decide which one owns it.
+            var byOwnerLabel = owned.ToDictionary(grab => GrabService.OwnerLabel(grab.Id), StringComparer.Ordinal);
             return new SeedContext(matching.Select(client => (client, new PathTranslator(client,
-                mappings.Where(mapping => mapping.DownloadClientId == client.Id).ToList()))).ToList(), selected);
+                mappings.Where(mapping => mapping.DownloadClientId == client.Id).ToList()))).ToList(), settings.DownloadClientId,
+                byOwnerLabel, settings.SeedFloorRatio, settings.SeedFloorHours);
         }
+
+        /// <summary>
+        /// Returns the grab that added this torrent: the hash matches and the torrent carries both the grab's per-operation
+        /// ownership label and its configured label. Anything else keeps the client's own seed semantics.
+        /// </summary>
+        public OwnedGrab? OwnerOf(JsonElement torrent)
+        {
+            if (grabs.Count == 0 || !torrent.TryGetProperty("hashString", out var hashValue) ||
+                hashValue.ValueKind != JsonValueKind.String)
+                return null;
+            var hash = hashValue.GetString()!;
+            var labels = Labels(torrent);
+            foreach (var label in labels)
+            {
+                if (grabs.TryGetValue(label, out var grab) && string.Equals(grab.InfoHash, hash, StringComparison.OrdinalIgnoreCase) &&
+                    labels.Contains(grab.Label))
+                    return grab;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Replaces the client's unlimited goal with the plugin's effective goal: the strictest of the indexer snapshot on the
+        /// grab, any finite limit the client applies and the global floor. A torrent with no finite component at all stays
+        /// unbounded, and is never reclaimable.
+        /// </summary>
+        public TransmissionFileProtection PluginGoal(TransmissionFileProtection protection, OwnedGrab grab)
+        {
+            var goal = SeedReleaseService.Evaluate(protection.FileComplete, protection.UploadRatio, protection.SecondsSeeding,
+                protection.RatioGoal, grab.SeedRatio, grab.SeedMinutes is { } minutes ? minutes * 60L : null, floorRatio, floorHours);
+            var bounded = goal.Ratio.HasValue || goal.Seconds.HasValue;
+            return protection with
+            {
+                HasFiniteSeedGoal = bounded,
+                SeedGoalSatisfied = bounded && goal.Met,
+                RatioGoal = goal.Ratio,
+                IdleGoalMinutes = null,
+                SeedingGoalSeconds = goal.Seconds,
+                PluginOwned = true
+            };
+        }
+
+        /// <summary>The path mappings of the client a grab used.</summary>
+        public PathTranslator PathsFor(OwnedGrab grab) =>
+            clients.Where(entry => entry.Client.Id == grab.ClientId).Select(entry => entry.Paths).FirstOrDefault() ?? primary;
 
         /// <summary>
         /// Chooses the client whose mappings apply to a torrent: the one whose label the torrent carries, else the client
@@ -318,6 +389,8 @@ public sealed record TransmissionSeedSnapshot(
 /// <param name="IdleGoalMinutes">The effective idle goal, if configured.</param>
 /// <param name="SecondsSeeding">The torrent's cumulative seeding time.</param>
 /// <param name="Status">Transmission's current activity code.</param>
+/// <param name="SeedingGoalSeconds">The plugin's seeding-time goal for a torrent it added, if any.</param>
+/// <param name="PluginOwned">Whether this plugin added the torrent, so the goal is its effective seed goal.</param>
 public sealed record TransmissionFileProtection(
     bool FileComplete,
     bool HasFiniteSeedGoal,
@@ -326,4 +399,6 @@ public sealed record TransmissionFileProtection(
     double UploadRatio,
     int? IdleGoalMinutes,
     long SecondsSeeding,
-    int Status);
+    int Status,
+    long? SeedingGoalSeconds = null,
+    bool PluginOwned = false);

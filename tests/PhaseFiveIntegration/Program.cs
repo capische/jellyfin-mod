@@ -844,6 +844,7 @@ internal static partial class Phase5
         lock (torznab.MovieItems)
             torznab.MovieItems.Add(new("Reader.Movie.2021.1080p.WEB-DL-GRP", "guid-movieM", torznab.Download("movieM"), Size, 25,
                 new() { ["imdbid"] = "0000119" }));
+        var removeCallsBeforeM = transmission.RemoveCalls;
         var (grabM, hashM) = await GrabAsync(admin, ids["movieM"], null, fixtureM);
         transmission.Progress(hashM, 1.0);
         var completedM = await CompleteAsync(dbPath, grabM, Tick);
@@ -862,12 +863,28 @@ internal static partial class Phase5
         preview = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview"));
         var previewM = PreviewItem(preview, completedM.BindingId!.Value);
         Assert(previewM.GetProperty("state").GetString() == "blocked" && previewM.GetProperty("torrentManaged").ValueKind == JsonValueKind.True &&
-            previewM.GetProperty("reason").GetString() == "seed_goal_unbounded",
-            "The reader finds the mapped seeding copy of the library file instead of reporting an incomplete index: " + previewM);
+            previewM.GetProperty("reason").GetString() == "seed_goal_unmet" && previewM.GetProperty("ratioGoal").GetDouble() == 1.0,
+            "The reader finds the mapped seeding copy and holds it to the plugin's floor, not an unbounded goal: " + previewM);
+        Assert(transmission.Torrents[hashM].SeedRatioMode == 2 && transmission.Torrents[hashM].SeedIdleMode == 2,
+            "The client itself still has no stopping condition for the plugin's torrent");
         var previewThird = PreviewItem(preview, thirdBindingId);
         Assert(preview.GetProperty("seedIndexUnresolvedFiles").GetInt32() > 0 && previewThird.GetProperty("state").GetString() == "blocked" &&
             previewThird.GetProperty("reason").GetString() == "seed_index_incomplete",
             "Torrent data that no mapping resolves still blocks non-torrent media (fail closed): " + previewThird);
+        transmission.Torrents[hashM].UploadRatio = 0.6;
+        var earlyM = await host.Service<RetentionExecutor>().ReclaimAsync(completedM.BindingId!.Value, CancellationToken.None);
+        Assert(earlyM.State != "completed" && File.Exists(completedM.DestinationPath!),
+            $"Nothing is deleted before the seed goal is met ({earlyM.State} {earlyM.Reason})");
+        transmission.Torrents[hashM].UploadRatio = 1.2;
+        preview = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview"));
+        previewM = PreviewItem(preview, completedM.BindingId!.Value);
+        Assert(previewM.GetProperty("state").GetString() == "due" && previewM.GetProperty("torrentManaged").ValueKind == JsonValueKind.True,
+            "Once the plugin's goal is met, the library file of a plugin torrent is due: " + previewM);
+        var reclaimM = await host.Service<RetentionExecutor>().ReclaimAsync(completedM.BindingId!.Value, CancellationToken.None);
+        Assert(reclaimM.State == "completed" && reclaimM.PhysicalBytesReleased == 0 && !File.Exists(completedM.DestinationPath!) &&
+            inspector.TryInspect(completedM.SourceLocalPath!, out var seedingM) && seedingM.HardlinkCount == 1 &&
+            transmission.Torrents.ContainsKey(hashM) && transmission.RemoveCalls == removeCallsBeforeM,
+            "Retention reclaims only the library link, reports 0 bytes and leaves the seeding torrent alone");
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))
