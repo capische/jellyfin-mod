@@ -23,9 +23,18 @@ public sealed class DatabaseInitializer(
             await database.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
             // Only this process runs reconciliation, so a row still "running" belongs to a process that
             // stopped before finishing it (P2.R10).
-            var interrupted = await database.ReconciliationRuns.Where(run => run.Status == "running")
-                .ExecuteUpdateAsync(setters => setters.SetProperty(run => run.Status, "interrupted")
-                    .SetProperty(run => run.CompletedAt, DateTime.UtcNow), cancellationToken).ConfigureAwait(false);
+            // Tracked updates, not ExecuteUpdate: the host runs EF Core 10, whose bulk-update setter type differs
+            // from the EF Core 9 this plugin compiles against, and a type-load failure here stops the server.
+            var stranded = await database.ReconciliationRuns.Where(run => run.Status == "running")
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var run in stranded)
+            {
+                run.Status = "interrupted";
+                run.CompletedAt = DateTime.UtcNow;
+            }
+
+            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            var interrupted = stranded.Count;
             if (interrupted > 0)
                 logger.LogWarning("JellyfinMod marked {Count} unfinished reconciliation runs as interrupted", interrupted);
             await ReconciliationRunHistory.PruneAsync(database, cancellationToken).ConfigureAwait(false);
@@ -59,8 +68,10 @@ internal static class ReconciliationRunHistory
         var cutoff = await database.ReconciliationRuns.OrderByDescending(run => run.StartedAt)
             .Skip(Keep - 1).Select(run => (DateTime?)run.StartedAt).FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
-        if (cutoff is { } oldestKept)
-            await database.ReconciliationRuns.Where(run => run.StartedAt < oldestKept && run.Status != "running")
-                .ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        if (cutoff is not { } oldestKept) return;
+        database.ReconciliationRuns.RemoveRange(await database.ReconciliationRuns
+            .Where(run => run.StartedAt < oldestKept && run.Status != "running")
+            .ToListAsync(cancellationToken).ConfigureAwait(false));
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 }
