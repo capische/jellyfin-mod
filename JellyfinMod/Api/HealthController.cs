@@ -47,6 +47,10 @@ public class HealthController : ControllerBase
         "discover.skipped",
         "reconciliation.conflicts",
         "reconciliation.orphans",
-        "entries.libraryBusy"
+        "entries.libraryBusy",
+        "entries.qualityProfile",
+        "acquisition.settings",
+        "acquisition.releases",
+        "acquisition.grabHold"
     ];
 }

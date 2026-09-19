@@ -1,7 +1,3 @@
-using System.Net;
-using System.Net.Http.Headers;
-using System.Net.Http.Json;
-using System.Text;
 using System.Text.Json;
 using MediaBrowser.Common.Net;
 using Microsoft.Extensions.Logging;
@@ -15,7 +11,6 @@ public sealed class TransmissionSeedClient(
     UnixFileInspector files,
     ILogger<TransmissionSeedClient> logger)
 {
-    private const string SessionHeader = "X-Transmission-Session-Id";
     private static readonly string[] SessionFields =
         ["version", "seedRatioLimited", "seedRatioLimit", "idle-seeding-limit-enabled", "idle-seeding-limit",
             "incomplete-dir", "incomplete-dir-enabled", "rename-partial-files"];
@@ -105,48 +100,16 @@ public sealed class TransmissionSeedClient(
         }
     }
 
-    private static HttpRequestMessage Request(Uri endpoint, string method, object arguments, PluginConfiguration settings)
-    {
-        var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
-        {
-            Content = JsonContent.Create(new { method, arguments })
-        };
-        if (!string.IsNullOrEmpty(settings.TransmissionUsername) || !string.IsNullOrEmpty(settings.TransmissionPassword))
-        {
-            var value = Convert.ToBase64String(Encoding.UTF8.GetBytes(
-                settings.TransmissionUsername + ":" + settings.TransmissionPassword));
-            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", value);
-        }
-
-        return request;
-    }
-
-    private static async Task<HttpResponseMessage> SendAsync(
+    private static Task<HttpResponseMessage> SendAsync(
         HttpClient client,
         Uri endpoint,
         string method,
         object arguments,
         PluginConfiguration settings,
-        CancellationToken cancellationToken)
-    {
-        using var request = Request(endpoint, method, arguments, settings);
-        var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (response.StatusCode != HttpStatusCode.Conflict ||
-            !response.Headers.TryGetValues(SessionHeader, out var values) || values.FirstOrDefault() is not { } sessionId)
-            return response;
+        CancellationToken cancellationToken) => TransmissionRpc.SendAsync(client, endpoint, method, arguments,
+        settings.TransmissionUsername, settings.TransmissionPassword, cancellationToken);
 
-        response.Dispose();
-        using var retry = Request(endpoint, method, arguments, settings);
-        retry.Headers.TryAddWithoutValidation(SessionHeader, sessionId);
-        return await client.SendAsync(retry, cancellationToken).ConfigureAwait(false);
-    }
-
-    private static bool Success(JsonElement root, out JsonElement arguments)
-    {
-        arguments = default;
-        return root.TryGetProperty("result", out var result) && result.GetString() == "success" &&
-            root.TryGetProperty("arguments", out arguments) && arguments.ValueKind == JsonValueKind.Object;
-    }
+    private static bool Success(JsonElement root, out JsonElement arguments) => TransmissionRpc.Success(root, out arguments);
 
     private static TransmissionSession ParseSession(JsonElement arguments) => new(
         arguments.TryGetProperty("seedRatioLimited", out var ratioEnabled) && ratioEnabled.GetBoolean(),

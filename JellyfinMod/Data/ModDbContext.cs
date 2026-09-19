@@ -47,6 +47,21 @@ public class ModDbContext : DbContext
     /// <summary>Gets bound native episodes whose provider identity disagrees with their tracked episode.</summary>
     public DbSet<EpisodeConflict> EpisodeConflicts => Set<EpisodeConflict>();
 
+    /// <summary>Gets the configured Torznab indexers (P4.A2).</summary>
+    public DbSet<AcquisitionIndexer> AcquisitionIndexers => Set<AcquisitionIndexer>();
+
+    /// <summary>Gets the configured download clients (P4.A2).</summary>
+    public DbSet<AcquisitionDownloadClient> AcquisitionDownloadClients => Set<AcquisitionDownloadClient>();
+
+    /// <summary>Gets the quality profiles (P4.A2).</summary>
+    public DbSet<AcquisitionQualityProfile> AcquisitionQualityProfiles => Set<AcquisitionQualityProfile>();
+
+    /// <summary>Gets the singleton acquisition settings (P4.A2).</summary>
+    public DbSet<AcquisitionSettings> AcquisitionSettings => Set<AcquisitionSettings>();
+
+    /// <summary>Gets durable manual grab operations (P4.A5).</summary>
+    public DbSet<GrabOperation> GrabOperations => Set<GrabOperation>();
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
         => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -130,5 +145,33 @@ public class ModDbContext : DbContext
         });
 
         b.Entity<HistoryRecord>(e => e.HasIndex(x => x.EntryId));
+
+        b.Entity<AcquisitionIndexer>(e => e.HasIndex(x => x.Name).IsUnique());
+        b.Entity<AcquisitionDownloadClient>(e => e.HasIndex(x => x.Name).IsUnique());
+        b.Entity<AcquisitionQualityProfile>(e => e.HasIndex(x => x.Name).IsUnique());
+        b.Entity<AcquisitionSettings>(e =>
+        {
+            // A selected client or default profile cannot disappear underneath the settings (P4.A2).
+            e.HasOne<AcquisitionDownloadClient>().WithMany().HasForeignKey(x => x.DownloadClientId)
+                .OnDelete(DeleteBehavior.Restrict);
+            e.HasOne<AcquisitionQualityProfile>().WithMany().HasForeignKey(x => x.DefaultQualityProfileId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+        // Validated in code, not by a foreign key: adding one to Entries would make SQLite rebuild the catalog table
+        // during the upgrade. Profile deletion refuses while an entry still uses the profile (P4.A2).
+        b.Entity<Entry>(e => e.HasIndex(x => x.QualityProfileId));
+        b.Entity<GrabOperation>(e =>
+        {
+            e.Property(x => x.State).HasMaxLength(16);
+            e.HasIndex(x => new { x.RequestedBy, x.IdempotencyKey }).IsUnique();
+            // Durable single ownership of a target and of a client/hash while an operation is active (P4.A5).
+            e.HasIndex(x => x.ActiveTarget).IsUnique();
+            e.HasIndex(x => x.ActiveHash).IsUnique();
+            e.HasIndex(x => x.State);
+            e.HasIndex(x => x.EntryId);
+            // Grab operations are the audit of client handoffs; an entry removal detaches, never erases them.
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.SetNull);
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.SetNull);
+        });
     }
 }

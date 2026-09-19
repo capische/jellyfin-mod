@@ -57,7 +57,7 @@ try
     {
         await restarted.Database.MigrateAsync();
         var appliedMigrations = (await restarted.Database.GetAppliedMigrationsAsync()).ToArray();
-        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length == 14, "Restart preserves rows and migrations");
+        Assert(await restarted.Entries.CountAsync() == 2 && appliedMigrations.Length == 15, "Restart preserves rows and migrations");
         Assert(appliedMigrations.Contains("20260910233343_PhaseTwoBindings"),
             "Published Phase 2 migration identity remains compatible with deployed databases");
         Assert(appliedMigrations.Contains("20260914125924_PhaseTwoBindingProvenance"),
@@ -72,6 +72,8 @@ try
             "Phase 3 adds durable recoverable reclamation operations");
         Assert(appliedMigrations.Contains("20260916130000_PhaseThreeRetentionRuns"),
             "Phase 3 adds durable scheduled and manual retention run summaries");
+        Assert(appliedMigrations.Contains("20260919071544_PhaseFourAcquisition"),
+            "Phase 4 adds acquisition settings, quality profiles and grab operations");
     }
 
     await ApiSmoke.RunAsync(folder);

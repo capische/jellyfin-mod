@@ -63,6 +63,9 @@ public sealed class EntryDto(Entry entry)
     /// <summary>Gets retentionPolicy.</summary>
     [JsonPropertyName("retentionPolicy")]
     public string RetentionPolicy { get; } = RetentionPolicies.ToWire(entry.RetentionPolicy);
+    /// <summary>Gets the assigned quality profile; null inherits the configured default (P4.A2).</summary>
+    [JsonPropertyName("qualityProfileId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public Guid? QualityProfileId { get; } = entry.QualityProfileId;
     /// <summary>Gets metadata.</summary>
     [JsonPropertyName("metadata")]
     public TmdbMetadata? Metadata { get; } = entry.MetadataJson is { } json ? JsonSerializer.Deserialize<TmdbMetadata>(json) : null;
@@ -101,7 +104,8 @@ public sealed record CreateEntryResult([property: JsonPropertyName("entry")] Ent
 public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto Entry,
     [property: JsonPropertyName("history")] IReadOnlyList<HistoryDto> History,
     [property: JsonPropertyName("episodes")] IReadOnlyList<EpisodeDto> Episodes,
-    [property: JsonPropertyName("retention")] RetentionSummaryDto Retention);
+    [property: JsonPropertyName("retention")] RetentionSummaryDto Retention,
+    [property: JsonPropertyName("acquisition"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] AcquisitionSummaryDto? Acquisition = null);
 
 /// <summary>Filtered remote page with an explicit continuation, not a misleading remote total.</summary>
 public sealed record DiscoveryResult([property: JsonPropertyName("items")] IReadOnlyList<TmdbMetadata> Items,
@@ -123,13 +127,31 @@ public sealed class CreateEntryRequest
     public Guid TargetLibraryId { get; set; }
 }
 
-/// <summary>The admin-only settings available before acquisition and retention.</summary>
+/// <summary>The admin-only entry settings: monitoring and, for entries, the quality profile (P4.A2).</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed class PatchEntryRequest
 {
+    private Guid? _qualityProfileId;
+
     /// <summary>Gets or sets future acquisition monitoring.</summary>
     [JsonPropertyName("monitored")]
     public bool? Monitored { get; set; }
+
+    /// <summary>Gets or sets the assigned quality profile; an explicit null restores inheritance.</summary>
+    [JsonPropertyName("qualityProfileId")]
+    public Guid? QualityProfileId
+    {
+        get => _qualityProfileId;
+        set
+        {
+            _qualityProfileId = value;
+            QualityProfileIdSpecified = true;
+        }
+    }
+
+    /// <summary>Gets a value indicating whether the request named a quality profile, including an explicit null.</summary>
+    [JsonIgnore]
+    public bool QualityProfileIdSpecified { get; private set; }
 }
 
 /// <summary>Explicit stable file-state names; integer serialization is never exposed.</summary>

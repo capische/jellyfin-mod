@@ -47,6 +47,46 @@ public sealed partial class UnixFileInspector
         }
     }
 
+    /// <summary>
+    /// Reads the canonical path and filesystem device of an existing directory with <c>statx</c>, so acquisition can
+    /// prove that downloads and the library share one filesystem before any import relies on hardlinks
+    /// (user decision 6).
+    /// </summary>
+    public bool TryGetDirectoryDevice(string path, out string canonicalPath, out string device)
+    {
+        canonicalPath = string.Empty;
+        device = string.Empty;
+        if (!OperatingSystem.IsLinux() || string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            var resolved = RealPath(Path.GetFullPath(path));
+            if (resolved is null || !Directory.Exists(resolved)) return false;
+            var buffer = Marshal.AllocHGlobal(256);
+            try
+            {
+                for (var offset = 0; offset < 256; offset += sizeof(long)) Marshal.WriteInt64(buffer, offset, 0);
+                if (NativeMethods.Statx(AtFileDescriptorCurrentWorkingDirectory, resolved, 0, StatxBasicStats, buffer) != 0)
+                    return false;
+                var mode = unchecked((ushort)Marshal.ReadInt16(buffer, 28));
+                if ((mode & 0xF000) != 0x4000) return false;
+                var deviceMajor = unchecked((uint)Marshal.ReadInt32(buffer, 136));
+                var deviceMinor = unchecked((uint)Marshal.ReadInt32(buffer, 140));
+                canonicalPath = resolved;
+                device = $"{deviceMajor:x8}:{deviceMinor:x8}";
+                return true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or
+            NotSupportedException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>Resolves an existing path through every symbolic-link segment.</summary>
     public bool TryCanonicalize(string path, out string canonicalPath)
     {

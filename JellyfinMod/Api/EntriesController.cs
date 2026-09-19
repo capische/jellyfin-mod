@@ -259,8 +259,13 @@ public sealed class EntriesController(
         if (user is null) return Unauthorized();
         var entry = await database.Entries.SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
         if (entry is null || !access.CanRead(user, entry)) return NotFound();
-        if (!request.Monitored.HasValue) return BadRequest();
-        entry.Monitored = request.Monitored.Value;
+        if (!request.Monitored.HasValue && !request.QualityProfileIdSpecified) return BadRequest();
+        if (request.QualityProfileId is { } profileId &&
+            !await database.AcquisitionQualityProfiles.AnyAsync(profile => profile.Id == profileId, cancellationToken))
+            return BadRequest(new ProblemDetails { Status = 400, Type = "invalid_quality_profile", Title = "The quality profile does not exist." });
+        if (request.Monitored.HasValue) entry.Monitored = request.Monitored.Value;
+        // Saving a profile is a separate administrator action; searches never change it (P4.A1).
+        if (request.QualityProfileIdSpecified) entry.QualityProfileId = request.QualityProfileId;
         await database.SaveChangesAsync(cancellationToken);
         return new EntryDto(entry);
     }
@@ -311,7 +316,8 @@ public sealed class EntriesController(
         if (entry is null || !access.CanRead(user, entry)) return NotFound();
         var episode = await database.Episodes.SingleOrDefaultAsync(e => e.EntryId == id && e.Id == episodeId, cancellationToken);
         if (episode is null || !access.CanReadEpisode(user, episode)) return NotFound();
-        if (!request.Monitored.HasValue) return BadRequest();
+        // Episodes inherit their series profile; only monitoring is an episode setting.
+        if (!request.Monitored.HasValue || request.QualityProfileIdSpecified) return BadRequest();
         episode.Monitored = request.Monitored.Value;
         await database.SaveChangesAsync(cancellationToken);
         return new EpisodeDto(episode);
@@ -344,6 +350,14 @@ public sealed class EntriesController(
             return Conflict(new ProblemDetails
             {
                 Status = 409, Title = "Automatic removal of this title's media is still in progress. Try again later."
+            });
+        // A grab still owning a client torrent keeps its title: removal would orphan the client association (P4.A6).
+        if (await database.GrabOperations.AnyAsync(operation => operation.EntryId == id && operation.ActiveTarget != null,
+                cancellationToken))
+            return Conflict(new ProblemDetails
+            {
+                Status = 409, Type = "grab_active",
+                Title = "A grab for this title is still active. Resolve it in the download client, then recheck it."
             });
         var episodeIds = await database.Episodes.Where(episode => episode.EntryId == id).Select(episode => episode.Id)
             .ToArrayAsync(cancellationToken);
@@ -437,14 +451,22 @@ public sealed class EntriesController(
         }
         var isAdmin = await IsAdministratorAsync();
         var readableEpisodes = episodes.Where(e => LibraryAccess.CanReadEpisode(e, visibleEpisodeIds)).ToArray();
+        // The newest grab per target supplies the acquisition summary; file availability stays separate (P4.A6).
+        var grabs = await database.GrabOperations.AsNoTracking().Where(operation => operation.EntryId == entry.Id)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var latestGrab = grabs.GroupBy(operation => operation.EpisodeId)
+            .ToDictionary(group => group.Key ?? Guid.Empty, group => group.OrderByDescending(operation => operation.CreatedAt).First());
+        AcquisitionSummaryDto? Summary(Guid? targetId) => latestGrab.TryGetValue(targetId ?? Guid.Empty, out var operation)
+            ? AcquisitionSummaryDto.From(operation, isAdmin) : null;
         var episodeDtos = readableEpisodes
             .Select(e => new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,
-                evaluations.GetValueOrDefault(e.Id)), isAdmin))).ToArray();
+                evaluations.GetValueOrDefault(e.Id)), isAdmin), Summary(e.Id))).ToArray();
         // A series aggregate is built only from episodes this requester may read (P3.T15).
         var readableTargets = readableEpisodes.Select(e => e.Id).Append(entry.Id).ToHashSet();
         var entryRetention = RetentionSummaries.ForViewer(RetentionSummaries.ForEntry(entry, policy,
             evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
         return new EntryDetail(new EntryDto(entry), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
-            DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodeDtos, entryRetention);
+            DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodeDtos, entryRetention,
+            entry.MediaType == "movie" ? Summary(null) : null);
     }
 }

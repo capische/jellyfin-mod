@@ -112,6 +112,12 @@ public class Entry
     /// </summary>
     public string? NativeRating { get; set; }
 
+    /// <summary>
+    /// Gets or sets the administrator-assigned quality profile; null inherits the configured default (P4.A2).
+    /// Episode searches inherit their series entry's resolved profile.
+    /// </summary>
+    public Guid? QualityProfileId { get; set; }
+
     /// <summary>Gets or sets the native tags last seen on the bound item as a JSON array (P3.T15).</summary>
     public string? NativeTagsJson { get; set; }
 }
