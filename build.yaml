@@ -17,5 +17,8 @@ artifacts:
 # Jellyfin 10.11 provides EF Core 9 and SQLite (managed and native) at runtime.
 # Do not bundle a second database stack or the Jellyfin host assemblies.
 - "JellyfinMod.dll"
+# The built web fork, without source maps. The plugin extracts and serves it, so installing the
+# plugin installs the interface (P7.S3). Built by jellyfin-sync --test --plugin-web.
+- "jellyfinmod-web.zip"
 changelog: >
   0.1.0.0 - Phase 0: plugin loads, health endpoint, configuration page.

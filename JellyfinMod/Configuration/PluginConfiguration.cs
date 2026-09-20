@@ -57,6 +57,15 @@ public class PluginConfiguration : BasePluginConfiguration
     /// <remarks>Write-only: a submitted value moves to the secret store and this field is saved empty.</remarks>
     public string TransmissionPassword { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Gets or sets how many days a superseded web bundle stays reachable after a plugin upgrade (P7.S3).
+    /// </summary>
+    /// <remarks>
+    /// A television app holds the page it loaded until it is fully closed and reopened, so deleting the old
+    /// bundle the moment a new one arrives would break a running client for no gain.
+    /// </remarks>
+    public int WebBundleGraceDays { get; set; } = 14;
+
     /// <summary>Gets or sets the secret-store reference for the TMDB Read Access Token (user decision 3).</summary>
     public string? TmdbReadAccessTokenRef { get; set; }
 

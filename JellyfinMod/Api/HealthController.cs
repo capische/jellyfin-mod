@@ -1,8 +1,11 @@
 using System.Net.Mime;
 using JellyfinMod.Data;
+using JellyfinMod.Services.Web;
+using MediaBrowser.Controller;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace JellyfinMod.Api;
 
@@ -17,9 +20,24 @@ namespace JellyfinMod.Api;
 public class HealthController : ControllerBase
 {
     private readonly DatabaseInitializer _database;
+    private readonly IServiceProvider _services;
 
     /// <summary>Initializes a new instance of the <see cref="HealthController"/> class.</summary>
-    public HealthController(DatabaseInitializer database) => _database = database;
+    /// <param name="database">The plugin database, whose readiness is what liveness means.</param>
+    /// <param name="services">
+    /// The container, so the interface subsystem can be asked for rather than required.
+    /// </param>
+    /// <remarks>
+    /// The web bundle store and the application host are resolved rather than injected on purpose. This endpoint
+    /// exists to answer when things are wrong; a Health check that returns 500 because an optional subsystem was
+    /// not registered tells an operator nothing and hides whatever they were actually diagnosing. Anything it
+    /// cannot resolve is simply reported as absent.
+    /// </remarks>
+    public HealthController(DatabaseInitializer database, IServiceProvider services)
+    {
+        _database = database;
+        _services = services;
+    }
 
     /// <summary>Reports plugin liveness.</summary>
     /// <response code="200">The plugin is loaded.</response>
@@ -32,13 +50,49 @@ public class HealthController : ControllerBase
         Name = Plugin.Instance?.Name,
         Version = Plugin.Instance?.Version.ToString(),
         Ok = _database.IsReady,
-        Capabilities = Capabilities
+        Capabilities = Capabilities,
+        Web = DescribeWeb()
     });
+
+    /// <summary>
+    /// What the plugin knows about the interface it serves (P7.S3), so the settings area and the acceptance
+    /// runner can see which bundle is live without reading the filesystem.
+    /// </summary>
+    private object? DescribeWeb()
+    {
+        var web = _services.GetService<WebBundleStore>();
+        if (web is null) return null;
+
+        var current = web.Current;
+        var hostVersion = _services.GetService<IServerApplicationHost>()?.ApplicationVersion.ToString();
+        var supported = current?.Manifest.SupportedServer;
+        // A host above the minimum that nobody has run yet is unknown, not known-bad: it runs and says so.
+        var untested = supported is not null
+            && hostVersion is not null
+            && supported.TestedOn.Count > 0
+            && !supported.IsTested(hostVersion);
+
+        return new
+        {
+            BundleId = current?.BundleId,
+            WebCommit = current?.Manifest.WebCommit,
+            BuiltAt = current?.Manifest.BuiltAt,
+            ServedAt = current?.ServedAt,
+            RetainedBundleIds = web.RetainedBundleIds,
+            HostVersion = hostVersion,
+            SupportedServer = supported is null ? null : new { supported.Minimum, supported.TestedOn },
+            Blocker = web.Blocker ?? (untested ? "server_version_untested" : null)
+        };
+    }
 
     /// <summary>
     /// Request fields and endpoints this build understands, so a newer web client never sends a field an older
     /// plugin rejects with 400 (P1.W14). Names are only ever added.
     /// </summary>
+    /// <remarks>
+    /// <c>ui</c> is the switch the web fork reads to decide whether to show the JellyfinMod interface at all
+    /// (P7.S2); <c>ui.web</c> says this build also serves that interface's bundle itself (P7.S3).
+    /// </remarks>
     public static readonly IReadOnlyList<string> Capabilities =
     [
         "browse.dueWithinDays",
@@ -56,6 +110,8 @@ public class HealthController : ControllerBase
         "import",
         "seedRelease",
         "automation",
-        "versions"
+        "versions",
+        "ui",
+        "ui.web"
     ];
 }

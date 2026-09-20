@@ -17,9 +17,9 @@ try
         .AddTransient(_ => new ModDbContext(path))
         .BuildServiceProvider();
     var initializer = NewInitializer(provider);
-    Assert(HealthStatus(initializer) == 503, "Health must be unavailable before migration");
+    Assert(HealthStatus(initializer, provider) == 503, "Health must be unavailable before migration");
     await initializer.StartAsync(CancellationToken.None);
-    Assert(HealthStatus(initializer) == 200, "Health must be ready after migration");
+    Assert(HealthStatus(initializer, provider) == 200, "Health must be ready after migration");
 
     var id = Guid.NewGuid();
     await using (var database = new ModDbContext(path))
@@ -47,7 +47,7 @@ try
         .BuildServiceProvider();
     var broken = NewInitializer(brokenProvider);
     await broken.StartAsync(CancellationToken.None);
-    Assert(HealthStatus(broken) == 503, "Failed migration reports unavailable without crashing the host");
+    Assert(HealthStatus(broken, brokenProvider) == 503, "Failed migration reports unavailable without crashing the host");
 
     var serializer = new XmlSerializer(typeof(PluginConfiguration));
     var selectedUserId = Guid.NewGuid();
@@ -84,8 +84,10 @@ static DatabaseInitializer NewInitializer(ServiceProvider services) => new(
     services.GetRequiredService<IServiceScopeFactory>(),
     services.GetRequiredService<ILogger<DatabaseInitializer>>());
 
-static int? HealthStatus(DatabaseInitializer initializer) =>
-    ((ObjectResult)new HealthController(initializer).GetHealth().Result!).StatusCode;
+// The container is passed rather than the individual services: Health asks it for the interface subsystem and
+// reports whatever it cannot find as absent, which is exactly the case this smoke host exercises.
+static int? HealthStatus(DatabaseInitializer initializer, IServiceProvider services) =>
+    ((ObjectResult)new HealthController(initializer, services).GetHealth().Result!).StatusCode;
 
 static void Assert(bool condition, string message)
 {

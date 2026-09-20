@@ -3,6 +3,7 @@ using JellyfinMod.Services;
 using JellyfinMod.Services.Acquisition;
 using JellyfinMod.Services.Automation;
 using JellyfinMod.Services.Import;
+using JellyfinMod.Services.Web;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
@@ -56,6 +57,11 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         AcquisitionServices.Add(services, () => Plugin.Instance!.DataPath);
         ImportServices.Add(services);
         AutomationServices.Add(services);
+        services.AddSingleton(provider => new WebBundleStore(
+            Plugin.Instance!.DataPath,
+            Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? Plugin.Instance!.DataPath,
+            provider.GetRequiredService<ILogger<WebBundleStore>>()));
+        services.AddSingleton<IHostedService, WebBundleInstaller>();
         services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<DatabaseInitializer>());
         AcquisitionServices.AddHostedServices(services);
