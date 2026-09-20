@@ -506,12 +506,17 @@ public sealed class ImportService(
             .ConfigureAwait(false);
     }
 
-    /// <summary>Asks Jellyfin to refresh only the folder that received the file (P5.I5).</summary>
+    /// <summary>
+    /// Asks Jellyfin to refresh the folder that received the file (P5.I5). A reported change is enough when the
+    /// host acts on it, but on the deployed host a brand-new folder stayed unindexed until a library scan ran,
+    /// so the second attempt escalates to one rather than repeating a call that already did nothing (P5.I5).
+    /// </summary>
     private async Task RequestScanAsync(ImportOperation operation)
     {
         try
         {
             libraryMonitor.ReportFileSystemChanged(operation.DestinationPath!);
+            if (operation.ScanAttempts >= 1) library.QueueLibraryScan();
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
@@ -546,7 +551,10 @@ public sealed class ImportService(
 
         if (operation.State != ImportStates.Scanning) return;
         var timeout = TimeSpan.FromMinutes(Math.Max(1, settings.ScanTimeoutMinutes));
-        if (operation.ScanRequestedAt is not { } requested || Now - requested < timeout) return;
+        // The reported change is cheap and usually enough; a minute later the escalation to a library scan is
+        // worth its cost, and only after the full window does the operation give up (P5.I5).
+        var wait = operation.ScanAttempts < 2 ? TimeSpan.FromSeconds(Math.Min(60, timeout.TotalSeconds)) : timeout;
+        if (operation.ScanRequestedAt is not { } requested || Now - requested < wait) return;
         if (operation.ScanAttempts < 2)
         {
             await RequestScanAsync(operation).ConfigureAwait(false);
