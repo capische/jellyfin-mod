@@ -540,6 +540,71 @@ static async Task VerifyPreviewHttpAsync(
             "Each movie version is evaluated separately and a complete RPC index verifies a non-torrent copy");
         Assert(escapedRow.GetProperty("reason").GetString() == "symlink_escape",
             "A parent symlink that resolves outside its library root is blocked");
+
+        // A read-only mount is the case the executor already refused; the preview must say so too, or an
+        // administrator reads "due" for media that can never be deleted (P3.T18).
+        var readOnlyDirectory = Path.Combine(libraryPath, "readonly");
+        Directory.CreateDirectory(readOnlyDirectory);
+        var readOnlyMedia = Path.Combine(readOnlyDirectory, "version2.mkv");
+        File.Move(secondMedia, readOnlyMedia);
+        secondVersion.Path = readOnlyMedia;
+        await using (var repoint = new ModDbContext(databasePath))
+        {
+            var binding = await repoint.EntryBindings.SingleAsync(candidate =>
+                candidate.JellyfinItemId == secondVersion.Id);
+            binding.MediaPath = readOnlyMedia;
+            await repoint.SaveChangesAsync();
+        }
+
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(readOnlyDirectory,
+                UnixFileMode.UserRead | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
+        // root ignores directory permissions, so only an unprivileged run can observe this. Jellyfin runs as an
+        // ordinary user, and the Pi suites run unprivileged for the same reason.
+        var writableAnyway = true;
+        try
+        {
+            var probe = Path.Combine(readOnlyDirectory, "probe.tmp");
+            File.WriteAllText(probe, "probe");
+            File.Delete(probe);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            writableAnyway = false;
+        }
+
+        try
+        {
+            if (writableAnyway)
+            {
+                Console.WriteLine(
+                    "SKIP: read-only preview reason needs an unprivileged run (this process can write anyway)");
+            }
+            else
+            {
+                using var readOnlyPreview = await http.GetFromJsonAsync<JsonDocument>("/JellyfinMod/Retention/Preview");
+                var readOnlyRow = FindRow(readOnlyPreview!.RootElement, secondVersion.Id);
+                Assert(readOnlyRow.GetProperty("state").GetString() == "blocked" &&
+                    readOnlyRow.GetProperty("reason").GetString() == "media_not_writable",
+                    "Media in a directory this process cannot write is reported as blocked, not due: " +
+                    readOnlyRow.GetRawText());
+                Assert(File.Exists(readOnlyMedia), "The read-only representation is still on disk after the preview");
+            }
+        }
+        finally
+        {
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(readOnlyDirectory, UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                    UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
+            File.Move(readOnlyMedia, secondMedia);
+            secondVersion.Path = secondMedia;
+            await using var restore = new ModDbContext(databasePath);
+            var binding = await restore.EntryBindings.SingleAsync(candidate =>
+                candidate.JellyfinItemId == secondVersion.Id);
+            binding.MediaPath = secondMedia;
+            await restore.SaveChangesAsync();
+            Directory.Delete(readOnlyDirectory, true);
+        }
         Assert(episodeRow.GetProperty("reason").GetString() == "favorite_series",
             "A favorite series protects its otherwise eligible episode representation");
 

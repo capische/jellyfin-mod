@@ -43,6 +43,7 @@ public sealed class RetentionRunner(
             // Recover interrupted operations first. Finishing an unlinked operation deletes nothing and a
             // prepared one revalidates every protection, so this also runs while retention is disabled.
             var processedActions = 0;
+            var blockedReasons = new Dictionary<string, int>(StringComparer.Ordinal);
             var openActionIds = await database.RetentionOperations.AsNoTracking()
                 .Where(operation => operation.State == RetentionOperationStates.Prepared ||
                     operation.State == RetentionOperationStates.Unlinked)
@@ -66,7 +67,7 @@ public sealed class RetentionRunner(
                 var result = await ExecuteAsync(bindingId, cancellationToken).ConfigureAwait(false);
                 if (result.State is not (RetentionOperationStates.Prepared or RetentionOperationStates.Unlinked))
                     run.Interrupted++;
-                Count(run, result);
+                Count(run, result, blockedReasons);
                 processedActions++;
                 await CheckpointAsync(run, progress, processedActions).ConfigureAwait(false);
             }
@@ -122,7 +123,7 @@ public sealed class RetentionRunner(
                     }
 
                     var result = await ExecuteAsync(candidate.BindingId, cancellationToken).ConfigureAwait(false);
-                    Count(run, result);
+                    Count(run, result, blockedReasons);
                     // Only candidates that prepared an operation use the batch budget; a blocked candidate
                     // (for example media_not_writable) must not stop writable due media behind it.
                     if (result.OperationId.HasValue) processedActions++;
@@ -130,7 +131,7 @@ public sealed class RetentionRunner(
                 }
             }
 
-            await FinishAsync(run, RetentionRunStatuses.Completed, null).ConfigureAwait(false);
+            await FinishAsync(run, RetentionRunStatuses.Completed, BlockedSummary(blockedReasons)).ConfigureAwait(false);
             progress.Report(100);
             return run;
         }
@@ -225,8 +226,27 @@ public sealed class RetentionRunner(
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
-    private static void Count(RetentionRun run, RetentionExecutionResult result)
+    /// <summary>
+    /// Names why each due representation was left alone. A run that reports only a blocked count cannot tell an
+    /// administrator which media was spared or why, which matters most for a feature that deletes files (P3.T18).
+    /// </summary>
+    private static string? BlockedSummary(IReadOnlyDictionary<string, int> blockedReasons) =>
+        blockedReasons.Count == 0
+            ? null
+            : "Left alone: " + string.Join(", ", blockedReasons.OrderByDescending(reason => reason.Value)
+                .ThenBy(reason => reason.Key, StringComparer.Ordinal)
+                .Select(reason => $"{reason.Key} ({reason.Value})")) + ".";
+
+    private void Count(RetentionRun run, RetentionExecutionResult result, IDictionary<string, int> blockedReasons)
     {
+        if (result.State == RetentionOperationStates.Blocked || result.State == RetentionOperationStates.Failed)
+        {
+            var reason = string.IsNullOrEmpty(result.Reason) ? "unknown" : result.Reason;
+            blockedReasons[reason] = blockedReasons.TryGetValue(reason, out var count) ? count + 1 : 1;
+            logger.LogInformation(
+                "JellyfinMod retention left binding {BindingId} alone: {Reason}", result.BindingId, reason);
+        }
+
         switch (result.State)
         {
             case RetentionOperationStates.Completed:

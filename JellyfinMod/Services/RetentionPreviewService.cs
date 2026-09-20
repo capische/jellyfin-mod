@@ -96,6 +96,15 @@ public sealed class RetentionPreviewService(
             }
         }
 
+        // Media on a read-only mount can never be reclaimed, and the executor refuses it. Reporting it as due
+        // would tell an administrator that untouchable media is about to be deleted (P3.T18).
+        foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
+        {
+            var path = candidate.File?.CanonicalPath ?? candidate.Target.Path;
+            if (!string.IsNullOrEmpty(path) && !files.CanUnlink(path))
+                candidate.Block(RetentionPreviewReasons.MediaNotWritable);
+        }
+
         var seedCandidates = inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection)
             .ToArray();
         if (seedCandidates.Length > 0)
@@ -415,6 +424,7 @@ internal static class RetentionPreviewReasons
     public const string SeedGoalUnmet = "seed_goal_unmet";
     public const string SharedPathNotAllEligible = "shared_path_not_all_eligible";
     public const string Eligible = "eligible";
+    public const string MediaNotWritable = "media_not_writable";
     public const string ProtectionPending = "protection_pending";
     public const string NativeBindingUnavailable = "native_binding_unavailable";
 }
