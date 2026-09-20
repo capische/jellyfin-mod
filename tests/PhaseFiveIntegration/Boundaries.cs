@@ -119,7 +119,8 @@ internal sealed class TorznabBoundary : IAsyncDisposable
         Address = new Uri(_app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single());
     }
 
-    private const string Caps = """
+    /// <summary>The advertised capability document; a boundary can be given narrower search support.</summary>
+    public string Caps { get; set; } = """
         <?xml version="1.0" encoding="UTF-8"?>
         <caps>
           <server title="JellyfinMod phase 5 boundary"/>

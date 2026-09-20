@@ -95,6 +95,9 @@ internal static class Phase6
             AddMovie(database, ids, movies.Id, "up", 460, "Up Movie", 2020, "tt0900460", monitored: true);
             AddMovie(database, ids, movies.Id, "kept", 461, "Kept Movie", 2020, "tt0900461", monitored: true);
             AddMovie(database, ids, movies.Id, "order", 462, "Order Movie", 2020, "tt0900462", monitored: false);
+            // Two titles whose only releases live on a tracker that advertises nothing but a text search.
+            AddMovie(database, ids, movies.Id, "textauto", 463, "Text Only Movie", 2021, "tt0900463", monitored: true);
+            AddMovie(database, ids, movies.Id, "textmanual", 464, "Text Manual Movie", 2019, "tt0900464", monitored: true);
             var series = new Entry
             {
                 MediaType = "series", TmdbId = 500, Title = "Auto Show", Year = 2024, TargetLibraryId = tv.Id, Monitored = true,
@@ -122,9 +125,12 @@ internal static class Phase6
 
         await using var torznab = new TorznabBoundary();
         await using var flaky = new TorznabBoundary();
+        // A public tracker as most of them are: a text search and no id search at all (user decision 2026-09-20).
+        await using var publicTracker = new TorznabBoundary { Caps = TextOnlyCaps };
         await using var transmission = new TransmissionBoundary();
         await torznab.StartAsync();
         await flaky.StartAsync();
+        await publicTracker.StartAsync();
         await transmission.StartAsync();
         // No path mapping here: Transmission reports the same folder Jellyfin sees, which the Phase 3 seed reader needs.
         transmission.Roots[downloads] = downloads;
@@ -179,8 +185,8 @@ internal static class Phase6
         services = host.App.Services;
         try
         {
-            host = await ScenariosAsync(host, world, dbPath, time, logs, configuration, torznab, flaky, transmission, fixtures, ids, taskManager,
-                Release, downloads, value => services = value);
+            host = await ScenariosAsync(host, world, dbPath, time, logs, configuration, torznab, flaky, publicTracker, transmission, fixtures, ids,
+                taskManager, Release, downloads, value => services = value);
         }
         finally
         {
@@ -188,11 +194,29 @@ internal static class Phase6
         }
     }
 
+    /// <summary>What a public tracker advertises: a text search, and no imdbid, tmdbid or tvdbid search.</summary>
+    private const string TextOnlyCaps = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <caps>
+          <server title="JellyfinMod text-only boundary"/>
+          <limits max="100" default="100"/>
+          <searching>
+            <search available="yes" supportedParams="q"/>
+            <tv-search available="yes" supportedParams="q"/>
+            <movie-search available="yes" supportedParams="q"/>
+          </searching>
+          <categories>
+            <category id="2000" name="Movies"/>
+            <category id="5000" name="TV"/>
+          </categories>
+        </caps>
+        """;
+
     private static async Task<PluginHost> ScenariosAsync(PluginHost host, World world, string dbPath, ShiftedTimeProvider time,
         CapturingLoggerProvider logs, PluginConfiguration configuration, TorznabBoundary torznab, TorznabBoundary flaky,
-        TransmissionBoundary transmission, Dictionary<string, TorrentFixture> fixtures, Dictionary<string, Guid> ids,
-        Func<IServiceProvider, ITaskManager> taskManager, Action<TorznabBoundary, string, string, string?, string?> release, string downloads,
-        Action<IServiceProvider> setServices)
+        TorznabBoundary publicTracker, TransmissionBoundary transmission, Dictionary<string, TorrentFixture> fixtures,
+        Dictionary<string, Guid> ids, Func<IServiceProvider, ITaskManager> taskManager,
+        Action<TorznabBoundary, string, string, string?, string?> release, string downloads, Action<IServiceProvider> setServices)
     {
         var admin = host.Client(world.Admin, true);
         var ordinary = host.Client(world.Ordinary, false);
@@ -301,7 +325,7 @@ internal static class Phase6
                     TargetId = ids[key], EntryId = ids[key], NextSearchAt = start.AddMinutes(-offset), ProfileRevisionSeen = 1
                 });
             // Episodes and the other movies are pushed out so these runs are about the five.
-            foreach (var key in new[] { "s1e1", "up", "kept" })
+            foreach (var key in new[] { "s1e1", "up", "kept", "textauto", "textmanual" })
                 database.AutomationTargets.Add(new AutomationTargetState
                 {
                     TargetId = ids[key], EntryId = key == "s1e1" ? ids["series"] : ids[key], EpisodeId = key == "s1e1" ? ids[key] : null,
@@ -680,6 +704,84 @@ internal static class Phase6
                 operations[1].MediaPath.Contains("1080p", StringComparison.Ordinal) && operations.All(value => value.Provenance == "retention"),
                 "The executor processes the 720p before the 1080p of the same due title");
         }
+
+        // ---- M3 title matches: a release a public tracker could only match by title and year is grabbable by hand,
+        // but automation takes one only from an indexer trusted for it (user decision 2026-09-20).
+        var textOnly = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Settings/Indexers", new
+        {
+            name = "Public tracker", baseUrl = new Uri(publicTracker.Address, "/api").ToString(), enabled = true, categories = new[] { 2000 },
+            apiKey = new { action = "replace", value = publicTracker.ApiKey }, minIntervalSeconds = 0, dailyQueryBudget = 1000
+        }), 201, "Text-only indexer");
+        var textOnlyId = textOnly.GetProperty("id").AsGuid();
+        Assert(!textOnly.GetProperty("automateTitleMatches").GetBoolean(), "A new indexer is not trusted for title matches");
+        await ReadAsync(await admin.PostAsync($"/JellyfinMod/Settings/Indexers/{textOnlyId}/Test", null), 200, "Text-only indexer test");
+        var verified = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/Indexers")).EnumerateArray()
+            .Single(item => item.GetProperty("id").AsGuid() == textOnlyId);
+        Assert(Strings(verified.GetProperty("capabilities").GetProperty("movieSearch")).SequenceEqual(["q"]),
+            "The tracker advertises a text search and no id search: " + verified.GetProperty("capabilities").GetRawText());
+        release(publicTracker, "textauto", "Text.Only.Movie.2021.1080p.WEB-DL-GRP", null, null);
+        release(publicTracker, "textmanual", "Text.Manual.Movie.2019.1080p.WEB-DL-GRP", null, null);
+
+        // The picker shows the release as eligible and matched by title alone, so nothing else can hide it from automation.
+        var textSearch = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Releases?entryId={ids["textauto"]}"));
+        var textCandidate = textSearch.GetProperty("candidates").EnumerateArray()
+            .Single(item => item.GetProperty("rawTitle").GetString() == "Text.Only.Movie.2021.1080p.WEB-DL-GRP");
+        Assert(textCandidate.GetProperty("eligible").GetBoolean() &&
+            textCandidate.GetProperty("match").GetProperty("identity").GetString() == "title",
+            "The tracker's only candidate is eligible and matched by title and year alone: " + textCandidate.GetRawText());
+
+        await ForceDueAsync(dbPath, time, ids["textauto"]);
+        var runL = await Run();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var decision = await database.AutomationDecisions.AsNoTracking()
+                .SingleAsync(value => value.RunId == runL.Id && value.TargetId == ids["textauto"]);
+            Assert(runL.Searched == 1 && runL.Grabbed == 0 && decision.Kind == AutomationDecisionKinds.Skipped &&
+                decision.Reason == AutomationReasons.NoEligibleCandidate &&
+                !await database.GrabOperations.AnyAsync(value => value.EntryId == ids["textauto"]) &&
+                !await database.ImportOperations.AnyAsync(value => value.EntryId == ids["textauto"]),
+                $"An untrusted indexer's title match is searched but never grabbed automatically ({Describe(runL)}; " +
+                $"{decision.Kind} {decision.Reason} {decision.Detail})");
+        }
+
+        // The manual path is untouched by the rule: an administrator grabs a title match from the same untrusted indexer.
+        var manualSearch = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Releases?entryId={ids["textmanual"]}"));
+        var manualCandidate = manualSearch.GetProperty("candidates").EnumerateArray()
+            .Single(item => item.GetProperty("rawTitle").GetString() == "Text.Manual.Movie.2019.1080p.WEB-DL-GRP");
+        Assert(manualCandidate.GetProperty("match").GetProperty("identity").GetString() == "title", "The manual candidate is a title match");
+        await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+        {
+            searchId = manualSearch.GetProperty("searchId").AsGuid(), releaseId = manualCandidate.GetProperty("releaseId").GetString(),
+            idempotencyKey = "p6-title-manual"
+        }), 202, "Administrator grabs a title match by hand");
+        await WaitForTorrentAsync(transmission, fixtures["textmanual"].InfoHash);
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var grab = await database.GrabOperations.AsNoTracking().SingleAsync(value => value.EntryId == ids["textmanual"]);
+            Assert(!grab.Automatic && grab.IndexerId == textOnlyId,
+                "The by-hand grab of a title match reaches the client from the untrusted indexer");
+        }
+
+        // Trusting the indexer for title matches lets the next run grab the release the previous one refused.
+        var trusted = await ReadAsync(await admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Indexers/{textOnlyId}", new
+        {
+            name = "Public tracker", baseUrl = new Uri(publicTracker.Address, "/api").ToString(), enabled = true, automateTitleMatches = true,
+            categories = new[] { 2000 }, minIntervalSeconds = 0, dailyQueryBudget = 1000, revision = textOnly.GetProperty("revision").GetInt32()
+        }), 200, "Administrator trusts the indexer for title matches");
+        Assert(trusted.GetProperty("automateTitleMatches").GetBoolean() && !trusted.GetProperty("verified").GetBoolean(),
+            "The trust setting reads back and the changed indexer must prove its capabilities again");
+        await ForceDueAsync(dbPath, time, ids["textauto"]);
+        var runM = await Run();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var grab = await database.GrabOperations.AsNoTracking().SingleAsync(value => value.EntryId == ids["textauto"]);
+            Assert(runM.Grabbed == 1 && grab.Automatic && grab.IndexerId == textOnlyId &&
+                grab.RequestedBy == JellyfinMod.Services.Acquisition.GrabService.AutomationUserId,
+                $"Once the indexer is trusted the same title match is grabbed automatically from it ({Describe(runM)}; " +
+                $"{await DecisionsAsync(dbPath, runM.Id, ids)})");
+        }
+
+        await WaitForTorrentAsync(transmission, fixtures["textauto"].InfoHash);
 
         // ---- Settings survive a restart; the whole run wrote no media_missing.
         await host.DisposeAsync();
