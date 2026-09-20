@@ -520,26 +520,52 @@ internal static partial class Phase5
         Assert(transmission.Torrents.ContainsKey(foreignHash), "A torrent the plugin did not add, in the same label, is never removed");
 
         // ================= An existing native file gains a second version; the indexer's 14 days outlast the floor.
+        // Jellyfin keeps one item for a movie folder and attaches the new file as a further media source of it, so
+        // the import only finishes if each media source is bound on its own file (P6.M6).
         var thirdFolder = Path.Combine(world.Movies.Location, "Third Movie (2022)");
         Directory.CreateDirectory(thirdFolder);
         var thirdExisting = Path.Combine(thirdFolder, "Third Movie (2022).mkv");
         await File.WriteAllBytesAsync(thirdExisting, new byte[4096]);
-        world.Native.AddMovie(world.Movies, thirdExisting, 102);
+        var thirdMovie = world.Native.AddMovie(world.Movies, thirdExisting, 102);
         await WaitAsync(async () =>
         {
             await using var database = new ModDbContext(dbPath);
             return await database.EntryBindings.AnyAsync(value => value.EntryId == ids["movieC"]) ? true : (bool?)null;
         }, "The existing file is bound by reconciliation");
+        Guid firstBindingC;
+        await using (var database = new ModDbContext(dbPath))
+            firstBindingC = (await database.EntryBindings.AsNoTracking().SingleAsync(value => value.EntryId == ids["movieC"])).Id;
         var (grabC, hashC) = await GrabAsync(admin, ids["movieC"], null, fixtures["movieC"]);
         transmission.Progress(hashC, 1.0);
         var completedC = await CompleteAsync(dbPath, grabC, Tick);
         Assert(completedC.DestinationPath == Path.Combine(thirdFolder, "Third Movie (2022) - 2160p WEB-DL.mkv"),
             "A second version lands in the existing folder with the folder name as its prefix; nothing is renamed");
+        Assert(world.Native.Items.OfType<MediaBrowser.Controller.Entities.Movies.Movie>()
+                .Count(movie => movie.ProviderIds.GetValueOrDefault("Tmdb") == "102") == 1 &&
+            thirdMovie.LocalAlternateVersions.SequenceEqual([completedC.DestinationPath!]),
+            "Jellyfin indexed the second file as another media source of the same item, not as a second item");
         await using (var database = new ModDbContext(dbPath))
         {
             var bindings = await database.EntryBindings.AsNoTracking().Where(value => value.EntryId == ids["movieC"]).ToListAsync();
             Assert(bindings.Count == 2 && bindings.Select(value => value.VersionGroupId).Distinct().Count() == 1 && File.Exists(thirdExisting),
                 "Both versions are bound in one native version group and the existing file is untouched");
+            var owning = bindings.Single(value => value.OwnerItemId is null);
+            var source = bindings.Single(value => value.OwnerItemId is not null);
+            Assert(owning.Id == firstBindingC && owning.JellyfinItemId == thirdMovie.Id && owning.MediaPath == thirdExisting &&
+                source.OwnerItemId == thirdMovie.Id && source.JellyfinItemId != thirdMovie.Id &&
+                source.MediaPath == completedC.DestinationPath && completedC.BindingId == source.Id &&
+                completedC.NativeItemId == source.JellyfinItemId,
+                "Each media source is bound to its own file and the import completes against its own destination, " +
+                $"leaving the first version's binding untouched (first {owning.MediaPath}; second {source.MediaPath})");
+            Assert((await database.Entries.AsNoTracking().SingleAsync(value => value.Id == ids["movieC"])).JellyfinItemId == thirdMovie.Id,
+                "The entry still points at the item a client can open, never at a media source of it");
+            var rows = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["movieC"]}"))
+                .GetProperty("versions").EnumerateArray().ToArray();
+            Assert(rows.Length == 2 && rows.All(row => row.GetProperty("jellyfinItemId").AsGuid() == thirdMovie.Id) &&
+                rows.Select(row => row.GetProperty("mediaSourceId").GetString()).Distinct().Count() == 2 &&
+                rows.Any(row => row.GetProperty("mediaSourceId").GetString() == source.JellyfinItemId.ToString("N") &&
+                    row.GetProperty("label").GetString() == "2160p WEB-DL"),
+                "The selector plays the chosen media source of the one item: " + string.Join("; ", rows.Select(row => row.GetRawText())));
             var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedC.Id);
             // The indexer snapshot requires 14 days: simulated by setting the recorded snapshot, documented in PHASE5 I9.
             seed.IndexerSeconds = (long)TimeSpan.FromDays(14).TotalSeconds;

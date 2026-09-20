@@ -386,16 +386,19 @@ public sealed class RetentionExecutor(
             var binding = await database.EntryBindings.SingleOrDefaultAsync(
                 candidate => candidate.Id == operation.BindingId, cancellationToken).ConfigureAwait(false);
             if (binding is not null) database.EntryBindings.Remove(binding);
+            // A further media source is not navigable; the title that owns it is the one an entry points at (P6.M6).
             var remaining = await database.EntryBindings.AsNoTracking()
                 .Where(candidate => candidate.EntryId == operation.EntryId && candidate.Id != operation.BindingId)
-                .OrderBy(candidate => candidate.JellyfinItemId == candidate.VersionGroupId ? 0 : 1)
+                .OrderBy(candidate => candidate.OwnerItemId == null ? 0 : 1)
+                .ThenBy(candidate => candidate.JellyfinItemId == candidate.VersionGroupId ? 0 : 1)
                 .ThenBy(candidate => candidate.VersionGroupId).ThenBy(candidate => candidate.JellyfinItemId)
                 .ToArrayAsync(cancellationToken).ConfigureAwait(false);
             var entry = await database.Entries.SingleAsync(candidate => candidate.Id == operation.EntryId,
                 cancellationToken).ConfigureAwait(false);
-            entry.JellyfinItemId = remaining
-                .FirstOrDefault(candidate => candidate.JellyfinItemId == entry.JellyfinItemId)?.JellyfinItemId ??
-                remaining.FirstOrDefault()?.JellyfinItemId;
+            entry.JellyfinItemId = entry.JellyfinItemId is { } current &&
+                remaining.Any(candidate => (candidate.OwnerItemId ?? candidate.JellyfinItemId) == current)
+                    ? current
+                    : remaining.FirstOrDefault() is { } next ? next.OwnerItemId ?? next.JellyfinItemId : null;
             entry.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
             if (remaining.Length == 0)
                 await RetentionTargetReset.ResetAsync(database, entry.Id, null,

@@ -13,6 +13,13 @@ public sealed class EntryBinding
     public Guid TargetLibraryId { get; set; }
     /// <summary>Gets or sets Jellyfin's primary version identity, or this item's identity when it is not an alternate.</summary>
     public Guid VersionGroupId { get; set; }
+    /// <summary>
+    /// Gets or sets the navigable native title this representation is a media source of, or null when the
+    /// representation is that title itself. Jellyfin exposes the extra files of one movie folder as further
+    /// media sources of one item (P6.M6); each carries its own item identity, path and streams, but only the
+    /// owning title can be opened in the web client.
+    /// </summary>
+    public Guid? OwnerItemId { get; set; }
     /// <summary>Gets or sets the native media path observed for this representation.</summary>
     public string? MediaPath { get; set; }
     /// <summary>Gets or sets the Linux mount identity observed for the media path.</summary>

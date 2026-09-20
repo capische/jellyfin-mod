@@ -192,6 +192,17 @@ public sealed class RetentionEvaluator(
                 .Select(binding => binding.JellyfinItemId).ToArrayAsync(cancellationToken).ConfigureAwait(false)
             : await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == target.Entry.Id)
                 .Select(binding => binding.JellyfinItemId).ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        // Reclaiming the file a movie folder resolved from leaves its other media sources without a native item
+        // until Jellyfin re-resolves the folder and reconciliation observes it (P6.M6). Unreadable is not the
+        // same as unwatched: reading evidence now would report none and restart the title's window, so the
+        // previous evaluation stands until the bindings are current again.
+        if (library is not null && hadPriorEvaluation && boundItemIds.Length > 0 &&
+            boundItemIds.All(itemId => ResolvesNatively(itemId) == false))
+        {
+            await SaveAsync(result, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         var observations = await LoadCurrentObservationsAsync(targetId, userIds, boundItemIds, cancellationToken)
             .ConfigureAwait(false);
         var missingUserIds = userIds.Where(userId => !observations.ContainsKey(userId)).ToArray();
@@ -306,6 +317,19 @@ public sealed class RetentionEvaluator(
                 .All(property => property.Metadata.Name == nameof(RetentionEvaluation.EvaluatedAt)))
             tracked.State = EntityState.Unchanged;
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Whether Jellyfin still has this native item, or null when the library cannot answer.</summary>
+    private bool? ResolvesNatively(Guid itemId)
+    {
+        try
+        {
+            return library!.GetItemById(itemId) is not null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
     }
 
     private static bool IsActive(User user) =>

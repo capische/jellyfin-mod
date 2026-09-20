@@ -587,6 +587,12 @@ internal static class Phase6
             versions.Count(item => item.GetProperty("isDefault").GetBoolean()) == 1 && versions.All(item => item.GetProperty("sizeBytes").GetInt64() == Size) &&
             versions.All(item => item.GetProperty("mediaSourceId").GetString()!.Length == 32),
             "Entry detail lists both versions with resolution, label, size and one default");
+        // Jellyfin holds both files as media sources of one item, so the rows differ by media source, not by item.
+        Assert(versions.Select(item => item.GetProperty("jellyfinItemId").AsGuid()).Distinct().Count() == 1 &&
+            versions.Select(item => item.GetProperty("mediaSourceId").GetString()).Distinct().Count() == 2 &&
+            versions.Select(item => item.GetProperty("bindingId").AsGuid()).Distinct().Count() == 2,
+            "Both versions play through the same item and their own media source: " +
+            string.Join("; ", versions.Select(item => item.GetRawText())));
         Assert(detail.GetProperty("upgrade").GetProperty("blockedReason").GetString() == "already_held_at_cutoff",
             "The administrator sees why no further upgrade happens");
         var viewerDetail = Json.Parse(await ordinary.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}"));
@@ -653,7 +659,11 @@ internal static class Phase6
                 $"baseline {evaluation.BaselineAt:o} fresh {evaluation.RequiresFreshCompletion} after-run {afterRunEvaluation}; history " +
                 string.Join(", ", await database.History.AsNoTracking().Where(value => value.EntryId == ids["up"]).OrderBy(value => value.CreatedAt)
                     .Select(value => value.EventType + "@" + value.CreatedAt.ToString("o")).ToListAsync()) + "; observations " + string.Join(", ", observations.Select(value =>
-                    $"{value.JellyfinItemId} played {value.Played} at {value.CompletedAt:o} last {value.LastPlayedAt:o}")));
+                    $"{value.JellyfinItemId} played {value.Played} at {value.CompletedAt:o} last {value.LastPlayedAt:o} " +
+                    $"evidence {value.EvidenceAvailable}")) + "; bindings " + string.Join(", ",
+                    (await database.EntryBindings.AsNoTracking().Where(value => value.EntryId == ids["up"]).ToListAsync())
+                        .Select(value => $"{value.JellyfinItemId} owner {value.OwnerItemId} " +
+                            $"alive {world.Native.Items.Any(item => item.Id == value.JellyfinItemId)} {value.MediaPath}")));
         }
 
         transmission.Torrents[up2160Hash].UploadRatio = 5;

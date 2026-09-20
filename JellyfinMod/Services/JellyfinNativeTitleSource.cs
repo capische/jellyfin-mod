@@ -110,9 +110,19 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         var providerId = ProviderTmdbId(representative);
         // An unidentified series is unmatched regardless of incomplete episode metadata.
         if (providerId is null)
-            return new(representative.Id, folder.Id, representative.Name,
-                Snapshot(work.MediaType, null, folder.Id, representative, copies,
-                    copies.Select(item => item.Id).ToHashSet(), [], _mediaStorage.ReadMountTable()), false, null);
+        {
+            try
+            {
+                return new(representative.Id, folder.Id, representative.Name,
+                    Snapshot(work.MediaType, null, folder.Id, representative, copies,
+                        copies.Select(item => item.Id).ToHashSet(), [], _mediaStorage.ReadMountTable()), false, null);
+            }
+            catch (AmbiguousMediaSourceException error)
+            {
+                return new(representative.Id, folder.Id, representative.Name, null, true, error.Message);
+            }
+        }
+
         if (work.MediaType == "movie")
         {
             foreach (var movie in copies.Cast<Movie>())
@@ -140,6 +150,12 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
                 Snapshot(work.MediaType, providerId, folder.Id, representative, copies,
                     copies.Select(item => item.Id).ToHashSet(), episodes, mounts) with { SkippedEpisodes = skipped },
                 false, null);
+        }
+        catch (AmbiguousMediaSourceException error)
+        {
+            // Nothing is guessed about which file belongs to which media source: the title keeps its bindings
+            // and state, and the run reports it (P6.M6).
+            return new(representative.Id, folder.Id, representative.Name, null, true, error.Message);
         }
         catch (InvalidOperationException error)
         {
@@ -205,11 +221,21 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         var metadata = new TmdbMetadata(mediaType, tmdbId ?? 0, representative.Name,
             representative.PremiereDate, representative.Overview, null, null, ProviderId(representative, "Imdb"),
             ParseProviderId(representative, "Tvdb"), false, null, RuntimeMinutes(representative), [], [], []);
+        var representations = new List<NativeRepresentation>();
+        foreach (var copy in copies)
+        {
+            var versionGroupId = mediaType == "movie" ? VersionGroup((Movie)copy, movieIds!) : copy.Id;
+            representations.Add(new(copy.Id, libraryId, IsPlayable(copy), versionGroupId, copy.Path,
+                mounts.Capture(copy.Path)));
+            if (mediaType != "movie") continue;
+            foreach (var source in AlternateMediaSources((Movie)copy))
+                representations.Add(new(source.Id, libraryId, IsPlayable(source), versionGroupId, source.Path,
+                    mounts.Capture(source.Path), copy.Id));
+        }
+
         return new(mediaType, tmdbId, libraryId, representative.Name, representative.ProductionYear,
             metadata.ImdbId, representative.Overview, null, JsonSerializer.Serialize(metadata),
-            copies.Select(copy => new NativeRepresentation(copy.Id, libraryId, IsPlayable(copy),
-                mediaType == "movie" ? VersionGroup((Movie)copy, movieIds!) : copy.Id, copy.Path,
-                mounts.Capture(copy.Path))).ToArray(), episodes,
+            representations.DistinctBy(representation => representation.JellyfinItemId).ToArray(), episodes,
             copies.Min(copy => copy.DateCreated))
         {
             NativeRating = representative.CustomRating ?? representative.OfficialRating,
@@ -259,6 +285,30 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             .ThenBy(episode => episode.EpisodeNumber).ThenBy(episode => episode.JellyfinItemId).ToArray();
     }
 
+    /// <summary>
+    /// The further media sources Jellyfin attaches to one title (P6.M6). The extra video files of a movie folder
+    /// stay one item with several sources; each source is a native item of its own with its own path and streams,
+    /// so each is observed as its own representation of the same version group. A stacked (multi-part) file makes
+    /// the pairing of a source to a file ambiguous, so such a title is reported rather than guessed at.
+    /// </summary>
+    private IEnumerable<Video> AlternateMediaSources(Video video)
+    {
+        var paths = video.LocalAlternateVersions;
+        if (paths is not { Length: > 0 }) yield break;
+        if (video.IsStacked)
+            throw new AmbiguousMediaSourceException(video.Path);
+        foreach (var path in paths)
+        {
+            if (string.IsNullOrWhiteSpace(path)) continue;
+            // Jellyfin drops a source whose item it has not written yet; so does this observation, and the next
+            // event or repair run picks it up.
+            if (library.GetItemById(library.GetNewItemId(path, typeof(Video))) is not Video source ||
+                string.IsNullOrWhiteSpace(source.Path)) continue;
+            if (source.IsStacked) throw new AmbiguousMediaSourceException(source.Path);
+            yield return source;
+        }
+    }
+
     private static Guid VersionGroup(Movie movie, IReadOnlySet<Guid> movieIds)
     {
         var primaryId = PrimaryVersionId(movie);
@@ -302,6 +352,11 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         ? (int)Math.Round(TimeSpan.FromTicks(ticks).TotalMinutes)
         : null;
 }
+
+/// <summary>A title whose files cannot be matched to its media sources one by one (P6.M6).</summary>
+public sealed class AmbiguousMediaSourceException(string? path)
+    : InvalidOperationException("A multi-part file makes this title's media sources ambiguous: " +
+        (string.IsNullOrWhiteSpace(path) ? "no path" : Path.GetFileName(path)));
 
 /// <summary>One native title work item or a bounded diagnostic produced while inspecting it.</summary>
 public sealed record NativeCatalogObservation(Guid NativeItemId, Guid TargetLibraryId, string Title,

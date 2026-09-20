@@ -100,9 +100,13 @@ public sealed class LibraryEventListener(
         else pending[key] = now;
     }
 
+    // Gaining or losing a further media source changes nothing else about the item, so the files behind those
+    // sources are part of what makes an update worth reconciling (P6.M6).
     private static string Fingerprint(MediaBrowser.Controller.Entities.BaseItem item) => string.Join('|',
         item.Path, item.IsVirtualItem, item.ProviderIds.GetValueOrDefault("Tmdb"), item.ParentIndexNumber,
-        item.IndexNumber, (item as Episode)?.IndexNumberEnd, (item as Episode)?.SeriesId);
+        item.IndexNumber, (item as Episode)?.IndexNumberEnd, (item as Episode)?.SeriesId,
+        item is MediaBrowser.Controller.Entities.Video video
+            ? string.Join(',', video.LocalAlternateVersions ?? []) : null);
 
     private async Task ProcessAsync(CancellationToken cancellationToken)
     {

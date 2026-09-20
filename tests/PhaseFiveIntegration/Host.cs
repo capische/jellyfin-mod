@@ -129,26 +129,53 @@ internal sealed partial class NativeWorld
         }
     }
 
+    /// <summary>
+    /// Jellyfin's item identity for a path, as <c>ILibraryManager.GetNewItemId</c> derives it: the same file always
+    /// resolves to the same identity, and the local alternate versions of a video are found through it.
+    /// </summary>
+    public static Guid NewItemId(string key, Type type) =>
+        new(System.Security.Cryptography.MD5.HashData(System.Text.Encoding.Unicode.GetBytes(type.FullName + key)));
+
+    /// <summary>
+    /// Adds the native item Jellyfin's movie resolver would produce for a file. A movie folder that already has a
+    /// video resolves to ONE movie whose further files become its local alternate versions: each is its own native
+    /// video item with its own path, but the folder still holds a single Movie (MovieResolver, 10.11.11).
+    /// </summary>
     public Movie AddMovie(TestLibrary library, string file, int? tmdbId = null)
     {
         var folder = Path.GetDirectoryName(file)!;
         var sibling = _items.Values.OfType<Movie>().Where(movie => Path.GetDirectoryName(movie.Path) == folder && folder != library.Location)
             .OrderBy(movie => movie.DateCreated).FirstOrDefault();
+        if (sibling is not null)
+        {
+            AddAlternateVersion(sibling, file);
+            return sibling;
+        }
+
         var folderMatch = TmdbPattern().Match(Path.GetFileName(folder));
-        var tmdb = tmdbId?.ToString(CultureInfo.InvariantCulture) ??
-            (folderMatch.Success ? folderMatch.Groups[1].Value : sibling?.ProviderIds.GetValueOrDefault("Tmdb"));
+        var tmdb = tmdbId?.ToString(CultureInfo.InvariantCulture) ?? (folderMatch.Success ? folderMatch.Groups[1].Value : null);
         var movie = new Movie
         {
-            Id = Guid.NewGuid(), Name = TitlePattern().Match(Path.GetFileName(folder)).Groups[1].Value.Trim(), Path = file,
-            DateCreated = DateTime.UtcNow
+            Id = NewItemId(file, typeof(Movie)), Name = TitlePattern().Match(Path.GetFileName(folder)).Groups[1].Value.Trim(),
+            Path = file, DateCreated = DateTime.UtcNow
         };
         if (tmdb is not null) movie.ProviderIds["Tmdb"] = tmdb;
-        // Jellyfin groups files that start with their folder's name as alternate versions of the first one.
-        if (sibling is not null)
-            movie.PrimaryVersionId = sibling.PrimaryVersionId is { Length: > 0 } primary && _items.ContainsKey(Guid.Parse(primary))
-                ? primary : sibling.Id.ToString("N");
         Add(library, movie);
         return movie;
+    }
+
+    /// <summary>Attaches one more file of the same folder as a further media source of an existing video.</summary>
+    private void AddAlternateVersion(Video owner, string file)
+    {
+        var source = new Video
+        {
+            Id = NewItemId(file, typeof(Video)), Name = Path.GetFileNameWithoutExtension(file), Path = file,
+            DateCreated = DateTime.UtcNow
+        };
+        owner.LocalAlternateVersions = [.. owner.LocalAlternateVersions, file];
+        _items[source.Id] = source;
+        // The owning item is what Jellyfin saves and reports; the media source has no place of its own in a library.
+        _updated?.Invoke(this, new ItemChangeEventArgs { Item = owner });
     }
 
     private void AddEpisode(TestLibrary library, string file)
@@ -197,9 +224,40 @@ internal sealed partial class NativeWorld
             foreach (var alternate in orphans.Skip(1)) alternate.PrimaryVersionId = orphans[0].Id.ToString("N");
         }
 
+        // A removed media source leaves its owner; a removed owner lets the folder resolve afresh, so the first
+        // remaining file becomes the movie and takes an identity of its own, as Jellyfin's resolver would.
+        var owner = _items.Values.OfType<Video>().FirstOrDefault(candidate => item.Path is not null &&
+            candidate.LocalAlternateVersions.Contains(item.Path, StringComparer.Ordinal));
+        if (owner is not null)
+        {
+            owner.LocalAlternateVersions = owner.LocalAlternateVersions.Where(path =>
+                !string.Equals(path, item.Path, StringComparison.Ordinal)).ToArray();
+            _updated?.Invoke(this, new ItemChangeEventArgs { Item = owner });
+        }
+
+        (Movie Item, TestLibrary Home)? promoted = null;
+        if (item is Video { LocalAlternateVersions: { Length: > 0 } remaining } && LibraryOf(item) is { } home)
+        {
+            foreach (var path in remaining) _items.TryRemove(NewItemId(path, typeof(Video)), out _);
+            var movie = new Movie
+            {
+                Id = NewItemId(remaining[0], typeof(Movie)), Name = item.Name, Path = remaining[0],
+                DateCreated = DateTime.UtcNow, LocalAlternateVersions = remaining.Skip(1).ToArray()
+            };
+            foreach (var (key, value) in item.ProviderIds) movie.ProviderIds[key] = value;
+            foreach (var path in movie.LocalAlternateVersions)
+                _items[NewItemId(path, typeof(Video))] = new Video
+                {
+                    Id = NewItemId(path, typeof(Video)), Name = Path.GetFileNameWithoutExtension(path), Path = path,
+                    DateCreated = DateTime.UtcNow
+                };
+            promoted = (movie, home);
+        }
+
         foreach (var library in Libraries) lock (library.Items) library.Items.Remove(item);
         foreach (var series in _items.Values.OfType<TestSeries>()) lock (series.Items) series.Items.Remove(item);
         _removed?.Invoke(this, new ItemChangeEventArgs { Item = item });
+        if (promoted is { } resolved) Add(resolved.Home, resolved.Item);
     }
 
     private TestLibrary? LibraryOf(BaseItem item)
@@ -243,6 +301,7 @@ internal sealed partial class NativeWorld
                     ItemId = folder.Id.ToString(), Name = folder.Name, Locations = [folder.Location],
                     CollectionType = folder.CollectionType == CollectionType.tvshows ? CollectionTypeOptions.tvshows : CollectionTypeOptions.movies
                 }).ToList();
+            case "GetNewItemId": return NewItemId((string)arguments![0]!, (Type)arguments[1]!);
             case "GetItemById":
                 var id = (Guid)arguments![0]!;
                 return Libraries.FirstOrDefault(library => library.Id == id) as BaseItem ?? _items.GetValueOrDefault(id);

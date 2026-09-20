@@ -165,15 +165,18 @@ public sealed class ReconciliationService(
         var missingItems = 0;
         foreach (var entry in entries)
         {
+            // Only a title can be opened; a further media source of one names its owner instead (P6.M6).
             var playableBindings = bindings.Where(binding => binding.EntryId == entry.Id &&
                     observation.PlayableTitleIds.Contains(binding.JellyfinItemId))
-                .OrderBy(binding => binding.JellyfinItemId == binding.VersionGroupId ? 0 : 1)
+                .OrderBy(binding => binding.OwnerItemId is null ? 0 : 1)
+                .ThenBy(binding => binding.JellyfinItemId == binding.VersionGroupId ? 0 : 1)
                 .ThenBy(binding => binding.VersionGroupId).ThenBy(binding => binding.JellyfinItemId).ToArray();
-            var selected = playableBindings.FirstOrDefault(binding => binding.JellyfinItemId == entry.JellyfinItemId) ??
+            var selected = playableBindings.FirstOrDefault(binding =>
+                    (binding.OwnerItemId ?? binding.JellyfinItemId) == entry.JellyfinItemId) ??
                 playableBindings.FirstOrDefault();
             if (selected is not null)
             {
-                entry.JellyfinItemId = selected.JellyfinItemId;
+                entry.JellyfinItemId = selected.OwnerItemId ?? selected.JellyfinItemId;
                 entry.State = FileState.OnDisk;
             }
             else
@@ -262,6 +265,12 @@ public sealed class ReconciliationService(
             representation.VersionGroupId == Guid.Empty ||
             representation.VersionGroupId.HasValue && !representationIds.Contains(representation.VersionGroupId.Value)))
             throw new ArgumentException("Every native representation must carry the observed library provenance.", nameof(snapshot));
+        // A further media source must name an observed title that is itself a title, never another media source.
+        var titleIds = snapshot.Representations.Where(representation => representation.OwnerItemId is null)
+            .Select(representation => representation.JellyfinItemId).ToHashSet();
+        if (snapshot.Representations.Any(representation => representation.OwnerItemId is { } ownerId &&
+            (ownerId == representation.JellyfinItemId || !titleIds.Contains(ownerId))))
+            throw new ArgumentException("Every further media source must belong to an observed native title.", nameof(snapshot));
         if (snapshot.MediaType == "movie" && snapshot.Episodes.Count > 0)
             throw new ArgumentException("Movie observations cannot contain episodes.", nameof(snapshot));
         if (snapshot.Episodes.Any(episode => episode.JellyfinItemId == Guid.Empty ||
@@ -371,12 +380,14 @@ public sealed class ReconciliationService(
             {
                 var versionGroupId = representation.VersionGroupId ?? representation.JellyfinItemId;
                 var structuralChange = binding.VersionGroupId != versionGroupId ||
-                    binding.TargetLibraryId != representation.TargetLibraryId;
+                    binding.TargetLibraryId != representation.TargetLibraryId ||
+                    binding.OwnerItemId != representation.OwnerItemId;
                 if (structuralChange || binding.MediaPath != representation.MediaPath ||
                     binding.StorageIdentity != representation.StorageIdentity)
                 {
                     binding.VersionGroupId = versionGroupId;
                     binding.TargetLibraryId = representation.TargetLibraryId;
+                    binding.OwnerItemId = representation.OwnerItemId;
                     binding.MediaPath = representation.MediaPath;
                     binding.StorageIdentity = representation.StorageIdentity;
                     if (structuralChange) entryBindingChanges++;
@@ -391,9 +402,20 @@ public sealed class ReconciliationService(
                 JellyfinItemId = representation.JellyfinItemId,
                 TargetLibraryId = representation.TargetLibraryId,
                 VersionGroupId = representation.VersionGroupId ?? representation.JellyfinItemId,
+                OwnerItemId = representation.OwnerItemId,
                 MediaPath = representation.MediaPath,
                 StorageIdentity = representation.StorageIdentity
             });
+            entryBindingChanges++;
+        }
+
+        // A further media source has no existence of its own: when the title that owned it is gone from a
+        // complete observation of this entry, the row is stale rather than absent media. Its file, if it is
+        // still there, is named by one of the observed representations above (P6.M6).
+        foreach (var stale in entryBindings.Where(binding => binding.OwnerItemId is { } ownerId &&
+                     !representationIds.Contains(ownerId) && !representationIds.Contains(binding.JellyfinItemId)))
+        {
+            database.EntryBindings.Remove(stale);
             entryBindingChanges++;
         }
 
@@ -407,8 +429,8 @@ public sealed class ReconciliationService(
         var episodeChanges = 0;
         if (selected is not null)
         {
-            entryChanged = entry.JellyfinItemId != selected.JellyfinItemId || entry.State != FileState.OnDisk;
-            entry.JellyfinItemId = selected.JellyfinItemId;
+            entryChanged = entry.JellyfinItemId != selected.NavigableItemId || entry.State != FileState.OnDisk;
+            entry.JellyfinItemId = selected.NavigableItemId;
             entry.State = FileState.OnDisk;
         }
 
@@ -652,11 +674,22 @@ public sealed class ReconciliationService(
         return _liveLibraries.Contains(libraryId);
     }
 
+    /// <summary>
+    /// Chooses the native item the entry points at. Only a title can be opened, so a further media source of one
+    /// (P6.M6) is represented here by the title that owns it, never by its own identity.
+    /// </summary>
     private static NativeRepresentation? SelectRepresentation(Guid? currentId, IReadOnlyList<NativeRepresentation> candidates)
-        => candidates.FirstOrDefault(candidate => candidate.JellyfinItemId == currentId) ??
-            candidates.OrderBy(candidate => candidate.JellyfinItemId == candidate.VersionGroupId ? 0 : 1)
+    {
+        var titles = candidates.Where(candidate => candidate.OwnerItemId is null).ToArray();
+        return titles.FirstOrDefault(candidate => candidate.JellyfinItemId == currentId) ??
+            titles.OrderBy(candidate => candidate.JellyfinItemId == candidate.VersionGroupId ? 0 : 1)
                 .ThenBy(candidate => candidate.VersionGroupId ?? candidate.JellyfinItemId)
+                .ThenBy(candidate => candidate.JellyfinItemId).FirstOrDefault() ??
+            // A title whose only playable media is a further media source still opens through that title.
+            candidates.FirstOrDefault(candidate => candidate.NavigableItemId == currentId) ??
+            candidates.OrderBy(candidate => candidate.VersionGroupId ?? candidate.JellyfinItemId)
                 .ThenBy(candidate => candidate.JellyfinItemId).FirstOrDefault();
+    }
 
     private static IEnumerable<(NativeEpisodeSnapshot Observation, string Detail)> FindObservationConflicts(
         IReadOnlyList<NativeEpisodeSnapshot> observations)
@@ -933,9 +966,22 @@ public sealed record NativeTitleSnapshot(string MediaType, int? TmdbId, Guid Tar
         SkippedEpisodes.Any(episode => episode.SeriesItemId == seriesItemId && episode.IsPlayable);
 }
 
-/// <summary>One native movie or series representation.</summary>
+/// <summary>One native movie or series representation: a title, or one further media source of one.</summary>
+/// <param name="JellyfinItemId">The native item behind this media source.</param>
+/// <param name="TargetLibraryId">The library the observation came from.</param>
+/// <param name="IsPlayable">Whether the representation has media.</param>
+/// <param name="VersionGroupId">Jellyfin's primary version identity for the group this belongs to.</param>
+/// <param name="MediaPath">The file this media source plays.</param>
+/// <param name="StorageIdentity">The mount identity observed for that file.</param>
+/// <param name="OwnerItemId">
+/// The navigable title this is a further media source of, or null when the representation is that title itself (P6.M6).
+/// </param>
 public sealed record NativeRepresentation(Guid JellyfinItemId, Guid TargetLibraryId, bool IsPlayable,
-    Guid? VersionGroupId = null, string? MediaPath = null, string? StorageIdentity = null);
+    Guid? VersionGroupId = null, string? MediaPath = null, string? StorageIdentity = null, Guid? OwnerItemId = null)
+{
+    /// <summary>The native item a user opens to play this representation.</summary>
+    public Guid NavigableItemId => OwnerItemId ?? JellyfinItemId;
+}
 
 /// <summary>One playable or unavailable native episode observation.</summary>
 public sealed record NativeEpisodeSnapshot(Guid JellyfinItemId, Guid SeriesItemId, int? TmdbId,

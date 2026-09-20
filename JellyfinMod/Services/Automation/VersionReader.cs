@@ -18,20 +18,26 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
     public async Task<IReadOnlyList<VersionDto>> ForAsync(Guid entryId, Guid? episodeId, RetentionEvaluation? evaluation, bool administrator,
         CancellationToken cancellationToken)
     {
-        List<(Guid BindingId, Guid ItemId, string? Path, bool IsDefault)> bindings = episodeId is { } id
+        // A version is a media source: its own item carries the streams and is what Play must ask for, while the
+        // item a client opens is the title that owns it (P6.M6).
+        List<(Guid BindingId, Guid ItemId, Guid OwnerId, string? Path, bool IsDefault)> bindings = episodeId is { } id
             ? (await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == id).ToListAsync(cancellationToken)
-                .ConfigureAwait(false)).Select(binding => (binding.Id, binding.JellyfinItemId, binding.MediaPath, false)).ToList()
+                .ConfigureAwait(false)).Select(binding => (binding.Id, binding.JellyfinItemId, binding.JellyfinItemId,
+                    binding.MediaPath, false)).ToList()
             : (await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entryId).ToListAsync(cancellationToken)
-                .ConfigureAwait(false)).Select(binding => (binding.Id, binding.JellyfinItemId, binding.MediaPath,
-                    binding.JellyfinItemId == binding.VersionGroupId)).ToList();
+                .ConfigureAwait(false)).Select(binding => (binding.Id, binding.JellyfinItemId,
+                    binding.OwnerItemId ?? binding.JellyfinItemId, binding.MediaPath,
+                    binding.OwnerItemId is null && binding.JellyfinItemId == binding.VersionGroupId)).ToList();
         if (bindings.Count == 0) return [];
         if (episodeId is not null && bindings.Count > 0)
             bindings[0] = bindings[0] with { IsDefault = true };
+        // Keyed by the file the import landed, because a version's binding can be re-identified when a sibling goes.
         var labels = (await database.ImportOperations.AsNoTracking()
-                .Where(operation => operation.BindingId != null && operation.VersionLabel != null && operation.EntryId == entryId)
+                .Where(operation => operation.DestinationPath != null && operation.VersionLabel != null && operation.EntryId == entryId)
                 .ToListAsync(cancellationToken).ConfigureAwait(false))
-            .GroupBy(operation => operation.BindingId!.Value)
-            .ToDictionary(group => group.Key, group => group.OrderByDescending(operation => operation.CompletedAt).First().VersionLabel!);
+            .GroupBy(operation => operation.DestinationPath!, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.OrderByDescending(operation => operation.CompletedAt).First().VersionLabel!,
+                StringComparer.Ordinal);
         var seeds = await database.SeedReleaseOperations.AsNoTracking()
             .Where(seed => seed.EntryId == entryId && SeedReleaseStates.Open.Contains(seed.State))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
@@ -58,8 +64,9 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
                 ? new VersionRetentionDto("waiting", administrator ? SeedReleaseReasons.GoalUnmet : "seeding")
                 : evaluation is null ? null
                 : new VersionRetentionDto(evaluation.State, administrator ? evaluation.Reason : null);
-            result.Add(new VersionDto(binding.ItemId, binding.ItemId.ToString("N", CultureInfo.InvariantCulture), binding.BindingId,
-                labels.GetValueOrDefault(binding.BindingId) ?? Label(binding.Path), quality, resolution ?? ResolutionOf(video),
+            result.Add(new VersionDto(binding.OwnerId, binding.ItemId.ToString("N", CultureInfo.InvariantCulture), binding.BindingId,
+                (binding.Path is null ? null : labels.GetValueOrDefault(binding.Path)) ?? Label(binding.Path),
+                quality, resolution ?? ResolutionOf(video),
                 video?.Width, video?.Height, video?.Codec, video?.VideoRange.ToString(), video?.BitDepth, audio?.Codec, audio?.Channels,
                 inspected ? (long)file.LogicalBytes : null, binding.IsDefault, retention));
         }
