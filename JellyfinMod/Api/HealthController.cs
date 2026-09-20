@@ -81,7 +81,28 @@ public class HealthController : ControllerBase
             RetainedBundleIds = web.RetainedBundleIds,
             HostVersion = hostVersion,
             SupportedServer = supported is null ? null : new { supported.Minimum, supported.TestedOn },
-            Blocker = web.Blocker ?? (untested ? "server_version_untested" : null)
+            Blocker = web.Blocker ?? (untested ? "server_version_untested" : null),
+            Takeover = DescribeTakeover()
+        };
+    }
+
+    /// <summary>What the plugin did to the host's web root, if anything (P7.S4).</summary>
+    private object? DescribeTakeover()
+    {
+        var takeover = _services.GetService<WebRootTakeover>();
+        if (takeover is null) return null;
+
+        var state = takeover.State;
+        return new
+        {
+            state.Status,
+            state.WebRoot,
+            state.BundleId,
+            state.StockSha256,
+            state.PatchedSha256,
+            state.PatchedAt,
+            state.PatchedBy,
+            state.Blocker
         };
     }
 
@@ -91,7 +112,8 @@ public class HealthController : ControllerBase
     /// </summary>
     /// <remarks>
     /// <c>ui</c> is the switch the web fork reads to decide whether to show the JellyfinMod interface at all
-    /// (P7.S2); <c>ui.web</c> says this build also serves that interface's bundle itself (P7.S3).
+    /// (P7.S2); <c>ui.web</c> says this build also serves that interface's bundle itself (P7.S3);
+    /// <c>ui.takeover</c> says it can replace the host's own document at <c>/web</c> (P7.S4).
     /// </remarks>
     public static readonly IReadOnlyList<string> Capabilities =
     [
@@ -112,6 +134,7 @@ public class HealthController : ControllerBase
         "automation",
         "versions",
         "ui",
-        "ui.web"
+        "ui.web",
+        "ui.takeover"
     ];
 }

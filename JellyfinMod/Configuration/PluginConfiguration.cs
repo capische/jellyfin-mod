@@ -58,6 +58,16 @@ public class PluginConfiguration : BasePluginConfiguration
     public string TransmissionPassword { get; set; } = string.Empty;
 
     /// <summary>
+    /// Gets or sets a value indicating whether the plugin replaces the Jellyfin interface at <c>/web</c>.
+    /// </summary>
+    /// <remarks>
+    /// On by default, in every shape (accepted user decision 7, 2026-09-20): installing the plugin is how an
+    /// operator asks for this interface, so it applies as soon as the web root is writable. Turning it off
+    /// restores the host's own document; the interface stays reachable at <c>/web-mod</c> either way.
+    /// </remarks>
+    public bool UiTakeoverEnabled { get; set; } = true;
+
+    /// <summary>
     /// Gets or sets how many days a superseded web bundle stays reachable after a plugin upgrade (P7.S3).
     /// </summary>
     /// <remarks>

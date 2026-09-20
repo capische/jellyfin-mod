@@ -61,6 +61,10 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
             Plugin.Instance!.DataPath,
             Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? Plugin.Instance!.DataPath,
             provider.GetRequiredService<ILogger<WebBundleStore>>()));
+        services.AddSingleton(provider => new WebRootTakeover(
+            Plugin.Instance!.DataPath,
+            provider.GetRequiredService<WebBundleStore>(),
+            provider.GetRequiredService<ILogger<WebRootTakeover>>()));
         services.AddSingleton<IHostedService, WebBundleInstaller>();
         services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<DatabaseInitializer>());

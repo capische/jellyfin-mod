@@ -23,10 +23,17 @@ public static partial class WebDocumentRenderer
     /// <summary>Marks a document this plugin produced, so it is never mistaken for a stock one.</summary>
     public const string Marker = "<!-- jellyfinmod:takeover -->";
 
+    /// <summary>The stock copy the failsafe falls back to, written beside the patched document.</summary>
+    public const string StockCopyName = "index.jellyfinmod-stock.html";
+
     /// <summary>Renders the served document with its assets rooted at <paramref name="assetRoot"/>.</summary>
     /// <param name="document">The bundle's own <c>jellyfinmod.html</c>.</param>
     /// <param name="assetRoot">Absolute path the bundle's files are served from, with a trailing slash.</param>
-    public static string Render(string document, string assetRoot)
+    /// <param name="withFailsafe">
+    /// Whether to include the recovery script. Needed when this document replaces the host's own
+    /// <c>index.html</c>, where a bundle that fails to load would otherwise leave a blank page and no way back.
+    /// </param>
+    public static string Render(string document, string assetRoot, bool withFailsafe = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(assetRoot);
         var root = assetRoot.EndsWith('/') ? assetRoot : assetRoot + '/';
@@ -39,13 +46,73 @@ public static partial class WebDocumentRenderer
                 : match.Value;
         });
 
-        // Placed first in <head> so it is set before the deferred entry scripts run.
-        var preamble = Marker + "<script>window.__jfmodAssetRoot=" + JsonString(root) + ";</script>";
+        if (withFailsafe)
+        {
+            // Every entry script and stylesheet reports its own failure, so a bundle that is gone or unreachable
+            // is noticed at the first missing file rather than as a blank page.
+            rewritten = ScriptOrLink().Replace(rewritten, match =>
+                match.Value.Contains("onerror", StringComparison.OrdinalIgnoreCase)
+                    ? match.Value
+                    : match.Value[..^1] + " onerror=\"__jfmodStock()\">");
+        }
+
+        // Placed first in <head> so both run before the deferred entry scripts.
+        var preamble = Marker
+            + "<script>window.__jfmodAssetRoot=" + JsonString(root) + ";</script>"
+            + (withFailsafe ? "<script>" + Failsafe + "</script>" : string.Empty);
         var head = HeadTag().Match(rewritten);
         return head.Success
             ? rewritten[..(head.Index + head.Length)] + preamble + rewritten[(head.Index + head.Length)..]
             : preamble + rewritten;
     }
+
+    /// <summary>
+    /// The recovery script, inlined into a patched document.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the answer to the one genuinely dangerous thing this plugin does. The patched document is the
+    /// login page, and it is also the Dashboard that an administrator would use to undo a bad patch — so if the
+    /// bundle it points at is missing, the usual way out is inside the page that is broken.
+    /// </para>
+    /// <para>
+    /// So the stock page is kept beside the patched one and loaded in its place, at the same address, whenever
+    /// the bundle does not run: a script or stylesheet failed, or the bundle never set its marker by the time the
+    /// document finished parsing. The plugin being uninstalled, disabled, or serving a bundle that was pruned all
+    /// look the same from here, and all recover the same way.
+    /// </para>
+    /// <para>
+    /// <c>XMLHttpRequest</c> and <c>document.write</c> are deliberate rather than dated: they work on the oldest
+    /// webOS engines this fork supports, where <c>fetch</c> and module scripts do not. A <c>sessionStorage</c>
+    /// latch stops a failing stock page from reloading itself for ever.
+    /// </para>
+    /// </remarks>
+    private const string Failsafe = """
+        (function () {
+          var KEY = 'jfmod-stock-fallback';
+          var STOCK = 'index.jellyfinmod-stock.html';
+          var done = false;
+          window.__jfmodStock = function () {
+            if (done) { return; }
+            done = true;
+            try { if (sessionStorage.getItem(KEY)) { return; } sessionStorage.setItem(KEY, '1'); } catch (e) {}
+            var request = new XMLHttpRequest();
+            request.open('GET', STOCK, true);
+            request.onload = function () {
+              if (request.status >= 200 && request.status < 300 && request.responseText) {
+                document.open(); document.write(request.responseText); document.close();
+              } else { location.replace(STOCK + location.search + location.hash); }
+            };
+            request.onerror = function () { location.replace(STOCK + location.search + location.hash); };
+            request.send(null);
+          };
+          window.addEventListener('DOMContentLoaded', function () {
+            // Deferred scripts have run by now, so the bundle has had its chance to say it executed.
+            if (!window.__jfmodBundle) { window.__jfmodStock(); }
+            else { try { sessionStorage.removeItem(KEY); } catch (e) {} }
+          });
+        })();
+        """;
 
     /// <summary>Whether this document was produced by <see cref="Render"/> rather than shipped by the host.</summary>
     public static bool IsRendered(string document) => document.Contains(Marker, StringComparison.Ordinal);
@@ -70,6 +137,9 @@ public static partial class WebDocumentRenderer
 
     [GeneratedRegex("<head(?:\\s[^>]*)?>", RegexOptions.IgnoreCase)]
     private static partial Regex HeadTag();
+
+    [GeneratedRegex("<(?:script|link)\\s[^>]*>", RegexOptions.IgnoreCase)]
+    private static partial Regex ScriptOrLink();
 
     [GeneratedRegex("^[a-z][a-z0-9+.-]*:", RegexOptions.IgnoreCase)]
     private static partial Regex AbsoluteScheme();
