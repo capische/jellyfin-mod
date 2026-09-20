@@ -254,43 +254,56 @@ public sealed class ReleaseSearchService(
         if (cache.RemainingBackOff(indexer.Id) is { } wait)
             return ([], Outcome("rate_limited", "The indexer asked to wait before searching again.", retry: (int)Math.Ceiling(wait.TotalSeconds)), 0);
 
-        var (parameters, identity, method) = BuildQuery(caps, target);
-        if (parameters is null)
+        var attempts = BuildQueries(caps, target);
+        if (attempts.Count == 0)
             return ([], Outcome("unsupported_search", "The indexer does not advertise a search this title can use."), 0);
         var configured = indexer.Categories.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(value => int.Parse(value, CultureInfo.InvariantCulture)).ToArray();
         var categories = caps.Categories.Count == 0 ? configured : configured.Where(caps.Categories.Contains).ToArray();
         if (configured.Length > 0 && categories.Length == 0)
             return ([], Outcome("unsupported_search", "None of the configured categories is advertised by the indexer."), 0);
-        if (categories.Length > 0) parameters.Add(("cat", string.Join(',', categories)));
         var limit = Math.Min(caps.LimitMax ?? MaxLimit, MaxLimit);
-        parameters.Add(("limit", limit.ToString(CultureInfo.InvariantCulture)));
-
         var allowedHosts = AcquisitionConfiguration.AllowedHosts(indexer);
         var items = new List<TorznabItem>();
         var truncated = false;
         var pages = 0;
+        var identity = attempts[0].Identity;
+        var method = attempts[0].Method;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(options.Timeout);
         try
         {
-            for (var page = 0; ; page++)
+            // Real indexers answer nothing for a query their own engine cannot match — 1337x returns zero
+            // for "Night of the Living Dead" and eighty for "night living dead". Each attempt is tried until
+            // one returns rows; the evaluator still verifies every row against the target, so a looser query
+            // cannot grab the wrong title (P4.A3).
+            foreach (var attempt in attempts)
             {
-                var offset = items.Count;
-                var pageParameters = parameters.Append(("offset", offset.ToString(CultureInfo.InvariantCulture))).ToArray();
-                pages++;
-                var result = await torznab.SearchAsync(endpoint, pageParameters, timeout.Token).ConfigureAwait(false);
-                items.AddRange(result.Items);
-                // The feed's own offset/total decides; without a total, a full page means there may be more.
-                var more = result.Items.Count > 0 && (result.Total is { } total
-                    ? offset + result.Items.Count < total
-                    : result.Items.Count >= limit);
-                if (!more) break;
-                if (page + 1 >= options.MaxPages)
+                identity = attempt.Identity;
+                method = attempt.Method;
+                var parameters = attempt.Parameters;
+                if (categories.Length > 0) parameters.Add(("cat", string.Join(',', categories)));
+                parameters.Add(("limit", limit.ToString(CultureInfo.InvariantCulture)));
+                for (var page = 0; ; page++)
                 {
-                    truncated = true;
-                    break;
+                    var offset = items.Count;
+                    var pageParameters = parameters.Append(("offset", offset.ToString(CultureInfo.InvariantCulture))).ToArray();
+                    pages++;
+                    var result = await torznab.SearchAsync(endpoint, pageParameters, timeout.Token).ConfigureAwait(false);
+                    items.AddRange(result.Items);
+                    // The feed's own offset/total decides; without a total, a full page means there may be more.
+                    var more = result.Items.Count > 0 && (result.Total is { } total
+                        ? offset + result.Items.Count < total
+                        : result.Items.Count >= limit);
+                    if (!more) break;
+                    if (page + 1 >= options.MaxPages)
+                    {
+                        truncated = true;
+                        break;
+                    }
                 }
+
+                if (items.Count > 0) break;
             }
         }
         catch (TorznabException error)
@@ -312,31 +325,67 @@ public sealed class ReleaseSearchService(
         return (candidates, Outcome(candidates.Count == 0 ? "no_results" : "ok", null, candidates.Count, truncated), pages);
     }
 
-    private static (List<(string, string)>? Parameters, SearchIdentity Identity, string Method) BuildQuery(
-        TorznabCapabilities caps, ReleaseTarget target)
+    private readonly record struct SearchAttempt(
+        List<(string Name, string Value)> Parameters, SearchIdentity Identity, string Method);
+
+    /// <summary>
+    /// The queries to try in order: the provider id an indexer advertises first, then the title with its year,
+    /// the bare title, and finally the title without the small words that some indexer engines cannot match.
+    /// </summary>
+    private static List<SearchAttempt> BuildQueries(TorznabCapabilities caps, ReleaseTarget target)
     {
-        if (target.MediaType == "movie")
+        var attempts = new List<SearchAttempt>();
+        var isMovie = target.MediaType == "movie";
+        var searchCaps = isMovie ? caps.MovieSearch : caps.TvSearch;
+        var searchType = isMovie ? "movie" : "tvsearch";
+        if (isMovie)
         {
             if (caps.MovieSearch.Contains("imdbid") && target.ImdbId is { Length: > 2 } imdb)
-                return ([("t", "movie"), ("imdbid", imdb.TrimStart('t', 'T'))], SearchIdentity.ProviderId, "imdbid");
+                attempts.Add(new([("t", "movie"), ("imdbid", imdb.TrimStart('t', 'T'))], SearchIdentity.ProviderId, "imdbid"));
             if (caps.MovieSearch.Contains("tmdbid"))
-                return ([("t", "movie"), ("tmdbid", target.TmdbId.ToString(CultureInfo.InvariantCulture))], SearchIdentity.ProviderId, "tmdbid");
-            var text = target.Year is { } year ? $"{target.Title} {year}" : target.Title;
-            if (caps.MovieSearch.Contains("q")) return ([("t", "movie"), ("q", text)], SearchIdentity.QueryOnly, "q");
-            if (caps.Search.Contains("q")) return ([("t", "search"), ("q", text)], SearchIdentity.QueryOnly, "q");
-            return (null, SearchIdentity.QueryOnly, "none");
+                attempts.Add(new([("t", "movie"), ("tmdbid", target.TmdbId.ToString(CultureInfo.InvariantCulture))],
+                    SearchIdentity.ProviderId, "tmdbid"));
+        }
+        else if (caps.TvSearch.Contains("tvdbid") && caps.TvSearch.Contains("season") && caps.TvSearch.Contains("ep") &&
+                 target.TvdbId is { } tvdb)
+        {
+            attempts.Add(new([("t", "tvsearch"), ("tvdbid", tvdb.ToString(CultureInfo.InvariantCulture)),
+                ("season", target.SeasonNumber!.Value.ToString(CultureInfo.InvariantCulture)),
+                ("ep", target.EpisodeNumber!.Value.ToString(CultureInfo.InvariantCulture))], SearchIdentity.ProviderId, "tvdbid"));
         }
 
-        var season = target.SeasonNumber!.Value.ToString(CultureInfo.InvariantCulture);
-        var episode = target.EpisodeNumber!.Value.ToString(CultureInfo.InvariantCulture);
-        if (caps.TvSearch.Contains("tvdbid") && caps.TvSearch.Contains("season") && caps.TvSearch.Contains("ep") &&
-            target.TvdbId is { } tvdb)
-            return ([("t", "tvsearch"), ("tvdbid", tvdb.ToString(CultureInfo.InvariantCulture)), ("season", season), ("ep", episode)],
-                SearchIdentity.ProviderId, "tvdbid");
-        var query = $"{target.Title} S{target.SeasonNumber:00}E{target.EpisodeNumber:00}";
-        if (caps.TvSearch.Contains("q")) return ([("t", "tvsearch"), ("q", query)], SearchIdentity.QueryOnly, "q");
-        if (caps.Search.Contains("q")) return ([("t", "search"), ("q", query)], SearchIdentity.QueryOnly, "q");
-        return (null, SearchIdentity.QueryOnly, "none");
+        foreach (var (text, method) in TextQueries(target))
+        {
+            if (searchCaps.Contains("q")) attempts.Add(new([("t", searchType), ("q", text)], SearchIdentity.QueryOnly, method));
+            else if (caps.Search.Contains("q")) attempts.Add(new([("t", "search"), ("q", text)], SearchIdentity.QueryOnly, method));
+        }
+
+        return attempts;
+    }
+
+    private static readonly string[] SmallWords =
+        ["a", "an", "and", "at", "for", "from", "in", "of", "on", "or", "the", "to", "with"];
+
+    private static List<(string Text, string Method)> TextQueries(ReleaseTarget target)
+    {
+        var suffix = target.MediaType == "movie"
+            ? null
+            : $"S{target.SeasonNumber:00}E{target.EpisodeNumber:00}";
+        var queries = new List<(string, string)>();
+        void Add(string text, string method)
+        {
+            var value = suffix is null ? text : text + " " + suffix;
+            if (!string.IsNullOrWhiteSpace(text) && queries.TrueForAll(existing =>
+                    !string.Equals(existing.Item1, value, StringComparison.OrdinalIgnoreCase)))
+                queries.Add((value, method));
+        }
+
+        if (target.MediaType == "movie" && target.Year is { } year) Add($"{target.Title} {year}", "q");
+        Add(target.Title, "q_title");
+        var words = target.Title.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(word => !SmallWords.Contains(word, StringComparer.OrdinalIgnoreCase)).ToArray();
+        if (words.Length > 0) Add(string.Join(' ', words), "q_simplified");
+        return queries;
     }
 
     private static List<ReleaseCandidate> Evaluate(AcquisitionIndexer indexer, IEnumerable<TorznabItem> items, ReleaseTarget target,

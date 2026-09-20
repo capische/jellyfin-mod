@@ -27,6 +27,13 @@ public sealed class AcquisitionIndexer
     /// <summary>Gets or sets a value indicating whether searches include this source.</summary>
     public bool Enabled { get; set; }
 
+    /// <summary>
+    /// Gets or sets a value indicating whether automation may grab releases this indexer could only match by
+    /// title and year. Off by default: most public trackers advertise no id search, so a text match is all they
+    /// offer, and an automatic grab of a wrong match would download the wrong title (user decision 2026-09-20).
+    /// </summary>
+    public bool AutomateTitleMatches { get; set; }
+
     /// <summary>Gets or sets the comma-separated numeric Torznab categories searched.</summary>
     [MaxLength(512)]
     public string Categories { get; set; } = string.Empty;

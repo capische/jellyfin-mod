@@ -276,7 +276,13 @@ public sealed class AutomationRunner(
 
         var qualities = AcquisitionConfiguration.Qualities(target.Profile);
         var heldIndex = target.IsUpgrade ? VersionQuality.ProfileIndex(qualities, target.Upgrade!.HeldBest) : int.MaxValue;
+        // A release matched only by title and year is grabbable by hand, but automation takes one only from an
+        // indexer the administrator marked as trusted for that (user decision 2026-09-20).
+        var titleMatchIndexers = await database.AcquisitionIndexers.AsNoTracking()
+            .Where(indexer => indexer.AutomateTitleMatches).Select(indexer => indexer.Id)
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
         var eligible = snapshot.Candidates.Where(candidate => candidate.Evaluation.Eligible &&
+                (candidate.Evaluation.Identity != "title" || titleMatchIndexers.Contains(candidate.IndexerId)) &&
                 (!target.IsUpgrade || VersionQuality.ProfileIndex(qualities, candidate.Parsed.Quality) < heldIndex))
             .ToArray();
         if (eligible.Length == 0)

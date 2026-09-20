@@ -166,6 +166,8 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
     torznab.Indexers["good"] = good;
     var queryOnly = new IndexerScript { ApiKey = "q-key", Caps = TorznabBoundary.Caps("q", "q") };
     queryOnly.MovieItems.Add(new("Example.Movie.2024.1080p.WEB-DL-QONLY", "q-a", dl("movie"), 4_000_000_000, 60, []));
+    // Same title, wrong year: a text-only match must still be refused on the year (user decision 2026-09-20).
+    queryOnly.MovieItems.Add(new("Example.Movie.1998.1080p.WEB-DL-QOLD", "q-b", dl("movie"), 4_000_000_000, 60, []));
     torznab.Indexers["qonly"] = queryOnly;
     torznab.Indexers["slow"] = new IndexerScript
     {
@@ -425,7 +427,15 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         Rejected("Other.Film.2019.1080p.WEB-DL-GRP", "identity_mismatch");
         Rejected("Example.Movie.2024.1080p.WEB-DL-EVIL", "download_host_not_allowed");
         Rejected("Example.Movie.2024.1080p.WEB-DL-V2", "unsupported_hash");
-        Rejected("Example.Movie.2024.1080p.WEB-DL-QONLY", "identity_unverified");
+        // Most public trackers advertise no id search, so a title-and-year match is the only identity they can
+        // give. It is grabbable by hand and marked as such; automation ignores it unless the indexer is trusted.
+        var titleMatched = byTitle["Example.Movie.2024.1080p.WEB-DL-QONLY"];
+        Assert(titleMatched.GetProperty("eligible").GetBoolean() &&
+            titleMatched.GetProperty("match").GetProperty("identity").GetString() == "title" &&
+            titleMatched.GetProperty("match").GetProperty("method").GetString()!.StartsWith("q", StringComparison.Ordinal),
+            "A text-only indexer's release matching title and year is eligible and reported as a title match: " +
+            titleMatched.GetRawText());
+        Rejected("Example.Movie.1998.1080p.WEB-DL-QOLD", "year_mismatch");
         var freeleech = byTitle["Example.Movie.2024.720p.WEBRip.x264-GRP"];
         Assert(freeleech.GetProperty("eligible").GetBoolean() && freeleech.GetProperty("freeleech").GetBoolean() &&
             freeleech.GetProperty("contributions").EnumerateArray().Any(item => item.GetProperty("code").GetString() == "freeleech"),

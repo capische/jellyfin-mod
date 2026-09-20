@@ -23,6 +23,7 @@ public sealed record IndexerSettingsDto(
     [property: JsonPropertyName("baseUrl")] string BaseUrl,
     [property: JsonPropertyName("apiKeyConfigured")] bool ApiKeyConfigured,
     [property: JsonPropertyName("enabled")] bool Enabled,
+    [property: JsonPropertyName("automateTitleMatches")] bool AutomateTitleMatches,
     [property: JsonPropertyName("categories")] IReadOnlyList<int> Categories,
     [property: JsonPropertyName("priority")] int Priority,
     [property: JsonPropertyName("downloadHosts")] IReadOnlyList<string> DownloadHosts,
@@ -64,6 +65,12 @@ public sealed class IndexerSettingsRequest
     /// <summary>Gets or sets whether searches use this indexer.</summary>
     [JsonPropertyName("enabled")]
     public bool Enabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether automation may grab a release this indexer matched by title and year alone.
+    /// </summary>
+    [JsonPropertyName("automateTitleMatches")]
+    public bool AutomateTitleMatches { get; set; }
 
     /// <summary>Gets or sets the numeric Torznab categories searched.</summary>
     [JsonPropertyName("categories")]

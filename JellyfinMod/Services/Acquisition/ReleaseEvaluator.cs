@@ -175,13 +175,10 @@ public static class ReleaseEvaluator
             return "mismatch";
         }
 
-        if (facts.Search == SearchIdentity.QueryOnly)
-        {
-            rejections.Add(new("identity_unverified",
-                "Found by text search only; the indexer cannot confirm this is the same title."));
-            return "unverified";
-        }
-
+        // Most public trackers advertise no id search at all, so a text match is the only identity they can
+        // offer. The parsed title and year must both agree; such a release is grabbable by hand and, unless the
+        // indexer is trusted for it, never grabbed automatically (user decision 2026-09-20).
+        var titleOnly = facts.Search == SearchIdentity.QueryOnly;
         var idConfirmed = target.MediaType == "movie"
             ? facts.ImdbId is not null && SameImdb(facts.ImdbId, target.ImdbId) || facts.TmdbId == target.TmdbId
             : facts.TvdbId is not null && facts.TvdbId == target.TvdbId;
@@ -201,14 +198,14 @@ public static class ReleaseEvaluator
                 return "unverified";
             }
 
-            if (target.Year is { } year && Math.Abs(parsed.Year.Value - year) > 1)
+            if (target.Year is { } year && parsed.Year.Value != year)
             {
                 rejections.Add(new("year_mismatch", $"The release is from {parsed.Year}, not {year}."));
                 return "unverified";
             }
         }
 
-        return "verified";
+        return titleOnly ? "title" : "verified";
     }
 
     private static bool TitleMatches(ReleaseTarget target, string? parsedTitle)

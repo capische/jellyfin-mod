@@ -457,6 +457,7 @@ public sealed partial class AcquisitionSettingsController(
         indexer.Name = request.Name.Trim();
         indexer.BaseUrl = request.BaseUrl.Trim();
         indexer.Enabled = request.Enabled;
+        indexer.AutomateTitleMatches = request.AutomateTitleMatches;
         indexer.Categories = string.Join(',', request.Categories.Distinct().Order());
         indexer.Priority = request.Priority;
         indexer.DownloadHosts = string.Join(',', request.DownloadHosts.Select(host => host.Trim().ToLowerInvariant()).Distinct());
@@ -498,7 +499,7 @@ public sealed partial class AcquisitionSettingsController(
     private static IndexerSettingsDto ToDto(AcquisitionIndexer indexer)
     {
         var capabilities = indexer.VerifiedRevision == indexer.Revision ? AcquisitionConfiguration.Capabilities(indexer) : null;
-        return new IndexerSettingsDto(indexer.Id, indexer.Name, indexer.BaseUrl, indexer.ApiKeySecretRef is not null, indexer.Enabled,
+        return new IndexerSettingsDto(indexer.Id, indexer.Name, indexer.BaseUrl, indexer.ApiKeySecretRef is not null, indexer.Enabled, indexer.AutomateTitleMatches,
             indexer.Categories.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(value => int.Parse(value, System.Globalization.CultureInfo.InvariantCulture)).ToArray(), indexer.Priority,
             indexer.DownloadHosts.Split(',', StringSplitOptions.RemoveEmptyEntries), indexer.MinimumSeedRatio, indexer.MinimumSeedMinutes,
             indexer.Revision, capabilities is not null,
