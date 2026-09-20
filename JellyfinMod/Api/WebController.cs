@@ -7,9 +7,14 @@ using Microsoft.AspNetCore.StaticFiles;
 namespace JellyfinMod.Api;
 
 /// <summary>
-/// Serves the JellyfinMod web bundle (P7.S3).
+/// Serves the JellyfinMod web bundle at <c>/web-mod</c> (P7.S3).
 /// </summary>
 /// <remarks>
+/// <para>
+/// The address deliberately mirrors the host's own <c>/web</c> rather than sitting under <c>/JellyfinMod</c>:
+/// this is a static site a person types into a browser, not an API. Every actual API this plugin exposes stays
+/// under <c>/JellyfinMod</c>.
+/// </para>
 /// <para>
 /// Anonymous by necessity, not by oversight: these are the scripts and stylesheets of a page nobody has signed
 /// into yet, exactly like the host's own <c>/web</c>. Only files inside an extracted, verified bundle are
@@ -22,7 +27,7 @@ namespace JellyfinMod.Api;
 /// </remarks>
 [ApiController]
 [AllowAnonymous]
-[Route("JellyfinMod/Web")]
+[Route("web-mod")]
 public class WebController : ControllerBase
 {
     private static readonly FileExtensionContentTypeProvider ContentTypes = new();
@@ -94,5 +99,5 @@ public class WebController : ControllerBase
     /// proxy, so it is right for this request by construction.
     /// </summary>
     private string AssetRoot(string bundleId) =>
-        $"{Request.PathBase.Value?.TrimEnd('/') ?? string.Empty}/JellyfinMod/Web/{bundleId}/";
+        $"{Request.PathBase.Value?.TrimEnd('/') ?? string.Empty}/web-mod/{bundleId}/";
 }
