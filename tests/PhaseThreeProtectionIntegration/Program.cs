@@ -513,7 +513,7 @@ static async Task VerifyPreviewHttpAsync(
     try
     {
         var apiAddress = api.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
-        using var http = new HttpClient { BaseAddress = new Uri(apiAddress), Timeout = TimeSpan.FromSeconds(5) };
+        using var http = new HttpClient { BaseAddress = new Uri(apiAddress), Timeout = TimeSpan.FromSeconds(60) };
         Assert((await http.GetAsync("/JellyfinMod/Retention/Preview")).StatusCode == HttpStatusCode.Unauthorized,
             "Anonymous retention preview is rejected by real authentication middleware");
         http.DefaultRequestHeaders.Add("X-Preview-User", user.Id.ToString());

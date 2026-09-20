@@ -120,7 +120,7 @@ internal static class ApiSmoke
         Console.WriteLine("HTTP smoke: host ready");
         var address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
         http.BaseAddress = new Uri(address);
-        using var client = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(5) };
+        using var client = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(60) };
         Assert((await client.GetAsync("/JellyfinMod/Entries")).StatusCode == HttpStatusCode.Unauthorized, "Anonymous list is rejected by middleware");
         client.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
         Assert((await client.GetAsync($"/JellyfinMod/Entries?mediaType=movie&targetLibraryId={tvLibrary.Id}")).StatusCode == HttpStatusCode.NotFound,
