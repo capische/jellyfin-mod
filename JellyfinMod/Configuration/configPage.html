@@ -82,6 +82,8 @@
 
 .jfmod-dim{color:var(--jf-palette-text-secondary,rgba(255,255,255,.7))}
 .jfmod-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em}
+.jfmod-settings .emby-button.button-flat,.jfmod-sheet .emby-button.button-flat{color:var(--jf-palette-text-secondary,rgba(255,255,255,.7))}
+.jfmod-settings .emby-button.button-flat:hover,.jfmod-sheet .emby-button.button-flat:hover{color:var(--jf-palette-primary-main,#00a4dc);background:var(--jf-palette-action-hover,rgba(255,255,255,.08))}
 .jfmod-btn-sm{padding:.5em .8em!important;font-size:.92em;min-width:0}
 .jfmod-btn-icon{padding:.4em .55em!important;min-width:2.1em}
 .jfmod-danger-text{color:var(--jf-palette-error-main,#c62828)!important}
@@ -720,9 +722,9 @@
 <div class="jfmod-sheet-scrim" id="JfmodSheetScrim" hidden></div>
 <div class="jfmod-sheet" id="JfmodSheet" role="dialog" aria-modal="true" aria-labelledby="JfmodSheetTitle" hidden>
   <div class="jfmod-sheet-head">
-    <button is="emby-button" type="button" class="jfmod-btn-icon" id="JfmodSheetBack" aria-label="Back"><span>←</span></button>
+    <button is="emby-button" type="button" class="button-flat jfmod-btn-icon" id="JfmodSheetBack" aria-label="Back"><span>←</span></button>
     <h2 id="JfmodSheetTitle"></h2>
-    <button is="emby-button" type="button" class="jfmod-btn-sm jfmod-danger-text" id="JfmodSheetDelete"><span>Delete</span></button>
+    <button is="emby-button" type="button" class="button-flat jfmod-btn-sm jfmod-danger-text" id="JfmodSheetDelete"><span>Delete</span></button>
   </div>
   <div class="jfmod-sheet-body" id="JfmodSheetBody"></div>
   <div class="jfmod-sheet-foot">
@@ -1018,18 +1020,18 @@
           status.appendChild(words);
           row.appendChild(status);
           if (pending) {
-            row.appendChild(button('Undo', 'jfmod-btn-sm', function () {
+            row.appendChild(button('Undo', 'button-flat jfmod-btn-sm', function () {
               state.clearSecrets[key] = false;
               renderSecret(key, label, configured);
               var undone = $('[data-secret-slot="' + key + '"] button');
               if (undone) undone.focus();
             }));
           } else {
-            row.appendChild(button('Replace', 'jfmod-btn-sm', function () {
+            row.appendChild(button('Replace', 'button-flat jfmod-btn-sm', function () {
               edit.hidden = false;
               input.focus();
             }));
-            row.appendChild(button('Clear', 'jfmod-btn-sm jfmod-danger-text', function () {
+            row.appendChild(button('Clear', 'button-flat jfmod-btn-sm jfmod-danger-text', function () {
               state.clearSecrets[key] = true;
               renderSecret(key, label, configured);
               var undo = $('[data-secret-slot="' + key + '"] button');
@@ -1547,9 +1549,9 @@
           foot.appendChild(status);
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
-          actions.appendChild(button('↑', 'jfmod-btn-icon', function () { moveMapping(index, -1); }));
-          actions.appendChild(button('↓', 'jfmod-btn-icon', function () { moveMapping(index, 1); }));
-          actions.appendChild(button('Remove', 'jfmod-btn-sm jfmod-danger-text', function () {
+          actions.appendChild(button('↑', 'button-flat jfmod-btn-icon', function () { moveMapping(index, -1); }));
+          actions.appendChild(button('↓', 'button-flat jfmod-btn-icon', function () { moveMapping(index, 1); }));
+          actions.appendChild(button('Remove', 'button-flat jfmod-btn-sm jfmod-danger-text', function () {
             state.mappings.splice(index, 1);
             renderMappings();
             $('#AddMapping').focus();
@@ -1674,7 +1676,7 @@
 
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
-          var test = button('Test', 'jfmod-btn-sm', function () { testIndexer(indexer, test); });
+          var test = button('Test', 'button-flat jfmod-btn-sm', function () { testIndexer(indexer, test); });
           actions.appendChild(test);
           actions.appendChild(button('Edit', 'raised jfmod-btn-sm', function () { openIndexerSheet(indexer); }));
           row.appendChild(actions);
@@ -1856,7 +1858,7 @@
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
           if (!profile.isDefault) {
-            actions.appendChild(button('Make default', 'jfmod-btn-sm', function () { makeDefaultProfile(profile); }));
+            actions.appendChild(button('Make default', 'button-flat jfmod-btn-sm', function () { makeDefaultProfile(profile); }));
           }
           actions.appendChild(button('Edit', 'raised jfmod-btn-sm', function () { openProfileSheet(profile); }));
           row.appendChild(actions);
@@ -1975,11 +1977,11 @@
           }
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
-          var up = button('↑', 'jfmod-btn-icon', function () { moveQuality(index, -1, known); });
+          var up = button('↑', 'button-flat jfmod-btn-icon', function () { moveQuality(index, -1, known); });
           up.setAttribute('aria-label', 'Move ' + quality + ' up');
-          var down = button('↓', 'jfmod-btn-icon', function () { moveQuality(index, 1, known); });
+          var down = button('↓', 'button-flat jfmod-btn-icon', function () { moveQuality(index, 1, known); });
           down.setAttribute('aria-label', 'Move ' + quality + ' down');
-          var remove = button('Remove', 'jfmod-btn-sm', function () {
+          var remove = button('Remove', 'button-flat jfmod-btn-sm', function () {
             profileOrder.splice(index, 1);
             renderProfileQualities(known, undefined);
             var adderButton = $('#ProfileQualityAdd button', sheet.body);
@@ -2004,7 +2006,7 @@
         adder.appendChild(selectField('ProfileQualityToAdd', 'Quality to add', remaining.map(function (quality) {
           return { id: quality, name: quality };
         }), ''));
-        var add = button('Add to allowed', 'jfmod-btn-sm', function () {
+        var add = button('Add to allowed', 'button-flat jfmod-btn-sm', function () {
           var select = $('#ProfileQualityToAdd', sheet.body);
           if (!select || !select.value) return;
           profileOrder.push(select.value);
@@ -2565,7 +2567,7 @@
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
           ['Rebind', 'Keep'].forEach(function (action) {
-            actions.appendChild(button(action, action === 'Rebind' ? 'raised jfmod-btn-sm' : 'jfmod-btn-sm', function () {
+            actions.appendChild(button(action, action === 'Rebind' ? 'raised jfmod-btn-sm' : 'button-flat jfmod-btn-sm', function () {
               modRequest('POST', 'Reconciliation/Conflicts/' + conflict.id + '/' + action).then(loadAll, function (error) {
                 return fail('diagnostics', error);
               });
