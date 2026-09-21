@@ -884,29 +884,51 @@
       }
 
       // A control the server would refuse keeps its tab stop and its focus ring; only the
-      // look and the sentence beside it say no (UX §13, T19).
+      // look and the sentence beside it say no (UX §13, T19). The reason is announced through
+      // aria-describedby as well as the tooltip, so it is never a hover-only affordance.
+      var refusalIds = 0;
       function refuse(element, reason) {
         if (!element) return;
+        var describedBy = element.getAttribute('data-jfmod-reason');
         if (reason) {
           element.setAttribute('aria-disabled', 'true');
           element.setAttribute('title', reason);
+          if (!describedBy) {
+            describedBy = 'jfmod-reason-' + (++refusalIds);
+            element.setAttribute('data-jfmod-reason', describedBy);
+            var note = document.createElement('span');
+            note.id = describedBy;
+            note.className = 'jfmod-visually-hidden';
+            element.parentNode.insertBefore(note, element.nextSibling);
+          }
+          var target = document.getElementById(describedBy);
+          if (target) target.textContent = reason;
+          element.setAttribute('aria-describedby', describedBy);
         } else {
           element.removeAttribute('aria-disabled');
           element.removeAttribute('title');
+          element.removeAttribute('aria-describedby');
+          var stale = describedBy && document.getElementById(describedBy);
+          if (stale) stale.textContent = '';
         }
       }
       function refused(element) { return element && element.getAttribute('aria-disabled') === 'true'; }
 
+      // The label of a stock button lives in a span; swap that, not the button's whole content.
+      function labelNode(element) { return element.querySelector('span') || element; }
       function busy(element, isBusy, label) {
         if (!element) return;
+        var words = labelNode(element);
         if (isBusy) {
           element.classList.add('jfmod-busy');
           element.setAttribute('aria-disabled', 'true');
-          if (label) { element.dataset.jfmodLabel = element.textContent; element.textContent = label; }
+          element.setAttribute('aria-live', 'polite');
+          if (label) { element.dataset.jfmodLabel = words.textContent; words.textContent = label; }
         } else {
           element.classList.remove('jfmod-busy');
           element.removeAttribute('aria-disabled');
-          if (element.dataset.jfmodLabel) { element.textContent = element.dataset.jfmodLabel; delete element.dataset.jfmodLabel; }
+          element.removeAttribute('aria-live');
+          if (element.dataset.jfmodLabel) { words.textContent = element.dataset.jfmodLabel; delete element.dataset.jfmodLabel; }
         }
       }
 
@@ -1264,6 +1286,10 @@
         sheet.onDelete = options.onDelete;
         sheet.remove.hidden = !options.onDelete;
         refuse(sheet.remove, options.deleteRefusedBecause || null);
+        // A refusal is never only a tooltip: it is written into the sheet's own footer line.
+        if (options.deleteRefusedBecause) {
+          sheet.meta.textContent = (options.meta ? options.meta + ' · ' : '') + options.deleteRefusedBecause;
+        }
         sheet.root.hidden = false;
         sheet.scrim.hidden = false;
         var first = sheet.body.querySelector('input:not([type=hidden]), select, textarea, button');
@@ -2097,15 +2123,16 @@
         text($('[data-savemeta="grabbing"]'), 'Saved · revision ' + acquisition.revision);
       }
 
-      // A refused checkbox is still focusable and still clickable, so the click is what explains it.
+      // A refused checkbox is still focusable and still clickable; the click is what explains it.
+      // Rewriting the reason re-announces it through the live region beside the box.
       $('#AcquisitionEnabled').addEventListener('click', function (event) {
         if (!refused(event.currentTarget)) return;
         event.preventDefault();
         event.currentTarget.checked = false;
         var reason = $('#AcquisitionEnabledReason');
-        reason.textContent = reason.textContent;
-        reason.setAttribute('role', 'alert');
-        window.setTimeout(function () { reason.setAttribute('role', 'status'); }, 100);
+        var words = reason.textContent;
+        reason.textContent = '';
+        window.setTimeout(function () { reason.textContent = words; }, 50);
       });
 
       function saveGrabbing() {
@@ -2628,8 +2655,6 @@
           state.reconciliation = values[14];
           state.conflicts = values[15] || [];
           state.orphans = values[16] || [];
-          // "Grabbing" and "Indexers" read the same failure as the acquisition endpoints.
-          state.failed.profiles = state.failed.profiles && state.failed.grabbing;
 
           var chosen = state.client
             ? state.clients.filter(function (client) { return client.id === state.client.id; })[0]
