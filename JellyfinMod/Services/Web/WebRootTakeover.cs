@@ -144,8 +144,19 @@ public sealed class WebRootTakeover
                 return new TakeoverState { Status = "inconsistent", WebRoot = "writable", Blocker = "pristine_missing" };
             }
 
-            if (observedHash == record.PatchedSha256 && record.BundleId == bundle.BundleId)
+            if (observedHash == record.PatchedSha256
+                && record.BundleId == bundle.BundleId
+                && record.RendererVersion == WebDocumentRenderer.Version)
+            {
                 return Patched(record, "writable");
+            }
+
+            if (record.RendererVersion != WebDocumentRenderer.Version)
+            {
+                _logger.LogInformation(
+                    "JellyfinMod is re-rendering its patched index.html: it was written by renderer version {Old}, this build is {New}",
+                    record.RendererVersion, WebDocumentRenderer.Version);
+            }
 
             if (observedHash != record.PatchedSha256)
             {
@@ -194,8 +205,6 @@ public sealed class WebRootTakeover
                 throw new IOException("The pristine copy did not verify after it was written.");
         }
 
-        // Always render from the pristine copy, never from what is on disk: a marked file must never become the
-        // input to another render, or the document would accumulate layers of patching.
         var pristine = File.ReadAllText(pristinePath);
         var pristineHash = Hash(pristine);
         if (pristineHash != stockHash)
@@ -208,7 +217,19 @@ public sealed class WebRootTakeover
 
         WriteAtomic(Path.Combine(webRoot, WebDocumentRenderer.StockCopyName), pristine);
 
-        var patched = WebDocumentRenderer.Render(pristine, $"/web-mod/{bundle.BundleId}/", withFailsafe: true);
+        // Rendered from the BUNDLE's own document, never from the host's. The host's index.html lists the host's
+        // own scripts; rewriting those URLs to point into our bundle would load the bundle's *stock* entry, which
+        // is a working Jellyfin but not this interface. The bundle document is also never a patched file, so
+        // patches still cannot stack — the pristine copy's job is to be the way back, not the input.
+        var source = Path.Combine(bundle.Directory, WebBundleStore.DocumentName);
+        if (!File.Exists(source))
+        {
+            _logger.LogError("JellyfinMod will not patch: bundle {BundleId} has no {Document}", bundle.BundleId, WebBundleStore.DocumentName);
+            return new TakeoverState { Status = "stock", WebRoot = "writable", Blocker = "web_bundle_corrupt" };
+        }
+
+        var patched = WebDocumentRenderer.Render(
+            File.ReadAllText(source), $"/web-mod/{bundle.BundleId}/", withFailsafe: true);
         WriteAtomic(indexPath, patched);
         var patchedHash = Hash(patched);
 
@@ -218,6 +239,7 @@ public sealed class WebRootTakeover
             StockSha256 = stockHash,
             PatchedSha256 = patchedHash,
             BundleId = bundle.BundleId,
+            RendererVersion = WebDocumentRenderer.Version,
             PatchedAt = DateTime.UtcNow,
             PatchedBy = PatchedBy(reason, record)
         };
@@ -373,6 +395,10 @@ public sealed record TakeoverRecord
     /// <summary>Gets the bundle the patched document points at.</summary>
     [JsonPropertyName("bundleId")]
     public string? BundleId { get; init; }
+
+    /// <summary>Gets the renderer version that produced the patched document.</summary>
+    [JsonPropertyName("rendererVersion")]
+    public int RendererVersion { get; init; }
 
     /// <summary>Gets when the patch was applied.</summary>
     [JsonPropertyName("patchedAt")]

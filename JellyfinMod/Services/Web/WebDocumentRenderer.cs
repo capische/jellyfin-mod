@@ -26,6 +26,18 @@ public static partial class WebDocumentRenderer
     /// <summary>The stock copy the failsafe falls back to, written beside the patched document.</summary>
     public const string StockCopyName = "index.jellyfinmod-stock.html";
 
+    /// <summary>
+    /// How this renderer builds a document. Bumped whenever the output changes for the same inputs.
+    /// </summary>
+    /// <remarks>
+    /// The takeover re-renders when the bundle changes, which is almost always the right trigger — but a plugin
+    /// upgrade can change the rendering itself while the bundle stays put, and without this the engine would look
+    /// at a correctly-recorded patched file and decide there was nothing to do. That failure is silent and
+    /// survives restarts, which is the worst combination, so the renderer states its own version and the engine
+    /// treats a change in it exactly like a change of bundle.
+    /// </remarks>
+    public const int Version = 2;
+
     /// <summary>Renders the served document with its assets rooted at <paramref name="assetRoot"/>.</summary>
     /// <param name="document">The bundle's own <c>jellyfinmod.html</c>.</param>
     /// <param name="assetRoot">Absolute path the bundle's files are served from, with a trailing slash.</param>
@@ -48,9 +60,10 @@ public static partial class WebDocumentRenderer
 
         if (withFailsafe)
         {
-            // Every entry script and stylesheet reports its own failure, so a bundle that is gone or unreachable
-            // is noticed at the first missing file rather than as a blank page.
-            rewritten = ScriptOrLink().Replace(rewritten, match =>
+            // Only the files the interface cannot run without: entry scripts and stylesheets. A manifest or a
+            // touch icon that fails to load is cosmetic, and tearing the page down to stock over one would be a
+            // far worse failure than the one it was reacting to.
+            rewritten = ScriptOrStylesheet().Replace(rewritten, match =>
                 match.Value.Contains("onerror", StringComparison.OrdinalIgnoreCase)
                     ? match.Value
                     : match.Value[..^1] + " onerror=\"__jfmodStock()\">");
@@ -138,8 +151,8 @@ public static partial class WebDocumentRenderer
     [GeneratedRegex("<head(?:\\s[^>]*)?>", RegexOptions.IgnoreCase)]
     private static partial Regex HeadTag();
 
-    [GeneratedRegex("<(?:script|link)\\s[^>]*>", RegexOptions.IgnoreCase)]
-    private static partial Regex ScriptOrLink();
+    [GeneratedRegex("<script\\s[^>]*\\bsrc\\s*=[^>]*>|<link\\s[^>]*rel\\s*=\\s*\"stylesheet\"[^>]*>", RegexOptions.IgnoreCase)]
+    private static partial Regex ScriptOrStylesheet();
 
     [GeneratedRegex("^[a-z][a-z0-9+.-]*:", RegexOptions.IgnoreCase)]
     private static partial Regex AbsoluteScheme();
