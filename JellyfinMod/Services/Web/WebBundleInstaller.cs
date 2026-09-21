@@ -16,6 +16,7 @@ namespace JellyfinMod.Services.Web;
 public sealed class WebBundleInstaller(
     WebBundleStore store,
     WebRootTakeover takeover,
+    PluginRepository repository,
     IApplicationPaths paths,
     ILogger<WebBundleInstaller> logger) : IHostedService
 {
@@ -34,6 +35,10 @@ public sealed class WebBundleInstaller(
                 (paths as IServerApplicationPaths)?.WebPath,
                 "startup",
                 cancellationToken).ConfigureAwait(false);
+
+            // Built here rather than on the first Dashboard visit, so opening the plugin page is not the thing
+            // that pays for zipping the package.
+            await repository.PublishAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {

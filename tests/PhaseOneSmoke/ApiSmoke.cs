@@ -9,6 +9,7 @@ using JellyfinMod;
 using JellyfinMod.Api;
 using JellyfinMod.Data;
 using JellyfinMod.Services;
+using JellyfinMod.Services.Web;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
@@ -86,6 +87,14 @@ internal static class ApiSmoke
         var configuration = Stub<IServerConfigurationManager>.Create((method, args) => method.Name == "get_Configuration"
             ? new ServerConfiguration { SortRemoveWords = ["the", "a"], SortRemoveCharacters = [], SortReplaceCharacters = [] } : null);
         builder.Services.AddTransient(_ => new CatalogSortName(configuration));
+        // P7.S5: the repository publishes itself from JPRM's meta.json, so a directory shaped like an
+        // installed plugin is all it needs to be exercised over real HTTP.
+        var packageFolder = Path.Combine(folder, "package");
+        Directory.CreateDirectory(packageFolder);
+        File.WriteAllText(Path.Combine(packageFolder, "meta.json"), "{\"category\":\"General\",\"changelog\":\"smoke\",\"description\":\"Smoke description\",\"guid\":\"6f1a2b3c-4d5e-4f60-9a71-8b2c3d4e5f60\",\"name\":\"JellyfinMod\",\"overview\":\"Smoke overview\",\"owner\":\"kxalex\",\"targetAbi\":\"10.11.0.0\",\"timestamp\":\"2026-09-19T10:49:06.0000000Z\",\"version\":\"0.1.0.0\"}");
+        File.WriteAllText(Path.Combine(packageFolder, "JellyfinMod.dll"), "a real file to package, not a real assembly");
+        builder.Services.AddSingleton(_ => new PluginRepository(
+            packageFolder, Path.Combine(folder, "repo-data"), NullLogger<PluginRepository>.Instance));
         builder.Services.AddSingleton(Stub<IDtoService>.Create((method, args) => method.Name == "GetBaseItemDto"
             ? new BaseItemDto { Id = ((BaseItem)args![0]!).Id, Name = ((BaseItem)args[0]!).Name } : null));
         builder.Services.AddSingleton(Stub<IUserDataManager>.Create((method, args) => method.Name == "GetUserData" ? new UserItemData { Key = "smoke" } : null));
@@ -677,6 +686,41 @@ internal static class ApiSmoke
                     .Select(value => value.GetString()).Contains("browse.dueWithinDays"),
                 "Health advertises capabilities so newer clients can gate newer request fields");
         }
+        // P7.S5: the plugin publishes a repository the server can install from, so the Dashboard details
+        // panel has a package to describe. A manifest whose checksum disagrees with the file it points at is
+        // worse than no manifest -- the server downloads it and then refuses it -- so both are checked.
+        using (var manifestResponse = await client.GetAsync("/JellyfinMod/Repository"))
+        {
+            Assert(manifestResponse.IsSuccessStatusCode, "The repository manifest is served");
+            using var manifest = JsonDocument.Parse(await manifestResponse.Content.ReadAsStringAsync());
+            var package = manifest.RootElement.EnumerateArray().Single();
+            Assert(package.GetProperty("guid").GetString() == "6f1a2b3c-4d5e-4f60-9a71-8b2c3d4e5f60",
+                "The manifest carries the plugin's own guid, so the server matches it to the installed plugin");
+            var version = package.GetProperty("versions").EnumerateArray().Single();
+            foreach (var required in new[] { "version", "changelog", "targetAbi", "sourceUrl", "checksum", "timestamp" })
+            {
+                Assert(version.TryGetProperty(required, out var value) && !string.IsNullOrEmpty(value.GetString()),
+                    $"The manifest version carries {required}, which the server requires");
+            }
+
+            Assert(version.GetProperty("targetAbi").GetString() == "10.11.0.0",
+                "The manifest takes targetAbi from meta.json rather than restating it");
+
+            var sourceUrl = version.GetProperty("sourceUrl").GetString()!;
+            using var packageResponse = await client.GetAsync(new Uri(sourceUrl).AbsolutePath);
+            Assert(packageResponse.IsSuccessStatusCode, "The manifest sourceUrl resolves to the package");
+            var bytes = await packageResponse.Content.ReadAsByteArrayAsync();
+            var checksum = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(bytes));
+            Assert(string.Equals(checksum, version.GetProperty("checksum").GetString(), StringComparison.OrdinalIgnoreCase),
+                "The served package hashes to the checksum the manifest claims, so the server accepts the download");
+        }
+
+        using (var missingPackage = await client.GetAsync("/JellyfinMod/Repository/JellyfinMod_9.9.9.9.zip"))
+        {
+            Assert(missingPackage.StatusCode == HttpStatusCode.NotFound,
+                "The repository serves only the package its manifest names");
+        }
+
         // P2.R8: an Add that cannot get the library in time reports "library busy", not a TMDB timeout.
         http.Response = null;
         http.BeforeResponse = null;
