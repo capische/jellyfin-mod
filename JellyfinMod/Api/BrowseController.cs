@@ -112,8 +112,16 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             candidates = candidates.Where(row => row.Entry is { State: FileState.OnDisk } &&
                 dueEntryIds.Contains(row.Entry.Id));
         }
-        // Across libraries, the native copy that carries the bound entry (and its retention summary) wins (P1.P10).
-        if (!request.TargetLibraryId.HasValue) candidates = candidates.GroupBy(row => row.TitleIdentity).Select(group => group
+        // One row per title, always: the native copy that carries the bound entry (and its retention summary)
+        // wins (P1.P10, PHASE1 "never see duplicates of accessible owned titles").
+        //
+        // This used to run only when browsing across libraries, on the assumption that a single library cannot
+        // hold the same title twice. It can: an unbound catalog entry and the native item for the same TMDB id
+        // both name the same title, and the grid then showed every such show twice — 105 series became 162 rows
+        // on the acceptance library, 55 of them duplicates (P7.S6). Binding is what should have collapsed them,
+        // but a missing binding is a reconciliation lag, not a licence to show the user the same show twice, so
+        // the display rule holds on its own.
+        candidates = candidates.GroupBy(row => row.TitleIdentity).Select(group => group
             .OrderBy(row => row.Native is null).ThenBy(row => row.Entry is null)
             .ThenBy(row => row.Identity, StringComparer.Ordinal).First());
         var filtered = candidates.ToArray();
