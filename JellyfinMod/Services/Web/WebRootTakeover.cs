@@ -39,17 +39,20 @@ public sealed class WebRootTakeover
     private readonly string _stateDirectory;
     private readonly WebBundleStore _bundles;
     private readonly ILogger<WebRootTakeover> _logger;
+    private readonly string _baseUrl;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     /// <summary>Initializes a new instance of the <see cref="WebRootTakeover"/> class.</summary>
     /// <param name="dataPath">The plugin's version-independent data directory.</param>
     /// <param name="bundles">The installed bundles.</param>
     /// <param name="logger">The logger.</param>
-    public WebRootTakeover(string dataPath, WebBundleStore bundles, ILogger<WebRootTakeover> logger)
+    /// <param name="baseUrl">The host's configured URL prefix.</param>
+    public WebRootTakeover(string dataPath, WebBundleStore bundles, ILogger<WebRootTakeover> logger, string baseUrl = "")
     {
         _stateDirectory = Path.Combine(dataPath, "web-root");
         _bundles = bundles;
         _logger = logger;
+        _baseUrl = string.IsNullOrEmpty(baseUrl.Trim('/')) ? string.Empty : "/" + baseUrl.Trim('/');
     }
 
     /// <summary>Gets the last observed state.</summary>
@@ -146,7 +149,8 @@ public sealed class WebRootTakeover
 
             if (observedHash == record.PatchedSha256
                 && record.BundleId == bundle.BundleId
-                && record.RendererVersion == WebDocumentRenderer.Version)
+                && record.RendererVersion == WebDocumentRenderer.Version
+                && record.BaseUrl == _baseUrl)
             {
                 return Patched(record, "writable");
             }
@@ -181,7 +185,7 @@ public sealed class WebRootTakeover
     }
 
     /// <summary>
-    /// Writes the pristine copy, the stock copy and the patched document, in that order.
+    /// Writes the pristine copy, the stock copy, the recovery record and then the patched document.
     /// </summary>
     /// <remarks>
     /// Order is the safety property. Nothing replaces <c>index.html</c> until a verified copy of the original
@@ -229,8 +233,7 @@ public sealed class WebRootTakeover
         }
 
         var patched = WebDocumentRenderer.Render(
-            File.ReadAllText(source), $"/web-mod/{bundle.BundleId}/", withFailsafe: true);
-        WriteAtomic(indexPath, patched);
+            File.ReadAllText(source), $"{_baseUrl}/web-mod/{bundle.BundleId}/", withFailsafe: true);
         var patchedHash = Hash(patched);
 
         var updated = new TakeoverRecord
@@ -240,10 +243,15 @@ public sealed class WebRootTakeover
             PatchedSha256 = patchedHash,
             BundleId = bundle.BundleId,
             RendererVersion = WebDocumentRenderer.Version,
+            BaseUrl = _baseUrl,
             PatchedAt = DateTime.UtcNow,
             PatchedBy = PatchedBy(reason, record)
         };
+        // The record is a write-ahead recovery record: even if the process stops at the next rename,
+        // restart can verify the pristine copy and reconcile either the old or the new live document.
+        // A failed metadata write must never leave a newly patched index without recovery information.
         WriteState(updated);
+        WriteAtomic(indexPath, patched);
 
         _logger.LogInformation(
             "JellyfinMod replaced the Jellyfin web interface at /web with bundle {BundleId} ({Reason}). "
@@ -399,6 +407,10 @@ public sealed record TakeoverRecord
     /// <summary>Gets the renderer version that produced the patched document.</summary>
     [JsonPropertyName("rendererVersion")]
     public int RendererVersion { get; init; }
+
+    /// <summary>Gets the host URL prefix used to render the document.</summary>
+    [JsonPropertyName("baseUrl")]
+    public string BaseUrl { get; init; } = string.Empty;
 
     /// <summary>Gets when the patch was applied.</summary>
     [JsonPropertyName("patchedAt")]

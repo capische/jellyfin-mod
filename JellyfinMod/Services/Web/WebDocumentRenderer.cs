@@ -36,7 +36,7 @@ public static partial class WebDocumentRenderer
     /// survives restarts, which is the worst combination, so the renderer states its own version and the engine
     /// treats a change in it exactly like a change of bundle.
     /// </remarks>
-    public const int Version = 2;
+    public const int Version = 3;
 
     /// <summary>Renders the served document with its assets rooted at <paramref name="assetRoot"/>.</summary>
     /// <param name="document">The bundle's own <c>jellyfinmod.html</c>.</param>
@@ -97,7 +97,8 @@ public static partial class WebDocumentRenderer
     /// <para>
     /// <c>XMLHttpRequest</c> and <c>document.write</c> are deliberate rather than dated: they work on the oldest
     /// webOS engines this fork supports, where <c>fetch</c> and module scripts do not. A <c>sessionStorage</c>
-    /// latch stops a failing stock page from reloading itself for ever.
+    /// latch limits redirects when even the stock copy cannot be fetched. Successful stock recovery clears it,
+    /// and a later visit can always try the stock copy again.
     /// </para>
     /// </remarks>
     private const string Failsafe = """
@@ -105,18 +106,25 @@ public static partial class WebDocumentRenderer
           var KEY = 'jfmod-stock-fallback';
           var STOCK = 'index.jellyfinmod-stock.html';
           var done = false;
+          function redirectToStock() {
+            // Only redirects need a tab-wide latch. A later visit must still try the stock XHR.
+            if (location.pathname.slice(-STOCK.length) === STOCK) { return; }
+            try { if (sessionStorage.getItem(KEY)) { return; } sessionStorage.setItem(KEY, '1'); } catch (e) {}
+            location.replace(STOCK + location.search + location.hash);
+          }
           window.__jfmodStock = function () {
             if (done) { return; }
             done = true;
-            try { if (sessionStorage.getItem(KEY)) { return; } sessionStorage.setItem(KEY, '1'); } catch (e) {}
             var request = new XMLHttpRequest();
             request.open('GET', STOCK, true);
             request.onload = function () {
-              if (request.status >= 200 && request.status < 300 && request.responseText) {
+              if (request.status >= 200 && request.status < 300 && request.responseText
+                  && request.responseText.indexOf('<!-- jellyfinmod:takeover -->') === -1) {
+                try { sessionStorage.removeItem(KEY); } catch (e) {}
                 document.open(); document.write(request.responseText); document.close();
-              } else { location.replace(STOCK + location.search + location.hash); }
+              } else { redirectToStock(); }
             };
-            request.onerror = function () { location.replace(STOCK + location.search + location.hash); };
+            request.onerror = redirectToStock;
             request.send(null);
           };
           window.addEventListener('DOMContentLoaded', function () {

@@ -4,7 +4,9 @@ using JellyfinMod.Services.Acquisition;
 using JellyfinMod.Services.Automation;
 using JellyfinMod.Services.Import;
 using JellyfinMod.Services.Web;
+using MediaBrowser.Common.Net;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -64,7 +66,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton(provider => new WebRootTakeover(
             Plugin.Instance!.DataPath,
             provider.GetRequiredService<WebBundleStore>(),
-            provider.GetRequiredService<ILogger<WebRootTakeover>>()));
+            provider.GetRequiredService<ILogger<WebRootTakeover>>(),
+            provider.GetRequiredService<IServerConfigurationManager>().GetNetworkConfiguration().BaseUrl));
         services.AddSingleton(provider => new PluginRepository(
             Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? Plugin.Instance!.DataPath,
             Plugin.Instance!.DataPath,
