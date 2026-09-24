@@ -734,6 +734,45 @@ static async Task VerifyPreviewHttpAsync(
         Assert(verified.Reason == "kept" && File.Exists(episodeMedia),
             $"A verified file passes the identity check and meets the next protection, its episode Keep ({verified.Reason})");
 
+        // RET2-R9: a per-file Keep follows its file within one filesystem and is lost when the file moves to another. The
+        // Linux runner mounts a second filesystem at JFMOD_XFS (a tmpfs); the binding and native path follow each move as
+        // reconciliation records them.
+        var otherFilesystem = Environment.GetEnvironmentVariable("JFMOD_XFS");
+        if (string.IsNullOrEmpty(otherFilesystem) || !Directory.Exists(otherFilesystem))
+        {
+            Console.WriteLine("SKIP: per-file Keep across filesystems needs JFMOD_XFS, a directory on a second filesystem");
+        }
+        else
+        {
+            async Task MoveEpisodeAsync(string target)
+            {
+                File.Move(nativeEpisode.Path!, target);
+                nativeEpisode.Path = target;
+                await using var moveDatabase = new ModDbContext(databasePath);
+                var binding = await moveDatabase.EpisodeBindings.SingleAsync(candidate => candidate.Id == episodeBindingId);
+                binding.MediaPath = target;
+                await moveDatabase.SaveChangesAsync();
+            }
+
+            async Task<bool?> EpisodeFileKeptAsync()
+            {
+                using var keptDetail = await http.GetFromJsonAsync<JsonDocument>($"/JellyfinMod/Entries/{seriesEntry.Id}");
+                var versions = keptDetail!.RootElement.GetProperty("episodes")[0].GetProperty("versions");
+                return versions.GetArrayLength() == 1 && versions[0].TryGetProperty("kept", out var value) ? value.GetBoolean() : null;
+            }
+
+            Assert((await http.PostAsync(versionBase, null)).IsSuccessStatusCode, "Keep the episode's file by itself");
+            Assert(await EpisodeFileKeptAsync() == true, "The kept file reads as kept");
+            var renamed = Path.Combine(Path.GetDirectoryName(episodeMedia)!, "episode renamed.mkv");
+            await MoveEpisodeAsync(renamed);
+            Assert(await EpisodeFileKeptAsync() == true, "Renamed within one filesystem, the file is still kept (same device and inode)");
+            await MoveEpisodeAsync(Path.Combine(otherFilesystem, "episode.mkv"));
+            Assert(await EpisodeFileKeptAsync() == false, "Moved to another filesystem, the file is no longer kept (RET2-R9)");
+            await MoveEpisodeAsync(episodeMedia);
+            Assert(await EpisodeFileKeptAsync() == true, "A file back at the kept path is kept by its path");
+            Assert((await http.DeleteAsync(versionBase)).IsSuccessStatusCode, "Stop keeping the file again");
+        }
+
         using var kept = await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Keep", null);
         var keptBody = await kept.Content.ReadAsStringAsync();
         Assert(kept.IsSuccessStatusCode, "An administrator can keep a series: " +
