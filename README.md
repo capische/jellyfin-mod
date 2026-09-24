@@ -152,7 +152,15 @@ is re-patched with the new bundle at startup.
 **Rollback:** an older image tag rolls back Jellyfin, not the plugin: a newer plugin already in the
 config volume stays, because its database migrations are forward-only. To run an older plugin,
 remove `/config/plugins/JellyfinMod_<newer>/` with the container stopped, knowing the database
-may carry migrations that version does not know.
+may carry migrations that version does not know. **Settings do not roll back with it.** Since the
+Phase 7 settings contract (plugin `8efe9ea`) the TMDB token reference and the seed-protection
+connection live in the plugin database, and the one-time import empties them from the XML
+configuration. A plugin older than that reads only the XML, so after such a rollback discovery reports
+that an administrator must configure a token and retention blocks on `transmission_unconfigured`,
+although the token and password are still in the secret store. Nothing is lost and nothing is
+deleted (retention fails safe), but the older build needs the TMDB token and the seed-protection
+Transmission entered again on its own Dashboard page. Going forward again, the newer plugin imports
+whatever the older one saved, and removes a secret only when nothing references it any more.
 **Manual recovery** if `/web` is ever broken: recreate the container (its web directory is stock
 again), or copy `index.jellyfinmod-stock.html` over `index.html` in the web directory, or copy
 `/config/data/jellyfinmod/web-root/index.html.pristine`. None of these needs the Dashboard.
