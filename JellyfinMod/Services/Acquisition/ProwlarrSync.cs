@@ -358,7 +358,11 @@ public sealed class ProwlarrSync(
     private sealed record RemoteIndexer(int Id, string Name, string Protocol, bool Enable, int Priority, int[] Categories, string[] DownloadHosts);
 }
 
-/// <summary>Scheduled Prowlarr sync, every six hours by default (PHASE7 §6).</summary>
+/// <summary>
+/// Scheduled Prowlarr sync (PHASE7 §6). The task wakes every 15 minutes, the shortest interval a source may ask
+/// for, and syncs each enabled source whose own <c>SyncIntervalMinutes</c> (360 by default) has passed since its
+/// last sync (REVIEW-2026-09-24 S9-R1).
+/// </summary>
 public sealed class ProwlarrSyncTask(IServiceScopeFactory scopeFactory) : IScheduledTask, IConfigurableScheduledTask
 {
     /// <inheritdoc />
@@ -384,15 +388,23 @@ public sealed class ProwlarrSyncTask(IServiceScopeFactory scopeFactory) : ISched
 
     /// <inheritdoc />
     public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() =>
-        [new() { Type = TaskTriggerInfoType.IntervalTrigger, IntervalTicks = TimeSpan.FromHours(6).Ticks }];
+        [new() { Type = TaskTriggerInfoType.IntervalTrigger, IntervalTicks = WakeInterval.Ticks }];
+
+    /// <summary>How often the task looks for a source that is due; the smallest interval a source may set.</summary>
+    public static readonly TimeSpan WakeInterval = TimeSpan.FromMinutes(15);
 
     /// <inheritdoc />
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
     {
         using var scope = scopeFactory.CreateScope();
         var sync = scope.ServiceProvider.GetRequiredService<ProwlarrSync>();
-        var ids = await scope.ServiceProvider.GetRequiredService<ModDbContext>().ProwlarrSources.AsNoTracking().Where(source => source.Enabled)
-            .Select(source => source.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var now = scope.ServiceProvider.GetRequiredService<TimeProvider>().GetUtcNow().UtcDateTime;
+        var sources = await scope.ServiceProvider.GetRequiredService<ModDbContext>().ProwlarrSources.AsNoTracking().Where(source => source.Enabled)
+            .Select(source => new { source.Id, source.LastSyncAt, source.SyncIntervalMinutes }).ToListAsync(cancellationToken).ConfigureAwait(false);
+        // A minute of slack so a trigger that fires a moment early does not push a due source a whole wake later.
+        var ids = sources.Where(source => source.LastSyncAt is not { } last ||
+                now - last >= TimeSpan.FromMinutes(source.SyncIntervalMinutes) - TimeSpan.FromMinutes(1))
+            .Select(source => source.Id).ToList();
         for (var index = 0; index < ids.Count; index++)
         {
             await sync.SyncByIdAsync(ids[index], cancellationToken).ConfigureAwait(false);

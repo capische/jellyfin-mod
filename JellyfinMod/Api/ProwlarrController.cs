@@ -68,16 +68,47 @@ public sealed class ProwlarrController(
         if (request.Revision != source.Revision)
             return Conflict(Problem("revision_conflict", "This configuration changed since it was loaded. Reload and try again."));
         var previous = source.ApiKeySecretRef;
+        var previousBase = source.BaseUrl;
         source.Name = request.Name.Trim();
         source.BaseUrl = request.BaseUrl.Trim().TrimEnd('/');
         source.Enabled = request.Enabled;
         source.SyncIntervalMinutes = request.SyncIntervalMinutes;
         if (request.ApiKey.Action == "replace") source.ApiKeySecretRef = await secrets.AddAsync(request.ApiKey.Value!, cancellationToken);
         source.Revision++;
+        var moved = !string.Equals(previousBase, source.BaseUrl, StringComparison.Ordinal);
+        if (moved) await MoveSyncedIndexersAsync(source, previousBase, cancellationToken);
         if (await SaveAsync(cancellationToken) is { } conflict) return conflict;
         if (previous != source.ApiKeySecretRef) await secrets.RemoveAsync(previous, CancellationToken.None);
         cache.Invalidate();
+        // Re-verify at the new address now rather than at the next scheduled sync; its outcome is on the source.
+        if (moved && source.Enabled) await sync.SyncByIdAsync(source.Id, cancellationToken);
+        database.ChangeTracker.Clear();
+        source = await database.ProwlarrSources.SingleAsync(value => value.Id == id, cancellationToken);
         return await ToDtoAsync(source, cancellationToken);
+    }
+
+    /// <summary>
+    /// Points every synced indexer at the source's new address in the same save that moves the source, so no search,
+    /// <c>t=caps</c> or download ever goes to the old host with the source's key (REVIEW-2026-09-24 S9-R3). The
+    /// feeds must prove themselves again at the new address.
+    /// </summary>
+    private async Task MoveSyncedIndexersAsync(ProwlarrSource source, string previousBase, CancellationToken cancellationToken)
+    {
+        var oldHost = new Uri(previousBase).Host;
+        var newBase = new Uri(source.BaseUrl.TrimEnd('/') + "/");
+        var rows = await database.AcquisitionIndexers.Where(indexer => indexer.ProwlarrSourceId == source.Id).ToListAsync(cancellationToken);
+        foreach (var row in rows)
+        {
+            if (row.ProwlarrIndexerId is { } prowlarrId) row.BaseUrl = new Uri(newBase, $"{prowlarrId}/api").ToString();
+            var hosts = row.DownloadHosts.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(host => string.Equals(host, oldHost, StringComparison.OrdinalIgnoreCase) ? newBase.Host : host)
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+            row.DownloadHosts = string.Join(',', hosts);
+            row.Revision++;
+            row.VerifiedRevision = null;
+            row.CapabilitiesJson = null;
+            row.CapabilitiesFetchedAt = null;
+        }
     }
 
     /// <summary>Removes the source and its synced indexers, unless a grab through one is still active.</summary>

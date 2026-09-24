@@ -87,7 +87,11 @@ public sealed partial class AcquisitionSettingsController(
             indexer.MinimumSeedMinutes = request.MinimumSeedMinutes;
             if (request.MinIntervalSeconds is { } managedInterval) indexer.MinIntervalSeconds = managedInterval;
             if (request.DailyQueryBudget is { } managedBudget) indexer.DailyQueryBudget = managedBudget;
+            // None of these fields changes the endpoint its capabilities describe, so a verified indexer stays
+            // verified (REVIEW-2026-09-24 S9-R2); an unverified one still waits for the next sync or a Test.
+            var stillVerified = indexer.VerifiedRevision == indexer.Revision;
             indexer.Revision++;
+            if (stillVerified) indexer.VerifiedRevision = indexer.Revision;
             if (await SaveAsync(cancellationToken) is { } managedConflict) return managedConflict;
             return ToDto(indexer);
         }

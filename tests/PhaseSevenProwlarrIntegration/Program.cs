@@ -183,6 +183,11 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         }), 200, "Administrator changes the synced indexer's budget");
         Assert(patched.GetProperty("dailyQueryBudget").GetInt32() == 7 && patched.GetProperty("name").GetString() == "Alpha (Prowlarr)" &&
             patched.GetProperty("baseUrl").GetString() == alpha.GetProperty("baseUrl").GetString(), "Only the override fields change on a synced indexer");
+        Assert(patched.GetProperty("verified").GetBoolean(),
+            "S9-R2: a budget change on a verified synced indexer keeps it verified (its endpoint did not change)");
+        var readiness = await Read(admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition reads");
+        Assert(!readiness.GetProperty("blockers").EnumerateArray().Any(value => value.GetString() == "no_verified_indexer"),
+            "S9-R2: with the synced indexer the only verified one, acquisition readiness still has a verified indexer after the edit");
         await Expect(Read(admin.DeleteAsync($"/JellyfinMod/Settings/Indexers/{alphaId}"), 409, "Deleting a synced indexer is refused"), "prowlarr_managed");
         for (var run = 0; run < 3; run++) await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Sync", null), 200, "Sync");
         Assert(Synced(await Indexers(), 1).GetProperty("dailyQueryBudget").GetInt32() == 7, "The budget override survives three syncs");
@@ -201,6 +206,75 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         test = await Read(admin.PostAsync($"/JellyfinMod/Settings/Indexers/{alphaId}/Test", null), 200, "Synced indexer test");
         Assert(test.GetProperty("ok").GetBoolean() && torznab.Indexers["alpha"].Queries.Last().Contains("apikey=" + rotated, StringComparison.Ordinal),
             "The next request through a synced indexer uses the rotated key");
+
+        // ---- S9-R3: Prowlarr moves host. The synced feeds follow in the same save and are re-verified at the new
+        //      address; the old boundary receives nothing more, not even with the new key.
+        await using (var moved = new ProwlarrBoundary(torznab, "127.0.0.2"))
+        {
+            await moved.StartAsync();
+            moved.ApiKey = prowlarr.ApiKey;
+            foreach (var pair in prowlarr.Indexers) moved.Indexers[pair.Key] = (JsonObject)pair.Value.DeepClone();
+            foreach (var pair in prowlarr.Feeds) moved.Feeds[pair.Key] = pair.Value;
+            var oldRequests = prowlarr.Requests;
+            source = (await Read(admin.GetAsync("/JellyfinMod/Settings/Prowlarr"), 200, "Sources")).EnumerateArray().Single();
+            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
+            {
+                name = "Prowlarr", baseUrl = moved.Address.ToString(), apiKey = new { action = "unchanged" }, revision = source.GetProperty("revision").GetInt32()
+            }), 200, "Administrator moves the source to a new host");
+            alpha = Synced(await Indexers(), 1);
+            Assert(alpha.GetProperty("baseUrl").GetString() == new Uri(moved.Address, "/1/api").ToString() &&
+                alpha.GetProperty("downloadHosts").EnumerateArray().Select(value => value.GetString()).SequenceEqual(["127.0.0.2", "alpha.example"]) &&
+                alpha.GetProperty("verified").GetBoolean() && Synced(await Indexers(), 2).GetProperty("baseUrl").GetString()!.StartsWith(moved.Address.ToString(), StringComparison.Ordinal),
+                "S9-R3: the synced feeds and the download allow-list name the new host at once, re-verified there");
+            test = await Read(admin.PostAsync($"/JellyfinMod/Settings/Indexers/{alphaId}/Test", null), 200, "Synced indexer test after the move");
+            Assert(test.GetProperty("ok").GetBoolean() && moved.FeedRequests > 0, "S9-R3: t=caps reaches the new host");
+            Assert(prowlarr.Requests == oldRequests, "S9-R3: the old host receives nothing after the move");
+            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
+            {
+                name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "unchanged" }, revision = source.GetProperty("revision").GetInt32()
+            }), 200, "Administrator moves the source back");
+            Assert(Synced(await Indexers(), 1).GetProperty("baseUrl").GetString() == new Uri(prowlarr.Address, "/1/api").ToString() &&
+                Synced(await Indexers(), 1).GetProperty("verified").GetBoolean(), "Moving back re-points and re-verifies the feeds");
+        }
+
+        // ---- S9-R1: the scheduled task honours the source's own interval.
+        var task = new JellyfinMod.Services.Acquisition.ProwlarrSyncTask(host.Service<IServiceScopeFactory>());
+        Assert(task.GetDefaultTriggers().Single().IntervalTicks == TimeSpan.FromMinutes(15).Ticks, "The sync task wakes every 15 minutes");
+        async Task<DateTime?> LastSync()
+        {
+            await using var database = new ModDbContext(dbPath);
+            return (await database.ProwlarrSources.AsNoTracking().SingleAsync()).LastSyncAt;
+        }
+
+        async Task SetInterval(int minutes)
+        {
+            var current = (await Read(admin.GetAsync("/JellyfinMod/Settings/Prowlarr"), 200, "Sources")).EnumerateArray().Single();
+            await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
+            {
+                name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "unchanged" }, syncIntervalMinutes = minutes,
+                enabled = true, revision = current.GetProperty("revision").GetInt32()
+            }), 200, $"Administrator sets the interval to {minutes} minutes");
+        }
+
+        await SetInterval(60);
+        await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Sync", null), 200, "Sync");
+        var synced = await LastSync();
+        time.Offset += TimeSpan.FromMinutes(30);
+        await task.ExecuteAsync(new Progress<double>(), default);
+        Assert(await LastSync() == synced, "S9-R1: 30 minutes into a 60-minute interval the task does not sync");
+        time.Offset += TimeSpan.FromMinutes(31);
+        await task.ExecuteAsync(new Progress<double>(), default);
+        var resynced = await LastSync();
+        Assert(resynced > synced, "S9-R1: once 60 minutes have passed the task syncs");
+        await SetInterval(15);
+        time.Offset += TimeSpan.FromMinutes(16);
+        await task.ExecuteAsync(new Progress<double>(), default);
+        Assert(await LastSync() > resynced, "S9-R1: with a 15-minute interval it syncs after 16 minutes, where 60 would have waited");
+        await SetInterval(360);
+        time.Offset += TimeSpan.FromMinutes(16);
+        var before360 = await LastSync();
+        await task.ExecuteAsync(new Progress<double>(), default);
+        Assert(await LastSync() == before360, "S9-R1: back at the 360-minute default it waits again");
 
         // ---- Prowlarr's own back-off opens the breaker.
         prowlarr.DisabledTill[1] = DateTime.UtcNow.AddHours(3);
@@ -300,8 +374,12 @@ static void Assert(bool condition, string message)
 /// A real HTTP Prowlarr boundary: system status, health, the indexer list and status with <c>X-Api-Key</c>, and each
 /// indexer's Torznab feed at <c>/{id}/api</c> forwarded to the Torznab boundary. Faults are injectable.
 /// </summary>
-internal sealed class ProwlarrBoundary(TorznabBoundary torznab) : IAsyncDisposable
+internal sealed class ProwlarrBoundary(TorznabBoundary torznab, string host = "127.0.0.1") : IAsyncDisposable
 {
+    private int _requests;
+    private int _feedRequests;
+    public int Requests => _requests;
+    public int FeedRequests => _feedRequests;
     private WebApplication _app = null!;
     private readonly HttpClient _forward = new();
     public string ApiKey { get; set; } = string.Empty;
@@ -314,10 +392,15 @@ internal sealed class ProwlarrBoundary(TorznabBoundary torznab) : IAsyncDisposab
     public async Task StartAsync()
     {
         var builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions());
-        builder.WebHost.UseKestrel().UseUrls("http://127.0.0.1:0");
+        builder.WebHost.UseKestrel().UseUrls($"http://{host}:0");
         builder.Services.AddRouting();
         builder.Logging.ClearProviders();
         _app = builder.Build();
+        _app.Use(async (context, next) =>
+        {
+            Interlocked.Increment(ref _requests);
+            await next();
+        });
         _app.MapGet("/api/v1/system/status", context => Api(context, () => new JsonObject { ["version"] = "1.99.0-boundary" }));
         _app.MapGet("/api/v1/health", context => Api(context, () => new JsonArray()));
         _app.MapGet("/api/v1/indexer", context => Api(context, () =>
@@ -329,6 +412,7 @@ internal sealed class ProwlarrBoundary(TorznabBoundary torznab) : IAsyncDisposab
             (JsonNode)new JsonObject { ["indexerId"] = pair.Key, ["disabledTill"] = pair.Value.ToString("O") }).ToArray())));
         _app.MapGet("/{id:int}/api", async context =>
         {
+            Interlocked.Increment(ref _feedRequests);
             var id = int.Parse((string)context.Request.RouteValues["id"]!, System.Globalization.CultureInfo.InvariantCulture);
             if (!Feeds.TryGetValue(id, out var feed)) { context.Response.StatusCode = 404; return; }
             var response = await _forward.GetAsync(new Uri(torznab.Address, $"/{feed}/api{context.Request.QueryString}"));
