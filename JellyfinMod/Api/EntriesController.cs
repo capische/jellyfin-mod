@@ -158,7 +158,7 @@ public sealed class EntriesController(
         timeout.CancelAfter(TimeSpan.FromSeconds(60));
         try
         {
-            var outcome = await new SeriesMetadataRefresher(database, tmdb, libraryLock, retentionGate, reconciliation, writeBudget)
+            var outcome = await new SeriesMetadataRefresher(database, tmdb, libraryLock, retentionGate, reconciliation, writeBudget, access)
                 .RefreshAsync(id, timeout.Token);
             if (outcome == SeriesRefreshOutcome.LibraryBusy) return LibraryBusy();
             if (outcome == SeriesRefreshOutcome.NotFound) return NotFound();
@@ -268,7 +268,9 @@ public sealed class EntriesController(
                 : "Kept media indefinitely"
         });
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-        await retentionEvaluator.EvaluateAllAsync(cancellationToken).ConfigureAwait(false);
+        // Only this title's targets can change; re-evaluating every title would hold the write lock for minutes on a slow
+        // disk (RET3-R6).
+        await retentionEvaluator.EvaluateEntriesAsync([entry.Id], cancellationToken).ConfigureAwait(false);
         return new EntryDto(entry);
     }
 
@@ -363,10 +365,13 @@ public sealed class EntriesController(
                     policy = RetentionPolicies.ToWire(targetPolicy), reclaimAfterDays = targetDays })
             });
             // Anything but a Keep restarts the episode's grace now: a changed window never reuses a deadline computed
-            // under the old one, so shortening it cannot make the episode due at once (P3.T13).
-            if (!keeping) await RestartGraceAsync(episode.Id, cancellationToken).ConfigureAwait(false);
-
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            // under the old one, so shortening it cannot make the episode due at once (P3.T13). Under the target's
+            // evaluation gate, so no evaluation in flight saves over the restart (RET3-R4).
+            using (await RetentionEvaluator.HoldTargetAsync(episode.Id, cancellationToken).ConfigureAwait(false))
+            {
+                if (!keeping) await RestartGraceAsync(episode.Id, cancellationToken).ConfigureAwait(false);
+                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
 
         await retentionEvaluator.EvaluateEpisodeAsync(episode.Id, cancellationToken).ConfigureAwait(false);
@@ -446,8 +451,11 @@ public sealed class EntriesController(
                 Data = JsonSerializer.Serialize(new { episodeId = episode?.Id, bindingId }) });
             // The file follows its title's retention again with a window of its own from now, never an old deadline that
             // already passed while it was kept (RET2-R2), exactly as un-keeping an episode restarts its grace (Q4).
-            await RestartGraceAsync(episode?.Id ?? id, cancellationToken).ConfigureAwait(false);
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            using (await RetentionEvaluator.HoldTargetAsync(episode?.Id ?? id, cancellationToken).ConfigureAwait(false))
+            {
+                await RestartGraceAsync(episode?.Id ?? id, cancellationToken).ConfigureAwait(false);
+                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
 
         if (episode is not null) await retentionEvaluator.EvaluateEpisodeAsync(episode.Id, cancellationToken).ConfigureAwait(false);
@@ -575,6 +583,12 @@ public sealed class EntriesController(
             ? access.CoveredPositions(user, access.GetNativeItems(user, "series", libraryId)
                 .Where(item => seriesCopies.Contains(item.Id) || item.Id == existing.JellyfinItemId))
             : new Dictionary<(int Season, int Episode), HashSet<int>>();
+        // What the title's own bound files cover counts too, whatever this user can see (RET3-R5).
+        foreach (var (position, ids) in await access.CoveredByBindingsAsync(database, existing.Id, cancellationToken))
+        {
+            if (!covered.TryGetValue(position, out var known)) covered[position] = known = [];
+            known.UnionWith(ids);
+        }
         // Only the request which observed no entry initially completes its requested episode set.
         // A later duplicate request still returns early without changing administrator settings.
         foreach (var remote in snapshot)

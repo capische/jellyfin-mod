@@ -13,14 +13,30 @@ public sealed class ReconciliationService(
     ReconciliationLibraryLock libraryLock,
     MediaStorageIdentity? mediaStorage = null,
     TimeProvider? clock = null,
-    ILibraryManager? library = null)
+    ILibraryManager? library = null,
+    UnixFileInspector? files = null)
 {
     private readonly MediaStorageIdentity _mediaStorage = mediaStorage ?? new();
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
+    private readonly UnixFileInspector _files = files ?? new();
+
+    /// <summary>The file's fingerprint now, or null when it cannot be read (RET3-R3).</summary>
+    private string? Fingerprint(string? path) =>
+        !string.IsNullOrEmpty(path) && _files.TryInspect(path, out var observed) ? observed.FileFingerprint : null;
+
+    /// <summary>
+    /// Whether a bound file was replaced in place since reconciliation last saw it: same path, a different fingerprint
+    /// (RET3-R3). Jellyfin 12 derives the item id from the path, so the replacement keeps the binding and its old play
+    /// state; only the file itself tells them apart. A binding recorded before fingerprints existed is not a replacement.
+    /// </summary>
+    private static bool ReplacedInPlace(string? boundPath, string? boundFingerprint, string? observedPath, string? observed) =>
+        string.Equals(boundPath, observedPath, StringComparison.Ordinal) && boundFingerprint is not null && observed is not null &&
+        !string.Equals(boundFingerprint, observed, StringComparison.Ordinal);
     /// <summary>Reconciles one library-scoped native title observation.</summary>
     public async Task<ReconciliationResult> ReconcileAsync(NativeTitleSnapshot snapshot, CancellationToken cancellationToken)
     {
         await using var lease = await libraryLock.AcquireAsync(snapshot.TargetLibraryId, cancellationToken).ConfigureAwait(false);
+        using var operation = SqliteWriteDiagnostics.Operation("reconciliation");
         return await ReconcileAsync(snapshot, true, cancellationToken).ConfigureAwait(false);
     }
 
@@ -248,7 +264,53 @@ public sealed class ReconciliationService(
         }
 
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await DetachOrphanVersionKeepsAsync(absentBindings.Select(binding => binding.EntryId)
+            .Concat(absentEpisodeBindings.Select(binding => episodeOwners[binding.EpisodeId])).ToHashSet(), cancellationToken)
+            .ConfigureAwait(false);
         return new(missingItems, true, null, excluded.Count, unverified);
+    }
+
+    /// <summary>
+    /// Removes a per-file Keep that no longer matches any file of its title, by path or by physical identity, and says so
+    /// in History (RET3-R7). Left in place it would keep protecting its old path forever, so a different file that lands
+    /// there later would be kept without anyone having kept it. The file it kept went (a move to another filesystem, a
+    /// copy-and-delete, a removal); the new file, if any, starts over and can be kept again.
+    /// </summary>
+    internal async Task<int> DetachOrphanVersionKeepsAsync(IReadOnlyCollection<Guid> entryIds, CancellationToken cancellationToken)
+    {
+        if (entryIds.Count == 0) return 0;
+        var ids = entryIds.ToArray();
+        var keeps = await database.VersionKeeps.Where(keep => ids.Contains(keep.EntryId))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (keeps.Count == 0) return 0;
+        var files = await database.EntryBindings.AsNoTracking().Where(binding => ids.Contains(binding.EntryId))
+            .Select(binding => new { binding.EntryId, binding.MediaPath, binding.FileFingerprint })
+            .Concat(database.EpisodeBindings.AsNoTracking()
+                .Join(database.Episodes.AsNoTracking().Where(episode => ids.Contains(episode.EntryId)),
+                    binding => binding.EpisodeId, episode => episode.Id,
+                    (binding, episode) => new { episode.EntryId, binding.MediaPath, binding.FileFingerprint }))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var detached = 0;
+        foreach (var keep in keeps)
+        {
+            var matches = files.Any(file => file.EntryId == keep.EntryId &&
+                (string.Equals(file.MediaPath, keep.MediaPath, StringComparison.Ordinal) ||
+                 keep.PhysicalIdentity is { Length: > 0 } identity && file.FileFingerprint is { } fingerprint &&
+                 fingerprint.StartsWith(identity + "|", StringComparison.Ordinal)));
+            if (matches) continue;
+            database.VersionKeeps.Remove(keep);
+            database.History.Add(new HistoryRecord
+            {
+                EntryId = keep.EntryId,
+                EventType = "version_keep_detached",
+                Summary = $"Stopped keeping {Path.GetFileName(keep.MediaPath)}: that file is no longer part of this title",
+                Data = JsonSerializer.Serialize(new { episodeId = keep.EpisodeId, mediaPath = keep.MediaPath, reason = "file_gone" })
+            });
+            detached++;
+        }
+
+        if (detached > 0) await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return detached;
     }
 
     /// <summary>
@@ -275,7 +337,7 @@ public sealed class ReconciliationService(
     /// completion after now; History says why. This is the direction that deletes less: surviving siblings wait too.
     /// </summary>
     private async Task RestartForNewFileAsync(Guid entryId, Guid? episodeId, string? label, IEnumerable<string?> paths,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool replacedInPlace = false)
     {
         var now = _clock.GetUtcNow().UtcDateTime;
         await RetentionTargetReset.ResetAsync(database, entryId, episodeId, now, cancellationToken).ConfigureAwait(false);
@@ -284,10 +346,11 @@ public sealed class ReconciliationService(
         {
             EntryId = entryId,
             EventType = "retention_reset",
-            Summary = (label is null ? string.Empty : label + ": ") + "Retention restarted: a new file arrived" +
+            Summary = (label is null ? string.Empty : label + ": ") +
+                (replacedInPlace ? "Retention restarted: a file was replaced in place" : "Retention restarted: a new file arrived") +
                 (files.Length == 1 ? " (" + files[0] + ")" : files.Length > 1 ? $" ({files.Length} files)" : string.Empty) +
                 "; it counts down only after a new watch",
-            Data = JsonSerializer.Serialize(new { episodeId, reason = "new_file", files })
+            Data = JsonSerializer.Serialize(new { episodeId, reason = replacedInPlace ? "replaced_in_place" : "new_file", files })
         });
     }
 
@@ -457,11 +520,16 @@ public sealed class ReconciliationService(
         var knownRepresentations = entryBindings.ToDictionary(binding => binding.JellyfinItemId);
         var boundMoviePaths = entryBindings.Select(binding => binding.MediaPath).ToHashSet(StringComparer.Ordinal);
         var arrivedMovieFiles = new List<string?>();
+        var replacedMovieFiles = new List<string?>();
         var entryBindingChanges = 0;
         foreach (var representation in snapshot.Representations)
         {
+            var fingerprint = Fingerprint(representation.MediaPath);
             if (knownRepresentations.TryGetValue(representation.JellyfinItemId, out var binding))
             {
+                if (ReplacedInPlace(binding.MediaPath, binding.FileFingerprint, representation.MediaPath, fingerprint))
+                    replacedMovieFiles.Add(representation.MediaPath);
+                if (fingerprint is not null) binding.FileFingerprint = fingerprint;
                 var versionGroupId = representation.VersionGroupId ?? representation.JellyfinItemId;
                 var structuralChange = binding.VersionGroupId != versionGroupId ||
                     binding.TargetLibraryId != representation.TargetLibraryId ||
@@ -490,7 +558,8 @@ public sealed class ReconciliationService(
                 VersionGroupId = representation.VersionGroupId ?? representation.JellyfinItemId,
                 OwnerItemId = representation.OwnerItemId,
                 MediaPath = representation.MediaPath,
-                StorageIdentity = representation.StorageIdentity
+                StorageIdentity = representation.StorageIdentity,
+                FileFingerprint = fingerprint
             });
             entryBindingChanges++;
         }
@@ -545,24 +614,25 @@ public sealed class ReconciliationService(
                     .Where(evaluation => evaluation.EntryId == entry.Id && evaluation.EpisodeId != null)
                     .Select(evaluation => evaluation.TargetId).ToListAsync(cancellationToken).ConfigureAwait(false))
                 .ToHashSet();
-            var arrivals = new List<(Guid EpisodeId, string? MediaPath)>();
+            var arrivals = new List<(Guid EpisodeId, string? MediaPath, bool InPlace)>();
             episodeChanges = ReconcileEpisodes(entry.Id, snapshot.TargetLibraryId, episodes, episodeBindings,
                 usable, created, evaluatedEpisodes, arrivals);
             foreach (var arrived in arrivals.GroupBy(item => item.EpisodeId))
             {
                 var episode = episodes.Single(candidate => candidate.Id == arrived.Key);
                 await RestartForNewFileAsync(entry.Id, episode.Id,
-                    $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00}", arrived.Select(item => item.MediaPath), cancellationToken)
-                    .ConfigureAwait(false);
+                    $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00}", arrived.Select(item => item.MediaPath), cancellationToken,
+                    arrived.All(item => item.InPlace)).ConfigureAwait(false);
             }
             await RecordEpisodeConflictsAsync(entry.Id, usable, rebindable, skipped, cancellationToken)
                 .ConfigureAwait(false);
         }
 
-        if (!created && snapshot.MediaType == "movie" && arrivedMovieFiles.Count > 0 &&
+        if (!created && snapshot.MediaType == "movie" && arrivedMovieFiles.Count + replacedMovieFiles.Count > 0 &&
             await database.RetentionEvaluations.AnyAsync(evaluation => evaluation.TargetId == entry.Id, cancellationToken)
                 .ConfigureAwait(false))
-            await RestartForNewFileAsync(entry.Id, null, null, arrivedMovieFiles, cancellationToken).ConfigureAwait(false);
+            await RestartForNewFileAsync(entry.Id, null, null, arrivedMovieFiles.Concat(replacedMovieFiles), cancellationToken,
+                arrivedMovieFiles.Count == 0).ConfigureAwait(false);
 
         if (created)
         {
@@ -613,6 +683,8 @@ public sealed class ReconciliationService(
             database.ChangeTracker.Clear();
             return await ReconcileAsync(snapshot, false, cancellationToken).ConfigureAwait(false);
         }
+
+        if (!created) await DetachOrphanVersionKeepsAsync([entry.Id], cancellationToken).ConfigureAwait(false);
 
         return new(created ? ReconciliationOutcome.Created : entryChanged || entryBindingChanges > 0 || episodeChanges > 0
             ? ReconciliationOutcome.Updated : ReconciliationOutcome.Unchanged, entry.Id, episodeChanges, null)
@@ -877,9 +949,11 @@ public sealed class ReconciliationService(
         IReadOnlyList<NativeEpisodeSnapshot> observations,
         bool backfilled,
         IReadOnlySet<Guid> evaluatedEpisodes,
-        ICollection<(Guid EpisodeId, string? MediaPath)> arrivals)
+        ICollection<(Guid EpisodeId, string? MediaPath, bool InPlace)> arrivals)
     {
         var changedEpisodeIds = new HashSet<Guid>();
+        // The air dates of the TMDB episodes the series lists, to tell a daily show's neighbours apart (RET3-R5).
+        var listedAirDates = episodes.Where(episode => !episode.IsPositionIdentity).Select(episode => episode.AirDate).ToArray();
         var boundBefore = episodeBindings.Select(binding => binding.EpisodeId).ToHashSet();
         var pathsBefore = episodeBindings.GroupBy(binding => binding.EpisodeId).ToDictionary(group => group.Key,
             group => group.Select(binding => binding.MediaPath).ToHashSet(StringComparer.Ordinal));
@@ -916,10 +990,16 @@ public sealed class ReconciliationService(
                 // A TMDB-identified episode that takes a file by its number only has not verified that the file is that
                 // episode (RET2-R3); the native episode's own TMDB id, or its title or air date, confirms it.
                 var unverified = !episode.IsPositionIdentity && candidate.TmdbId != episode.TmdbId &&
-                    !EpisodeIdentityEvidence.Agrees(candidate.Title, candidate.AirDate, episode.Title, episode.AirDate);
+                    !EpisodeIdentityEvidence.Agrees(candidate.Title, candidate.AirDate, episode.Title, episode.AirDate, listedAirDates);
+                var fingerprint = Fingerprint(candidate.MediaPath);
                 if (knownBindings.TryGetValue(candidate.JellyfinItemId, out var existingBinding))
                 {
                     existingBinding.IdentityUnverified = unverified;
+                    // The same path now holds other bytes: a new file for retention, like any arrival (RET3-R3).
+                    if (existingBinding.EpisodeId == episode.Id &&
+                        ReplacedInPlace(existingBinding.MediaPath, existingBinding.FileFingerprint, candidate.MediaPath, fingerprint))
+                        arrivals.Add((episode.Id, candidate.MediaPath, true));
+                    if (fingerprint is not null) existingBinding.FileFingerprint = fingerprint;
                     var structuralChange = existingBinding.SeriesItemId != candidate.SeriesItemId ||
                         existingBinding.TargetLibraryId != targetLibraryId;
                     if (structuralChange ||
@@ -944,7 +1024,8 @@ public sealed class ReconciliationService(
                     TargetLibraryId = targetLibraryId,
                     MediaPath = candidate.MediaPath,
                     StorageIdentity = candidate.StorageIdentity,
-                    IdentityUnverified = unverified
+                    IdentityUnverified = unverified,
+                    FileFingerprint = fingerprint
                 };
                 database.EpisodeBindings.Add(newBinding);
                 knownBindings.Add(candidate.JellyfinItemId, newBinding);
@@ -952,7 +1033,7 @@ public sealed class ReconciliationService(
                 // A file an episode that retention already tracks did not have before (RET2-R1).
                 if ((boundBefore.Contains(episode.Id) || evaluatedEpisodes.Contains(episode.Id)) &&
                     !(pathsBefore.TryGetValue(episode.Id, out var paths) && paths.Contains(candidate.MediaPath)))
-                    arrivals.Add((episode.Id, candidate.MediaPath));
+                    arrivals.Add((episode.Id, candidate.MediaPath, false));
             }
 
             var candidates = allCandidates.Where(observation => observation.IsPlayable).ToArray();
@@ -1054,7 +1135,8 @@ public sealed class ReconciliationService(
                     SeriesItemId = observation.SeriesItemId,
                     TargetLibraryId = targetLibraryId,
                     MediaPath = observation.MediaPath,
-                    StorageIdentity = observation.StorageIdentity
+                    StorageIdentity = observation.StorageIdentity,
+                    FileFingerprint = Fingerprint(observation.MediaPath)
                 };
                 database.EpisodeBindings.Add(binding);
                 knownBindings.Add(observation.JellyfinItemId, binding);
@@ -1103,7 +1185,8 @@ public sealed class ReconciliationService(
                     SeriesItemId = observation.SeriesItemId,
                     TargetLibraryId = targetLibraryId,
                     MediaPath = observation.MediaPath,
-                    StorageIdentity = observation.StorageIdentity
+                    StorageIdentity = observation.StorageIdentity,
+                    FileFingerprint = Fingerprint(observation.MediaPath)
                 };
                 database.EpisodeBindings.Add(binding);
                 knownBindings.Add(observation.JellyfinItemId, binding);

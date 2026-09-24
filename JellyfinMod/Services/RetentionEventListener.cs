@@ -156,6 +156,8 @@ public sealed class RetentionEventListener(
                 try
                 {
                     using var scope = scopeFactory.CreateScope();
+                    using var operation = JellyfinMod.Data.SqliteWriteDiagnostics.Operation("retention listener " +
+                        (work.Key is PolicyKey or AccessKey ? work.Key : work.Key.Split(':')[0]));
                     if (work.Key == PolicyKey)
                     {
                         await scope.ServiceProvider.GetRequiredService<RetentionPolicyService>()

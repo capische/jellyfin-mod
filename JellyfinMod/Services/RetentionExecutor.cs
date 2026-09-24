@@ -45,7 +45,10 @@ public sealed class RetentionExecutor(
         }
 
         await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
-        var initialPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
+        // Only the titles this action can touch are re-evaluated; the run evaluated every title once before it started
+        // (RET3-R6).
+        var entryIds = await EntriesOfBindingsAsync([bindingId], cancellationToken).ConfigureAwait(false);
+        var initialPreview = await preview.PreviewAsync(cancellationToken, null, entryIds).ConfigureAwait(false);
         var initial = Find(initialPreview, bindingId);
         if (initial is null)
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
@@ -57,7 +60,10 @@ public sealed class RetentionExecutor(
         lockedLibraryIds.UnionWith(LibrariesContaining(initial.CanonicalPath));
         await using var libraryLease = await AcquireLibrariesAsync(
             lockedLibraryIds, cancellationToken).ConfigureAwait(false);
-        var currentPreview = await preview.PreviewAsync(cancellationToken).ConfigureAwait(false);
+        var groupEntries = initialGroup.Select(item => item.EntryId).Concat(entryIds)
+            .Concat(await EntriesOfBindingsAsync([.. await CurrentBindingSetAsync(initial.CanonicalPath!, cancellationToken)
+                .ConfigureAwait(false)], cancellationToken).ConfigureAwait(false)).ToHashSet();
+        var currentPreview = await preview.PreviewAsync(cancellationToken, null, groupEntries).ConfigureAwait(false);
         var candidate = Find(currentPreview, bindingId);
         if (candidate is null || candidate.State != RetentionPreviewStates.Due)
             return RetentionExecutionResult.NotStarted(bindingId,
@@ -140,7 +146,8 @@ public sealed class RetentionExecutor(
         if (await IdentityUnverifiedAsync(bindingId, cancellationToken).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.IdentityUnverified);
         var replacement = new HashSet<Guid> { bindingId };
-        var initialPreview = await preview.PreviewAsync(cancellationToken, replacement).ConfigureAwait(false);
+        var replacedEntries = await EntriesOfBindingsAsync([bindingId], cancellationToken).ConfigureAwait(false);
+        var initialPreview = await preview.PreviewAsync(cancellationToken, replacement, replacedEntries).ConfigureAwait(false);
         var initial = Find(initialPreview, bindingId);
         if (initial is null)
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
@@ -150,7 +157,8 @@ public sealed class RetentionExecutor(
         var lockedLibraryIds = SamePathGroup(initialPreview, initial).Select(candidate => candidate.TargetLibraryId).ToHashSet();
         lockedLibraryIds.UnionWith(LibrariesContaining(initial.CanonicalPath));
         await using var libraryLease = await AcquireLibrariesAsync(lockedLibraryIds, cancellationToken).ConfigureAwait(false);
-        var currentPreview = await preview.PreviewAsync(cancellationToken, replacement).ConfigureAwait(false);
+        var currentPreview = await preview.PreviewAsync(cancellationToken, replacement,
+            SamePathGroup(initialPreview, initial).Select(item => item.EntryId).Concat(replacedEntries).ToHashSet()).ConfigureAwait(false);
         var candidate = Find(currentPreview, bindingId);
         if (candidate is null || candidate.State != RetentionPreviewStates.Due)
             return RetentionExecutionResult.NotStarted(bindingId, candidate?.Reason ?? RetentionExecutionReasons.BindingUnavailable);
@@ -256,8 +264,14 @@ public sealed class RetentionExecutor(
         // An upgrade replacement skips the watched rule and the window (P6.M5, PHASE10 Q10); every physical check below
         // still runs.
         var replacement = operations.All(operation => operation.Provenance == RetentionProvenances.UpgradeReplaced);
+        // The action's titles, and every title with a binding at the file now (one added since prepare included), are
+        // evaluated afresh: the same set a full evaluation would have refreshed for this file.
+        var bindingsAtFile = await CurrentBindingSetAsync(operations[0].MediaPath, cancellationToken).ConfigureAwait(false);
+        var actionEntries = (await EntriesOfBindingsAsync(operations.Select(operation => operation.BindingId).Concat(bindingsAtFile)
+            .ToArray(), cancellationToken).ConfigureAwait(false)).Concat(operations.Where(operation => operation.EntryId.HasValue)
+            .Select(operation => operation.EntryId!.Value)).ToHashSet();
         var currentPreview = await preview.PreviewAsync(cancellationToken,
-            replacement ? operations.Select(operation => operation.BindingId).ToHashSet() : null).ConfigureAwait(false);
+            replacement ? operations.Select(operation => operation.BindingId).ToHashSet() : null, actionEntries).ConfigureAwait(false);
         foreach (var operation in operations)
         {
             var candidate = Find(currentPreview, operation.BindingId);
@@ -330,7 +344,7 @@ public sealed class RetentionExecutor(
             operation.UnlinkedAt = unlinkedAt;
             operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
         }
-        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        await SaveAfterUnlinkAsync(operations).ConfigureAwait(false);
         foreach (var operation in operations) TryRemoveNative(operation);
         return await CompleteUnderLeaseAsync(operations, requestedBindingId, CancellationToken.None).ConfigureAwait(false);
     }
@@ -354,8 +368,10 @@ public sealed class RetentionExecutor(
         RetentionOperation operation,
         CancellationToken cancellationToken)
     {
-        await using var transaction = await database.Database.BeginTransactionAsync(cancellationToken)
-            .ConfigureAwait(false);
+        // BEGIN IMMEDIATE waits for the write lock and may give up on a busy database; nothing has changed yet, so it
+        // is retried (RET3-R6). A failure after it leaves the operation unlinked, and the next run completes it.
+        await using var transaction = await SqliteBusy.RetryAsync(
+            () => database.Database.BeginTransactionAsync(cancellationToken), cancellationToken).ConfigureAwait(false);
         if (operation.EntryId is not { } entryId)
         {
             // Removal is refused while an operation is open, so this only happens to legacy rows.
@@ -479,6 +495,46 @@ public sealed class RetentionExecutor(
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return RetentionExecutionResult.From(operation);
+    }
+
+    /// <summary>
+    /// Records that the file is gone. The unlink already happened, so this save must not be lost to a busy database: it is
+    /// retried for about two minutes (RET3-R6), and a final failure is logged as an error. The operation then stays
+    /// prepared with its file absent, which the next run records as vanished; nothing else is deleted either way.
+    /// </summary>
+    private async Task SaveAfterUnlinkAsync(IReadOnlyList<RetentionOperation> operations)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception error) when (SqliteBusy.IsBusy(error) && attempt < 8)
+            {
+                logger.LogWarning("JellyfinMod unlinked {Path} but the database was busy; recording it again (attempt {Attempt})",
+                    operations[0].MediaPath, attempt);
+                await Task.Delay(TimeSpan.FromSeconds(10), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception error)
+            {
+                logger.LogError(error, "JellyfinMod unlinked {Path} for retention operation {ActionId} but could not record it; " +
+                    "the next run will find the operation prepared with its file gone", operations[0].MediaPath, operations[0].ActionId);
+                throw;
+            }
+        }
+    }
+
+    /// <summary>The entries that own these movie or episode bindings.</summary>
+    private async Task<HashSet<Guid>> EntriesOfBindingsAsync(IReadOnlyCollection<Guid> bindingIds, CancellationToken cancellationToken)
+    {
+        var movies = await database.EntryBindings.AsNoTracking().Where(binding => bindingIds.Contains(binding.Id))
+            .Select(binding => binding.EntryId).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var episodes = await database.EpisodeBindings.AsNoTracking().Where(binding => bindingIds.Contains(binding.Id))
+            .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id, (_, episode) => episode.EntryId)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return movies.Concat(episodes).ToHashSet();
     }
 
     /// <summary>Retries native item removal for reclaimed media whose cleanup failed earlier (P3.T14).</summary>

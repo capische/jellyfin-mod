@@ -106,6 +106,24 @@ public sealed class RetentionLiveCheck(
                 return RetentionLiveReasons.Kept;
         }
 
+        // A watch counts only when Jellyfin dates it at or after the target's floor, exactly as the evaluator counts it
+        // (RET3-R4): a played flag with no date (an imported state, or Jellyfin 12 marking the other versions of a
+        // finished one) or an old date reattached to a re-acquired file is not a completion here either.
+        DateTime? floor = null;
+        if (requireCompletion)
+        {
+            var targetId = operation.EpisodeId ?? operation.EntryId;
+            var evaluation = targetId is { } id
+                ? await database.RetentionEvaluations.AsNoTracking().SingleOrDefaultAsync(item => item.TargetId == id, cancellationToken)
+                    .ConfigureAwait(false)
+                : null;
+            if (evaluation is null) return RetentionLiveReasons.NotCompleted;
+            floor = RetentionEvaluator.FreshFloor(evaluation, policy);
+        }
+
+        bool Counts(UserItemData? state) => state is { Played: true, PlaybackPositionTicks: 0, LastPlayedDate: { } played } &&
+            floor is { } since && DateTime.SpecifyKind(played, DateTimeKind.Utc) >= since;
+
         var completedBy = new HashSet<Guid>();
         var fileCompletedBy = new HashSet<Guid>();
         foreach (var user in eligibleUsers)
@@ -117,8 +135,8 @@ public sealed class RetentionLiveCheck(
             if (policy.ExemptFavourites && current.Any(state => state.IsFavorite)) return RetentionLiveReasons.Favorite;
             if (policy.ExemptFavourites && series is not null && userData.GetUserData(user, series)?.IsFavorite == true)
                 return RetentionLiveReasons.FavoriteSeries;
-            if (current.Any(state => state.Played)) completedBy.Add(user.Id);
-            if (coversSeveral && userData.GetUserData(user, multi!) is { Played: true, PlaybackPositionTicks: 0 }) fileCompletedBy.Add(user.Id);
+            if (current.Any(Counts)) completedBy.Add(user.Id);
+            if (coversSeveral && Counts(userData.GetUserData(user, multi!))) fileCompletedBy.Add(user.Id);
         }
 
         if (!requireCompletion) return null;

@@ -28,14 +28,16 @@ public sealed class SeriesMetadataRefresher(
     ReconciliationLibraryLock libraryLock,
     RetentionExecutionGate retentionGate,
     JellyfinItemReconciliationRunner? reconciliation = null,
-    LibraryWriteBudget? writeBudget = null)
+    LibraryWriteBudget? writeBudget = null,
+    LibraryAccess? access = null)
 {
     /// <summary>
     /// Whether a position-identity episode and the TMDB episode listed at its position are evidently the same episode:
-    /// the same air date within a day, or the same title ignoring case, punctuation and spacing (RET-R2).
+    /// the same title ignoring case, punctuation and spacing, or the same air date within a day where no other listed
+    /// episode airs that close (RET-R2, RET3-R5).
     /// </summary>
-    private static bool SameEpisode(Episode positional, Episode remote) =>
-        EpisodeIdentityEvidence.Agrees(positional.Title, positional.AirDate, remote.Title, remote.AirDate);
+    private static bool SameEpisode(Episode positional, Episode remote, IReadOnlyCollection<DateTime?> listedAirDates) =>
+        EpisodeIdentityEvidence.Agrees(positional.Title, positional.AirDate, remote.Title, remote.AirDate, listedAirDates);
 
     /// <summary>Refreshes one series entry. TMDB failures surface as <see cref="TmdbException"/>.</summary>
     public async Task<SeriesRefreshOutcome> RefreshAsync(Guid id, CancellationToken cancellationToken)
@@ -69,6 +71,12 @@ public sealed class SeriesMetadataRefresher(
             // identity, bindings, Keep and retention evidence, so the same file is never tracked twice.
             var byPosition = existing.Where(episode => episode.IsPositionIdentity)
                 .ToDictionary(episode => originalPositions[episode.Id]);
+            var listedAirDates = snapshot.Select(remote => remote.AirDate).ToArray();
+            // The numbers the title's own bound files cover, Jellyfin 12's hidden versions and every number of a
+            // multi-episode file included (RET3-R5): a row there without a file of its own is not searched for.
+            var covered = access is null
+                ? new Dictionary<(int Season, int Episode), HashSet<int>>()
+                : await access.CoveredByBindingsAsync(database, entry.Id, cancellationToken);
             if (snapshot.Any(remote => byTmdbId.TryGetValue(remote.TmdbId, out var local) &&
                 (local.SeasonNumber != remote.SeasonNumber || local.EpisodeNumber != remote.EpisodeNumber)))
             {
@@ -100,7 +108,7 @@ public sealed class SeriesMetadataRefresher(
                     // A position row came from a library file whose numbering may not be TMDB's (RET-R2). It takes the
                     // TMDB episode listed at its position only with evidence that they are the same episode: the same
                     // air date, or the same title. Otherwise it stays as it is and no second row takes its position.
-                    if (!SameEpisode(positional, remote)) continue;
+                    if (!SameEpisode(positional, remote, listedAirDates)) continue;
                     byPosition.Remove((remote.SeasonNumber, remote.EpisodeNumber));
                     positional.TmdbId = remote.TmdbId;
                     (positional.SeasonNumber, positional.EpisodeNumber) = originalPositions[positional.Id];
@@ -121,6 +129,8 @@ public sealed class SeriesMetadataRefresher(
                 else
                 {
                     remote.EntryId = entry.Id;
+                    if (LibraryAccess.CoveredUnverified(covered, remote.SeasonNumber, remote.EpisodeNumber, remote.TmdbId))
+                        remote.Monitored = false;
                     database.Episodes.Add(remote);
                 }
             }
@@ -129,6 +139,24 @@ public sealed class SeriesMetadataRefresher(
             // Preserve unmatched local episodes so a partial snapshot is never interpreted as deletion.
             foreach (var unmatched in byTmdbId.Values.Concat(byPosition.Values))
                 (unmatched.SeasonNumber, unmatched.EpisodeNumber) = originalPositions[unmatched.Id];
+
+            // A monitored row with no file of its own at a number a bound file already covers would be searched for, and
+            // grabbed, again (RET3-R5): it stops being monitored, and History says so.
+            var boundEpisodeIds = (await database.EpisodeBindings.AsNoTracking()
+                .Where(binding => database.Episodes.Any(episode => episode.Id == binding.EpisodeId && episode.EntryId == entry.Id))
+                .Select(binding => binding.EpisodeId).ToListAsync(cancellationToken)).ToHashSet();
+            foreach (var row in existing.Where(row => row.Monitored && !boundEpisodeIds.Contains(row.Id) &&
+                         LibraryAccess.CoveredUnverified(covered, row.SeasonNumber, row.EpisodeNumber, row.TmdbId)))
+            {
+                row.Monitored = false;
+                database.History.Add(new HistoryRecord
+                {
+                    EntryId = entry.Id,
+                    EventType = "episode_unmonitored",
+                    Summary = $"Stopped monitoring S{row.SeasonNumber:00}E{row.EpisodeNumber:00}: a library file already covers it",
+                    Data = JsonSerializer.Serialize(new { episodeId = row.Id, row.SeasonNumber, row.EpisodeNumber, reason = "covered" })
+                });
+            }
             entry.Title = metadata.Title;
             entry.Year = metadata.PremiereDate?.Year;
             entry.ImdbId = metadata.ImdbId;

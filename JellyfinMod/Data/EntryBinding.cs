@@ -24,4 +24,10 @@ public sealed class EntryBinding
     public string? MediaPath { get; set; }
     /// <summary>Gets or sets the Linux mount identity observed for the media path.</summary>
     public string? StorageIdentity { get; set; }
+    /// <summary>
+    /// Gets or sets the file's fingerprint (physical identity, size and modification time) when reconciliation last saw it,
+    /// or null before it was first read (RET3-R3). A different fingerprint at the same path is a new file.
+    /// </summary>
+    [System.ComponentModel.DataAnnotations.MaxLength(512)]
+    public string? FileFingerprint { get; set; }
 }

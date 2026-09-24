@@ -328,6 +328,56 @@ try
         Assert(await arrivals.EpisodeBindings.AnyAsync(binding => binding.JellyfinItemId == numbered.JellyfinItemId &&
                 !binding.IdentityUnverified),
             "An agreeing title verifies the file's identity (RET2-R3)");
+
+        // RET3-R5: a daily show lists its episodes a day apart. A file numbered one off (TVDB/scene numbering against
+        // TMDB's) whose air date is a day from the row's is the neighbouring episode as readily as this one, so the date
+        // is no evidence there: the binding stays unverified. A weekly show keeps the one-day tolerance.
+        var dailyEntry = new Entry { MediaType = "series", TmdbId = 7790, TargetLibraryId = library, Title = "Daily" };
+        arrivals.Entries.Add(dailyEntry);
+        var monday = new DateTime(2026, 3, 2);
+        for (var number = 1; number <= 5; number++)
+            arrivals.Episodes.Add(new JellyfinMod.Data.Episode
+            {
+                EntryId = dailyEntry.Id, TmdbId = 97900 + number, SeasonNumber = 1, EpisodeNumber = number,
+                Title = $"Daily episode {number}", AirDate = monday.AddDays(number - 1)
+            });
+        await arrivals.SaveChangesAsync();
+        var dailySeries = Guid.NewGuid();
+        // The file says S01E03 but is TMDB's E02: aired Tuesday, a day before TMDB's E03 (Wednesday).
+        var offByOne = new NativeEpisodeSnapshot(Guid.NewGuid(), dailySeries, null, 1, 3, true, "Tuesday's show",
+            AirDate: monday.AddDays(1), MediaPath: "/d/S01E03.mkv");
+        await reconciler.ReconcileAsync(new NativeTitleSnapshot("series", 7790, library, "Daily", 2026, null, null, null, null,
+            [new(dailySeries, library, true)], [offByOne]), default);
+        arrivals.ChangeTracker.Clear();
+        Assert(await arrivals.EpisodeBindings.AnyAsync(binding => binding.JellyfinItemId == offByOne.JellyfinItemId &&
+                binding.IdentityUnverified),
+            "On a daily show an air date one day off does not verify a file bound by its number (RET3-R5)");
+        await reconciler.ReconcileAsync(new NativeTitleSnapshot("series", 7790, library, "Daily", 2026, null, null, null, null,
+            [new(dailySeries, library, true)], [offByOne with { AirDate = monday.AddDays(2) }]), default);
+        arrivals.ChangeTracker.Clear();
+        Assert(await arrivals.EpisodeBindings.AnyAsync(binding => binding.JellyfinItemId == offByOne.JellyfinItemId &&
+                binding.IdentityUnverified),
+            "On a daily show even the exact date is no evidence while a neighbour airs within a day of it (RET3-R5)");
+
+        var weeklyEntry = new Entry { MediaType = "series", TmdbId = 7791, TargetLibraryId = library, Title = "Weekly" };
+        arrivals.Entries.Add(weeklyEntry);
+        for (var number = 1; number <= 3; number++)
+            arrivals.Episodes.Add(new JellyfinMod.Data.Episode
+            {
+                EntryId = weeklyEntry.Id, TmdbId = 97910 + number, SeasonNumber = 1, EpisodeNumber = number,
+                Title = $"Weekly episode {number}", AirDate = monday.AddDays(7 * (number - 1))
+            });
+        await arrivals.SaveChangesAsync();
+        var weeklySeries = Guid.NewGuid();
+        // Aired a day before TMDB's date (a time-zone difference): still that episode.
+        var weekly = new NativeEpisodeSnapshot(Guid.NewGuid(), weeklySeries, null, 1, 2, true, "Local title",
+            AirDate: monday.AddDays(6), MediaPath: "/w/S01E02.mkv");
+        await reconciler.ReconcileAsync(new NativeTitleSnapshot("series", 7791, library, "Weekly", 2026, null, null, null, null,
+            [new(weeklySeries, library, true)], [weekly]), default);
+        arrivals.ChangeTracker.Clear();
+        Assert(await arrivals.EpisodeBindings.AnyAsync(binding => binding.JellyfinItemId == weekly.JellyfinItemId &&
+                !binding.IdentityUnverified),
+            "On a weekly show an air date a day off still verifies the file (RET3-R5)");
     }
 
     await BackfillIntegration.RunAsync(folder);

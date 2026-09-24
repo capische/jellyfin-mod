@@ -108,6 +108,7 @@ public sealed class SettingsController(
         CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        using var operation = SqliteWriteDiagnostics.Operation("seed-protection settings");
         if (request.Revision is null) return Invalid("revision_required");
         if (request.Source is not (SeedProtectionSources.AcquisitionClient or SeedProtectionSources.Separate))
             return Invalid("invalid_seed_protection_source");
@@ -197,6 +198,7 @@ public sealed class SettingsController(
     public async Task<ActionResult<RetentionSettingsDto>> PatchRetention(RetentionSettingsRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        using var operation = SqliteWriteDiagnostics.Operation("retention settings");
         if (request.Revision is null) return Invalid("revision_required");
         if (request.ReclaimAfterDays is < 1 or > 3650) return Invalid("invalid_reclaim_days", "Days must be between 1 and 3650.");
         var mode = Array.IndexOf(WatchedUserModes, request.WatchedUserMode);

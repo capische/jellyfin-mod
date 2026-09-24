@@ -16,6 +16,7 @@ public sealed class DatabaseInitializer(
     /// <inheritdoc />
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        SqliteWriteDiagnostics.Logger ??= logger;
         try
         {
             using var scope = scopeFactory.CreateScope();

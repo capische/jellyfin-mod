@@ -95,9 +95,20 @@ public class ModDbContext : DbContext
     /// <summary>Gets upgrade operations (P6.M5).</summary>
     public DbSet<UpgradeOperation> UpgradeOperations => Set<UpgradeOperation>();
 
+    /// <summary>
+    /// Saves, and saves again after a pause when SQLite reported the database busy (another writer held the write lock past
+    /// the busy timeout). A failed save wrote nothing and leaves every tracked change in place, so the retry is the same
+    /// save. Inside an explicit transaction the caller owns the outcome and nothing is retried here.
+    /// </summary>
+    public override Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default) =>
+        Database.CurrentTransaction is not null
+            ? base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken)
+            : SqliteBusy.RetryAsync(() => base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken), cancellationToken);
+
     /// <inheritdoc />
     protected override void OnConfiguring(DbContextOptionsBuilder options)
-        => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        => options.UseSqlite(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString())
+            .AddInterceptors(SqliteWriteDiagnostics.Interceptors);
 
     /// <inheritdoc />
     protected override void OnModelCreating(ModelBuilder b)

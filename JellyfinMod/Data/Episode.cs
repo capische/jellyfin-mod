@@ -53,13 +53,26 @@ public sealed class Episode
 /// </summary>
 internal static class EpisodeIdentityEvidence
 {
-    /// <summary>Returns true when the air dates agree within a day or the titles agree.</summary>
-    public static bool Agrees(string? title, DateTime? airDate, string? otherTitle, DateTime? otherAirDate)
+    /// <summary>
+    /// Returns true when the titles agree, or when the air dates agree within a day and no other episode the series lists
+    /// airs within a day of the file's date (RET3-R5). A daily show airs its episodes a day apart, so there a date a day
+    /// off, or even the same date shared by two episodes, names a neighbour as readily as the episode itself.
+    /// </summary>
+    /// <param name="title">The file's (native) title.</param>
+    /// <param name="airDate">The file's (native) air date.</param>
+    /// <param name="otherTitle">The listed episode's title.</param>
+    /// <param name="otherAirDate">The listed episode's air date.</param>
+    /// <param name="listedAirDates">Every air date the series lists, this episode's included; null when unknown.</param>
+    public static bool Agrees(string? title, DateTime? airDate, string? otherTitle, DateTime? otherAirDate,
+        IReadOnlyCollection<DateTime?>? listedAirDates = null)
     {
-        if (airDate is { } local && otherAirDate is { } listed && Math.Abs((local.Date - listed.Date).TotalDays) <= 1)
-            return true;
         var key = Key(title);
-        return key.Length > 0 && key == Key(otherTitle);
+        if (key.Length > 0 && key == Key(otherTitle)) return true;
+        if (airDate is not { } local || otherAirDate is not { } listed || Math.Abs((local.Date - listed.Date).TotalDays) > 1)
+            return false;
+        // Unknown neighbours are treated as a daily show: only the exact date is then evidence.
+        if (listedAirDates is null) return local.Date == listed.Date;
+        return listedAirDates.Count(date => date is { } other && Math.Abs((local.Date - other.Date).TotalDays) <= 1) == 1;
     }
 
     private static string Key(string? value) =>

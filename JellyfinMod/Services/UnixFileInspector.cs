@@ -32,7 +32,12 @@ public sealed partial class UnixFileInspector
                 if ((mask & StatxRequiredStats) != StatxRequiredStats) return false;
                 var linkCount = unchecked((uint)Marshal.ReadInt32(buffer, 16));
                 var size = unchecked((ulong)Marshal.ReadInt64(buffer, 40));
-                snapshot = new UnixFileSnapshot(resolved, Identity(buffer), linkCount, size);
+                var modifiedSeconds = Marshal.ReadInt64(buffer, 112);
+                var modifiedNanoseconds = unchecked((uint)Marshal.ReadInt32(buffer, 120));
+                snapshot = new UnixFileSnapshot(resolved, Identity(buffer), linkCount, size)
+                {
+                    ContentStamp = $"{size:x}:{modifiedSeconds:x}.{modifiedNanoseconds:x8}"
+                };
                 return true;
             }
             finally
@@ -376,4 +381,15 @@ public readonly record struct UnixFileSnapshot(
     string CanonicalPath,
     string PhysicalIdentity,
     uint HardlinkCount,
-    ulong LogicalBytes);
+    ulong LogicalBytes)
+{
+    /// <summary>Gets the file's size and modification time, which change when it is rewritten in place (RET3-R3).</summary>
+    public string ContentStamp { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Gets which file this is and which bytes it holds: the physical identity (device, inode, birth time), the size and the
+    /// modification time. Deleting and rewriting a file at the same path changes the inode; copying over it in place
+    /// changes the size or the modification time (RET3-R3).
+    /// </summary>
+    public string FileFingerprint => PhysicalIdentity + "|" + ContentStamp;
+}

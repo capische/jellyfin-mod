@@ -318,11 +318,16 @@ static async Task VerifyPreviewHttpAsync(
     // Real Jellyfin never returns null user data; items default to the fixtures' played state, and
     // liveStates overrides individual items for the P3.T8 live-revalidation scenarios.
     var liveStates = new Dictionary<Guid, UserItemData>();
+    // Called with each item whose live user data is read (RET3-R6 uses it to hold the database just before an unlink).
+    Action<Guid>? userDataRead = null;
     var userData = Stub<IUserDataManager>.Create((method, arguments) =>
         method.Name != "GetUserData" || arguments?[1] is not BaseItem item ? null
-        : liveStates.TryGetValue(item.Id, out var live) ? live
+        : Observe(userDataRead, item.Id) && liveStates.TryGetValue(item.Id, out var live) ? live
         : item.Id == series.Id ? new UserItemData { Key = "favorite-series", IsFavorite = true }
-        : new UserItemData { Key = item.Id.ToString("N"), Played = true, LastPlayedDate = now.AddDays(-3) });
+        : new UserItemData { Key = item.Id.ToString("N"), Played = true,
+            // A watch an hour ago, so the last check before an unlink sees a completion after every fixture's floor
+            // (decision 12 and RET3-R4 count only a watch dated at or after it).
+            LastPlayedDate = clock.GetUtcNow().UtcDateTime.AddHours(-1) });
     var sessionRows = new List<SessionInfo>();
     var sessionManager = Stub<ISessionManager>.Create((method, _) => method.Name == "get_Sessions"
         ? sessionRows.ToArray()
@@ -901,11 +906,252 @@ static async Task VerifyPreviewHttpAsync(
             user.Id, libraryFolder.Id, entry.Id);
         await VerifyPinnedExecutionAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
             user.Id, libraryFolder.Id);
+        await VerifyFileIdentityAsync(api.Services, http, databasePath, libraryPath, storage, tvLibraryFolder, items);
+        await VerifyUnlinkSurvivesBusyDatabaseAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
+            user.Id, libraryFolder.Id, hook => userDataRead = hook);
     }
     finally
     {
         await api.StopAsync();
     }
+}
+
+// RET3-R3 and RET3-R7, through real reconciliation, the real Keep endpoint and real files.
+static async Task VerifyFileIdentityAsync(
+    IServiceProvider services,
+    HttpClient http,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixtureLibrary tvLibrary,
+    IDictionary<Guid, BaseItem> nativeItems)
+{
+    var folder = Path.Combine(libraryPath, "identity-series");
+    Directory.CreateDirectory(folder);
+    var path = Path.Combine(folder, "Identity S01E01.mkv");
+    await File.WriteAllBytesAsync(path, Enumerable.Repeat((byte)1, 2048).ToArray());
+    var series = new FixtureSeries { Id = Guid.NewGuid(), Name = "Identity series" };
+    var native = new MediaBrowser.Controller.Entities.TV.Episode
+    {
+        Id = Guid.NewGuid(), Name = "Identity episode", Path = path, SeriesId = series.Id, ParentIndexNumber = 1, IndexNumber = 1
+    };
+    series.Items.Add(native);
+    tvLibrary.Items.Add(series);
+    nativeItems[series.Id] = series;
+    nativeItems[native.Id] = native;
+
+    async Task<ReconciliationResult> ReconcileAsync(Guid itemId, string mediaPath)
+    {
+        using var scope = services.CreateScope();
+        return await scope.ServiceProvider.GetRequiredService<ReconciliationService>().ReconcileAsync(new NativeTitleSnapshot(
+            "series", 900301, tvLibrary.Id, "Identity series", 2020, null, null, null, null,
+            [new(series.Id, tvLibrary.Id, true, series.Id)],
+            [new(itemId, series.Id, 900302, 1, 1, true, "Identity episode", MediaPath: mediaPath,
+                StorageIdentity: storage.Capture(mediaPath))]), default);
+    }
+
+    var created = await ReconcileAsync(native.Id, path);
+    Assert(created.Outcome == ReconciliationOutcome.Created, "The identity fixture series is tracked");
+    Guid entryId = created.EntryId!.Value, episodeId, bindingId;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var binding = await database.EpisodeBindings.SingleAsync(candidate => candidate.JellyfinItemId == native.Id);
+        (episodeId, bindingId) = (binding.EpisodeId, binding.Id);
+        Assert(!string.IsNullOrEmpty(binding.FileFingerprint), "Reconciliation records the bound file's fingerprint (RET3-R3)");
+    }
+
+    async Task ScheduleAsync()
+    {
+        await using var database = new ModDbContext(databasePath);
+        var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(candidate => candidate.TargetId == episodeId);
+        if (evaluation is null)
+        {
+            evaluation = new RetentionEvaluation { EntryId = entryId, EpisodeId = episodeId, TargetId = episodeId };
+            database.RetentionEvaluations.Add(evaluation);
+        }
+
+        evaluation.State = "scheduled";
+        evaluation.Reason = "completion_policy_satisfied";
+        evaluation.BaselineAt = DateTime.UtcNow.AddDays(-10);
+        evaluation.CompletionBasisAt = DateTime.UtcNow.AddDays(-5);
+        evaluation.EligibleAt = DateTime.UtcNow.AddDays(-5);
+        evaluation.Deadline = DateTime.UtcNow.AddDays(-1);
+        await database.SaveChangesAsync();
+    }
+
+    async Task<(string State, string Reason, int Resets, string? LastReason)> ReadAsync()
+    {
+        await using var database = new ModDbContext(databasePath);
+        var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(candidate => candidate.TargetId == episodeId);
+        var resets = await database.History.AsNoTracking().Where(history => history.EntryId == entryId &&
+            history.EventType == "retention_reset").OrderBy(history => history.CreatedAt).ToListAsync();
+        var last = resets.LastOrDefault()?.Data is { } data ? JsonDocument.Parse(data).RootElement.GetProperty("reason").GetString() : null;
+        return (evaluation.State, evaluation.Reason, resets.Count, last);
+    }
+
+    // Same bytes, reconciled again: nothing happens.
+    await ScheduleAsync();
+    await ReconcileAsync(native.Id, path);
+    var unchanged = await ReadAsync();
+    Assert(unchanged is { State: "scheduled", Resets: 0 }, $"An unchanged file keeps its schedule: {unchanged}");
+
+    // Rewritten in place (the same inode, other bytes): a new file for retention.
+    await File.WriteAllBytesAsync(path, Enumerable.Repeat((byte)2, 3072).ToArray());
+    await ReconcileAsync(native.Id, path);
+    var rewritten = await ReadAsync();
+    Assert(rewritten is { State: "waiting", Reason: "representation_reset", Resets: 1, LastReason: "replaced_in_place" },
+        $"A file rewritten in place at the same path starts over and History says it was replaced (RET3-R3): {rewritten}");
+
+    // Deleted and written again under the same name (a new inode, the same size): a new file too.
+    await ScheduleAsync();
+    var replacement = path + ".part";
+    await File.WriteAllBytesAsync(replacement, Enumerable.Repeat((byte)3, 3072).ToArray());
+    File.Move(replacement, path, overwrite: true);
+    await ReconcileAsync(native.Id, path);
+    var recreated = await ReadAsync();
+    Assert(recreated is { State: "waiting", Reason: "representation_reset", Resets: 2, LastReason: "replaced_in_place" },
+        $"A file deleted and written again at the same path starts over (RET3-R3): {recreated}");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var summary = (await database.History.AsNoTracking().Where(history => history.EntryId == entryId &&
+            history.EventType == "retention_reset").OrderByDescending(history => history.CreatedAt).FirstAsync()).Summary;
+        Assert(summary.Contains("replaced in place", StringComparison.Ordinal), "History says the file was replaced: " + summary);
+    }
+
+    // RET3-R7: keep the file by itself, then move it by copy and delete (a new inode at a new path). The Keep matches no
+    // file of the title any more: it is removed with one History event, and a new file at the old path is not kept.
+    var versionKeep = $"/JellyfinMod/Entries/{entryId}/Versions/{bindingId}/Keep";
+    Assert((await http.PostAsync(versionKeep, null)).IsSuccessStatusCode, "An administrator keeps the file by itself");
+    async Task<bool?> KeptAsync()
+    {
+        using var detail = await http.GetFromJsonAsync<JsonDocument>($"/JellyfinMod/Entries/{entryId}");
+        var versions = detail!.RootElement.GetProperty("episodes")[0].GetProperty("versions");
+        return versions.GetArrayLength() == 1 && versions[0].TryGetProperty("kept", out var value) ? value.GetBoolean() : null;
+    }
+
+    Assert(await KeptAsync() == true, "The kept file reads as kept");
+    var copied = Path.Combine(folder, "Identity S01E01 copied.mkv");
+    File.Copy(path, copied);
+    File.Delete(path);
+    native.Path = copied;
+    await ReconcileAsync(native.Id, copied);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        Assert(!await database.VersionKeeps.AnyAsync(keep => keep.EntryId == entryId) &&
+            await database.History.CountAsync(history => history.EntryId == entryId && history.EventType == "version_keep_detached") == 1,
+            "A per-file Keep whose file went is removed, with one version_keep_detached event (RET3-R7)");
+    }
+
+    Assert(await KeptAsync() == false, "The copied file is not kept: the Keep was for the file that went");
+    await File.WriteAllBytesAsync(path, Enumerable.Repeat((byte)4, 1024).ToArray());
+    File.Delete(copied);
+    native.Path = path;
+    await ReconcileAsync(native.Id, path);
+    Assert(await KeptAsync() == false, "A new file at the old kept path is not kept (RET3-R7)");
+
+    // A rename within one filesystem keeps a per-file Keep (same inode, RET2-R9), through reconciliation too.
+    Assert((await http.PostAsync(versionKeep, null)).IsSuccessStatusCode, "Keep the new file");
+    var renamed = Path.Combine(folder, "Identity S01E01 renamed.mkv");
+    File.Move(path, renamed);
+    native.Path = renamed;
+    await ReconcileAsync(native.Id, renamed);
+    Assert(await KeptAsync() == true, "A renamed file is still kept (same device and inode)");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        Assert(await database.History.CountAsync(history => history.EntryId == entryId && history.EventType == "version_keep_detached") == 1,
+            "A rename detaches nothing");
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == entryId));
+        await database.SaveChangesAsync();
+    }
+
+    tvLibrary.Items.Remove(series);
+    nativeItems.Remove(series.Id);
+    nativeItems.Remove(native.Id);
+    Directory.Delete(folder, true);
+}
+
+static bool Observe(Action<Guid>? read, Guid itemId)
+{
+    read?.Invoke(itemId);
+    return true;
+}
+
+// RET3-R6: the save that records an unlink must not be lost to a busy database. Another connection takes SQLite's write
+// lock when the executor reads live state, the last step before the unlink, and holds it past the busy timeout; the
+// file is unlinked, the first save gives up with `database is locked`, and the retry records the reclamation.
+static async Task VerifyUnlinkSurvivesBusyDatabaseAsync(
+    IServiceProvider services,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    PluginConfiguration settings,
+    IDictionary<Guid, BaseItem> nativeItems,
+    Guid userId,
+    Guid libraryId,
+    Action<Action<Guid>?> setUserDataRead)
+{
+    settings.RetentionEnabled = true;
+    var policy = await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
+    var fixture = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems, userId, libraryId,
+        900401, "ret3-r6-busy", RetentionOperationStatesForTest.Prepared, keep: false);
+    Guid itemId, entryId;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var operation = await database.RetentionOperations.SingleAsync(candidate => candidate.Id == fixture.OperationId);
+        operation.PolicyVersion = policy.Version;
+        (await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == operation.EntryId)).PolicyVersion = policy.Version;
+        await database.SaveChangesAsync();
+        (itemId, entryId) = (operation.JellyfinItemId, operation.EntryId!.Value);
+    }
+
+    var holder = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={databasePath}");
+    await holder.OpenAsync();
+    Task? released = null;
+    var held = TimeSpan.FromSeconds(40);
+    setUserDataRead(id =>
+    {
+        if (id != itemId || released is not null) return;
+        using (var begin = holder.CreateCommand())
+        {
+            begin.CommandText = "BEGIN IMMEDIATE;";
+            begin.ExecuteNonQuery();
+        }
+
+        released = Task.Run(async () =>
+        {
+            await Task.Delay(held);
+            using var commit = holder.CreateCommand();
+            commit.CommandText = "COMMIT;";
+            commit.ExecuteNonQuery();
+        });
+    });
+    var started = DateTime.UtcNow;
+    var result = (await services.GetRequiredService<RetentionExecutor>().RecoverAsync(default))
+        .Single(candidate => candidate.OperationId == fixture.OperationId);
+    setUserDataRead(null);
+    Assert(released is not null, "The database was held from the moment live state was read before the unlink");
+    await released!;
+    await holder.DisposeAsync();
+    Assert(DateTime.UtcNow - started >= held,
+        "The executor waited out the held database rather than finishing before it was released");
+    Assert(result.State == "completed" && result.Reason == "reclaimed" && !File.Exists(fixture.MediaPath) &&
+        File.Exists(fixture.SidecarPath),
+        $"An unlink whose first save met a busy database is still recorded as reclaimed (RET3-R6): {result.State}/{result.Reason}");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var operation = await database.RetentionOperations.AsNoTracking().SingleAsync(candidate => candidate.Id == fixture.OperationId);
+        Assert(operation.State == "completed" && operation.UnlinkedAt is not null &&
+            await database.History.CountAsync(history => history.Id == fixture.OperationId && history.EventType == "reclaimed") == 1 &&
+            !await database.EntryBindings.AnyAsync(binding => binding.EntryId == entryId),
+            "The operation, its history and the binding removal are all recorded once");
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == entryId));
+        await database.SaveChangesAsync();
+    }
+
+    File.Delete(fixture.SidecarPath);
+    settings.RetentionEnabled = false;
+    await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
 }
 
 static JsonElement FindRow(JsonElement preview, Guid jellyfinItemId) =>
@@ -1645,6 +1891,54 @@ static async Task VerifyLiveStateRevalidationAsync(
             $"Missing evidence is read live without a repair run: {observation?.SourceReason}/{evaluation.State}/{evaluation.Reason}");
     }
 
+    // RET3-R4: the last check before the unlink counts a watch only at or after the target's floor, as the evaluator does.
+    // The stored observation says the movie was finished after its baseline, so the evaluation is scheduled and past its
+    // deadline; Jellyfin's live state, read just before the unlink, holds only a watch from before that baseline (an old
+    // play state reattached to a re-acquired file). The unlink is refused and the file is byte-identical.
+    var stale = await SeedAsync(900206, "ret3-r4-stale");
+    var staleNow = clock.GetUtcNow().UtcDateTime;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var evaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == stale.EntryId);
+        evaluation.BaselineAt = staleNow.AddDays(-2);
+        var observation = await database.CompletionObservations.SingleAsync(candidate => candidate.TargetId == stale.EntryId);
+        observation.LastPlayedAt = staleNow.AddDays(-1.5);
+        observation.CompletedAt = staleNow.AddDays(-1.5);
+        await database.SaveChangesAsync();
+    }
+
+    liveStates[stale.ItemId] = new UserItemData { Key = "ret3-r4", Played = true, LastPlayedDate = staleNow.AddDays(-3) };
+    var staleBytes = await File.ReadAllBytesAsync(stale.Fixture.MediaPath);
+    var staleResult = await RecoverAsync(stale.Fixture);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(candidate => candidate.TargetId == stale.EntryId);
+        Assert(evaluation.State == "scheduled" && evaluation.Deadline < staleNow,
+            $"The stored evidence schedules the movie and its deadline passed: {evaluation.State} {evaluation.Deadline:o}");
+    }
+
+    Assert(staleResult.State == "blocked" && staleResult.Reason == "live_not_completed" && File.Exists(stale.Fixture.MediaPath) &&
+        (await File.ReadAllBytesAsync(stale.Fixture.MediaPath)).SequenceEqual(staleBytes),
+        $"A live played state dated before the floor does not complete the target and the file is byte-identical (RET3-R4): " +
+        $"{staleResult.State}/{staleResult.Reason}");
+    var undated = await SeedAsync(900207, "ret3-r4-undated");
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var evaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == undated.EntryId);
+        evaluation.BaselineAt = staleNow.AddDays(-2);
+        var observation = await database.CompletionObservations.SingleAsync(candidate => candidate.TargetId == undated.EntryId);
+        observation.LastPlayedAt = staleNow.AddDays(-1.5);
+        observation.CompletedAt = staleNow.AddDays(-1.5);
+        await database.SaveChangesAsync();
+    }
+
+    liveStates[undated.ItemId] = new UserItemData { Key = "ret3-r4-undated", Played = true };
+    var undatedResult = (Result: await RecoverAsync(undated.Fixture), undated.Fixture.MediaPath);
+    Assert(undatedResult.Result.State == "blocked" && undatedResult.Result.Reason == "live_not_completed" &&
+        File.Exists(undatedResult.MediaPath),
+        $"A live played flag without a date (Jellyfin 12's propagated version flag) is not a completion either: " +
+        $"{undatedResult.Result.State}/{undatedResult.Result.Reason}");
+
     // P3.T16: a stacked multi-part movie is never reclaimed; unlinking one part would strand the rest.
     var multiPart = await SeedAsync(900205, "t16-multipart");
     var secondPart = Path.Combine(libraryPath, "t16-multipart-cd2.mkv");
@@ -1663,8 +1957,10 @@ static async Task VerifyLiveStateRevalidationAsync(
     nativeItems.Remove(versionB.Id);
     await using (var database = new ModDbContext(databasePath))
     {
-        foreach (var entryId in new[] { favorite.EntryId, unwatched.EntryId, grouped.EntryId, missing.EntryId, multiPart.EntryId })
+        foreach (var entryId in new[] { favorite.EntryId, unwatched.EntryId, grouped.EntryId, missing.EntryId, multiPart.EntryId,
+                     stale.EntryId })
             database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == entryId));
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == undated.EntryId));
         await database.SaveChangesAsync();
     }
 

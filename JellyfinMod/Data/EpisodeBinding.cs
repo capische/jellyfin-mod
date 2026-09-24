@@ -17,6 +17,12 @@ public sealed class EpisodeBinding
     public string? MediaPath { get; set; }
     /// <summary>Gets or sets the Linux mount identity observed for the media path.</summary>
     public string? StorageIdentity { get; set; }
+    /// <summary>
+    /// Gets or sets the file's fingerprint (physical identity, size and modification time) when reconciliation last saw it,
+    /// or null before it was first read (RET3-R3). A different fingerprint at the same path is a new file.
+    /// </summary>
+    [System.ComponentModel.DataAnnotations.MaxLength(512)]
+    public string? FileFingerprint { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether this file was bound to a TMDB-identified episode only by its season and episode

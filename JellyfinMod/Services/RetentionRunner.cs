@@ -22,6 +22,7 @@ public sealed class RetentionRunner(
     {
         await using var lease = await runGate.TryAcquireAsync(cancellationToken).ConfigureAwait(false)
             ?? throw new RetentionRunAlreadyActiveException();
+        using var operation = SqliteWriteDiagnostics.Operation("retention run");
         var now = clock.GetUtcNow().UtcDateTime;
 
         // Only this process runs batches, and it holds the run gate, so any other "running" row belongs

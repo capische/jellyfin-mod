@@ -202,6 +202,36 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     public Dictionary<(int Season, int Episode), HashSet<int>> CoveredPositions(User user, IEnumerable<BaseItem> seriesCopies) =>
         CoveredPositions(seriesCopies.SelectMany(series => GetEpisodes(user, series)));
 
+    /// <summary>
+    /// The numbers the title's own bound episode files cover (RET3-R5), read from the plugin's bindings rather than from
+    /// what one user can see: each bound native episode, the versions Jellyfin 12 groups under it (a double-episode file is
+    /// hidden as a version of the single episode it starts with), and every number of a multi-episode file.
+    /// </summary>
+    public async Task<Dictionary<(int Season, int Episode), HashSet<int>>> CoveredByBindingsAsync(Data.ModDbContext database,
+        Guid entryId, CancellationToken cancellationToken)
+    {
+        var itemIds = await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync(
+            database.EpisodeBindings.Where(binding => database.Episodes.Any(episode => episode.Id == binding.EpisodeId &&
+                episode.EntryId == entryId)).Select(binding => binding.JellyfinItemId).Distinct(), cancellationToken).ConfigureAwait(false);
+        var natives = new List<BaseItem>();
+        foreach (var itemId in itemIds)
+        {
+            try
+            {
+                if (library.GetItemById(itemId) is not MediaBrowser.Controller.Entities.Video video) continue;
+                natives.Add(video);
+                natives.AddRange(library.GetLocalAlternateVersionIds(video).Select(id => library.GetItemById(id)).OfType<BaseItem>());
+                natives.AddRange(library.GetLinkedAlternateVersions(video).OfType<BaseItem>());
+            }
+            catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
+            {
+                // An item that cannot be read covers nothing more than its row already holds.
+            }
+        }
+
+        return CoveredPositions(natives);
+    }
+
     /// <summary>Whether a file covers this number without carrying this TMDB episode id (RET2-R3).</summary>
     public static bool CoveredUnverified(IReadOnlyDictionary<(int Season, int Episode), HashSet<int>> covered, int season,
         int episode, int tmdbId) =>

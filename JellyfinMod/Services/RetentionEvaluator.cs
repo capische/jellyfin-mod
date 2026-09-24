@@ -34,8 +34,66 @@ public sealed class RetentionEvaluator(
             await EvaluateAsync(target, cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Re-evaluates every bound movie and episode.</summary>
+    /// <summary>
+    /// Re-evaluates every bound movie and episode, one full evaluation at a time in this process. A caller that finds a
+    /// full evaluation already running waits for it and then runs its own only when none started after it asked: an
+    /// evaluation that started later read everything this caller would read (every Keep, window, policy and user-data
+    /// change saved before the request), so repeating it adds nothing but write load. Switching retention on used to run
+    /// the listener's full evaluation and the administrator's preview side by side, each writing every target, and on a
+    /// slow disk one of them waited past SQLite's busy timeout (`database is locked`, 18096, 2026-09-24).
+    /// </summary>
     public async Task EvaluateAllAsync(CancellationToken cancellationToken)
+    {
+        var asked = Interlocked.Read(ref fullEvaluationsStarted);
+        await FullEvaluationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (Interlocked.Read(ref fullEvaluationsCompletedFrom) > asked) return;
+            var started = Interlocked.Increment(ref fullEvaluationsStarted);
+            await EvaluateAllCoreAsync(cancellationToken).ConfigureAwait(false);
+            Interlocked.Exchange(ref fullEvaluationsCompletedFrom, started);
+        }
+        finally
+        {
+            FullEvaluationGate.Release();
+        }
+    }
+
+    /// <summary>One full evaluation at a time (see <see cref="EvaluateAllAsync"/>).</summary>
+    private static readonly SemaphoreSlim FullEvaluationGate = new(1, 1);
+
+    /// <summary>How many full evaluations have started, and the start number of the last one that completed.</summary>
+    private static long fullEvaluationsStarted;
+    private static long fullEvaluationsCompletedFrom;
+
+    /// <summary>
+    /// Re-evaluates every target of the given entries: each movie, and each bound episode of each series. The executor
+    /// uses it under its locks for the titles an action touches, instead of re-evaluating every title three times per
+    /// action (RET3-R6).
+    /// </summary>
+    public async Task EvaluateEntriesAsync(IReadOnlyCollection<Guid> entryIds, CancellationToken cancellationToken)
+    {
+        if (entryIds.Count == 0) return;
+        database.ChangeTracker.Clear();
+        var ids = entryIds.Distinct().ToArray();
+        var movieTargets = await database.Entries.AsNoTracking()
+            .Where(entry => ids.Contains(entry.Id) && entry.MediaType == "movie" &&
+                database.EntryBindings.Any(binding => binding.EntryId == entry.Id))
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        var episodeTargets = await database.EpisodeBindings.AsNoTracking()
+            .Join(database.Episodes.AsNoTracking().Where(episode => ids.Contains(episode.EntryId)),
+                binding => binding.EpisodeId, episode => episode.Id, (_, episode) => episode)
+            .Join(database.Entries.AsNoTracking(), episode => episode.EntryId, entry => entry.Id,
+                (episode, entry) => new Target(entry, episode.Id, episode.RetentionPolicy, episode.ReclaimAfterDays))
+            .Distinct()
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var entry in movieTargets)
+            await EvaluateAsync(new Target(entry, null), cancellationToken).ConfigureAwait(false);
+        foreach (var target in episodeTargets)
+            await EvaluateAsync(target, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task EvaluateAllCoreAsync(CancellationToken cancellationToken)
     {
         database.ChangeTracker.Clear();
         var movieTargets = await database.EntryBindings.AsNoTracking()
@@ -117,16 +175,46 @@ public sealed class RetentionEvaluator(
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await EvaluateCoreAsync(target, cancellationToken).ConfigureAwait(false);
+            // A busy database (another writer past the busy timeout) is retried rather than failing a preview or a run.
+            await SqliteBusy.RetryAsync(async () =>
+            {
+                database.ChangeTracker.Clear();
+                await EvaluateCoreAsync(target, cancellationToken).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
         }
-        catch (DbUpdateException error) when (error.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 })
+        catch (DbUpdateException error) when (error.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 } ||
+                                              error is DbUpdateConcurrencyException)
         {
+            // Another writer created the row first (19), or reset its baseline or grace while this evaluation read it
+            // (a concurrency token, RET3-R4): evaluate again from what is stored now.
             database.ChangeTracker.Clear();
-            await EvaluateCoreAsync(target, cancellationToken).ConfigureAwait(false);
+            await SqliteBusy.RetryAsync(() => EvaluateCoreAsync(target, cancellationToken), cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Holds one target's evaluation gate, for a writer outside the evaluator that changes the target's evaluation row
+    /// (an administrator's grace restart, RET3-R4). Take it before any database transaction, as the evaluator does, and
+    /// release it before evaluating the target.
+    /// </summary>
+    internal static async Task<IDisposable> HoldTargetAsync(Guid targetId, CancellationToken cancellationToken)
+    {
+        var gate = TargetGates.GetOrAdd(targetId, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new GateRelease(gate);
+    }
+
+    private sealed class GateRelease(SemaphoreSlim gate) : IDisposable
+    {
+        private int released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref released, 1) == 0) gate.Release();
         }
     }
 

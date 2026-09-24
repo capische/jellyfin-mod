@@ -46,14 +46,19 @@ public sealed class RetentionEvaluation
     public DateTime EvaluatedAt { get; set; }
 
     /// <summary>Gets or sets the earliest instant the current representation's grace may start.</summary>
-    /// <remarks>Set when the target is first evaluated and again when its last representation is reclaimed or unbound.</remarks>
+    /// <remarks>
+    /// Set when the target is first evaluated and again when its last representation is reclaimed or unbound. A concurrency
+    /// token (RET3-R4): an evaluation that read the row before a reset cannot save over it; it is evaluated again.
+    /// </remarks>
+    [ConcurrencyCheck]
     public DateTime BaselineAt { get; set; }
 
     /// <summary>
     /// Gets or sets the earliest instant grace may start because an administrator restarted it (un-Keep or a changed
     /// window, PHASE10 Q4). Unlike the schedule it survives retention being switched off and on (Q9), so a restarted
-    /// countdown can never fall back to an older, already expired one.
+    /// countdown can never fall back to an older, already expired one. A concurrency token, like <see cref="BaselineAt"/>.
     /// </summary>
+    [ConcurrencyCheck]
     public DateTime? GraceNotBefore { get; set; }
 
     /// <summary>
