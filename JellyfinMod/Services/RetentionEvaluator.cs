@@ -121,9 +121,8 @@ public sealed class RetentionEvaluator(
         {
             // A target's grace never starts before it was first evaluated, which is at or after its
             // binding. Historical native play dates must not make newly bound media due at once.
-            // An episode additionally needs a completion after that first evaluation (P10.E1, proposed default for
-            // PHASE10 question 1): tracking a library's episodes must not turn its whole watched backlog into one wave
-            // of reclamation. Only watching, or marking played, after tracking began counts.
+            // An episode additionally needs a completion after that first evaluation and after retention was enabled
+            // (P10.E1, PHASE10 question 1 answered 2026-09-24): only a new watch counts.
             result = new RetentionEvaluation
             {
                 EntryId = target.Entry.Id,
@@ -279,8 +278,16 @@ public sealed class RetentionEvaluator(
             }
         }
 
+        // Only a new watch counts for an episode (PHASE10 Q1, answered 2026-09-24): a completion must carry Jellyfin's own
+        // last-played instant at or after the later of when the episode was first tracked and when retention was last
+        // enabled, so nothing watched before per-episode retention existed, or while it was off, ever becomes due.
+        var freshFloor = target.EpisodeId.HasValue && policy.EnabledAt is { } enabledAt
+            ? Latest(result.BaselineAt, enabledAt)
+            : result.BaselineAt;
+        var requiresFresh = result.RequiresFreshCompletion || target.EpisodeId.HasValue;
         var completed = observations.Values
-            .Select(observation => (observation.UserId, CompletedAt: CompletionInstant(observation, result, now)))
+            .Select(observation => (observation.UserId,
+                CompletedAt: CompletionInstant(observation, requiresFresh, freshFloor, now)))
             .Where(item => item.CompletedAt.HasValue)
             .ToDictionary(item => item.UserId, item => item.CompletedAt!.Value);
         DateTime? completionBasis = policy.WatchedUserMode switch
@@ -372,15 +379,17 @@ public sealed class RetentionEvaluator(
     /// baseline counts; the stored start of the completed state may predate it when Jellyfin
     /// reattached old user data, so a later native last-played value is accepted as the fresh one.
     /// </summary>
-    private static DateTime? CompletionInstant(CompletionObservation observation, RetentionEvaluation result, DateTime now)
+    private static DateTime? CompletionInstant(CompletionObservation observation, bool requiresFresh, DateTime floor, DateTime now)
     {
         if (!observation.Played || observation.PlaybackPositionTicks != 0 || !observation.CompletedAt.HasValue) return null;
-        if (!result.RequiresFreshCompletion) return observation.CompletedAt.Value;
+        if (!requiresFresh) return observation.CompletedAt.Value;
         // A fresh completion must carry Jellyfin's own last-played instant at or after the baseline. A played state with
         // no last-played date (an imported or synced watched flag) has no evidence of when it happened; the stored start
         // of the completed state is then only the time the plugin first read it, which is not a new completion (P10.E1).
-        if (observation.LastPlayedAt is not { } lastPlayed || lastPlayed < result.BaselineAt || lastPlayed > now) return null;
-        return observation.CompletedAt.Value >= result.BaselineAt ? observation.CompletedAt.Value : lastPlayed;
+        // Jellyfin's MarkPlayed keeps an older LastPlayedDate when one exists and MarkUnplayed clears it, so "mark played"
+        // on an item played before the floor stays old, while mark unplayed then played, or a real playback, is fresh.
+        if (observation.LastPlayedAt is not { } lastPlayed || lastPlayed < floor || lastPlayed > now) return null;
+        return observation.CompletedAt.Value >= floor ? observation.CompletedAt.Value : lastPlayed;
     }
 
     private static void Set(RetentionEvaluation result, string state, string reason)
