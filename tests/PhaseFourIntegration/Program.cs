@@ -323,7 +323,16 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             "A download folder beside a library on another filesystem is accepted");
         Assert(shmClient.GetProperty("sameFilesystemLibraryIds").EnumerateArray().Select(value => value.AsGuid()).SequenceEqual([world.Far.Id]),
             "Only libraries whose roots share the folder's statx device and mount are recorded");
-        Assert((await admin.DeleteAsync($"/JellyfinMod/Settings/DownloadClients/{shmClient.GetProperty("id").AsGuid()}")).StatusCode ==
+        // The very first client is selected on creation (P7.S11), and a selected client cannot be deleted.
+        var shmId = shmClient.GetProperty("id").AsGuid();
+        var firstSelection = await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition settings read");
+        Assert(firstSelection.GetProperty("downloadClientId").AsGuid() == shmId, "The first client created is selected when none exists");
+        await ExpectAsync(admin.DeleteAsync($"/JellyfinMod/Settings/DownloadClients/{shmId}"), 409, "download_client_selected",
+            "The selected client cannot be deleted");
+        await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Acquisition",
+            new { enabled = false, downloadClientId = (Guid?)null, defaultQualityProfileId = (Guid?)null,
+                revision = firstSelection.GetProperty("revision").GetInt32() }), 200, "An administrator can leave no client selected");
+        Assert((await admin.DeleteAsync($"/JellyfinMod/Settings/DownloadClients/{shmId}")).StatusCode ==
             HttpStatusCode.NoContent, "An unused client can be deleted");
         Directory.Delete(far + "-downloads");
         await ExpectAsync(admin.PostAsJsonAsync("/JellyfinMod/Settings/DownloadClients", Client(Path.Combine(media, "downloads"), label: "jfmod-owned")),
@@ -333,6 +342,12 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         var clientDto = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Settings/DownloadClients", Client(Path.Combine(media, "downloads"))),
             201, "Administrator creates the Transmission client");
         var clientId = clientDto.GetProperty("id").AsGuid();
+        // Again the only client, so selected; clear it so readiness below starts from nothing selected.
+        var secondSelection = await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition settings read");
+        Assert(secondSelection.GetProperty("downloadClientId").AsGuid() == clientId, "A client created when none exists is selected");
+        await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Acquisition",
+            new { enabled = false, downloadClientId = (Guid?)null, defaultQualityProfileId = (Guid?)null,
+                revision = secondSelection.GetProperty("revision").GetInt32() }), 200, "The selection is cleared");
         var sameFilesystem = clientDto.GetProperty("sameFilesystemLibraryIds").EnumerateArray().Select(value => value.AsGuid()).ToHashSet();
         Assert(sameFilesystem.SetEquals([world.Movies.Id, world.Movies2.Id, world.Tv.Id]) &&
             clientDto.GetProperty("passwordConfigured").GetBoolean() && !clientDto.GetRawText().Contains(transmission.Password, StringComparison.Ordinal),
@@ -348,6 +363,10 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             "The client test completes the session-id handshake over real HTTP and adds nothing");
         var badPassword = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Settings/DownloadClients",
             Client(Path.Combine(media, "downloads"), password: "not-the-password")), 201, "A client with a wrong password can be saved");
+        var noneSelected = await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition settings read");
+        Assert(noneSelected.GetProperty("downloadClientId").ValueKind == JsonValueKind.Null,
+            "Creating a client while others exist never selects it, even with none selected");
+        var acquisitionRevision = noneSelected.GetProperty("revision").GetInt32();
         var badTest = await ReadAsync(await admin.PostAsync($"/JellyfinMod/Settings/DownloadClients/{badPassword.GetProperty("id").AsGuid()}/Test", null),
             200, "Wrong password test answers");
         Assert(!badTest.GetProperty("ok").GetBoolean() && badTest.GetProperty("code").GetString() == "client_auth_failed",
@@ -356,11 +375,11 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         var settings = await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition settings read");
         Assert(!settings.GetProperty("ready").GetBoolean() && Strings(settings.GetProperty("blockers")).SequenceEqual(["no_download_client", "no_default_profile"]),
             "Readiness lists every missing prerequisite");
-        var notReady = await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Acquisition", new { enabled = true, revision = 1 });
+        var notReady = await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Acquisition", new { enabled = true, revision = acquisitionRevision });
         Assert(notReady.StatusCode == HttpStatusCode.Conflict && (await notReady.Content.ReadAsStringAsync()).Contains("acquisition_not_ready"),
             "Grabs cannot be enabled before a verified indexer, client and default profile exist");
         settings = await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Acquisition",
-            new { enabled = true, downloadClientId = clientId, defaultQualityProfileId = hdId, revision = 1 }), 200, "Administrator enables grabs");
+            new { enabled = true, downloadClientId = clientId, defaultQualityProfileId = hdId, revision = acquisitionRevision }), 200, "Administrator enables grabs");
         Assert(settings.GetProperty("enabled").GetBoolean() && settings.GetProperty("ready").GetBoolean() &&
             settings.GetProperty("holdSeconds").GetInt32() == 2 && settings.GetProperty("seedProtectionMatchesClient").GetBoolean(),
             "Enabled acquisition reports its hold, and with no XML endpoint seed protection reads the selected client (P7.S7 default 12)");

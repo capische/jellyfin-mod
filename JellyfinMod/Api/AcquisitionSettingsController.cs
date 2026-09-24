@@ -171,7 +171,19 @@ public sealed partial class AcquisitionSettingsController(
         Apply(client, request, destination);
         client.PasswordSecretRef = request.Password.Action == "replace"
             ? await secrets.AddAsync(request.Password.Value!, cancellationToken) : null;
+        // The very first client becomes the selected one (P7.S11). The setup wizard's download-client step is done only
+        // once a client is selected, and the only selector is the Grabbing step that this step unlocks, so a fresh
+        // install could never leave step 2. Only when no client exists at all: a selection an administrator made, or
+        // chose to leave empty while clients exist (the Dashboard page offers "None"), is never changed here.
+        var firstClient = !await database.AcquisitionDownloadClients.AnyAsync(cancellationToken);
         database.AcquisitionDownloadClients.Add(client);
+        var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
+        if (firstClient && settings.DownloadClientId is null)
+        {
+            settings.DownloadClientId = client.Id;
+            settings.Revision++;
+        }
+
         if (request.PathMappings is { } created) ReplaceMappings(client.Id, created, []);
         if (await SaveAsync(cancellationToken) is { } conflict)
         {
