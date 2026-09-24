@@ -23,7 +23,7 @@ def main():
         if not source.is_file() or not source.stat().st_size:
             parser.error(f"Missing or empty package artifact: {source}")
 
-    # JPRM 1.1 emits the repository's legacy `image` field. Jellyfin 10.11's
+    # JPRM 1.1 emits the repository's legacy `image` field. Jellyfin 12.0.0's
     # installed-plugin image endpoint instead reads `imagePath` from meta.json.
     config["image"] = image.name
     metadata = jprm.generate_metadata(config)

@@ -21,19 +21,20 @@ decision logs; several questions in them are settled.
 
 ## Target
 
-Pinned to the server actually running on the Pi.
+Pinned to the server every instance runs, and the one the Docker image pins by digest: Jellyfin
+12.0.0 on .NET 10.
 
 | | |
 | --- | --- |
-| Framework | `net9.0` |
-| Packages | `Jellyfin.Controller` / `Jellyfin.Model` `10.11.11` |
-| `targetAbi` | `10.11.0.0` |
+| Framework | `net10.0` |
+| Packages | `Jellyfin.Controller` / `Jellyfin.Model` `12.0.0` |
+| EF Core | `Microsoft.EntityFrameworkCore.Sqlite` `10.0.11`, the version the host ships |
+| `targetAbi` | `12.0.0.0` |
 
 There is no Jellyfin 11.x — versions ran 10.x to 10.11, then dropped the leading `10.`, so 10.12
-became 12.0. Moving to 12.0 / net10 is a deliberate later step, not drift.
-
-`targetAbi` is a minimum: this build runs on the Jellyfin 12.0.0 server the Docker image pins, and
-that is the only host it has been tested on. The compatibility matrix is PHASE7 §3.5.
+became 12.0. **Jellyfin 10.11 is no longer supported** (decided 2026-09-24): the plugin compiles
+against 12.0.0 and a 10.11 server refuses to load it (`targetAbi` is a minimum). The compatibility
+matrix is PHASE7 §3.5. Building needs the .NET 10 SDK.
 
 ## Layout
 
@@ -70,15 +71,15 @@ Package the compiled assembly and plugin-card logo with the JPRM-based helper:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r scripts/requirements.txt
-.venv/bin/python scripts/package_plugin.py JellyfinMod/bin/Release/net9.0 artifacts/package
+.venv/bin/python scripts/package_plugin.py JellyfinMod/bin/Release/net10.0 artifacts/package
 ```
 
 Copy all three generated files (`JellyfinMod.dll`, `logo.png`, `meta.json`) from `artifacts/package`
 into the plugin's own folder under the server's persistent `plugins/` directory, then restart
-Jellyfin. The helper reads `build.yaml` and adds the `imagePath` field required by Jellyfin 10.11;
+Jellyfin. The helper reads `build.yaml` and adds the `imagePath` field Jellyfin 12.0.0 reads;
 copying only the DLL leaves the installed plugin card without its logo.
 The assembly version matches `build.yaml` (`0.1.0.0`).
-Jellyfin 10.11 already supplies EF Core 9 and SQLite, including the native SQLite library; do
+Jellyfin 12.0.0 already supplies EF Core 10 and SQLite, including the native SQLite library; do
 not copy the host assemblies or a second database stack into the plugin directory.
 
 For plugin-only deployment from the sibling web checkout:

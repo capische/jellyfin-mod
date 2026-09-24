@@ -23,8 +23,9 @@ public sealed class DatabaseInitializer(
             await database.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
             // Only this process runs reconciliation, so a row still "running" belongs to a process that
             // stopped before finishing it (P2.R10).
-            // Tracked updates, not ExecuteUpdate: the host runs EF Core 10, whose bulk-update setter type differs
-            // from the EF Core 9 this plugin compiles against, and a type-load failure here stops the server.
+            // Tracked updates. They were required while the plugin compiled against EF Core 9 and the host ran
+            // EF Core 10 (the bulk-update setter type differs, and the type-load failure stopped the server); the
+            // plugin now compiles against the host's own EF Core 10.0.11, so ExecuteUpdate would bind as well.
             var stranded = await database.ReconciliationRuns.Where(run => run.Status == "running")
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
             foreach (var run in stranded)

@@ -25,25 +25,25 @@ internal static class BackfillIntegration
         movies.Add(new Movie { Id = Guid.NewGuid(), Name = "Unmatched", Path = "/media/unmatched.mkv" });
         var primary = Movie(8000, movieLibraryId);
         var alternate = Movie(8000, movieLibraryId);
-        alternate.PrimaryVersionId = primary.Id.ToString("N");
+        alternate.PrimaryVersionId = primary.Id;
         movies.Add(primary);
         movies.Add(alternate);
-        var jellyfin12Primary = Movie12(8050, movieLibraryId);
-        var jellyfin12Alternate = Movie12(8050, movieLibraryId);
-        jellyfin12Primary.Id = Guid.Parse("30000000-0000-0000-0000-000000000050");
-        jellyfin12Alternate.Id = Guid.Parse("40000000-0000-0000-0000-000000000050");
-        jellyfin12Alternate.PrimaryVersionId = jellyfin12Primary.Id;
-        movies.Add(jellyfin12Primary);
-        movies.Add(jellyfin12Alternate);
-        var conflictingPrimary = Movie12(8100, movieLibraryId);
-        var conflictingAlternate = Movie12(8101, movieLibraryId);
+        var orderedPrimary = Movie(8050, movieLibraryId);
+        var orderedAlternate = Movie(8050, movieLibraryId);
+        orderedPrimary.Id = Guid.Parse("30000000-0000-0000-0000-000000000050");
+        orderedAlternate.Id = Guid.Parse("40000000-0000-0000-0000-000000000050");
+        orderedAlternate.PrimaryVersionId = orderedPrimary.Id;
+        movies.Add(orderedPrimary);
+        movies.Add(orderedAlternate);
+        var conflictingPrimary = Movie(8100, movieLibraryId);
+        var conflictingAlternate = Movie(8101, movieLibraryId);
         conflictingAlternate.PrimaryVersionId = conflictingPrimary.Id;
         movies.Add(conflictingPrimary);
         movies.Add(conflictingAlternate);
         var movieVersionGroups = new Dictionary<Guid, Guid>
         {
             [alternate.Id] = primary.Id,
-            [jellyfin12Alternate.Id] = jellyfin12Primary.Id,
+            [orderedAlternate.Id] = orderedPrimary.Id,
             [conflictingAlternate.Id] = conflictingPrimary.Id
         };
 
@@ -165,11 +165,11 @@ internal static class BackfillIntegration
         Assert(await database.EntryBindings.CountAsync(binding => binding.EntryId ==
             database.Entries.Single(entry => entry.TmdbId == 8000).Id) == 2,
             "Native primary and alternate movie versions converge to one entry with two durable bindings");
-        var jellyfin12Entry = await database.Entries.SingleAsync(entry => entry.TmdbId == 8050);
-        Assert(jellyfin12Entry.JellyfinItemId == new[] { jellyfin12Primary.Id, jellyfin12Alternate.Id }.Min() &&
-            await database.EntryBindings.CountAsync(binding => binding.EntryId == jellyfin12Entry.Id &&
-                binding.VersionGroupId == jellyfin12Primary.Id) == 2,
-            "Jellyfin 12 nullable Guid version identities preserve deterministic grouping through reconciliation");
+        var orderedEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 8050);
+        Assert(orderedEntry.JellyfinItemId == new[] { orderedPrimary.Id, orderedAlternate.Id }.Min() &&
+            await database.EntryBindings.CountAsync(binding => binding.EntryId == orderedEntry.Id &&
+                binding.VersionGroupId == orderedPrimary.Id) == 2,
+            "Version identities preserve deterministic grouping through reconciliation, whichever id sorts first");
 
         database.ChangeTracker.Clear();
         var rerun = await Runner(database).RunAsync(new InlineProgress(_ => { }), default);
@@ -391,17 +391,6 @@ internal static class BackfillIntegration
         return movie;
     }
 
-    private static Jellyfin12Movie Movie12(int tmdbId, Guid libraryId)
-    {
-        var movie = new Jellyfin12Movie
-        {
-            Id = Guid.NewGuid(), Name = "Movie " + tmdbId, Path = $"/media/{libraryId}/{tmdbId}.mkv",
-            ProductionYear = 2026
-        };
-        movie.ProviderIds["Tmdb"] = tmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        return movie;
-    }
-
     private static MediaBrowser.Controller.Entities.TV.Episode Episode(
         int tmdbId,
         int seasonNumber,
@@ -440,11 +429,6 @@ internal static class BackfillIntegration
     private sealed class InlineProgress(Action<double> report) : IProgress<double>
     {
         public void Report(double value) => report(value);
-    }
-
-    private sealed class Jellyfin12Movie : Movie
-    {
-        public new Guid? PrimaryVersionId { get; set; }
     }
 
     private class Stub<T> : DispatchProxy where T : class

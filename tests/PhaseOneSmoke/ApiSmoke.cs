@@ -91,7 +91,7 @@ internal static class ApiSmoke
         // installed plugin is all it needs to be exercised over real HTTP.
         var packageFolder = Path.Combine(folder, "package");
         Directory.CreateDirectory(packageFolder);
-        File.WriteAllText(Path.Combine(packageFolder, "meta.json"), "{\"category\":\"General\",\"changelog\":\"smoke\",\"description\":\"Smoke description\",\"guid\":\"6f1a2b3c-4d5e-4f60-9a71-8b2c3d4e5f60\",\"name\":\"JellyfinMod\",\"overview\":\"Smoke overview\",\"owner\":\"kxalex\",\"targetAbi\":\"10.11.0.0\",\"timestamp\":\"2026-09-19T10:49:06.0000000Z\",\"version\":\"0.1.0.0\"}");
+        File.WriteAllText(Path.Combine(packageFolder, "meta.json"), "{\"category\":\"General\",\"changelog\":\"smoke\",\"description\":\"Smoke description\",\"guid\":\"6f1a2b3c-4d5e-4f60-9a71-8b2c3d4e5f60\",\"name\":\"JellyfinMod\",\"overview\":\"Smoke overview\",\"owner\":\"kxalex\",\"targetAbi\":\"12.0.0.0\",\"timestamp\":\"2026-09-19T10:49:06.0000000Z\",\"version\":\"0.1.0.0\"}");
         File.WriteAllText(Path.Combine(packageFolder, "JellyfinMod.dll"), "a real file to package, not a real assembly");
         builder.Services.AddSingleton(_ => new PluginRepository(
             packageFolder, Path.Combine(folder, "repo-data"), NullLogger<PluginRepository>.Instance));
@@ -703,7 +703,7 @@ internal static class ApiSmoke
                     $"The manifest version carries {required}, which the server requires");
             }
 
-            Assert(version.GetProperty("targetAbi").GetString() == "10.11.0.0",
+            Assert(version.GetProperty("targetAbi").GetString() == "12.0.0.0",
                 "The manifest takes targetAbi from meta.json rather than restating it");
 
             var sourceUrl = version.GetProperty("sourceUrl").GetString()!;

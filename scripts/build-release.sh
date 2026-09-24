@@ -65,7 +65,7 @@ if [[ -e $out ]]; then
     fi
 fi
 
-binary_dir="$root/JellyfinMod/bin/Release/net9.0"
+binary_dir="$root/JellyfinMod/bin/Release/net10.0"
 if ((build)); then
     "$dotnet" build -c Release "$root/JellyfinMod/JellyfinMod.csproj"
 fi

@@ -6,17 +6,22 @@
     <Version>0.1.0.0</Version>
   </PropertyGroup>
 
-  <!-- Pinned to the server actually running on the Pi. There is no Jellyfin 11.x: versions ran
-       10.x to 10.11, then dropped the leading "10.", so 10.12 became 12.0. Moving to 12.0 / net10
-       is a deliberate later step - see ../../jellyfin-web/docs/jellyfinmod/README.md 7.1. -->
+  <!-- Pinned to the server every instance runs: Jellyfin 12.0.0 on .NET 10 (the Docker image's
+       digest). There is no Jellyfin 11.x: versions ran 10.x to 10.11, then dropped the leading "10.",
+       so 10.12 became 12.0. 10.11 is no longer supported (decided 2026-09-24) - see
+       ../../jellyfin-web/docs/jellyfinmod/README.md 7.1. -->
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Controller" Version="10.11.11" />
-    <PackageReference Include="Jellyfin.Model" Version="10.11.11" />
+    <PackageReference Include="Jellyfin.Controller" Version="12.0.0" />
+    <PackageReference Include="Jellyfin.Model" Version="12.0.0" />
   </ItemGroup>
 
+  <!-- The EF Core the Jellyfin 12.0.0 host ships (Jellyfin.Database.Implementations 12.0.0 depends on
+       10.0.11, and the host's deps.json loads 10.0.11). The host supplies it at runtime; only
+       JellyfinMod.dll is packaged, so compiling against the same version is what keeps every call
+       binding to a member the host really has. -->
   <ItemGroup>
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.0" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.0">
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.11">
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
   </ItemGroup>

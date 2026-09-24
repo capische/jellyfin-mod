@@ -9,8 +9,8 @@
 
 ## Target and packaging
 
-- Target `net9.0`, Jellyfin Controller/Model `10.11.11`, and `targetAbi: 10.11.0.0`.
-- Do not change these pins to bypass build errors. A move to Jellyfin 12/.NET 10 is separate work.
+- Target `net10.0`, Jellyfin Controller/Model `12.0.0`, EF Core `10.0.11` (the host's own), and `targetAbi: 12.0.0.0`.
+- Jellyfin 10.11 is no longer supported (user decision, 2026-09-24). Do not change these pins to bypass build errors; a host upgrade is a deliberate retarget.
 - Keep the project at the repository root, shared settings in `Directory.Build.props`, and manifest in `build.yaml`.
 - Generate `meta.json` through JPRM; never hand-write it.
 

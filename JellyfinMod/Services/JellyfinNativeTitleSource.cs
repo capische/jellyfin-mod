@@ -1,6 +1,4 @@
-using System.Collections.Concurrent;
 using System.Globalization;
-using System.Reflection;
 using System.Text.Json;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Entities;
@@ -15,8 +13,6 @@ namespace JellyfinMod.Services;
 public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStorageIdentity? mediaStorage = null)
 {
     private const int PageSize = 50;
-    private const string PrimaryVersionIdPropertyName = "PrimaryVersionId";
-    private static readonly ConcurrentDictionary<Type, Func<Video, Guid?>> PrimaryVersionIdReaders = new();
     private readonly MediaStorageIdentity _mediaStorage = mediaStorage ?? new();
 
     /// <summary>Counts native title representations for scheduled-task progress without loading their metadata.</summary>
@@ -252,7 +248,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         var episodes = new List<NativeEpisodeSnapshot>();
         foreach (var series in seriesCopies)
         {
-            // Series.GetItemList rewrites recursive queries to a presentation key in 10.11.11.
+            // Series.GetItemList rewrites recursive queries to a presentation key (Series.cs, 12.0.0).
             // Query physical ancestry directly so grouped copies cannot borrow each other's episodes.
             var query = new InternalItemsQuery
             {
@@ -291,19 +287,23 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
     /// so each is observed as its own representation of the same version group. A stacked (multi-part) file makes
     /// the pairing of a source to a file ambiguous, so such a title is reported rather than guessed at.
     /// </summary>
+    /// <remarks>
+    /// The extra versions are the ones Jellyfin itself links to the title (<c>GetLocalAlternateVersionIds</c>, the
+    /// same list its media sources are built from), so no item id is derived here. Jellyfin 12 types an extra
+    /// version like its main item, not as <c>Video</c> as 10.11 did, and deleted every <c>Video</c>-typed one on
+    /// upgrade. Only the file versions of this folder are read; versions merged from other items are V1's work.
+    /// </remarks>
     private IEnumerable<Video> AlternateMediaSources(Video video)
     {
-        var paths = video.LocalAlternateVersions;
-        if (paths is not { Length: > 0 }) yield break;
+        // The paths come from the item itself, so a title without extra files costs no further query.
+        if (video.LocalAlternateVersions is not { Length: > 0 }) yield break;
         if (video.IsStacked)
             throw new AmbiguousMediaSourceException(video.Path);
-        foreach (var path in paths)
+        foreach (var id in library.GetLocalAlternateVersionIds(video))
         {
-            if (string.IsNullOrWhiteSpace(path)) continue;
             // Jellyfin drops a source whose item it has not written yet; so does this observation, and the next
             // event or repair run picks it up.
-            if (library.GetItemById(library.GetNewItemId(path, typeof(Video))) is not Video source ||
-                string.IsNullOrWhiteSpace(source.Path)) continue;
+            if (library.GetItemById(id) is not Video source || string.IsNullOrWhiteSpace(source.Path)) continue;
             if (source.IsStacked) throw new AmbiguousMediaSourceException(source.Path);
             yield return source;
         }
@@ -315,26 +315,9 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         return primaryId.HasValue && movieIds.Contains(primaryId.Value) ? primaryId.Value : movie.Id;
     }
 
+    /// <summary>The main item of a version group, or null for a video that is its own main item.</summary>
     private static Guid? PrimaryVersionId(Video video) =>
-        PrimaryVersionIdReaders.GetOrAdd(video.GetType(), CreatePrimaryVersionIdReader)(video);
-
-    private static Func<Video, Guid?> CreatePrimaryVersionIdReader(Type videoType)
-    {
-        for (var type = videoType; type is not null; type = type.BaseType)
-        {
-            var property = type.GetProperty(PrimaryVersionIdPropertyName,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly);
-            if (property is null) continue;
-            if (property.PropertyType == typeof(string))
-                return video => Guid.TryParse(property.GetValue(video) as string, out var id) && id != Guid.Empty ? id : null;
-            if (property.PropertyType == typeof(Guid) || property.PropertyType == typeof(Guid?))
-                return video => property.GetValue(video) is Guid id && id != Guid.Empty ? id : null;
-            throw new NotSupportedException(
-                $"Unsupported Jellyfin {PrimaryVersionIdPropertyName} type {property.PropertyType.FullName}.");
-        }
-
-        throw new MissingMemberException(videoType.FullName, PrimaryVersionIdPropertyName);
-    }
+        video.PrimaryVersionId is { } id && !id.Equals(Guid.Empty) ? id : null;
 
     private static bool IsPlayable(BaseItem item) => !string.IsNullOrWhiteSpace(item.Path);
 

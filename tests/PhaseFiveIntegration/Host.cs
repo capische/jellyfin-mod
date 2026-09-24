@@ -139,7 +139,7 @@ internal sealed partial class NativeWorld
     /// <summary>
     /// Adds the native item Jellyfin's movie resolver would produce for a file. A movie folder that already has a
     /// video resolves to ONE movie whose further files become its local alternate versions: each is its own native
-    /// video item with its own path, but the folder still holds a single Movie (MovieResolver, 10.11.11).
+    /// item with its own path, but the folder still holds a single Movie in every item query (12.0.0).
     /// </summary>
     public Movie AddMovie(TestLibrary library, string file, int? tmdbId = null)
     {
@@ -164,13 +164,17 @@ internal sealed partial class NativeWorld
         return movie;
     }
 
-    /// <summary>Attaches one more file of the same folder as a further media source of an existing video.</summary>
-    private void AddAlternateVersion(Video owner, string file)
+    /// <summary>
+    /// Attaches one more file of the same folder as a further media source of an existing movie. Jellyfin 12 types
+    /// an extra version like its main item, derives its id from that type and its path, and points its owner and
+    /// primary version at the main item (LibraryManager.CreateItems, 12.0.0); 10.11 typed it as a plain Video.
+    /// </summary>
+    private void AddAlternateVersion(Movie owner, string file)
     {
-        var source = new Video
+        var source = new Movie
         {
-            Id = NewItemId(file, typeof(Video)), Name = Path.GetFileNameWithoutExtension(file), Path = file,
-            DateCreated = DateTime.UtcNow
+            Id = NewItemId(file, owner.GetType()), Name = Path.GetFileNameWithoutExtension(file), Path = file,
+            DateCreated = DateTime.UtcNow, OwnerId = owner.Id, PrimaryVersionId = owner.Id
         };
         owner.LocalAlternateVersions = [.. owner.LocalAlternateVersions, file];
         _items[source.Id] = source;
@@ -215,13 +219,14 @@ internal sealed partial class NativeWorld
     public void Remove(BaseItem item)
     {
         _items.TryRemove(item.Id, out _);
-        // Removing a primary version promotes the oldest remaining alternate, as a rescan of the folder would.
-        var orphans = _items.Values.OfType<Movie>().Where(movie => movie.PrimaryVersionId == item.Id.ToString("N"))
+        // Removing the main item of merged versions (other items pointing at it, with no owner) promotes the oldest
+        // remaining one.
+        var orphans = _items.Values.OfType<Movie>().Where(movie => movie.PrimaryVersionId == item.Id && movie.OwnerId.Equals(Guid.Empty))
             .OrderBy(movie => movie.DateCreated).ToArray();
         if (orphans.Length > 0)
         {
             orphans[0].PrimaryVersionId = null;
-            foreach (var alternate in orphans.Skip(1)) alternate.PrimaryVersionId = orphans[0].Id.ToString("N");
+            foreach (var alternate in orphans.Skip(1)) alternate.PrimaryVersionId = orphans[0].Id;
         }
 
         // A removed media source leaves its owner; a removed owner lets the folder resolve afresh, so the first
@@ -235,22 +240,20 @@ internal sealed partial class NativeWorld
             _updated?.Invoke(this, new ItemChangeEventArgs { Item = owner });
         }
 
+        // Removing a main item promotes its first remaining file version, which keeps its own item and id; the
+        // other versions move to it (LibraryManager.DeleteItem, 12.0.0).
         (Movie Item, TestLibrary Home)? promoted = null;
-        if (item is Video { LocalAlternateVersions: { Length: > 0 } remaining } && LibraryOf(item) is { } home)
+        if (item is Movie { LocalAlternateVersions: { Length: > 0 } remaining } main && LibraryOf(item) is { } home &&
+            remaining.Select(path => _items.GetValueOrDefault(NewItemId(path, main.GetType()))).OfType<Movie>().ToArray() is
+                { Length: > 0 } versions)
         {
-            foreach (var path in remaining) _items.TryRemove(NewItemId(path, typeof(Video)), out _);
-            var movie = new Movie
-            {
-                Id = NewItemId(remaining[0], typeof(Movie)), Name = item.Name, Path = remaining[0],
-                DateCreated = DateTime.UtcNow, LocalAlternateVersions = remaining.Skip(1).ToArray()
-            };
+            var movie = versions[0];
+            movie.PrimaryVersionId = null;
+            movie.OwnerId = Guid.Empty;
+            movie.Name = item.Name;
+            movie.LocalAlternateVersions = remaining.Where(path => !string.Equals(path, movie.Path, StringComparison.Ordinal)).ToArray();
             foreach (var (key, value) in item.ProviderIds) movie.ProviderIds[key] = value;
-            foreach (var path in movie.LocalAlternateVersions)
-                _items[NewItemId(path, typeof(Video))] = new Video
-                {
-                    Id = NewItemId(path, typeof(Video)), Name = Path.GetFileNameWithoutExtension(path), Path = path,
-                    DateCreated = DateTime.UtcNow
-                };
+            foreach (var version in versions.Skip(1)) version.PrimaryVersionId = version.OwnerId = movie.Id;
             promoted = (movie, home);
         }
 
@@ -269,7 +272,8 @@ internal sealed partial class NativeWorld
 
     private IReadOnlyList<BaseItem> Query(InternalItemsQuery query)
     {
-        IEnumerable<BaseItem> items = _items.Values;
+        // Jellyfin 12 leaves every version but the main one out of item queries (BaseItemRepository, 12.0.0).
+        IEnumerable<BaseItem> items = _items.Values.Where(item => item is not Video { PrimaryVersionId: not null });
         if (!query.ParentId.Equals(Guid.Empty)) items = items.Where(item => LibraryOf(item)?.Id == query.ParentId);
         if (query.IncludeItemTypes.Length > 0)
             items = items.Where(item => query.IncludeItemTypes.Contains(item switch
@@ -285,7 +289,7 @@ internal sealed partial class NativeWorld
         if (query.HasAnyProviderId is { Count: > 0 } providers)
             items = items.Where(item => providers.Any(provider => item.ProviderIds.GetValueOrDefault(provider.Key) == provider.Value));
         if (query.PresentationUniqueKey is { } group)
-            items = items.OfType<Movie>().Where(movie => (movie.PrimaryVersionId is { Length: > 0 } primary ? primary : movie.Id.ToString("N")) == group);
+            items = items.OfType<Movie>().Where(movie => (movie.PrimaryVersionId ?? movie.Id).ToString("N") == group);
         return items.OrderBy(item => item.Name, StringComparer.Ordinal).ThenBy(item => item.Id)
             .Skip(query.StartIndex ?? 0).Take(query.Limit ?? int.MaxValue).ToArray();
     }
@@ -302,6 +306,11 @@ internal sealed partial class NativeWorld
                     CollectionType = folder.CollectionType == CollectionType.tvshows ? CollectionTypeOptions.tvshows : CollectionTypeOptions.movies
                 }).ToList();
             case "GetNewItemId": return NewItemId((string)arguments![0]!, (Type)arguments[1]!);
+            case "GetLocalAlternateVersionIds":
+                // The file versions Jellyfin has linked to a video: an item exists for each of its extra paths.
+                var video = (Video)arguments![0]!;
+                return video.LocalAlternateVersions.Select(path => NewItemId(path, video.GetType()))
+                    .Where(versionId => _items.ContainsKey(versionId)).ToArray();
             case "GetItemById":
                 var id = (Guid)arguments![0]!;
                 return Libraries.FirstOrDefault(library => library.Id == id) as BaseItem ?? _items.GetValueOrDefault(id);

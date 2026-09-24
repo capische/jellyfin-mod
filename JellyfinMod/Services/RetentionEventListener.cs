@@ -88,8 +88,9 @@ public sealed class RetentionEventListener(
         Enqueue(new RetentionWork(AccessKey, null, null, null));
 
     /// <summary>
-    /// Users can be created, deleted, disabled or given other libraries without any event on 10.11.11, so a
-    /// fingerprint of active users and their access is compared periodically (P3.T11).
+    /// Users can be created, deleted, disabled or given other libraries without an event the plugin can rely on
+    /// (IUserManager raises only OnUserUpdated in 12.0.0), so a fingerprint of active users and their access is
+    /// compared periodically (P3.T11).
     /// </summary>
     private async Task PollAccessAsync(CancellationToken cancellationToken)
     {

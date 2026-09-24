@@ -9,7 +9,7 @@ using Microsoft.EntityFrameworkCore;
 namespace JellyfinMod.Services.Automation;
 
 /// <summary>
-/// Describes each held version for the version selector (P6.M8) from fields the pinned 10.11 host returns for its media
+/// Describes each held version for the version selector (P6.M8) from fields the Jellyfin 12.0.0 host returns for its media
 /// streams, plus each version's own retention state (P6.M7). Nothing is guessed: unknown fields stay null.
 /// </summary>
 public sealed class VersionReader(ModDbContext database, IMediaSourceManager? mediaSources, UnixFileInspector files)
