@@ -322,6 +322,9 @@ public sealed class RetentionEvaluator(
         var deadline = policy.TestWindowMinutes > 0 ? eligibleAt.AddMinutes(policy.TestWindowMinutes) : eligibleAt.AddDays(days);
         if (priorDeadline > deadline) deadline = priorDeadline.Value;
 
+        if (priorState != RetentionEvaluationStates.Scheduled)
+            await RecordWindowStartAsync(target, observations.Values, completionBasis.Value, deadline, cancellationToken)
+                .ConfigureAwait(false);
         result.State = RetentionEvaluationStates.Scheduled;
         result.Reason = RetentionEvaluationReasons.CompletionPolicySatisfied;
         result.CompletionBasisAt = completionBasis;
@@ -329,6 +332,51 @@ public sealed class RetentionEvaluator(
         result.Deadline = deadline;
         await SaveAsync(result, cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Records that a target's retention window started, with its cause and its files (PHASE10 Q8, 2026-09-24), so the
+    /// title's History says why and when its files will go. The cause is the save reason Jellyfin reported for the
+    /// completing user's data: the Trakt plugin's sync saves with <c>Import</c>.
+    /// </summary>
+    private async Task RecordWindowStartAsync(Target target, IEnumerable<CompletionObservation> observations, DateTime basis,
+        DateTime deadline, CancellationToken cancellationToken)
+    {
+        var source = observations.Where(observation => observation.Played)
+            .OrderBy(observation => Math.Abs((observation.LastPlayedAt ?? observation.CompletedAt ?? basis).Ticks - basis.Ticks))
+            .Select(observation => observation.SourceReason).FirstOrDefault() ?? string.Empty;
+        var cause = WindowCause(source);
+        var paths = target.EpisodeId is { } episodeId
+            ? await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == episodeId)
+                .Select(binding => binding.MediaPath).ToListAsync(cancellationToken).ConfigureAwait(false)
+            : await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == target.Entry.Id)
+                .Select(binding => binding.MediaPath).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var files = paths.Where(path => !string.IsNullOrEmpty(path)).Select(path => Path.GetFileName(path!)).Order(StringComparer.Ordinal)
+            .ToArray();
+        var label = target.EpisodeId.HasValue
+            ? await database.Episodes.AsNoTracking().Where(episode => episode.Id == target.EpisodeId)
+                .Select(episode => "S" + episode.SeasonNumber.ToString("00", System.Globalization.CultureInfo.InvariantCulture) +
+                    "E" + episode.EpisodeNumber.ToString("00", System.Globalization.CultureInfo.InvariantCulture))
+                .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
+            : null;
+        var what = files.Length == 1 ? "this file" : $"these {files.Length} files";
+        database.History.Add(new HistoryRecord
+        {
+            EntryId = target.Entry.Id,
+            EventType = "retention_started",
+            Summary = $"{(label is null ? string.Empty : label + ": ")}Added to retention ({cause}): {what} will be deleted on " +
+                $"{deadline.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture)} unless kept",
+            Data = System.Text.Json.JsonSerializer.Serialize(new { episodeId = target.EpisodeId, cause, sourceReason = source,
+                deadline = DateTime.SpecifyKind(deadline, DateTimeKind.Utc), files })
+        });
+    }
+
+    private static string WindowCause(string sourceReason) => sourceReason switch
+    {
+        "Import" => "watched on another device (Trakt)",
+        "TogglePlayed" => "marked played",
+        "PlaybackFinished" or "PlaybackProgress" or "PlaybackStart" => "watched on this server",
+        _ => "watched"
+    };
 
     /// <summary>Writes an evaluation only when something other than its evaluation time changed (P3.T11).</summary>
     private async Task SaveAsync(RetentionEvaluation result, CancellationToken cancellationToken)
