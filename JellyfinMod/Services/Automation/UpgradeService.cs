@@ -180,7 +180,31 @@ public sealed class UpgradeService(
         }
 
         if (result.State is "prepared" or "unlinked") return;
+        if (result.Reason == RetentionExecutionReasons.IdentityUnverified)
+        {
+            // The older file was bound to this episode by its number only (RET2-R3): the new version stays beside it, and
+            // the replacement waits until reconciliation verifies which episode the old file is. Recorded once.
+            var label = upgrade.EpisodeId is { } episodeId
+                ? await database.Episodes.AsNoTracking().Where(episode => episode.Id == episodeId)
+                    .Select(episode => "S" + episode.SeasonNumber.ToString("00", System.Globalization.CultureInfo.InvariantCulture) +
+                        "E" + episode.EpisodeNumber.ToString("00", System.Globalization.CultureInfo.InvariantCulture) + " ")
+                    .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
+                : null;
+            await AddHistoryAsync(upgrade, "upgrade_replacement_refused",
+                $"{label}Kept the older {upgrade.SupersededQuality ?? "version"}: it was matched to this episode by its number only, " +
+                "so it is not replaced until its identity is confirmed", IdentityRefusalId(upgrade.Id), cancellationToken).ConfigureAwait(false);
+        }
+
         await BlockAsync(upgrade, result.Reason).ConfigureAwait(false);
+    }
+
+    /// <summary>A stable history id for an upgrade's identity refusal, so a retried step records it once.</summary>
+    private static Guid IdentityRefusalId(Guid upgradeId)
+    {
+        var bytes = upgradeId.ToByteArray();
+        bytes[0] ^= 0x5A;
+        bytes[15] ^= 0xA5;
+        return new Guid(bytes);
     }
 
     private async Task BlockAsync(UpgradeOperation upgrade, string reason)

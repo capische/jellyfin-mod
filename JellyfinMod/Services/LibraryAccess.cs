@@ -177,8 +177,12 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     {
         if (series is not Folder) return;
         var nativeEpisodes = GetEpisodes(user, series);
+        // An Add does not monitor a row at a number a file already covers unless that file carries the row's TMDB id
+        // (RET2-R3): the file's numbering may not be TMDB's. Every number after the first of a multi-episode file counts.
+        var covered = CoveredPositions(nativeEpisodes);
         foreach (var episode in episodes)
         {
+            if (CoveredUnverified(covered, episode.SeasonNumber, episode.EpisodeNumber, episode.TmdbId)) episode.Monitored = false;
             var tmdbId = episode.TmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture);
             var matches = nativeEpisodes.Where(item => ProviderId(item, "Tmdb") == tmdbId).ToArray();
             if (matches.Length == 0)
@@ -188,6 +192,40 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
             episode.JellyfinItemId = matches[0].Id;
             episode.State = FileState.OnDisk;
         }
+    }
+
+    /// <summary>
+    /// The season and episode numbers the native files of these series copies cover, every number of a multi-episode file
+    /// included, each with the TMDB episode ids those files carry for it (RET2-R3). A number covered by a file that does
+    /// not carry a row's TMDB id holds a file whose identity for that row is unverified.
+    /// </summary>
+    public Dictionary<(int Season, int Episode), HashSet<int>> CoveredPositions(User user, IEnumerable<BaseItem> seriesCopies) =>
+        CoveredPositions(seriesCopies.SelectMany(series => GetEpisodes(user, series)));
+
+    /// <summary>Whether a file covers this number without carrying this TMDB episode id (RET2-R3).</summary>
+    public static bool CoveredUnverified(IReadOnlyDictionary<(int Season, int Episode), HashSet<int>> covered, int season,
+        int episode, int tmdbId) =>
+        covered.TryGetValue((season, episode), out var ids) && !ids.Contains(tmdbId);
+
+    private static Dictionary<(int Season, int Episode), HashSet<int>> CoveredPositions(IEnumerable<BaseItem> nativeEpisodes)
+    {
+        var covered = new Dictionary<(int Season, int Episode), HashSet<int>>();
+        foreach (var native in nativeEpisodes)
+        {
+            if (native is not MediaBrowser.Controller.Entities.TV.Episode { ParentIndexNumber: { } season, IndexNumber: { } first } episode)
+                continue;
+            var last = episode.IndexNumberEnd is { } end && end > first ? end : first;
+            var tmdbId = int.TryParse(ProviderId(native, "Tmdb"), System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : 0;
+            for (var number = first; number <= last; number++)
+            {
+                if (!covered.TryGetValue((season, number), out var ids)) covered[(season, number)] = ids = [];
+                // A multi-episode file names its first episode only; for the numbers after it, it verifies nothing.
+                if (number == first && tmdbId > 0) ids.Add(tmdbId);
+            }
+        }
+
+        return covered;
     }
 
     /// <summary>Checks a bound episode's own restrictions before returning its metadata.</summary>

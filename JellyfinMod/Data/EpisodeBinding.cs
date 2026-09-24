@@ -17,4 +17,12 @@ public sealed class EpisodeBinding
     public string? MediaPath { get; set; }
     /// <summary>Gets or sets the Linux mount identity observed for the media path.</summary>
     public string? StorageIdentity { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether this file was bound to a TMDB-identified episode only by its season and episode
+    /// number (RET2-R3). The file's own numbering may not be TMDB's, so nothing confirms it is that episode; an upgrade never
+    /// replaces such a file. Reconciliation clears it once the native episode carries the same TMDB episode id, or its title
+    /// or air date agrees with the TMDB episode's.
+    /// </summary>
+    public bool IdentityUnverified { get; set; }
 }

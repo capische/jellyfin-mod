@@ -34,14 +34,8 @@ public sealed class SeriesMetadataRefresher(
     /// Whether a position-identity episode and the TMDB episode listed at its position are evidently the same episode:
     /// the same air date within a day, or the same title ignoring case, punctuation and spacing (RET-R2).
     /// </summary>
-    private static bool SameEpisode(Episode positional, Episode remote)
-    {
-        if (positional.AirDate is { } local && remote.AirDate is { } listed && Math.Abs((local.Date - listed.Date).TotalDays) <= 1)
-            return true;
-        static string Key(string? value) => new((value ?? string.Empty).Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
-        var title = Key(positional.Title);
-        return title.Length > 0 && title == Key(remote.Title);
-    }
+    private static bool SameEpisode(Episode positional, Episode remote) =>
+        EpisodeIdentityEvidence.Agrees(positional.Title, positional.AirDate, remote.Title, remote.AirDate);
 
     /// <summary>Refreshes one series entry. TMDB failures surface as <see cref="TmdbException"/>.</summary>
     public async Task<SeriesRefreshOutcome> RefreshAsync(Guid id, CancellationToken cancellationToken)

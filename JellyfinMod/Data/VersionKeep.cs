@@ -5,8 +5,10 @@ namespace JellyfinMod.Data;
 /// <summary>
 /// An administrator's Keep on one file of a movie or an episode (P10, PHASE10 Q3 answered 2026-09-24). It is keyed by the
 /// file, not by the binding: Jellyfin re-identifies the remaining versions of a title when one of them goes, and a Keep
-/// held on the old binding would silently disappear with it. A file matches by its path or by its physical identity,
-/// so a Keep can only ever protect more than intended, never less.
+/// held on the old binding would silently disappear with it. A file matches by its path or by its physical identity
+/// (device, inode and birth time): a rename or move within one filesystem keeps the Keep, and a new file written at the
+/// kept path is protected too. A move to another filesystem changes both, so the Keep no longer applies and must be made
+/// again (RET2-R9). One path can be kept once per entry; the same folder in two libraries is two entries.
 /// </summary>
 public sealed class VersionKeep
 {

@@ -45,3 +45,23 @@ public sealed class Episode
     /// </summary>
     public bool IsPositionIdentity => TmdbId <= 0;
 }
+
+/// <summary>
+/// Whether two descriptions of an episode are evidently the same episode (RET-R2, RET2-R3): the same air date within a day,
+/// or the same title ignoring case, punctuation and spacing. A number alone is never evidence, because a library's numbering
+/// (TVDB, scene) and TMDB's can differ.
+/// </summary>
+internal static class EpisodeIdentityEvidence
+{
+    /// <summary>Returns true when the air dates agree within a day or the titles agree.</summary>
+    public static bool Agrees(string? title, DateTime? airDate, string? otherTitle, DateTime? otherAirDate)
+    {
+        if (airDate is { } local && otherAirDate is { } listed && Math.Abs((local.Date - listed.Date).TotalDays) <= 1)
+            return true;
+        var key = Key(title);
+        return key.Length > 0 && key == Key(otherTitle);
+    }
+
+    private static string Key(string? value) =>
+        new((value ?? string.Empty).Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+}

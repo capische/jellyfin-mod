@@ -170,13 +170,19 @@ try
             await database.EpisodeBindings.AnyAsync(binding => binding.EpisodeId == positionEpisode.Id &&
                 binding.JellyfinItemId == doubleEpisode),
             "A numbered native episode without a TMDB id is tracked by its position (P10.E1)");
-        // A series Refresh adopts the position row for the TMDB episode listed there, as SeriesMetadataRefresher does.
+        // RET2-R7: the episode the position-tracked double file also covers gets a row of its own, pointing at that file,
+        // with no binding and no monitoring.
+        var coveredEpisode = await database.Episodes.SingleAsync(episode => episode.EntryId == multiResult.EntryId &&
+            episode.SeasonNumber == 1 && episode.EpisodeNumber == 4);
+        Assert(coveredEpisode.TmdbId == 0 && coveredEpisode.JellyfinItemId == doubleEpisode && !coveredEpisode.Monitored &&
+            coveredEpisode.State == FileState.OnDisk &&
+            !await database.EpisodeBindings.AnyAsync(binding => binding.EpisodeId == coveredEpisode.Id),
+            "A position-tracked multi-episode file gives each episode it covers a row of its own (RET2-R7)");
+        // A series Refresh adopts the position rows for the TMDB episodes listed there, as SeriesMetadataRefresher does.
         positionEpisode.TmdbId = 5553;
         positionEpisode.Title = "Three";
-        database.Episodes.Add(new JellyfinMod.Data.Episode
-        {
-            EntryId = multiResult.EntryId!.Value, TmdbId = 5554, SeasonNumber = 1, EpisodeNumber = 4, Title = "Four"
-        });
+        coveredEpisode.TmdbId = 5554;
+        coveredEpisode.Title = "Four";
         await database.SaveChangesAsync();
         var combined = Guid.NewGuid();
         await service.ReconcileAsync(new NativeTitleSnapshot("series", 5550, tvLibrary, "Multi", 2020,
@@ -243,8 +249,85 @@ try
         var persisted = (await restarted.Entries.CountAsync(), await restarted.Episodes.CountAsync(),
             await restarted.EntryBindings.CountAsync(), await restarted.EpisodeBindings.CountAsync(),
             await restarted.History.CountAsync());
-        Assert(persisted == (6, 7, 9, 8, 13),
+        // The episode a double file covers is on disk from its first reconciliation (RET2-R7), so it records no later
+        // "became available" event.
+        Assert(persisted == (6, 7, 9, 8, 12),
             $"Reconciled identities, every observed copy and exact transition history persist after a real SQLite restart {persisted}");
+    }
+
+    // RET2-R1: a file that arrives for a tracked episode beside a surviving copy starts the episode over, with no inherited
+    // completion or deadline; the same file under a new native id is not a new file. RET2-R3: a file bound to a TMDB episode
+    // by its number only is unverified until a native TMDB id or an agreeing title confirms it.
+    await using (var arrivals = new ModDbContext(Path.Combine(folder, "arrival.db")))
+    {
+        await arrivals.Database.MigrateAsync();
+        var clock = new ArrivalClock(new DateTime(2026, 9, 24, 12, 0, 0, DateTimeKind.Utc));
+        var reconciler = new ReconciliationService(arrivals, new ReconciliationLibraryLock(), clock: clock);
+        var library = Guid.NewGuid();
+        var seriesA = Guid.NewGuid();
+        var seriesB = Guid.NewGuid();
+        var copyB = Guid.NewGuid();
+        NativeTitleSnapshot Series(params NativeEpisodeSnapshot[] episodes) => new("series", 7770, library, "Arrivals", 2020,
+            null, null, null, null, [new(seriesA, library, true), new(seriesB, library, true)], episodes);
+        var survivor = new NativeEpisodeSnapshot(copyB, seriesB, null, 1, 1, true, "Pilot", MediaPath: "/b/S01E01.mkv");
+        var entryId = (await reconciler.ReconcileAsync(Series(survivor), default)).EntryId!.Value;
+        var episodeId = await arrivals.Episodes.Where(episode => episode.EntryId == entryId).Select(episode => episode.Id).SingleAsync();
+        var evaluation = await arrivals.RetentionEvaluations.SingleAsync(item => item.TargetId == episodeId);
+        evaluation.State = "scheduled";
+        evaluation.Reason = "completion_policy_satisfied";
+        evaluation.CompletionBasisAt = clock.Now.AddDays(-2);
+        evaluation.EligibleAt = clock.Now.AddDays(-2);
+        evaluation.Deadline = clock.Now.AddDays(-1);
+        evaluation.BaselineAt = clock.Now.AddDays(-3);
+        evaluation.RequiresFreshCompletion = false;
+        await arrivals.SaveChangesAsync();
+        arrivals.ChangeTracker.Clear();
+
+        clock.Now = clock.Now.AddHours(1);
+        var reacquired = new NativeEpisodeSnapshot(Guid.NewGuid(), seriesA, null, 1, 1, true, "Pilot", MediaPath: "/a/S01E01.mkv");
+        await reconciler.ReconcileAsync(Series(reacquired, survivor), default);
+        arrivals.ChangeTracker.Clear();
+        evaluation = await arrivals.RetentionEvaluations.SingleAsync(item => item.TargetId == episodeId);
+        Assert(evaluation.State == "waiting" && evaluation.Reason == "representation_reset" && evaluation.Deadline is null &&
+            evaluation.CompletionBasisAt is null && evaluation.BaselineAt == clock.Now && evaluation.RequiresFreshCompletion &&
+            await arrivals.History.AnyAsync(history => history.EntryId == entryId && history.EventType == "retention_reset" &&
+                history.Data!.Contains("new_file")),
+            "A file arriving beside a surviving copy restarts the episode: no inherited completion or deadline (RET2-R1)");
+
+        evaluation.State = "scheduled";
+        evaluation.Deadline = clock.Now.AddDays(1);
+        await arrivals.SaveChangesAsync();
+        arrivals.ChangeTracker.Clear();
+        var renamedId = new NativeEpisodeSnapshot(Guid.NewGuid(), seriesB, null, 1, 1, true, "Pilot", MediaPath: "/b/S01E01.mkv");
+        await reconciler.ReconcileAsync(Series(reacquired, survivor, renamedId with { MediaPath = "/b/S01E01.mkv" }) with
+            { Episodes = [reacquired, renamedId] }, default);
+        arrivals.ChangeTracker.Clear();
+        Assert((await arrivals.RetentionEvaluations.SingleAsync(item => item.TargetId == episodeId)).State == "scheduled",
+            "The same file under a new native id is not a new file and keeps the schedule");
+
+        // RET2-R3: a TMDB episode takes a TMDB-less file by its number only.
+        var tmdbEntry = new Entry { MediaType = "series", TmdbId = 7780, TargetLibraryId = library, Title = "Numbered" };
+        arrivals.Entries.Add(tmdbEntry);
+        arrivals.Episodes.Add(new JellyfinMod.Data.Episode
+        {
+            EntryId = tmdbEntry.Id, TmdbId = 91014, SeasonNumber = 1, EpisodeNumber = 14, Title = "The Financial Permeability"
+        });
+        await arrivals.SaveChangesAsync();
+        var numberedSeries = Guid.NewGuid();
+        var numbered = new NativeEpisodeSnapshot(Guid.NewGuid(), numberedSeries, null, 1, 14, true, "Some other episode",
+            MediaPath: "/c/S01E14.mkv");
+        NativeTitleSnapshot Numbered(NativeEpisodeSnapshot episode) => new("series", 7780, library, "Numbered", 2020,
+            null, null, null, null, [new(numberedSeries, library, true)], [episode]);
+        await reconciler.ReconcileAsync(Numbered(numbered), default);
+        arrivals.ChangeTracker.Clear();
+        Assert(await arrivals.EpisodeBindings.AnyAsync(binding => binding.JellyfinItemId == numbered.JellyfinItemId &&
+                binding.IdentityUnverified),
+            "A file bound to a TMDB episode by its number only is unverified (RET2-R3)");
+        await reconciler.ReconcileAsync(Numbered(numbered with { Title = "The Financial Permeability" }), default);
+        arrivals.ChangeTracker.Clear();
+        Assert(await arrivals.EpisodeBindings.AnyAsync(binding => binding.JellyfinItemId == numbered.JellyfinItemId &&
+                !binding.IdentityUnverified),
+            "An agreeing title verifies the file's identity (RET2-R3)");
     }
 
     await BackfillIntegration.RunAsync(folder);
@@ -279,4 +362,11 @@ static async Task AssertThrowsAsync<TException>(Func<Task> action, string messag
     }
 
     throw new InvalidOperationException(message);
+}
+
+sealed class ArrivalClock(DateTime now) : TimeProvider
+{
+    public DateTime Now { get; set; } = now;
+
+    public override DateTimeOffset GetUtcNow() => new(Now, TimeSpan.Zero);
 }

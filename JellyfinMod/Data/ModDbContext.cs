@@ -135,9 +135,8 @@ public class ModDbContext : DbContext
 
         b.Entity<VersionKeep>(e =>
         {
-            e.HasIndex(x => x.MediaPath).IsUnique();
+            e.HasIndex(x => new { x.EntryId, x.MediaPath }).IsUnique();
             e.HasIndex(x => x.PhysicalIdentity);
-            e.HasIndex(x => x.EntryId);
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
         });

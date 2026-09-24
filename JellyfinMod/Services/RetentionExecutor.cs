@@ -135,6 +135,10 @@ public sealed class RetentionExecutor(
         var policy = await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
         if (!policy.Enabled)
             return RetentionExecutionResult.NotStarted(bindingId, RetentionEvaluationReasons.RetentionDisabled);
+        // A file bound to its episode by number only was never shown to be that episode; replacing it could remove the
+        // right file for a wrong-numbered release (RET2-R3). It stays until reconciliation verifies it.
+        if (await IdentityUnverifiedAsync(bindingId, cancellationToken).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.IdentityUnverified);
         var replacement = new HashSet<Guid> { bindingId };
         var initialPreview = await preview.PreviewAsync(cancellationToken, replacement).ConfigureAwait(false);
         var initial = Find(initialPreview, bindingId);
@@ -157,6 +161,8 @@ public sealed class RetentionExecutor(
             return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
         if (!files.CanUnlink(observed.CanonicalPath))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.MediaNotWritable);
+        if (await IdentityUnverifiedAsync(bindingId, cancellationToken).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.IdentityUnverified);
         var storageIdentity = await LoadStorageIdentityAsync(candidate, cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(storageIdentity))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.StorageUnavailable);
@@ -283,6 +289,12 @@ public sealed class RetentionExecutor(
             return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
                 RetentionExecutionReasons.PolicyChanged, null, cancellationToken).ConfigureAwait(false);
 
+        if (replacement)
+            foreach (var operation in operations)
+                if (await IdentityUnverifiedAsync(operation.BindingId, cancellationToken).ConfigureAwait(false))
+                    return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                        RetentionExecutionReasons.IdentityUnverified, null, cancellationToken).ConfigureAwait(false);
+
         // Stored observations can miss a favourite, unwatched or resume event, and a session can be
         // playing another version. Re-read live Jellyfin state for every affected target last.
         foreach (var operation in operations)
@@ -379,6 +391,10 @@ public sealed class RetentionExecutor(
                 covered.State = FileState.Reclaimed;
             }
 
+            // A file re-added at this path gets this item id again; its old evidence must not come back with it (RET2-R1).
+            if (remaining.Length > 0)
+                await ReconciliationService.ForgetRepresentationEvidenceAsync(database, episode.Id, operation.JellyfinItemId,
+                    cancellationToken).ConfigureAwait(false);
             if (remaining.Length == 0)
             {
                 await RetentionTargetReset.ResetAsync(database, entryId, episode.Id,
@@ -411,6 +427,9 @@ public sealed class RetentionExecutor(
                     ? current
                     : remaining.FirstOrDefault() is { } next ? next.OwnerItemId ?? next.JellyfinItemId : null;
             entry.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
+            if (remaining.Length > 0)
+                await ReconciliationService.ForgetRepresentationEvidenceAsync(database, entry.Id, operation.JellyfinItemId,
+                    cancellationToken).ConfigureAwait(false);
             if (remaining.Length == 0)
                 await RetentionTargetReset.ResetAsync(database, entry.Id, null,
                     clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
@@ -550,6 +569,11 @@ public sealed class RetentionExecutor(
             return new(false, evaluation.PolicyVersion, RetentionExecutionReasons.PolicyChanged);
         return new(true, policy.Version, RetentionPreviewReasons.Eligible);
     }
+
+    /// <summary>Whether an episode binding was made by number only and never verified (RET2-R3); a movie binding never is.</summary>
+    private Task<bool> IdentityUnverifiedAsync(Guid bindingId, CancellationToken cancellationToken) =>
+        database.EpisodeBindings.AsNoTracking().AnyAsync(binding => binding.Id == bindingId && binding.IdentityUnverified,
+            cancellationToken);
 
     private async Task<string?> LoadStorageIdentityAsync(
         RetentionRepresentationDto candidate,
@@ -719,6 +743,7 @@ internal static class RetentionExecutionReasons
     public const string MediaReappeared = "media_reappeared";
     public const string UnlinkFailed = "unlink_failed";
     public const string MediaNotWritable = "media_not_writable";
+    public const string IdentityUnverified = "identity_unverified";
     public const string MediaVanished = "media_vanished";
     public const string MediaStateUnknown = "media_state_unknown";
     public const string Unlinked = "unlinked";

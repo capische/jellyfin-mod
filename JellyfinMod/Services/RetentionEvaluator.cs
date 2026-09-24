@@ -69,6 +69,16 @@ public sealed class RetentionEvaluator(
         if (target is not null) await EvaluateAsync(target, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Re-evaluates one bound movie, for example after a Keep on one of its files changed (RET2-R2).</summary>
+    public async Task EvaluateMovieAsync(Guid entryId, CancellationToken cancellationToken)
+    {
+        database.ChangeTracker.Clear();
+        var movie = await database.Entries.AsNoTracking().Where(entry => entry.Id == entryId && entry.MediaType == "movie" &&
+                database.EntryBindings.Any(binding => binding.EntryId == entry.Id))
+            .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (movie is not null) await EvaluateAsync(new Target(movie, null), cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>Re-evaluates the stable target represented by a native movie or episode.</summary>
     public async Task EvaluateNativeItemAsync(Guid jellyfinItemId, CancellationToken cancellationToken)
     {
@@ -100,6 +110,11 @@ public sealed class RetentionEvaluator(
     /// </summary>
     private async Task EvaluateAsync(Target target, CancellationToken cancellationToken)
     {
+        // One evaluation of a target at a time (RET2-R4): a batch reads a target's Keep and window, then saves its result;
+        // an administrator's change that lands in between is followed by its own evaluation, which waits here and so
+        // always writes last. Without this a batch could save "scheduled" for an episode kept a moment earlier.
+        var gate = TargetGates.GetOrAdd(target.EpisodeId ?? target.Entry.Id, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await EvaluateCoreAsync(target, cancellationToken).ConfigureAwait(false);
@@ -109,7 +124,14 @@ public sealed class RetentionEvaluator(
             database.ChangeTracker.Clear();
             await EvaluateCoreAsync(target, cancellationToken).ConfigureAwait(false);
         }
+        finally
+        {
+            gate.Release();
+        }
     }
+
+    /// <summary>Per-target evaluation gates, shared by every scope of the plugin process.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, SemaphoreSlim> TargetGates = new();
 
     private async Task EvaluateCoreAsync(Target target, CancellationToken cancellationToken)
     {
@@ -342,9 +364,15 @@ public sealed class RetentionEvaluator(
         var deadline = policy.TestWindowMinutes > 0 ? eligibleAt.AddMinutes(policy.TestWindowMinutes) : eligibleAt.AddDays(days);
         if (priorDeadline > deadline) deadline = priorDeadline.Value;
 
-        if (priorState != RetentionEvaluationStates.Scheduled)
+        // One event per window (RET2-R5): switching retention off and on keeps the countdown (Q9) and does not announce it
+        // again; a restarted or new window has another deadline and is announced.
+        if (priorState != RetentionEvaluationStates.Scheduled &&
+            !(result.AnnouncedDeadline is { } announced && Math.Abs((announced - deadline).TotalSeconds) < 1))
+        {
             await RecordWindowStartAsync(target, observations.Values, completionBasis.Value, deadline, cancellationToken)
                 .ConfigureAwait(false);
+            result.AnnouncedDeadline = deadline;
+        }
         result.State = RetentionEvaluationStates.Scheduled;
         result.Reason = RetentionEvaluationReasons.CompletionPolicySatisfied;
         result.CompletionBasisAt = completionBasis;

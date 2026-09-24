@@ -364,20 +364,7 @@ public sealed class EntriesController(
             });
             // Anything but a Keep restarts the episode's grace now: a changed window never reuses a deadline computed
             // under the old one, so shortening it cannot make the episode due at once (P3.T13).
-            if (!keeping)
-            {
-                var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(
-                    item => item.TargetId == episode.Id, cancellationToken).ConfigureAwait(false);
-                if (evaluation is not null) evaluation.GraceNotBefore = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
-                if (evaluation is not null && evaluation.State == RetentionEvaluationStates.Scheduled)
-                {
-                    evaluation.State = RetentionEvaluationStates.Waiting;
-                    evaluation.Reason = RetentionEvaluationReasons.WaitingForCompletion;
-                    evaluation.Deadline = null;
-                    evaluation.EligibleAt = null;
-                    evaluation.CompletionBasisAt = null;
-                }
-            }
+            if (!keeping) await RestartGraceAsync(episode.Id, cancellationToken).ConfigureAwait(false);
 
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -457,10 +444,33 @@ public sealed class EntriesController(
             database.VersionKeeps.RemoveRange(existing);
             database.History.Add(new HistoryRecord { EntryId = id, EventType = "version_unkept", Summary = $"Stopped keeping {name}",
                 Data = JsonSerializer.Serialize(new { episodeId = episode?.Id, bindingId }) });
+            // The file follows its title's retention again with a window of its own from now, never an old deadline that
+            // already passed while it was kept (RET2-R2), exactly as un-keeping an episode restarts its grace (Q4).
+            await RestartGraceAsync(episode?.Id ?? id, cancellationToken).ConfigureAwait(false);
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        if (episode is not null) await retentionEvaluator.EvaluateEpisodeAsync(episode.Id, cancellationToken).ConfigureAwait(false);
+        else await retentionEvaluator.EvaluateMovieAsync(id, cancellationToken).ConfigureAwait(false);
         return new VersionKeepResult(bindingId, keep);
+    }
+
+    /// <summary>
+    /// Restarts a target's grace now (PHASE10 Q4, RET2-R2): a running schedule goes back to waiting and the next evaluation
+    /// counts the window from this moment, so a change never makes the target due at once. The caller saves.
+    /// </summary>
+    private async Task RestartGraceAsync(Guid targetId, CancellationToken cancellationToken)
+    {
+        var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(
+            item => item.TargetId == targetId, cancellationToken).ConfigureAwait(false);
+        if (evaluation is null) return;
+        evaluation.GraceNotBefore = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
+        if (evaluation.State != RetentionEvaluationStates.Scheduled) return;
+        evaluation.State = RetentionEvaluationStates.Waiting;
+        evaluation.Reason = RetentionEvaluationReasons.WaitingForCompletion;
+        evaluation.Deadline = null;
+        evaluation.EligibleAt = null;
+        evaluation.CompletionBasisAt = null;
     }
 
     /// <summary>Updates an individual episode's future monitoring, restricted to administrators.</summary>
@@ -557,16 +567,25 @@ public sealed class EntriesController(
         // wish to search for it (RET-R2): the position row is left exactly as it is, and no second row is created there.
         var heldPositions = tracked.Where(episode => episode.IsPositionIdentity)
             .Select(episode => (episode.SeasonNumber, episode.EpisodeNumber)).ToHashSet();
+        // A row at a number a library file covers without carrying the row's TMDB id is not monitored by an Add (RET2-R3):
+        // the file's numbering may not be TMDB's, so the row may be searched for, and later upgraded, as the wrong episode.
+        var seriesCopies = await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == existing.Id)
+            .Select(binding => binding.JellyfinItemId).ToListAsync(cancellationToken);
+        var covered = existing.TargetLibraryId is { } libraryId
+            ? access.CoveredPositions(user, access.GetNativeItems(user, "series", libraryId)
+                .Where(item => seriesCopies.Contains(item.Id) || item.Id == existing.JellyfinItemId))
+            : new Dictionary<(int Season, int Episode), HashSet<int>>();
         // Only the request which observed no entry initially completes its requested episode set.
         // A later duplicate request still returns early without changing administrator settings.
         foreach (var remote in snapshot)
         {
             if (episodes.TryGetValue(remote.TmdbId, out var local))
             {
-                local.Monitored = true;
+                if (!LibraryAccess.CoveredUnverified(covered, local.SeasonNumber, local.EpisodeNumber, local.TmdbId)) local.Monitored = true;
             }
             else if (!heldPositions.Contains((remote.SeasonNumber, remote.EpisodeNumber)))
             {
+                if (LibraryAccess.CoveredUnverified(covered, remote.SeasonNumber, remote.EpisodeNumber, remote.TmdbId)) remote.Monitored = false;
                 remote.EntryId = existing.Id;
                 database.Episodes.Add(remote);
             }
@@ -613,8 +632,9 @@ public sealed class EntriesController(
     /// </summary>
     private async Task<Dictionary<Guid, RetentionWarningDto>> RetentionWarningsAsync(Entry entry, IReadOnlyList<Episode> episodes,
         RetentionPolicySnapshot? policy, IReadOnlyDictionary<Guid, RetentionEvaluation> evaluations, IReadOnlyList<HistoryRecord> history,
-        CancellationToken cancellationToken)
+        bool isAdmin, CancellationToken cancellationToken)
     {
+        var now = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
         var result = new Dictionary<Guid, RetentionWarningDto>();
         if (policy?.Enabled != true) return result;
         var running = evaluations.Values.Where(evaluation => evaluation.State == RetentionEvaluationStates.Scheduled &&
@@ -640,7 +660,7 @@ public sealed class EntriesController(
                     HistoryDto.EpisodeOf(record.Data) == episode?.Id)
                 .OrderByDescending(record => record.CreatedAt).FirstOrDefault();
             result[evaluation.TargetId] = new RetentionWarningDto(DateTime.SpecifyKind(evaluation.Deadline!.Value, DateTimeKind.Utc),
-                CauseOf(started?.Data) ?? "watched", files);
+                CauseOf(started?.Data) ?? "watched", isAdmin ? files : [], evaluation.Deadline!.Value <= now);
         }
 
         return result;
@@ -691,7 +711,7 @@ public sealed class EntriesController(
         var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots, [entry.Id], cancellationToken)
             .ConfigureAwait(false);
         var versions = new JellyfinMod.Services.Automation.VersionReader(database, mediaSources, files ?? new UnixFileInspector());
-        var warnings = await RetentionWarningsAsync(entry, episodes, policy, evaluations, history, cancellationToken).ConfigureAwait(false);
+        var warnings = await RetentionWarningsAsync(entry, episodes, policy, evaluations, history, isAdmin, cancellationToken).ConfigureAwait(false);
         var episodeDtos = new List<EpisodeDto>();
         foreach (var e in readableEpisodes)
             episodeDtos.Add(new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,

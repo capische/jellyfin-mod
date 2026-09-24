@@ -253,15 +253,13 @@ public sealed class RetentionPreviewService(
         // A kept file is never reclaimed or replaced, whatever its title's schedule says (PHASE10 Q3).
         if (target.Path is { } keptPath && keptPaths.Contains(keptPath))
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.VersionKept, evaluation?.Deadline);
-        if (replacement)
-        {
-            // An upgrade replaces the older version straight away, without the watched rule or the window (PHASE6 M5,
-            // confirmed by the user as PHASE10 Q10 on 2026-09-24). Keep, a per-file Keep, seeding and read-only media
-            // still protect it.
-            if (target.Kept)
-                return PreviewCandidate.Blocked(target, RetentionEvaluationReasons.Kept, evaluation?.Deadline);
-        }
-        else
+        // Keep on the title or episode, read with the targets just now, wins over whatever the evaluation row says: a row
+        // saved by a batch that started before the Keep can still read "scheduled" (RET2-R4).
+        if (target.Kept)
+            return PreviewCandidate.Blocked(target, RetentionEvaluationReasons.Kept, evaluation?.Deadline);
+        // An upgrade replaces the older version straight away, without the watched rule or the window (PHASE6 M5, confirmed
+        // by the user as PHASE10 Q10 on 2026-09-24). Keep, a per-file Keep, seeding and read-only media still protect it.
+        if (!replacement)
         {
             if (evaluation is null)
                 return PreviewCandidate.Blocked(target, RetentionPreviewReasons.EvaluationMissing, null);

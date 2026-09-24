@@ -56,6 +56,12 @@ public sealed class RetentionEvaluation
     /// </summary>
     public DateTime? GraceNotBefore { get; set; }
 
+    /// <summary>
+    /// Gets or sets the deadline the last <c>retention_started</c> event announced (RET2-R5). A window is announced once:
+    /// switching retention off and on, which keeps the countdown (Q9), does not announce it again.
+    /// </summary>
+    public DateTime? AnnouncedDeadline { get; set; }
+
     /// <summary>Gets or sets a value indicating whether only completions after <see cref="BaselineAt"/> count.</summary>
     /// <remarks>Re-acquired media must be finished again; Jellyfin can reattach old user data to a re-added item.</remarks>
     public bool RequiresFreshCompletion { get; set; }
@@ -117,6 +123,7 @@ internal static class RetentionTargetReset
         evaluation.EvaluatedAt = now;
         evaluation.BaselineAt = now;
         evaluation.GraceNotBefore = null;
+        evaluation.AnnouncedDeadline = null;
         evaluation.RequiresFreshCompletion = true;
     }
 }

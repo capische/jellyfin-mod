@@ -157,6 +157,15 @@ public sealed class ReconciliationService(
             }
         }
 
+        foreach (var absent in absentBindings.Where(binding => bindings.Any(other => other.EntryId == binding.EntryId &&
+                     !absentBindings.Contains(other))))
+            await ForgetRepresentationEvidenceAsync(database, absent.EntryId, absent.JellyfinItemId, cancellationToken)
+                .ConfigureAwait(false);
+        foreach (var absent in absentEpisodeBindings.Where(binding => episodeBindings.Any(other =>
+                     other.EpisodeId == binding.EpisodeId && !absentEpisodeBindings.Contains(other))))
+            await ForgetRepresentationEvidenceAsync(database, absent.EpisodeId, absent.JellyfinItemId, cancellationToken)
+                .ConfigureAwait(false);
+
         foreach (var episodeId in absentEpisodeBindings.Select(binding => binding.EpisodeId).Distinct())
         {
             if (episodeBindings.All(binding => binding.EpisodeId != episodeId || absentEpisodeBindings.Contains(binding)))
@@ -256,6 +265,43 @@ public sealed class ReconciliationService(
             Summary = "Retention restarted: Jellyfin no longer reports " + (files.Length == 1 ? files[0] : $"{files.Length} files"),
             Data = JsonSerializer.Serialize(new { episodeId, reason = "binding_not_observed", files })
         });
+    }
+
+    /// <summary>
+    /// A file arrived for a movie or episode that retention already tracks, beside copies it still has or after the ones it
+    /// had went (RET2-R1). The new file must not inherit the target's completion or deadline: Jellyfin 12 gives a file
+    /// re-added at its old path its old item id and reattaches its old play state, and a surviving sibling (kept, seeding)
+    /// keeps the target's schedule running. As when the last file goes (P3.T7), the target starts over and needs a
+    /// completion after now; History says why. This is the direction that deletes less: surviving siblings wait too.
+    /// </summary>
+    private async Task RestartForNewFileAsync(Guid entryId, Guid? episodeId, string? label, IEnumerable<string?> paths,
+        CancellationToken cancellationToken)
+    {
+        var now = _clock.GetUtcNow().UtcDateTime;
+        await RetentionTargetReset.ResetAsync(database, entryId, episodeId, now, cancellationToken).ConfigureAwait(false);
+        var files = paths.Where(path => !string.IsNullOrEmpty(path)).Select(path => Path.GetFileName(path!)).Distinct().ToArray();
+        database.History.Add(new HistoryRecord
+        {
+            EntryId = entryId,
+            EventType = "retention_reset",
+            Summary = (label is null ? string.Empty : label + ": ") + "Retention restarted: a new file arrived" +
+                (files.Length == 1 ? " (" + files[0] + ")" : files.Length > 1 ? $" ({files.Length} files)" : string.Empty) +
+                "; it counts down only after a new watch",
+            Data = JsonSerializer.Serialize(new { episodeId, reason = "new_file", files })
+        });
+    }
+
+    /// <summary>
+    /// Forgets completion evidence read through a file that is no longer bound while its siblings stay (RET2-R1): a file
+    /// re-added later at the same path gets the same item id, which must not revive that evidence.
+    /// </summary>
+    internal static async Task ForgetRepresentationEvidenceAsync(ModDbContext database, Guid targetId, Guid jellyfinItemId,
+        CancellationToken cancellationToken)
+    {
+        foreach (var stale in await database.CompletionObservations
+                     .Where(observation => observation.TargetId == targetId && observation.JellyfinItemId == jellyfinItemId)
+                     .ToListAsync(cancellationToken).ConfigureAwait(false))
+            database.CompletionObservations.Remove(stale);
     }
 
     private bool IsProvenAbsent(string? path, string? identity, IReadOnlyList<string> locations, out string detail)
@@ -409,6 +455,8 @@ public sealed class ReconciliationService(
             : await database.EntryBindings.Where(binding => binding.EntryId == entry.Id)
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
         var knownRepresentations = entryBindings.ToDictionary(binding => binding.JellyfinItemId);
+        var boundMoviePaths = entryBindings.Select(binding => binding.MediaPath).ToHashSet(StringComparer.Ordinal);
+        var arrivedMovieFiles = new List<string?>();
         var entryBindingChanges = 0;
         foreach (var representation in snapshot.Representations)
         {
@@ -432,6 +480,8 @@ public sealed class ReconciliationService(
                 continue;
             }
 
+            // A file this movie did not have before (RET2-R1); the same file under a new native id is not one.
+            if (!boundMoviePaths.Contains(representation.MediaPath)) arrivedMovieFiles.Add(representation.MediaPath);
             database.EntryBindings.Add(new EntryBinding
             {
                 EntryId = entry.Id,
@@ -495,11 +545,24 @@ public sealed class ReconciliationService(
                     .Where(evaluation => evaluation.EntryId == entry.Id && evaluation.EpisodeId != null)
                     .Select(evaluation => evaluation.TargetId).ToListAsync(cancellationToken).ConfigureAwait(false))
                 .ToHashSet();
+            var arrivals = new List<(Guid EpisodeId, string? MediaPath)>();
             episodeChanges = ReconcileEpisodes(entry.Id, snapshot.TargetLibraryId, episodes, episodeBindings,
-                usable, created, evaluatedEpisodes);
+                usable, created, evaluatedEpisodes, arrivals);
+            foreach (var arrived in arrivals.GroupBy(item => item.EpisodeId))
+            {
+                var episode = episodes.Single(candidate => candidate.Id == arrived.Key);
+                await RestartForNewFileAsync(entry.Id, episode.Id,
+                    $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00}", arrived.Select(item => item.MediaPath), cancellationToken)
+                    .ConfigureAwait(false);
+            }
             await RecordEpisodeConflictsAsync(entry.Id, usable, rebindable, skipped, cancellationToken)
                 .ConfigureAwait(false);
         }
+
+        if (!created && snapshot.MediaType == "movie" && arrivedMovieFiles.Count > 0 &&
+            await database.RetentionEvaluations.AnyAsync(evaluation => evaluation.TargetId == entry.Id, cancellationToken)
+                .ConfigureAwait(false))
+            await RestartForNewFileAsync(entry.Id, null, null, arrivedMovieFiles, cancellationToken).ConfigureAwait(false);
 
         if (created)
         {
@@ -813,10 +876,13 @@ public sealed class ReconciliationService(
         IReadOnlyList<EpisodeBinding> episodeBindings,
         IReadOnlyList<NativeEpisodeSnapshot> observations,
         bool backfilled,
-        IReadOnlySet<Guid> evaluatedEpisodes)
+        IReadOnlySet<Guid> evaluatedEpisodes,
+        ICollection<(Guid EpisodeId, string? MediaPath)> arrivals)
     {
         var changedEpisodeIds = new HashSet<Guid>();
         var boundBefore = episodeBindings.Select(binding => binding.EpisodeId).ToHashSet();
+        var pathsBefore = episodeBindings.GroupBy(binding => binding.EpisodeId).ToDictionary(group => group.Key,
+            group => group.Select(binding => binding.MediaPath).ToHashSet(StringComparer.Ordinal));
         var knownBindings = episodeBindings.ToDictionary(binding => binding.JellyfinItemId);
 
         // A native episode that gained a TMDB id (the library switched scraper) keeps its position-identity row, which
@@ -847,8 +913,13 @@ public sealed class ReconciliationService(
                 owner.EpisodeId == episode.Id).ToArray();
             foreach (var candidate in allCandidates)
             {
+                // A TMDB-identified episode that takes a file by its number only has not verified that the file is that
+                // episode (RET2-R3); the native episode's own TMDB id, or its title or air date, confirms it.
+                var unverified = !episode.IsPositionIdentity && candidate.TmdbId != episode.TmdbId &&
+                    !EpisodeIdentityEvidence.Agrees(candidate.Title, candidate.AirDate, episode.Title, episode.AirDate);
                 if (knownBindings.TryGetValue(candidate.JellyfinItemId, out var existingBinding))
                 {
+                    existingBinding.IdentityUnverified = unverified;
                     var structuralChange = existingBinding.SeriesItemId != candidate.SeriesItemId ||
                         existingBinding.TargetLibraryId != targetLibraryId;
                     if (structuralChange ||
@@ -872,11 +943,16 @@ public sealed class ReconciliationService(
                     SeriesItemId = candidate.SeriesItemId,
                     TargetLibraryId = targetLibraryId,
                     MediaPath = candidate.MediaPath,
-                    StorageIdentity = candidate.StorageIdentity
+                    StorageIdentity = candidate.StorageIdentity,
+                    IdentityUnverified = unverified
                 };
                 database.EpisodeBindings.Add(newBinding);
                 knownBindings.Add(candidate.JellyfinItemId, newBinding);
                 changedEpisodeIds.Add(episode.Id);
+                // A file an episode that retention already tracks did not have before (RET2-R1).
+                if ((boundBefore.Contains(episode.Id) || evaluatedEpisodes.Contains(episode.Id)) &&
+                    !(pathsBefore.TryGetValue(episode.Id, out var paths) && paths.Contains(candidate.MediaPath)))
+                    arrivals.Add((episode.Id, candidate.MediaPath));
             }
 
             var candidates = allCandidates.Where(observation => observation.IsPlayable).ToArray();
@@ -1035,6 +1111,33 @@ public sealed class ReconciliationService(
 
             trackedPositions.Add(positionGroup.Key);
             changedEpisodeIds.Add(positionEpisode.Id);
+        }
+
+        // A position-tracked file holding several episodes (S01E07-E08) also gets a row for each episode it covers that no
+        // row holds yet (RET2-R7): without one the covered episode has no page, Keep or window of its own, and a later Add
+        // would create a monitored TMDB row there. The row points at the covering file and has no binding of its own, like
+        // the covered rows above; the file stays one unit that retention reclaims only when every covered episode is due.
+        foreach (var observation in observations.Where(observation => observation.IsPlayable && observation.TmdbId is null &&
+                     observation.EpisodeNumberEnd > observation.EpisodeNumber &&
+                     knownBindings.ContainsKey(observation.JellyfinItemId)))
+        {
+            for (var number = observation.EpisodeNumber + 1; number <= observation.EpisodeNumberEnd; number++)
+            {
+                if (!trackedPositions.Add((observation.SeasonNumber, number))) continue;
+                var covered = new Episode
+                {
+                    EntryId = entryId,
+                    TmdbId = 0,
+                    SeasonNumber = observation.SeasonNumber,
+                    EpisodeNumber = number,
+                    Title = observation.Title ?? string.Empty,
+                    Monitored = false,
+                    JellyfinItemId = observation.JellyfinItemId,
+                    State = FileState.OnDisk
+                };
+                database.Episodes.Add(covered);
+                changedEpisodeIds.Add(covered.Id);
+            }
         }
 
         // An episode's retention baseline is the moment it gains its first representation (P10.E1): only a completion

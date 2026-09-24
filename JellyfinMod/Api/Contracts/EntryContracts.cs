@@ -215,11 +215,14 @@ public sealed class EpisodeRetentionRequest
 
 /// <summary>
 /// A running retention window, shown to everyone who can see the title (PHASE10 Q8 and Q11, 2026-09-24): when its files
-/// will be deleted unless kept, why the window started, and which files it applies to.
+/// will be deleted unless kept, why the window started, and which files it applies to. Ordinary users get the date and the
+/// cause only; the file names, which can name library folders, are for administrators (RET2-R10). A date that has already
+/// passed is reported as overdue: the files go at the next retention run (RET2-R5).
 /// </summary>
 public sealed record RetentionWarningDto([property: JsonPropertyName("deadline")] DateTime Deadline,
     [property: JsonPropertyName("cause")] string Cause,
-    [property: JsonPropertyName("files")] IReadOnlyList<string> Files);
+    [property: JsonPropertyName("files")] IReadOnlyList<string> Files,
+    [property: JsonPropertyName("overdue")] bool Overdue = false);
 
 /// <summary>Whether one file is now kept (PHASE10 Q3).</summary>
 public sealed record VersionKeepResult([property: JsonPropertyName("bindingId")] Guid BindingId,
