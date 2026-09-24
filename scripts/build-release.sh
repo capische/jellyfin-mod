@@ -55,6 +55,16 @@ for required in index.html jellyfinmod.html jellyfinmod-web.json; do
     [[ -s $web_dist/$required ]] || die "$web_dist/$required is missing; build the fork's jellyfin-mod branch first"
 done
 
+# Never delete a directory this script did not make (REVIEW-2026-09-24 S5-R2): --out must be absent, empty,
+# or a previous release output, recognised by the marker written below.
+marker=".jellyfinmod-release-output"
+if [[ -e $out ]]; then
+    [[ -d $out ]] || die "--out $out exists and is not a directory; refusing to replace it"
+    if [[ -n "$(ls -A -- "$out")" && ! -f $out/$marker ]]; then
+        die "--out $out is not empty and was not written by this script (no $marker); choose an empty or new directory"
+    fi
+fi
+
 binary_dir="$root/JellyfinMod/bin/Release/net9.0"
 if ((build)); then
     "$dotnet" build -c Release "$root/JellyfinMod/JellyfinMod.csproj"
@@ -62,6 +72,7 @@ fi
 
 rm -rf "$out"
 mkdir -p "$out"
+: >"$out/$marker"
 
 # The bundle the plugin serves is dist/ without source maps (§4.5). Zipped from inside dist/ so the
 # archive's paths are the bundle's own.
