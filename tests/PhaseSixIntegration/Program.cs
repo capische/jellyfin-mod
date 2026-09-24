@@ -94,6 +94,8 @@ internal static class Phase6
             AddMovie(database, ids, movies.Id, "unmonitored", 450, "Quiet Movie", 2020, "tt0900450", monitored: false);
             AddMovie(database, ids, movies.Id, "up", 460, "Up Movie", 2020, "tt0900460", monitored: true);
             AddMovie(database, ids, movies.Id, "kept", 461, "Kept Movie", 2020, "tt0900461", monitored: true);
+            // RET2-R8: a title whose older file an administrator kept by itself (PHASE10 Q3) while an upgrade replaces (Q10).
+            AddMovie(database, ids, movies.Id, "filekept", 465, "File Kept Movie", 2020, "tt0900465", monitored: true);
             AddMovie(database, ids, movies.Id, "order", 462, "Order Movie", 2020, "tt0900462", monitored: false);
             // Two titles whose only releases live on a tracker that advertises nothing but a text search.
             AddMovie(database, ids, movies.Id, "textauto", 463, "Text Only Movie", 2021, "tt0900463", monitored: true);
@@ -325,7 +327,7 @@ internal static class Phase6
                     TargetId = ids[key], EntryId = ids[key], NextSearchAt = start.AddMinutes(-offset), ProfileRevisionSeen = 1
                 });
             // Episodes and the other movies are pushed out so these runs are about the five.
-            foreach (var key in new[] { "s1e1", "up", "kept", "textauto", "textmanual" })
+            foreach (var key in new[] { "s1e1", "up", "kept", "filekept", "textauto", "textmanual" })
                 database.AutomationTargets.Add(new AutomationTargetState
                 {
                     TargetId = ids[key], EntryId = key == "s1e1" ? ids["series"] : ids[key], EpisodeId = key == "s1e1" ? ids[key] : null,
@@ -519,33 +521,50 @@ internal static class Phase6
         var keptOld = Path.Combine(keptFolder, "Kept Movie (2020) [tmdbid-461] - 720p WEB-DL.mkv");
         await File.WriteAllBytesAsync(keptOld, new byte[4096]);
         world.Native.AddMovie(world.Movies, keptOld, 461);
+        var fileKeptFolder = Path.Combine(world.Movies.Location, "File Kept Movie (2020) [tmdbid-465]");
+        Directory.CreateDirectory(fileKeptFolder);
+        var fileKeptOld = Path.Combine(fileKeptFolder, "File Kept Movie (2020) [tmdbid-465] - 720p WEB-DL.mkv");
+        await File.WriteAllBytesAsync(fileKeptOld, new byte[4096]);
+        world.Native.AddMovie(world.Movies, fileKeptOld, 465);
         await WaitAsync(async () =>
         {
             await using var database = new ModDbContext(dbPath);
-            return await database.EntryBindings.CountAsync(value => value.EntryId == ids["up"] || value.EntryId == ids["kept"]) == 2 ? true : null;
-        }, "Both 720p files are bound");
-        foreach (var key in new[] { "up", "kept" })
+            return await database.EntryBindings.CountAsync(value => value.EntryId == ids["up"] || value.EntryId == ids["kept"] ||
+                value.EntryId == ids["filekept"]) == 3 ? true : null;
+        }, "The three 720p files are bound");
+        Guid fileKeptBinding;
+        await using (var database = new ModDbContext(dbPath))
+            fileKeptBinding = await database.EntryBindings.Where(value => value.EntryId == ids["filekept"]).Select(value => value.Id).SingleAsync();
+        await ExpectAsync(ordinary.PostAsync($"/JellyfinMod/Entries/{ids["filekept"]}/Versions/{fileKeptBinding}/Keep", null), 403, "",
+            "Ordinary users cannot keep a file");
+        await ReadAsync(await admin.PostAsync($"/JellyfinMod/Entries/{ids["filekept"]}/Versions/{fileKeptBinding}/Keep", null), 200,
+            "Keep the third title's 720p file by itself");
+        foreach (var key in new[] { "up", "kept", "filekept" })
             await ReadAsync(await admin.PatchAsJsonAsync($"/JellyfinMod/Entries/{ids[key]}", new { qualityProfileId = upgrade.GetProperty("id").AsGuid() }),
                 200, "Assign the upgrade profile");
         await ReadAsync(await admin.PostAsync($"/JellyfinMod/Entries/{ids["kept"]}/Keep", null), 200, "Keep the second title");
         release(torznab, "up1080", "Up.Movie.2020.1080p.WEB-DL-GRP", "0900460", null);
         release(torznab, "kept1080", "Kept.Movie.2020.1080p.WEB-DL-GRP", "0900461", null);
+        release(torznab, "filekept1080", "File.Kept.Movie.2020.1080p.WEB-DL-GRP", "0900465", null);
         var targets = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Automation/Targets?entryId={ids["up"]}"));
         Assert(targets.EnumerateArray().Single().GetProperty("upgradeEligible").GetBoolean() &&
             targets.EnumerateArray().Single().GetProperty("heldBestQuality").GetString() == "webdl-720p",
             "A held 720p below a 1080p cutoff is upgrade-eligible");
-        await ForceDueAsync(dbPath, time, ids["up"], ids["kept"]);
+        await ForceDueAsync(dbPath, time, ids["up"], ids["kept"], ids["filekept"]);
         var runK = await Run();
-        Assert(runK.UpgradesPlanned == 2, $"Both below-cutoff titles get an upgrade grab ({Describe(runK)})");
-        foreach (var key in new[] { "up1080", "kept1080" }) await WaitForTorrentAsync(transmission, fixtures[key].InfoHash);
+        Assert(runK.UpgradesPlanned == 3, $"The three below-cutoff titles get an upgrade grab ({Describe(runK)})");
+        foreach (var key in new[] { "up1080", "kept1080", "filekept1080" }) await WaitForTorrentAsync(transmission, fixtures[key].InfoHash);
         transmission.Progress(fixtures["up1080"].InfoHash, 1.0);
         transmission.Progress(fixtures["kept1080"].InfoHash, 1.0);
+        transmission.Progress(fixtures["filekept1080"].InfoHash, 1.0);
         await WaitAsync(async () =>
         {
             await Tick();
             await using var database = new ModDbContext(dbPath);
-            return await database.UpgradeOperations.CountAsync(value => value.State == UpgradeStates.Completed) == 2 ? true : null;
-        }, "Both upgrades finish", 60);
+            return await database.UpgradeOperations.CountAsync(value => value.State == UpgradeStates.Completed) == 2 &&
+                await database.UpgradeOperations.AnyAsync(value => value.EntryId == ids["filekept"] && value.State == UpgradeStates.Blocked)
+                ? true : null;
+        }, "Two upgrades finish and the file-kept one is blocked", 60);
         await using (var database = new ModDbContext(dbPath))
         {
             var up = await database.UpgradeOperations.AsNoTracking().SingleAsync(value => value.EntryId == ids["up"]);
@@ -565,6 +584,12 @@ internal static class Phase6
                 await database.EntryBindings.CountAsync(value => value.EntryId == ids["kept"]) == 2 &&
                 await database.AutomationDecisions.AnyAsync(value => value.EntryId == ids["kept"] && value.Reason == AutomationReasons.KeptEntry),
                 "Keep lets the title gain the 1080p version but never removes its 720p");
+            // Q10 with a per-file Keep (RET2-R8): the upgrade adds the 1080p and the kept 720p stays, blocked as version_kept.
+            var fileKept = await database.UpgradeOperations.AsNoTracking().SingleAsync(value => value.EntryId == ids["filekept"]);
+            Assert(fileKept.State == UpgradeStates.Blocked && fileKept.Reason == "version_kept" && File.Exists(fileKeptOld) &&
+                await database.EntryBindings.CountAsync(value => value.EntryId == ids["filekept"]) == 2 &&
+                !await database.RetentionOperations.AnyAsync(value => value.EntryId == ids["filekept"] && value.State == "completed"),
+                $"A per-file Keep on the older version stops the replacement while the new version is added ({fileKept.State}/{fileKept.Reason})");
         }
 
         // ---- M6 get another quality on purpose; M8 versions API.
@@ -619,6 +644,9 @@ internal static class Phase6
         await host.Service<RetentionPolicyService>().SyncAsync(configuration, CancellationToken.None);
         // The first evaluation records each user's finished state; the next one schedules from it (the stub's play time is "now").
         time.Offset += TimeSpan.FromMinutes(1);
+        // Every import restarts the title (P3.T7) and a new file restarts it too (RET2-R1), so evidence read before the 2160p
+        // import finished is older than the baseline; the evidence repair reads the watch again, as a playback event would.
+        await host.Service<RetentionCompletionService>().RefreshAllAsync(new Progress<double>(), CancellationToken.None);
         _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
         _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
         DateTime? scheduledDeadline;

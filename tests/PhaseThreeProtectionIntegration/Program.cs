@@ -640,6 +640,100 @@ static async Task VerifyPreviewHttpAsync(
             Assert(FindRow(keptPreview!.RootElement, nativeEpisode.Id).GetProperty("state").GetString() == "blocked",
                 "A kept episode's representation is never due");
 
+        // RET2-R8: un-Keep, the episode window editor and per-file Keep through the real authorization policy: anonymous
+        // 401, ordinary user 403, administrator 200.
+        Guid episodeBindingId;
+        await using (var bindingDatabase = new ModDbContext(databasePath))
+            episodeBindingId = await bindingDatabase.EpisodeBindings.Where(binding => binding.EpisodeId == episode.Id)
+                .Select(binding => binding.Id).SingleAsync();
+        var episodeBase = $"/JellyfinMod/Entries/{seriesEntry.Id}/Episodes/{episode.Id}";
+        var versionBase = $"/JellyfinMod/Entries/{seriesEntry.Id}/Versions/{episodeBindingId}/Keep";
+        HttpRequestMessage[] Writes() =>
+        [
+            new(HttpMethod.Delete, episodeBase + "/Keep"),
+            new(HttpMethod.Put, episodeBase + "/Retention") { Content = JsonContent.Create(new { policy = "days", reclaimAfterDays = 3 }) },
+            new(HttpMethod.Post, versionBase),
+            new(HttpMethod.Delete, versionBase)
+        ];
+        using (var anonymous = new HttpClient { BaseAddress = http.BaseAddress })
+            foreach (var request in Writes())
+                Assert((await anonymous.SendAsync(request)).StatusCode == HttpStatusCode.Unauthorized,
+                    $"Anonymous {request.Method} {request.RequestUri} is rejected");
+        using (var ordinaryHttp = new HttpClient { BaseAddress = http.BaseAddress })
+        {
+            ordinaryHttp.DefaultRequestHeaders.Add("X-Preview-User", user.Id.ToString());
+            foreach (var request in Writes())
+                Assert((await ordinaryHttp.SendAsync(request)).StatusCode == HttpStatusCode.Forbidden,
+                    $"An ordinary user cannot {request.Method} {request.RequestUri}");
+            // RET2-R10: an ordinary user's warning, where there is one, never names files.
+            using var ordinaryResponse = await ordinaryHttp.GetAsync($"/JellyfinMod/Entries/{entry.Id}");
+            using var ordinaryDetail = JsonDocument.Parse(ordinaryResponse.IsSuccessStatusCode
+                ? await ordinaryResponse.Content.ReadAsStringAsync() : "{}");
+            if (ordinaryDetail.RootElement.TryGetProperty("retentionWarning", out var ordinaryWarning) &&
+                ordinaryWarning.ValueKind == JsonValueKind.Object)
+                Assert(ordinaryWarning.GetProperty("files").GetArrayLength() == 0,
+                    "An ordinary user's retention warning shows the date and cause but no file names: " + ordinaryWarning.GetRawText());
+        }
+
+        using (var unkept = await http.DeleteAsync(episodeBase + "/Keep"))
+        {
+            var unkeptBody = await unkept.Content.ReadAsStringAsync();
+            Assert(unkept.IsSuccessStatusCode && unkeptBody.Contains("\"retentionPolicy\":\"inherit\""),
+                "An administrator can stop keeping an episode: " + unkept.StatusCode + " " + unkeptBody);
+        }
+        using (var windowed = await http.PutAsJsonAsync(episodeBase + "/Retention", new { policy = "days", reclaimAfterDays = 3 }))
+        {
+            var windowedBody = await windowed.Content.ReadAsStringAsync();
+            Assert(windowed.IsSuccessStatusCode && windowedBody.Contains("\"retentionPolicy\":\"days\"") &&
+                windowedBody.Contains("\"reclaimAfterDays\":3"),
+                "An administrator can give an episode its own window: " + windowed.StatusCode + " " + windowedBody);
+        }
+        Assert((await http.PutAsJsonAsync(episodeBase + "/Retention", new { policy = "days", reclaimAfterDays = 0 })).StatusCode ==
+            HttpStatusCode.BadRequest, "A window outside 1 to 3650 days is refused");
+        Assert((await http.PostAsync(versionBase, null)).IsSuccessStatusCode, "An administrator can keep one file");
+        Assert((await http.PostAsync(versionBase, null)).IsSuccessStatusCode, "Keeping a kept file again is idempotent");
+        await using (var graceDatabase = new ModDbContext(databasePath))
+        {
+            var before = await graceDatabase.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == episode.Id);
+            before.GraceNotBefore = null;
+            await graceDatabase.SaveChangesAsync();
+        }
+        Assert((await http.DeleteAsync(versionBase)).IsSuccessStatusCode, "An administrator can stop keeping one file");
+        await using (var graceDatabase = new ModDbContext(databasePath))
+        {
+            Assert(await graceDatabase.History.CountAsync(history => history.EntryId == seriesEntry.Id && history.EventType == "version_kept") == 1 &&
+                await graceDatabase.History.CountAsync(history => history.EntryId == seriesEntry.Id && history.EventType == "version_unkept") == 1 &&
+                !await graceDatabase.VersionKeeps.AnyAsync(),
+                "A file's Keep is recorded once and removed on un-Keep");
+            // RET2-R2: stopping a file's Keep restarts its target's grace from now, as un-keeping an episode does.
+            Assert((await graceDatabase.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == episode.Id))
+                .GraceNotBefore == clock.GetUtcNow().UtcDateTime, "Stopping a file's Keep restarts the episode's grace");
+        }
+
+        // RET2-R3: an upgrade never replaces a file bound to its episode by number only. The executor refuses before any
+        // preview or prepare, with a stable reason, and the file stays.
+        await using (var identityDatabase = new ModDbContext(databasePath))
+        {
+            (await identityDatabase.EpisodeBindings.SingleAsync(binding => binding.Id == episodeBindingId)).IdentityUnverified = true;
+            await identityDatabase.SaveChangesAsync();
+        }
+        var episodeBytes = await File.ReadAllBytesAsync(episodeMedia);
+        var refused = await api.Services.GetRequiredService<RetentionExecutor>().ReplaceAsync(episodeBindingId, Guid.NewGuid(), default);
+        Assert(refused.Reason == "identity_unverified" && refused.OperationId is null && File.Exists(episodeMedia) &&
+            (await File.ReadAllBytesAsync(episodeMedia)).SequenceEqual(episodeBytes),
+            $"A replacement of a file whose episode identity is unverified is refused and the file is untouched ({refused.Reason})");
+        await using (var identityDatabase = new ModDbContext(databasePath))
+        {
+            Assert(!await identityDatabase.RetentionOperations.AnyAsync(operation => operation.BindingId == episodeBindingId),
+                "No retention operation is prepared for an unverified replacement");
+            (await identityDatabase.EpisodeBindings.SingleAsync(binding => binding.Id == episodeBindingId)).IdentityUnverified = false;
+            await identityDatabase.SaveChangesAsync();
+        }
+        Assert((await http.PostAsync(episodeBase + "/Keep", null)).IsSuccessStatusCode, "Keep the episode again");
+        var verified = await api.Services.GetRequiredService<RetentionExecutor>().ReplaceAsync(episodeBindingId, Guid.NewGuid(), default);
+        Assert(verified.Reason == "kept" && File.Exists(episodeMedia),
+            $"A verified file passes the identity check and meets the next protection, its episode Keep ({verified.Reason})");
+
         using var kept = await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Keep", null);
         var keptBody = await kept.Content.ReadAsStringAsync();
         Assert(kept.IsSuccessStatusCode, "An administrator can keep a series: " +
