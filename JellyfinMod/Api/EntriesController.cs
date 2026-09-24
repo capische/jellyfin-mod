@@ -632,8 +632,8 @@ public sealed class EntriesController(
             var episode = episodes.FirstOrDefault(candidate => candidate.Id == evaluation.TargetId);
             if (evaluation.TargetId != entry.Id && episode is null) continue;
             if (RetentionOverrides.IsKept(entry, episode)) continue;
-            var files = paths.Where(path => path.TargetId == evaluation.TargetId && path.MediaPath is not null && !kept.Contains(path.MediaPath))
-                .Select(path => Path.GetFileName(path.MediaPath!)).Order(StringComparer.Ordinal).ToArray();
+            var files = RetentionFileNames.Distinct(paths.Where(path => path.TargetId == evaluation.TargetId && path.MediaPath is not null &&
+                !kept.Contains(path.MediaPath)).Select(path => path.MediaPath!));
             if (files.Length == 0) continue;
             var started = history.Where(record => record.EventType == "retention_started" &&
                     HistoryDto.EpisodeOf(record.Data) == episode?.Id)

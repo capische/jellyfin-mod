@@ -113,6 +113,30 @@ internal static class RetentionTargetReset
     }
 }
 
+/// <summary>Names files for people: the file name, lengthened by parent folders only where two files share one.</summary>
+internal static class RetentionFileNames
+{
+    /// <summary>Returns the shortest trailing part of each path that tells the files apart, in order.</summary>
+    public static string[] Distinct(IEnumerable<string> paths)
+    {
+        var parts = paths.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)
+            .Select(path => path.Split('/', StringSplitOptions.RemoveEmptyEntries)).ToArray();
+        var names = new string[parts.Length];
+        for (var index = 0; index < parts.Length; index++)
+        {
+            for (var length = 1; length <= parts[index].Length; length++)
+            {
+                var suffix = string.Join('/', parts[index][^length..]);
+                names[index] = suffix;
+                if (parts.Where((_, other) => other != index)
+                    .All(path => path.Length < length || string.Join('/', path[^length..]) != suffix)) break;
+            }
+        }
+
+        return names;
+    }
+}
+
 /// <summary>
 /// How a movie's or an episode's own retention override combines with its entry's (P10.E2). Keep on the entry or on the
 /// episode protects the episode; an episode's own window wins over its series' window, which wins over the global one.

@@ -354,8 +354,10 @@ public sealed class RetentionEvaluator(
                 .Select(binding => binding.MediaPath).ToListAsync(cancellationToken).ConfigureAwait(false)
             : await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == target.Entry.Id)
                 .Select(binding => binding.MediaPath).ToListAsync(cancellationToken).ConfigureAwait(false);
-        var files = paths.Where(path => !string.IsNullOrEmpty(path)).Select(path => Path.GetFileName(path!)).Order(StringComparer.Ordinal)
-            .ToArray();
+        // Kept files are not counting down; they stay out of the event (PHASE10 Q3).
+        var kept = (await database.VersionKeeps.AsNoTracking().Where(keep => keep.EntryId == target.Entry.Id)
+            .Select(keep => keep.MediaPath).ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet(StringComparer.Ordinal);
+        var files = RetentionFileNames.Distinct(paths.Where(path => !string.IsNullOrEmpty(path) && !kept.Contains(path!)).Select(path => path!));
         var label = target.EpisodeId.HasValue
             ? await database.Episodes.AsNoTracking().Where(episode => episode.Id == target.EpisodeId)
                 .Select(episode => "S" + episode.SeasonNumber.ToString("00", System.Globalization.CultureInfo.InvariantCulture) +
@@ -377,6 +379,8 @@ public sealed class RetentionEvaluator(
     private static string WindowCause(string sourceReason) => sourceReason switch
     {
         "Import" => "watched on another device (Trakt)",
+        // A client that syncs watched state from elsewhere writes user data directly (POST /UserItems/{id}/UserData).
+        "UpdateUserData" => "watched on another device (synced)",
         "TogglePlayed" => "marked played",
         "PlaybackFinished" or "PlaybackProgress" or "PlaybackStart" => "watched on this server",
         _ => "watched"
