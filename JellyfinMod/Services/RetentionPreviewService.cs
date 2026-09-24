@@ -281,6 +281,13 @@ public sealed class RetentionPreviewService(
         if (native is MediaBrowser.Controller.Entities.TV.Episode { IndexNumberEnd: { } lastEpisode } multiEpisode &&
             lastEpisode > (multiEpisode.IndexNumber ?? lastEpisode))
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiEpisodeUnsupported, evaluation?.Deadline);
+        // Jellyfin 10.11 merges several files of one episode into one item with alternate media sources. Episode
+        // observations list only the item, so its other files are not bound: reclaiming the primary would leave them
+        // behind untracked and re-resolved as a new item. Such an episode stays blocked until its versions are tracked
+        // like a movie's (P10, PHASE10 task E7).
+        if (target.EpisodeId.HasValue && native is Video episodeVideo &&
+            (episodeVideo.LocalAlternateVersions is { Length: > 0 } || episodeVideo.LinkedAlternateVersions is { Length: > 0 }))
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.EpisodeVersionsUntracked, evaluation?.Deadline);
         try
         {
             if (new FileInfo(native.Path).LinkTarget is not null)
@@ -420,6 +427,7 @@ internal static class RetentionPreviewReasons
     public const string SeedIndexIncomplete = "seed_index_incomplete";
     public const string MultiPartUnsupported = "multi_part_unsupported";
     public const string MultiEpisodeUnsupported = "multi_episode_unsupported";
+    public const string EpisodeVersionsUntracked = "episode_versions_untracked";
     public const string SeedingIncomplete = "seeding_incomplete";
     public const string SeedGoalUnbounded = "seed_goal_unbounded";
     public const string SeedGoalUnmet = "seed_goal_unmet";
