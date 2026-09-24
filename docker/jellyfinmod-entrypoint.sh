@@ -129,7 +129,11 @@ first_start_bootstrap() {
 
 register_repository() {
     # Once only. An administrator who removes the entry has decided, and a restart must not undo it.
-    [ -e "$repository_marker" ] && return 0
+    if [ -e "$repository_marker" ]; then
+        # The copy kept by the start that registered the entry has served its one start.
+        rm -f "$config_dir/system.xml.jellyfinmod-bak" 2>/dev/null
+        return 0
+    fi
     mkdir -p "$state_dir" || return 0
 
     system="$config_dir/system.xml"
@@ -166,12 +170,30 @@ register_repository() {
                 print "  <PluginRepositories>"; print ENVIRON["ENTRY"]; print "  </PluginRepositories>"; done = 1 } { print }' \
                 "$system" >"$system.jellyfinmod"
         fi
-        if [ -s "$system.jellyfinmod" ] && grep -q '/JellyfinMod/Repository<' "$system.jellyfinmod"; then
-            mv "$system.jellyfinmod" "$system"
-            log "registered the repository \"$repository_name\" at $url"
+        # Replace system.xml only with a complete rewrite (REVIEW-2026-09-24 S5-R1): awk must succeed, the output
+        # must be exactly the input plus the entry's lines, and end with the closing element. A full or
+        # read-only volume, or a failed awk, leaves the original byte for byte and says so.
+        status=$?
+        # Records, not newlines: Jellyfin writes system.xml without a final newline and awk adds one.
+        in_lines="$(awk 'END { print NR }' "$system" 2>/dev/null || echo -1)"
+        out_lines="$(awk 'END { print NR }' "$system.jellyfinmod" 2>/dev/null || echo -2)"
+        entry_lines="$(printf '%s\n' "$entry" | awk 'END { print NR }')"
+        if grep -q '<PluginRepositories>' "$system"; then
+            added=$entry_lines
         else
-            rm -f "$system.jellyfinmod"
-            log "could not add the repository to $system; left unchanged"
+            added=$((entry_lines + 2))
+            # The self-closing form is replaced by the open and close lines around the entry.
+            grep -q '<PluginRepositories */>' "$system" && added=$((entry_lines + 1))
+        fi
+        if [ "$status" -eq 0 ] && [ "$out_lines" -eq $((in_lines + added)) ] &&
+            grep -q '/JellyfinMod/Repository<' "$system.jellyfinmod" &&
+            tail -n 3 "$system.jellyfinmod" | grep -q '</ServerConfiguration>' &&
+            cp -p "$system" "$system.jellyfinmod-bak" &&
+            mv "$system.jellyfinmod" "$system"; then
+            log "registered the repository \"$repository_name\" at $url (previous system.xml kept as system.xml.jellyfinmod-bak for one start)"
+        else
+            rm -f "$system.jellyfinmod" "$system.jellyfinmod-bak" 2>/dev/null
+            log "could not rewrite $system completely (awk status $status, $out_lines of $((in_lines + added)) lines); left it unchanged and registered nothing"
             return 0
         fi
     fi
