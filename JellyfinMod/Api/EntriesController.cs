@@ -368,6 +368,7 @@ public sealed class EntriesController(
             {
                 var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(
                     item => item.TargetId == episode.Id, cancellationToken).ConfigureAwait(false);
+                if (evaluation is not null) evaluation.GraceNotBefore = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
                 if (evaluation is not null && evaluation.State == RetentionEvaluationStates.Scheduled)
                 {
                     evaluation.State = RetentionEvaluationStates.Waiting;

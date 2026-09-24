@@ -49,6 +49,13 @@ public sealed class RetentionEvaluation
     /// <remarks>Set when the target is first evaluated and again when its last representation is reclaimed or unbound.</remarks>
     public DateTime BaselineAt { get; set; }
 
+    /// <summary>
+    /// Gets or sets the earliest instant grace may start because an administrator restarted it (un-Keep or a changed
+    /// window, PHASE10 Q4). Unlike the schedule it survives retention being switched off and on (Q9), so a restarted
+    /// countdown can never fall back to an older, already expired one.
+    /// </summary>
+    public DateTime? GraceNotBefore { get; set; }
+
     /// <summary>Gets or sets a value indicating whether only completions after <see cref="BaselineAt"/> count.</summary>
     /// <remarks>Re-acquired media must be finished again; Jellyfin can reattach old user data to a re-added item.</remarks>
     public bool RequiresFreshCompletion { get; set; }
@@ -109,6 +116,7 @@ internal static class RetentionTargetReset
         evaluation.Deadline = null;
         evaluation.EvaluatedAt = now;
         evaluation.BaselineAt = now;
+        evaluation.GraceNotBefore = null;
         evaluation.RequiresFreshCompletion = true;
     }
 }

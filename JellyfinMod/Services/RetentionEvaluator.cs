@@ -318,6 +318,7 @@ public sealed class RetentionEvaluator(
         // restart a countdown that was running, and neither does the policy revision that switch bumps.
         var eligibleAt = Latest(Latest(completionBasis.Value, policy.GraceStartAt ?? now), result.BaselineAt);
         if (priorState == RetentionEvaluationStates.Disabled) policyChanged = false;
+        if (result.GraceNotBefore is { } restarted) eligibleAt = Latest(eligibleAt, restarted);
         if (!priorDeadline.HasValue && (accessChanged || policyChanged ||
             (hadPriorEvaluation && priorState != RetentionEvaluationStates.Disabled)))
             eligibleAt = Latest(eligibleAt, now);
