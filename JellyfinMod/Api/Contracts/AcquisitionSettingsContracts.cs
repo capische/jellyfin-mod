@@ -35,7 +35,12 @@ public sealed record IndexerSettingsDto(
     [property: JsonPropertyName("capabilitiesFetchedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? CapabilitiesFetchedAt,
     [property: JsonPropertyName("lastError"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? LastError,
     [property: JsonPropertyName("minIntervalSeconds")] int MinIntervalSeconds = 10,
-    [property: JsonPropertyName("dailyQueryBudget")] int DailyQueryBudget = 200);
+    [property: JsonPropertyName("dailyQueryBudget")] int DailyQueryBudget = 200,
+    [property: JsonPropertyName("managedBy")] string ManagedBy = "manual",
+    [property: JsonPropertyName("prowlarrSourceId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? ProwlarrSourceId = null,
+    [property: JsonPropertyName("prowlarrIndexerId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? ProwlarrIndexerId = null,
+    [property: JsonPropertyName("prowlarrRemovedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? ProwlarrRemovedAt = null,
+    [property: JsonPropertyName("breakerOpenUntil"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? BreakerOpenUntil = null);
 
 /// <summary>The safe subset of a verified Torznab capability document.</summary>
 public sealed record IndexerCapabilitiesDto(
@@ -286,3 +291,47 @@ public sealed record ConnectionTestDto(
     [property: JsonPropertyName("message")] string Message,
     [property: JsonPropertyName("version"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Version,
     [property: JsonPropertyName("apiVersion"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ApiVersion);
+
+/// <summary>A Prowlarr source; the API key is write-only (P7.S9).</summary>
+public sealed record ProwlarrSourceDto(
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("baseUrl")] string BaseUrl,
+    [property: JsonPropertyName("apiKeyConfigured")] bool ApiKeyConfigured,
+    [property: JsonPropertyName("enabled")] bool Enabled,
+    [property: JsonPropertyName("syncIntervalMinutes")] int SyncIntervalMinutes,
+    [property: JsonPropertyName("lastSyncAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? LastSyncAt,
+    [property: JsonPropertyName("lastSyncOutcome"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? LastSyncOutcome,
+    [property: JsonPropertyName("lastError"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? LastError,
+    [property: JsonPropertyName("consecutiveEmptySyncs")] int ConsecutiveEmptySyncs,
+    [property: JsonPropertyName("indexerCount")] int IndexerCount,
+    [property: JsonPropertyName("revision")] int Revision);
+
+/// <summary>Creates or replaces a Prowlarr source.</summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed class ProwlarrSourceRequest
+{
+    /// <summary>Gets or sets the unique name.</summary>
+    [Required, MaxLength(64), JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the base URL, without credentials or query.</summary>
+    [Required, MaxLength(1024), JsonPropertyName("baseUrl")]
+    public string BaseUrl { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the API key change.</summary>
+    [JsonPropertyName("apiKey")]
+    public SecretChangeRequest ApiKey { get; set; } = new();
+
+    /// <summary>Gets or sets whether the scheduled sync runs.</summary>
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Gets or sets the minutes between scheduled syncs.</summary>
+    [Range(15, 10080), JsonPropertyName("syncIntervalMinutes")]
+    public int SyncIntervalMinutes { get; set; } = 360;
+
+    /// <summary>Gets or sets the revision the change was made against.</summary>
+    [JsonPropertyName("revision")]
+    public int? Revision { get; set; }
+}

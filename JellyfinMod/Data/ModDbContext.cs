@@ -59,6 +59,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets the singleton acquisition settings (P4.A2).</summary>
     public DbSet<AcquisitionSettings> AcquisitionSettings => Set<AcquisitionSettings>();
 
+    /// <summary>Gets the Prowlarr sources whose indexers are synced (P7.S9).</summary>
+    public DbSet<ProwlarrSource> ProwlarrSources => Set<ProwlarrSource>();
+
     /// <summary>Gets durable manual grab operations (P4.A5).</summary>
     public DbSet<GrabOperation> GrabOperations => Set<GrabOperation>();
 
@@ -173,7 +176,13 @@ public class ModDbContext : DbContext
 
         b.Entity<HistoryRecord>(e => e.HasIndex(x => x.EntryId));
 
-        b.Entity<AcquisitionIndexer>(e => e.HasIndex(x => x.Name).IsUnique());
+        b.Entity<AcquisitionIndexer>(e =>
+        {
+            e.HasIndex(x => x.Name).IsUnique();
+            // A source's synced indexers go with it; a manual indexer has no source.
+            e.HasOne<ProwlarrSource>().WithMany().HasForeignKey(x => x.ProwlarrSourceId).OnDelete(DeleteBehavior.Cascade);
+        });
+        b.Entity<ProwlarrSource>(e => e.HasIndex(x => x.Name).IsUnique());
         b.Entity<AcquisitionDownloadClient>(e => e.HasIndex(x => x.Name).IsUnique());
         b.Entity<AcquisitionQualityProfile>(e => e.HasIndex(x => x.Name).IsUnique());
         b.Entity<AcquisitionSettings>(e =>

@@ -37,7 +37,13 @@ public sealed partial class AcquisitionSettingsController(
         if (!readiness.IsReady) return StatusCode(503);
         var indexers = await database.AcquisitionIndexers.AsNoTracking().OrderBy(value => value.Priority).ThenBy(value => value.Name)
             .ToListAsync(cancellationToken);
-        return indexers.Select(ToDto).ToArray();
+        var now = DateTime.UtcNow;
+        var breakers = (await database.IndexerBudgets.AsNoTracking().Where(state => state.BreakerOpenUntil != null).ToListAsync(cancellationToken))
+            .Where(state => state.BreakerOpenUntil > now).ToDictionary(state => state.IndexerId, state => state.BreakerOpenUntil);
+        return indexers.Select(indexer => ToDto(indexer) with
+        {
+            BreakerOpenUntil = breakers.GetValueOrDefault(indexer.Id) is { } until ? DateTime.SpecifyKind(until, DateTimeKind.Utc) : null
+        }).ToArray();
     }
 
     /// <summary>Creates an indexer.</summary>
@@ -69,6 +75,23 @@ public sealed partial class AcquisitionSettingsController(
         var indexer = await database.AcquisitionIndexers.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (indexer is null) return NotFound();
         if (request.Revision != indexer.Revision) return RevisionConflict();
+        if (indexer.ManagedBy == IndexerOwners.Prowlarr)
+        {
+            // A synced indexer's identity comes from Prowlarr; an administrator may change only what a sync never
+            // overwrites (PHASE7 §6): enabled, pacing, budget and seed minimums. Turning it off is remembered.
+            if (indexer.Enabled != request.Enabled)
+                indexer.AdminOverridesJson = JsonSerializer.Serialize(new { enabled = request.Enabled });
+            indexer.Enabled = request.Enabled;
+            indexer.AutomateTitleMatches = request.AutomateTitleMatches;
+            indexer.MinimumSeedRatio = request.MinimumSeedRatio;
+            indexer.MinimumSeedMinutes = request.MinimumSeedMinutes;
+            if (request.MinIntervalSeconds is { } managedInterval) indexer.MinIntervalSeconds = managedInterval;
+            if (request.DailyQueryBudget is { } managedBudget) indexer.DailyQueryBudget = managedBudget;
+            indexer.Revision++;
+            if (await SaveAsync(cancellationToken) is { } managedConflict) return managedConflict;
+            return ToDto(indexer);
+        }
+
         var previous = indexer.ApiKeySecretRef;
         Apply(indexer, request);
         indexer.ApiKeySecretRef = await ApplySecretAsync(previous, request.ApiKey, cancellationToken);
@@ -88,6 +111,8 @@ public sealed partial class AcquisitionSettingsController(
         if (!readiness.IsReady) return StatusCode(503);
         var indexer = await database.AcquisitionIndexers.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (indexer is null) return NotFound();
+        if (indexer.ManagedBy == IndexerOwners.Prowlarr)
+            return Conflict(ProblemBody("prowlarr_managed", "This indexer is synced from Prowlarr; turn it off here or remove it in Prowlarr."));
         database.AcquisitionIndexers.Remove(indexer);
         await database.SaveChangesAsync(cancellationToken);
         await secrets.RemoveAsync(indexer.ApiKeySecretRef, CancellationToken.None);
@@ -508,7 +533,8 @@ public sealed partial class AcquisitionSettingsController(
             capabilities is null ? null : new IndexerCapabilitiesDto(capabilities.MovieSearch, capabilities.TvSearch, capabilities.Search,
                 capabilities.Categories, capabilities.LimitMax, capabilities.LimitDefault),
             indexer.CapabilitiesFetchedAt is { } fetched ? DateTime.SpecifyKind(fetched, DateTimeKind.Utc) : null, indexer.LastError,
-            indexer.MinIntervalSeconds, indexer.DailyQueryBudget);
+            indexer.MinIntervalSeconds, indexer.DailyQueryBudget, indexer.ManagedBy, indexer.ProwlarrSourceId, indexer.ProwlarrIndexerId,
+            indexer.ProwlarrRemovedAt is { } removed ? DateTime.SpecifyKind(removed, DateTimeKind.Utc) : null);
     }
 
     private static DownloadClientSettingsDto ToDto(AcquisitionDownloadClient client, IEnumerable<DownloadClientPathMapping> mappings) =>

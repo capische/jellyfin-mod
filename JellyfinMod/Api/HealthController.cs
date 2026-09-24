@@ -141,6 +141,7 @@ public class HealthController : ControllerBase
         "settings.discovery",
         "settings.seedProtection",
         "settings.retention",
-        "setup"
+        "setup",
+        "acquisition.prowlarr"
     ];
 }

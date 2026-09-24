@@ -73,6 +73,84 @@ public sealed class AcquisitionIndexer
     /// <summary>Gets or sets the last stable capability failure code, when the latest check failed.</summary>
     [MaxLength(64)]
     public string? LastError { get; set; }
+
+    /// <summary>Gets or sets who owns the row: <c>manual</c>, or <c>prowlarr</c> for one a sync created (P7.S9).</summary>
+    [MaxLength(16)]
+    public string ManagedBy { get; set; } = IndexerOwners.Manual;
+
+    /// <summary>Gets or sets the Prowlarr source a synced indexer belongs to; its API key is the source's.</summary>
+    public Guid? ProwlarrSourceId { get; set; }
+
+    /// <summary>Gets or sets the indexer's id inside Prowlarr.</summary>
+    public int? ProwlarrIndexerId { get; set; }
+
+    /// <summary>Gets or sets when the indexer disappeared from Prowlarr; it is deleted 30 days later.</summary>
+    public DateTime? ProwlarrRemovedAt { get; set; }
+
+    /// <summary>
+    /// Gets or sets the fields an administrator changed on a synced indexer, as JSON (for example
+    /// <c>{"enabled":false}</c>); a sync never overwrites them.
+    /// </summary>
+    [MaxLength(1024)]
+    public string? AdminOverridesJson { get; set; }
+}
+
+/// <summary>Who owns an indexer row (P7.S9).</summary>
+public static class IndexerOwners
+{
+    /// <summary>Typed in by an administrator.</summary>
+    public const string Manual = "manual";
+
+    /// <summary>Created and kept in step by a Prowlarr sync.</summary>
+    public const string Prowlarr = "prowlarr";
+}
+
+/// <summary>
+/// One Prowlarr instance whose torrent indexers are imported as ordinary JellyfinMod indexers (P7.S9, PHASE7 §6).
+/// </summary>
+/// <remarks>The API key is stored once, in the secret store; synced indexers hold no key of their own.</remarks>
+public sealed class ProwlarrSource
+{
+    /// <summary>Gets or sets the stable identity.</summary>
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    /// <summary>Gets or sets the unique display name, used to suffix colliding indexer names.</summary>
+    [MaxLength(64)]
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the Prowlarr base URL, without credentials or query.</summary>
+    [MaxLength(1024)]
+    public string BaseUrl { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the secret-store reference of the API key.</summary>
+    [MaxLength(64)]
+    public string? ApiKeySecretRef { get; set; }
+
+    /// <summary>Gets or sets a value indicating whether the scheduled sync runs.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Gets or sets the minutes between scheduled syncs.</summary>
+    public int SyncIntervalMinutes { get; set; } = 360;
+
+    /// <summary>Gets or sets when the last sync ran.</summary>
+    public DateTime? LastSyncAt { get; set; }
+
+    /// <summary>Gets or sets the last sync's outcome code.</summary>
+    [MaxLength(64)]
+    public string? LastSyncOutcome { get; set; }
+
+    /// <summary>Gets or sets the last failure code, when the latest sync failed.</summary>
+    [MaxLength(64)]
+    public string? LastError { get; set; }
+
+    /// <summary>Gets or sets how many syncs in a row found no torrent indexer.</summary>
+    public int ConsecutiveEmptySyncs { get; set; }
+
+    /// <summary>Gets or sets when the last empty sync was counted; empty syncs count only an hour apart.</summary>
+    public DateTime? LastEmptySyncAt { get; set; }
+
+    /// <summary>Gets or sets the configuration revision.</summary>
+    public int Revision { get; set; } = 1;
 }
 
 /// <summary>The download client that receives manual grabs (P4.A2). Phase 4 supports Transmission RPC.</summary>

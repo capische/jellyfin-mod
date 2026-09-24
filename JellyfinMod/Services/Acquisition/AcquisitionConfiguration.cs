@@ -27,7 +27,7 @@ public sealed record AcquisitionState(
 /// The database context is transient, so callers pass their own: the settings row returned here must be tracked by
 /// the context that later saves it.
 /// </remarks>
-public sealed class AcquisitionConfiguration(AcquisitionSecretStore secrets, DownloadClientDrivers drivers)
+public sealed class AcquisitionConfiguration(AcquisitionSecretStore secrets, DownloadClientDrivers drivers, ModDbContext? database = null)
 {
     /// <summary>Loads the singleton settings row, tracked by <paramref name="database"/>, creating it on first use.</summary>
     public static async Task<AcquisitionSettings> GetSettingsAsync(ModDbContext database, CancellationToken cancellationToken)
@@ -90,10 +90,18 @@ public sealed class AcquisitionConfiguration(AcquisitionSecretStore secrets, Dow
     }
 
     /// <summary>Resolves an indexer's endpoint, including its API key, for one call.</summary>
+    /// <remarks>
+    /// A Prowlarr-synced indexer holds no key: it uses its source's, so rotating that one key rotates every feed and
+    /// the key is only ever sent to the source's own host (P7.S9).
+    /// </remarks>
     public async Task<TorznabEndpoint> EndpointAsync(AcquisitionIndexer indexer, CancellationToken cancellationToken)
     {
-        var key = await secrets.GetAsync(indexer.ApiKeySecretRef, cancellationToken).ConfigureAwait(false);
-        if (indexer.ApiKeySecretRef is not null && key is null)
+        var reference = indexer.ApiKeySecretRef;
+        if (indexer.ProwlarrSourceId is { } sourceId && database is not null)
+            reference = await database.ProwlarrSources.AsNoTracking().Where(source => source.Id == sourceId)
+                .Select(source => source.ApiKeySecretRef).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        var key = await secrets.GetAsync(reference, cancellationToken).ConfigureAwait(false);
+        if (reference is not null && key is null)
             throw new TorznabException("secret_unavailable", "The saved API key is no longer available; enter it again.");
         return new TorznabEndpoint(new Uri(indexer.BaseUrl), key);
     }

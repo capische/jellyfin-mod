@@ -30,6 +30,7 @@ public static class AcquisitionServices
         services.AddTransient<DownloadDestinationValidator>();
         services.AddTransient<AcquisitionConfiguration>();
         services.AddTransient<ReleaseSearchService>();
+        services.AddTransient<ProwlarrSync>();
         services.AddTransient<GrabService>();
         services.AddSingleton<GrabDispatcher>();
         // Path mappings and their probe belong to the download-client configuration (P5.I2).
