@@ -25,6 +25,25 @@ try
     await store.InstallAsync(7, CancellationToken.None);
     Check(store.Current is not null, "packaged web bundle installed");
 
+    // ---- At most three bundles on disk (§4.5): four earlier bundles within their grace period, then a restart.
+    var bundlesRoot = Path.Combine(root, "bundles", "web");
+    var earlier = new Dictionary<string, DateTime>();
+    for (var index = 1; index <= 4; index++)
+    {
+        var id = $"00000000000{index}";
+        Directory.CreateDirectory(Path.Combine(bundlesRoot, id));
+        File.WriteAllText(Path.Combine(bundlesRoot, id, "jellyfinmod.html"), "earlier bundle");
+        earlier[id] = DateTime.UtcNow.AddHours(-index);
+    }
+    earlier[store.Current!.BundleId] = DateTime.UtcNow.AddHours(-5);
+    File.WriteAllText(Path.Combine(bundlesRoot, "retained.json"), JsonSerializer.Serialize(earlier));
+    var restartedStore = new WebBundleStore(Path.Combine(root, "bundles"), Path.GetDirectoryName(package)!, NullLogger<WebBundleStore>.Instance);
+    await restartedStore.InstallAsync(14, CancellationToken.None);
+    Check(restartedStore.RetainedBundleIds.SequenceEqual([store.Current.BundleId, "000000000001", "000000000002"]),
+        "three bundles retained: the current one and the two most recent (" + string.Join(",", restartedStore.RetainedBundleIds) + ")");
+    Check(!Directory.Exists(Path.Combine(bundlesRoot, "000000000003")) && !Directory.Exists(Path.Combine(bundlesRoot, "000000000004")) &&
+        Directory.Exists(Path.Combine(bundlesRoot, "000000000002")), "older bundles are pruned from disk at once, inside their grace period");
+
     (WebRootTakeover Engine, string Index, string Stock) Scenario(string name, string prefix = "")
     {
         var web = Path.Combine(root, name, "web");

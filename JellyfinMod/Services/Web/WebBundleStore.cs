@@ -28,6 +28,9 @@ public sealed class WebBundleStore
     private const string ManifestName = "jellyfinmod-web.json";
     private const string RetainedName = "retained.json";
 
+    /// <summary>The most bundles kept on disk, the current one included.</summary>
+    public const int MaxRetained = 3;
+
     /// <summary>The document the plugin serves; the stock entry's index.html is never used here.</summary>
     public const string DocumentName = "jellyfinmod.html";
 
@@ -260,9 +263,13 @@ public sealed class WebBundleStore
         record[currentId] = DateTime.UtcNow;
 
         var cutoff = DateTime.UtcNow.AddDays(-Math.Max(0, graceDays));
+        // At most three bundles (§4.5, PHASE7 default 6): the current one and the two most recent before it, so a
+        // run of deployments cannot fill the disk while each one waits out its grace period.
+        var newest = record.Where(pair => pair.Key != currentId).OrderByDescending(pair => pair.Value)
+            .Take(MaxRetained - 1).Select(pair => pair.Key).ToHashSet(StringComparer.Ordinal);
         foreach (var (id, installedAt) in record.ToList())
         {
-            if (id == currentId || installedAt >= cutoff) continue;
+            if (id == currentId || (installedAt >= cutoff && newest.Contains(id))) continue;
             record.Remove(id);
             var path = Path.Combine(_root, id);
             try
