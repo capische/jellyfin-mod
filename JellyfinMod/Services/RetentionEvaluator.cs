@@ -113,6 +113,21 @@ public sealed class RetentionEvaluator(
 
     private async Task EvaluateCoreAsync(Target target, CancellationToken cancellationToken)
     {
+        // Keep and the window are read again for this target: a batch loads its targets once and can take minutes, so a
+        // Keep or un-Keep made meanwhile would otherwise be evaluated against the settings from before it (found live).
+        var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(
+            candidate => candidate.Id == target.Entry.Id, cancellationToken).ConfigureAwait(false);
+        if (entry is null) return;
+        target = target with { Entry = entry };
+        if (target.EpisodeId is { } currentEpisodeId)
+        {
+            var settings = await database.Episodes.AsNoTracking().Where(episode => episode.Id == currentEpisodeId)
+                .Select(episode => new { episode.RetentionPolicy, episode.ReclaimAfterDays })
+                .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            if (settings is null) return;
+            target = target with { EpisodePolicy = settings.RetentionPolicy, EpisodeDays = settings.ReclaimAfterDays };
+        }
+
         var now = clock.GetUtcNow().UtcDateTime;
         var targetId = target.EpisodeId ?? target.Entry.Id;
         var result = await database.RetentionEvaluations.SingleOrDefaultAsync(
