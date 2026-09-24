@@ -159,7 +159,12 @@ public sealed record VersionDto(
     [property: JsonPropertyName("audioChannels"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? AudioChannels,
     [property: JsonPropertyName("sizeBytes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? SizeBytes,
     [property: JsonPropertyName("isDefault")] bool IsDefault,
-    [property: JsonPropertyName("retention"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] VersionRetentionDto? Retention);
+    [property: JsonPropertyName("retention"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] VersionRetentionDto? Retention)
+{
+    /// <summary>Gets a value indicating whether an administrator kept this file while other versions may go (P10).</summary>
+    [JsonPropertyName("kept")]
+    public bool Kept { get; init; }
+}
 
 /// <summary>A version's own retention state (P6.M7): seeding can hold one version while another is scheduled.</summary>
 public sealed record VersionRetentionDto(

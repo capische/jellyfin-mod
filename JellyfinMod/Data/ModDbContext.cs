@@ -26,6 +26,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets the durable native episode representations.</summary>
     public DbSet<EpisodeBinding> EpisodeBindings => Set<EpisodeBinding>();
 
+    /// <summary>Gets the files an administrator kept while other versions of the same title may go (P10).</summary>
+    public DbSet<VersionKeep> VersionKeeps => Set<VersionKeep>();
+
     /// <summary>Gets full reconciliation run summaries.</summary>
     public DbSet<ReconciliationRun> ReconciliationRuns => Set<ReconciliationRun>();
 
@@ -127,6 +130,15 @@ public class ModDbContext : DbContext
         b.Entity<EpisodeBinding>(e =>
         {
             e.HasIndex(x => x.JellyfinItemId).IsUnique();
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        b.Entity<VersionKeep>(e =>
+        {
+            e.HasIndex(x => x.MediaPath).IsUnique();
+            e.HasIndex(x => x.PhysicalIdentity);
+            e.HasIndex(x => x.EntryId);
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
         });
 

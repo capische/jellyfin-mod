@@ -30,6 +30,19 @@ public sealed class SeriesMetadataRefresher(
     JellyfinItemReconciliationRunner? reconciliation = null,
     LibraryWriteBudget? writeBudget = null)
 {
+    /// <summary>
+    /// Whether a position-identity episode and the TMDB episode listed at its position are evidently the same episode:
+    /// the same air date within a day, or the same title ignoring case, punctuation and spacing (RET-R2).
+    /// </summary>
+    private static bool SameEpisode(Episode positional, Episode remote)
+    {
+        if (positional.AirDate is { } local && remote.AirDate is { } listed && Math.Abs((local.Date - listed.Date).TotalDays) <= 1)
+            return true;
+        static string Key(string? value) => new((value ?? string.Empty).Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+        var title = Key(positional.Title);
+        return title.Length > 0 && title == Key(remote.Title);
+    }
+
     /// <summary>Refreshes one series entry. TMDB failures surface as <see cref="TmdbException"/>.</summary>
     public async Task<SeriesRefreshOutcome> RefreshAsync(Guid id, CancellationToken cancellationToken)
     {
@@ -88,8 +101,13 @@ public sealed class SeriesMetadataRefresher(
                     local.AirDate = remote.AirDate;
                     local.RuntimeMinutes = remote.RuntimeMinutes;
                 }
-                else if (byPosition.Remove((remote.SeasonNumber, remote.EpisodeNumber), out var positional))
+                else if (byPosition.TryGetValue((remote.SeasonNumber, remote.EpisodeNumber), out var positional))
                 {
+                    // A position row came from a library file whose numbering may not be TMDB's (RET-R2). It takes the
+                    // TMDB episode listed at its position only with evidence that they are the same episode: the same
+                    // air date, or the same title. Otherwise it stays as it is and no second row takes its position.
+                    if (!SameEpisode(positional, remote)) continue;
+                    byPosition.Remove((remote.SeasonNumber, remote.EpisodeNumber));
                     positional.TmdbId = remote.TmdbId;
                     (positional.SeasonNumber, positional.EpisodeNumber) = originalPositions[positional.Id];
                     positional.Title = remote.Title;
@@ -97,6 +115,14 @@ public sealed class SeriesMetadataRefresher(
                     positional.StillPath = remote.StillPath;
                     positional.AirDate = remote.AirDate;
                     positional.RuntimeMinutes = remote.RuntimeMinutes;
+                    database.History.Add(new HistoryRecord
+                    {
+                        EntryId = entry.Id,
+                        EventType = "episode_adopted",
+                        Summary = $"S{positional.SeasonNumber:00}E{positional.EpisodeNumber:00} matched TMDB episode {remote.TmdbId}",
+                        Data = JsonSerializer.Serialize(new { episodeId = positional.Id, tmdbId = remote.TmdbId,
+                            positional.SeasonNumber, positional.EpisodeNumber })
+                    });
                 }
                 else
                 {

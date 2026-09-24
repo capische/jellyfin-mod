@@ -25,7 +25,7 @@ public sealed class RetentionLiveCheck(
     /// <param name="policy">The live policy.</param>
     /// <param name="cancellationToken">Cancels the check.</param>
     /// <param name="requireCompletion">
-    /// False for an upgrade replacement (P6.M5): the watched rule does not apply, every other live protection does.
+    /// True for every caller since RET-R2 (2026-09-24): an upgrade replacement also needs the watched rule.
     /// </param>
     public async Task<string?> BlockReasonAsync(
         RetentionOperation operation,
@@ -42,6 +42,16 @@ public sealed class RetentionLiveCheck(
                 .AnyAsync(episode => episode.Id == keptEpisodeId && episode.RetentionPolicy == RetentionPolicy.Never,
                     cancellationToken).ConfigureAwait(false))
             return RetentionLiveReasons.Kept;
+        // A kept file is read again too (PHASE10 Q3), by the path and identity the operation will unlink.
+        var bindingPath = operation.EpisodeId.HasValue
+            ? await database.EpisodeBindings.AsNoTracking().Where(binding => binding.Id == operation.BindingId)
+                .Select(binding => binding.MediaPath).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
+            : await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == operation.BindingId)
+                .Select(binding => binding.MediaPath).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (await database.VersionKeeps.AsNoTracking().AnyAsync(keep => keep.MediaPath == operation.MediaPath ||
+                keep.MediaPath == bindingPath || keep.PhysicalIdentity == operation.PhysicalIdentity, cancellationToken)
+                .ConfigureAwait(false))
+            return RetentionLiveReasons.VersionKept;
 
         Guid[] versionItemIds;
         Guid? seriesItemId = null;
@@ -82,7 +92,22 @@ public sealed class RetentionLiveCheck(
         if (operation.EpisodeId.HasValue && policy.ExemptFavourites && series is null)
             return RetentionLiveReasons.LiveStateUnavailable;
 
+        // A file holding several episodes: no episode it covers may be kept, and the file itself must be finished, because
+        // for an episode whose only copy it is, it is that episode (PHASE10 Q5).
+        var multi = library.GetItemById(operation.JellyfinItemId) as MediaBrowser.Controller.Entities.TV.Episode;
+        var coversSeveral = multi is { IndexNumberEnd: { } lastCovered, IndexNumber: { } firstCovered } && lastCovered > firstCovered;
+        if (coversSeveral && operation.EpisodeId.HasValue)
+        {
+            var season = multi!.ParentIndexNumber;
+            var (first, last) = (multi.IndexNumber!.Value, multi.IndexNumberEnd!.Value);
+            if (season is null || await database.Episodes.AsNoTracking().AnyAsync(episode => episode.EntryId == operation.EntryId &&
+                    episode.SeasonNumber == season && episode.EpisodeNumber >= first && episode.EpisodeNumber <= last &&
+                    episode.RetentionPolicy == RetentionPolicy.Never, cancellationToken).ConfigureAwait(false))
+                return RetentionLiveReasons.Kept;
+        }
+
         var completedBy = new HashSet<Guid>();
+        var fileCompletedBy = new HashSet<Guid>();
         foreach (var user in eligibleUsers)
         {
             var states = items.Select(item => userData.GetUserData(user, item)).ToArray();
@@ -93,18 +118,20 @@ public sealed class RetentionLiveCheck(
             if (policy.ExemptFavourites && series is not null && userData.GetUserData(user, series)?.IsFavorite == true)
                 return RetentionLiveReasons.FavoriteSeries;
             if (current.Any(state => state.Played)) completedBy.Add(user.Id);
+            if (coversSeveral && userData.GetUserData(user, multi!) is { Played: true, PlaybackPositionTicks: 0 }) fileCompletedBy.Add(user.Id);
         }
 
         if (!requireCompletion) return null;
-        var satisfied = policy.WatchedUserMode switch
+        bool Satisfied(HashSet<Guid> done) => policy.WatchedUserMode switch
         {
-            WatchedUserMode.AllUsers => eligibleUsers.All(user => completedBy.Contains(user.Id)),
+            WatchedUserMode.AllUsers => eligibleUsers.All(user => done.Contains(user.Id)),
             WatchedUserMode.SelectedUser => policy.SelectedUserId is { } selected &&
-                eligibleUsers.Any(user => user.Id == selected) && completedBy.Contains(selected),
-            WatchedUserMode.AnyUser => completedBy.Count > 0,
+                eligibleUsers.Any(user => user.Id == selected) && done.Contains(selected),
+            WatchedUserMode.AnyUser => done.Count > 0,
             _ => false
         };
-        return satisfied ? null : RetentionLiveReasons.NotCompleted;
+        if (!Satisfied(completedBy)) return RetentionLiveReasons.NotCompleted;
+        return coversSeveral && !Satisfied(fileCompletedBy) ? RetentionLiveReasons.NotCompleted : null;
     }
 
     /// <summary>Returns whether any session plays one of the items, or null when sessions cannot be read.</summary>
@@ -133,6 +160,7 @@ internal static class RetentionLiveReasons
 {
     public const string BindingUnavailable = "binding_unavailable";
     public const string Kept = "kept";
+    public const string VersionKept = "version_kept";
     public const string ActiveSession = "live_active_session";
     public const string ActiveSessionUnknown = "live_session_unknown";
     public const string NoAccessibleUsers = "live_no_accessible_users";

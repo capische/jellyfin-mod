@@ -123,6 +123,9 @@ public class HealthController : ControllerBase
         "retention.summary",
         // Episodes are tracked by position and carry their own Keep (P10.E1-E2).
         "retention.episodes",
+        // Episode un-Keep and window editor, per-file Keep, multi-episode files (PHASE10 Q3-Q5, 2026-09-24).
+        "retention.episodeControls",
+        "retention.versionKeep",
         "discover.skipped",
         "reconciliation.conflicts",
         "reconciliation.orphans",

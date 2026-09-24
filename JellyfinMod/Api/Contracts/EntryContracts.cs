@@ -196,6 +196,23 @@ public sealed class PatchEntryRequest
     public bool? SearchNow { get; set; }
 }
 
+/// <summary>An administrator's episode retention setting (PHASE10 Q4): inherit, days with a count, or never.</summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed class EpisodeRetentionRequest
+{
+    /// <summary>Gets or sets inherit, days or never.</summary>
+    [JsonPropertyName("policy")]
+    public string? Policy { get; set; }
+
+    /// <summary>Gets or sets the episode's own window, only with <c>days</c>.</summary>
+    [JsonPropertyName("reclaimAfterDays")]
+    public int? ReclaimAfterDays { get; set; }
+}
+
+/// <summary>Whether one file is now kept (PHASE10 Q3).</summary>
+public sealed record VersionKeepResult([property: JsonPropertyName("bindingId")] Guid BindingId,
+    [property: JsonPropertyName("kept")] bool Kept);
+
 /// <summary>Explicit stable file-state names; integer serialization is never exposed.</summary>
 public static class FileStates
 {

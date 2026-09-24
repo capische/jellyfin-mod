@@ -41,6 +41,9 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
         var seeds = await database.SeedReleaseOperations.AsNoTracking()
             .Where(seed => seed.EntryId == entryId && SeedReleaseStates.Open.Contains(seed.State))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
+        // A kept file is kept by path or by identity, like the preview reads it (PHASE10 Q3).
+        var keeps = await database.VersionKeeps.AsNoTracking().Where(keep => keep.EntryId == entryId)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
         var result = new List<VersionDto>();
         foreach (var binding in bindings.OrderBy(binding => binding.IsDefault ? 0 : 1).ThenBy(binding => binding.Path, StringComparer.Ordinal))
         {
@@ -60,7 +63,10 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
             UnixFileSnapshot file = default;
             var inspected = binding.Path is not null && files.TryInspect(binding.Path, out file);
             var seeding = inspected && seeds.Any(seed => seed.SeedingPhysicalIdentity == file.PhysicalIdentity && seed.GoalMetAt is null);
-            var retention = seeding
+            var kept = keeps.Any(keep => keep.MediaPath == binding.Path ||
+                inspected && (keep.MediaPath == file.CanonicalPath || keep.PhysicalIdentity == file.PhysicalIdentity));
+            var retention = kept ? new VersionRetentionDto("blocked", administrator ? "version_kept" : "protected")
+                : seeding
                 ? new VersionRetentionDto("waiting", administrator ? SeedReleaseReasons.GoalUnmet : "seeding")
                 : evaluation is null ? null
                 : new VersionRetentionDto(evaluation.State, administrator ? evaluation.Reason : null);
@@ -68,7 +74,7 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
                 (binding.Path is null ? null : labels.GetValueOrDefault(binding.Path)) ?? Label(binding.Path),
                 quality, resolution ?? ResolutionOf(video),
                 video?.Width, video?.Height, video?.Codec, video?.VideoRange.ToString(), video?.BitDepth, audio?.Codec, audio?.Channels,
-                inspected ? (long)file.LogicalBytes : null, binding.IsDefault, retention));
+                inspected ? (long)file.LogicalBytes : null, binding.IsDefault, retention) { Kept = kept });
         }
 
         return result;

@@ -39,6 +39,11 @@ public sealed class RetentionPreviewService(
         var evaluations = await database.RetentionEvaluations.AsNoTracking()
             .ToDictionaryAsync(evaluation => evaluation.TargetId, cancellationToken).ConfigureAwait(false);
         var targets = await LoadTargetsAsync(evaluations, cancellationToken).ConfigureAwait(false);
+        // Files an administrator kept while the title's other versions may go (PHASE10 Q3), by path and by identity.
+        var versionKeeps = await database.VersionKeeps.AsNoTracking().ToListAsync(cancellationToken).ConfigureAwait(false);
+        var keptPaths = versionKeeps.Select(keep => keep.MediaPath).ToHashSet(StringComparer.Ordinal);
+        var keptIdentities = versionKeeps.Where(keep => !string.IsNullOrEmpty(keep.PhysicalIdentity))
+            .Select(keep => keep.PhysicalIdentity!).ToHashSet(StringComparer.Ordinal);
         IReadOnlyDictionary<Guid, IReadOnlyList<string>> libraryRoots;
         try
         {
@@ -74,7 +79,8 @@ public sealed class RetentionPreviewService(
             .Where(target => activeItemIds.Contains(target.JellyfinItemId) || activeItemIds.Contains(target.VersionGroupId))
             .Select(target => target.VersionGroupId).ToHashSet();
         var inspected = targets.Select(target => Inspect(target, libraryRoots, now,
-            replacementBindingIds?.Contains(target.BindingId) == true)).ToArray();
+            replacementBindingIds?.Contains(target.BindingId) == true, keptPaths, keptIdentities)).ToArray();
+        await ApplyMultiEpisodeRuleAsync(inspected, policy, evaluations, now, cancellationToken).ConfigureAwait(false);
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
             if (activeItemIds is null)
@@ -232,14 +238,24 @@ public sealed class RetentionPreviewService(
         PreviewTarget target,
         IReadOnlyDictionary<Guid, IReadOnlyList<string>> libraryRoots,
         DateTime now,
-        bool replacement = false)
+        bool replacement,
+        IReadOnlySet<string> keptPaths,
+        IReadOnlySet<string> keptIdentities)
     {
         var evaluation = target.Evaluation;
+        // A kept file is never reclaimed or replaced, whatever its title's schedule says (PHASE10 Q3).
+        if (target.Path is { } keptPath && keptPaths.Contains(keptPath))
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.VersionKept, evaluation?.Deadline);
         if (replacement)
         {
-            // An upgrade replacement does not wait for the watched rule; Keep still protects the title (PHASE6 M5).
+            // An upgrade replacement does not wait for the retention window, but it does wait for the watched rule
+            // (RET-R2, 2026-09-24): an upgrade never deletes a version nobody has watched. Keep still protects it.
             if (target.Kept)
                 return PreviewCandidate.Blocked(target, RetentionEvaluationReasons.Kept, evaluation?.Deadline);
+            if (evaluation is null)
+                return PreviewCandidate.Blocked(target, RetentionPreviewReasons.EvaluationMissing, null);
+            if (evaluation.State != RetentionEvaluationStates.Scheduled)
+                return new(target, evaluation.State, evaluation.Reason, evaluation.Deadline, null);
         }
         else
         {
@@ -278,9 +294,17 @@ public sealed class RetentionPreviewService(
         // file also holds later episodes that may be unwatched, so neither is reclaimed (P3.T16).
         if (native is Video { AdditionalParts.Length: > 0 })
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiPartUnsupported, evaluation?.Deadline);
+        // A file holding several episodes is reclaimed only when every episode in it is due (PHASE10 Q5, answered
+        // 2026-09-24); that is decided below, once every candidate is known. An upgrade never replaces one.
+        (int Season, int First, int Last)? covered = null;
         if (native is MediaBrowser.Controller.Entities.TV.Episode { IndexNumberEnd: { } lastEpisode } multiEpisode &&
             lastEpisode > (multiEpisode.IndexNumber ?? lastEpisode))
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiEpisodeUnsupported, evaluation?.Deadline);
+        {
+            if (replacement || !target.EpisodeId.HasValue || multiEpisode.IndexNumber is not { } firstEpisode ||
+                multiEpisode.ParentIndexNumber is not { } season)
+                return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiEpisodeUnsupported, evaluation?.Deadline);
+            covered = (season, firstEpisode, lastEpisode);
+        }
         // Jellyfin 10.11 merges several files of one episode into one item with alternate media sources. Episode
         // observations list only the item, so its other files are not bound: reclaiming the primary would leave them
         // behind untracked and re-resolved as a new item. Such an episode stays blocked until its versions are tracked
@@ -304,9 +328,115 @@ public sealed class RetentionPreviewService(
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.SymlinkEscape, evaluation?.Deadline, observed);
         if (!files.TryInspect(target.Path!, out var bound) || bound.PhysicalIdentity != observed.PhysicalIdentity)
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaIdentityChanged, evaluation?.Deadline, observed);
+        if (keptIdentities.Contains(observed.PhysicalIdentity) || keptPaths.Contains(observed.CanonicalPath))
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.VersionKept, evaluation?.Deadline, observed);
         return new(target, RetentionPreviewStates.PendingProtection, RetentionPreviewReasons.ProtectionPending,
-            evaluation?.Deadline, observed);
+            evaluation?.Deadline, observed) { Covered = covered, Native = native };
     }
+
+    /// <summary>
+    /// A file holding several episodes (S01E01-E02) is reclaimed only when every episode in it is due (PHASE10 Q5):
+    /// no episode it covers is kept, every covered episode that has files of its own is due on its own schedule, and the
+    /// file itself was watched under the watched-user policy after the retention baseline, because for an episode whose
+    /// only copy is this file, this file is that episode. The longest window among the covered episodes applies.
+    /// </summary>
+    private async Task ApplyMultiEpisodeRuleAsync(IReadOnlyList<PreviewCandidate> inspected, RetentionPolicySnapshot? policy,
+        IReadOnlyDictionary<Guid, RetentionEvaluation> evaluations, DateTime now, CancellationToken cancellationToken)
+    {
+        var multi = inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection &&
+            candidate.Covered.HasValue).ToArray();
+        if (multi.Length == 0) return;
+        foreach (var candidate in multi)
+        {
+            var (season, first, last) = candidate.Covered!.Value;
+            var target = candidate.Target;
+            var evaluation = target.Evaluation;
+            if (policy is not { Enabled: true } || evaluation is null)
+            {
+                candidate.Block(RetentionPreviewReasons.MultiEpisodeNotAllDue);
+                continue;
+            }
+
+            var coveredRows = await database.Episodes.AsNoTracking()
+                .Where(episode => episode.EntryId == target.EntryId && episode.SeasonNumber == season &&
+                    episode.EpisodeNumber >= first && episode.EpisodeNumber <= last && episode.Id != target.EpisodeId)
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var ownRow = await database.Episodes.AsNoTracking().SingleOrDefaultAsync(
+                episode => episode.Id == target.EpisodeId, cancellationToken).ConfigureAwait(false);
+            if (ownRow is null || coveredRows.Any(row => RetentionOverrides.IsKept(target.Entry, row)))
+            {
+                candidate.Block(RetentionPreviewReasons.MultiEpisodeNotAllDue);
+                continue;
+            }
+
+            var coveredIds = coveredRows.Select(row => row.Id).ToArray();
+            var withFiles = (await database.EpisodeBindings.AsNoTracking()
+                    .Where(binding => coveredIds.Contains(binding.EpisodeId))
+                    .Select(binding => binding.EpisodeId).ToListAsync(cancellationToken).ConfigureAwait(false))
+                .ToHashSet();
+            if (coveredRows.Where(row => withFiles.Contains(row.Id)).Any(row =>
+                    !evaluations.TryGetValue(row.Id, out var own) || own.State != RetentionEvaluationStates.Scheduled ||
+                    own.Deadline is not { } ownDeadline || ownDeadline > now))
+            {
+                candidate.Block(RetentionPreviewReasons.MultiEpisodeNotAllDue);
+                continue;
+            }
+
+            var completion = FileCompletion(candidate, policy, Latest(evaluation.BaselineAt, policy.EnabledAt ?? evaluation.BaselineAt), now);
+            if (completion is not { } completedAt)
+            {
+                candidate.Block(RetentionPreviewReasons.MultiEpisodeNotAllDue);
+                continue;
+            }
+
+            var eligibleAt = Latest(Latest(completedAt, policy.EnabledAt ?? completedAt), evaluation.BaselineAt);
+            var deadline = policy.TestWindowMinutes > 0
+                ? eligibleAt.AddMinutes(policy.TestWindowMinutes)
+                : eligibleAt.AddDays(coveredRows.Append(ownRow).Max(row =>
+                    RetentionOverrides.WindowDays(target.Entry, row.RetentionPolicy, row.ReclaimAfterDays, policy.ReclaimAfterDays)));
+            if (deadline > now) candidate.Block(RetentionPreviewReasons.MultiEpisodeNotAllDue);
+        }
+    }
+
+    /// <summary>When the file itself was finished under the watched-user policy after <paramref name="floor"/>, or null.</summary>
+    private DateTime? FileCompletion(PreviewCandidate candidate, RetentionPolicySnapshot policy, DateTime floor, DateTime now)
+    {
+        try
+        {
+            if (candidate.Native is not { } native) return null;
+            var eligible = users.GetUsers().Where(IsActive)
+                .Where(user => access.CanUseLibrary(user, candidate.Target.Entry.MediaType, candidate.Target.Entry.TargetLibraryId))
+                .ToArray();
+            if (eligible.Length == 0) return null;
+            var completed = new Dictionary<Guid, DateTime>();
+            foreach (var user in eligible)
+            {
+                var state = userData.GetUserData(user, native);
+                if (state is null) return null;
+                if (state.PlaybackPositionTicks > 0) return null;
+                if (state.Played && state.LastPlayedDate is { } played)
+                {
+                    var utc = DateTime.SpecifyKind(played, DateTimeKind.Utc);
+                    if (utc >= floor && utc <= now) completed[user.Id] = utc;
+                }
+            }
+
+            return policy.WatchedUserMode switch
+            {
+                WatchedUserMode.AllUsers when eligible.All(user => completed.ContainsKey(user.Id)) => completed.Values.Max(),
+                WatchedUserMode.SelectedUser when policy.SelectedUserId is { } selected &&
+                    completed.TryGetValue(selected, out var at) => at,
+                WatchedUserMode.AnyUser when completed.Count > 0 => completed.Values.Min(),
+                _ => null
+            };
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    private static DateTime Latest(DateTime left, DateTime right) => left > right ? left : right;
 
     private bool IsSeriesFavorite(PreviewTarget target)
     {
@@ -362,6 +492,12 @@ public sealed class RetentionPreviewService(
         public UnixFileSnapshot? File { get; private set; } = file;
         public bool? TorrentManaged { get; private set; }
         public IReadOnlyList<TransmissionFileProtection> TorrentFiles { get; private set; } = [];
+
+        /// <summary>Gets the season and episode range of a multi-episode file, or null for a single episode.</summary>
+        public (int Season, int First, int Last)? Covered { get; init; }
+
+        /// <summary>Gets the native item this candidate was inspected against.</summary>
+        public BaseItem? Native { get; init; }
 
         public static PreviewCandidate Blocked(
             PreviewTarget target,
@@ -427,6 +563,8 @@ internal static class RetentionPreviewReasons
     public const string SeedIndexIncomplete = "seed_index_incomplete";
     public const string MultiPartUnsupported = "multi_part_unsupported";
     public const string MultiEpisodeUnsupported = "multi_episode_unsupported";
+    public const string MultiEpisodeNotAllDue = "multi_episode_not_all_due";
+    public const string VersionKept = "version_kept";
     public const string EpisodeVersionsUntracked = "episode_versions_untracked";
     public const string SeedingIncomplete = "seeding_incomplete";
     public const string SeedGoalUnbounded = "seed_goal_unbounded";

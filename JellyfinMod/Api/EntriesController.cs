@@ -277,7 +277,45 @@ public sealed class EntriesController(
     /// confirmation, idempotent, one history event on change. Keep on the series already covers every episode.
     /// </summary>
     [HttpPost("{id:guid}/Episodes/{episodeId:guid}/Keep"), Authorize(Policy = Policies.RequiresElevation)]
-    public async Task<ActionResult<EpisodeDto>> KeepEpisode(Guid id, Guid episodeId, CancellationToken cancellationToken)
+    public Task<ActionResult<EpisodeDto>> KeepEpisode(Guid id, Guid episodeId, CancellationToken cancellationToken) =>
+        ChangeEpisodeRetentionAsync(id, episodeId, RetentionPolicy.Never, null, cancellationToken);
+
+    /// <summary>
+    /// Stops keeping one episode (PHASE10 Q4, answered 2026-09-24). Its own window, if it has one, applies again, else its
+    /// series'; its grace restarts now rather than reusing an old deadline. A kept series still keeps the episode.
+    /// </summary>
+    [HttpDelete("{id:guid}/Episodes/{episodeId:guid}/Keep"), Authorize(Policy = Policies.RequiresElevation)]
+    public Task<ActionResult<EpisodeDto>> UnkeepEpisode(Guid id, Guid episodeId, CancellationToken cancellationToken) =>
+        ChangeEpisodeRetentionAsync(id, episodeId, null, null, cancellationToken);
+
+    /// <summary>
+    /// Sets one episode's own retention: inherit its series' window, its own number of days, or never (PHASE10 Q4). The
+    /// episode's grace restarts now. Series Keep wins over any episode window (PHASE10 Q2).
+    /// </summary>
+    [HttpPut("{id:guid}/Episodes/{episodeId:guid}/Retention"), Authorize(Policy = Policies.RequiresElevation)]
+    public async Task<ActionResult<EpisodeDto>> SetEpisodeRetention(Guid id, Guid episodeId, EpisodeRetentionRequest request,
+        CancellationToken cancellationToken)
+    {
+        RetentionPolicy? policy = request.Policy switch
+        {
+            "inherit" => RetentionPolicy.Inherit,
+            "days" => RetentionPolicy.Days,
+            "never" => RetentionPolicy.Never,
+            _ => null
+        };
+        if (policy is null || policy == RetentionPolicy.Days && request.ReclaimAfterDays is not (>= 1 and <= 3650) ||
+            policy != RetentionPolicy.Days && request.ReclaimAfterDays is not null)
+            return BadRequest(new ProblemDetails { Status = 400, Type = "invalid_retention",
+                Title = "Choose inherit, never, or a number of days from 1 to 3650." });
+        return await ChangeEpisodeRetentionAsync(id, episodeId, policy, request.ReclaimAfterDays, cancellationToken);
+    }
+
+    /// <summary>
+    /// Applies an administrator's episode retention change under the retention gate and the library lock, so a change that
+    /// returns has won any race with an unlink of this episode. <paramref name="policy"/> null means un-Keep.
+    /// </summary>
+    private async Task<ActionResult<EpisodeDto>> ChangeEpisodeRetentionAsync(Guid id, Guid episodeId, RetentionPolicy? policy,
+        int? days, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
         var user = access.GetUser(User);
@@ -287,8 +325,6 @@ public sealed class EntriesController(
         if (visible is null || !access.CanManage(user, visible) || visible.MediaType != "series") return NotFound();
         if (!visible.TargetLibraryId.HasValue) return BadRequest();
 
-        // Serialized with retention and reconciliation like entry Keep, so a Keep that returns has won any race
-        // with an unlink of this episode.
         await using var executionLease = await retentionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
         await using var libraryLease = await libraryLock.AcquireAsync(
             visible.TargetLibraryId.Value, cancellationToken).ConfigureAwait(false);
@@ -299,25 +335,131 @@ public sealed class EntriesController(
         var episode = await database.Episodes.SingleOrDefaultAsync(candidate => candidate.EntryId == id &&
             candidate.Id == episodeId, cancellationToken).ConfigureAwait(false);
         if (episode is null || !access.CanReadEpisode(user, episode)) return NotFound();
-        if (episode.RetentionPolicy != RetentionPolicy.Never)
+
+        var keeping = policy == RetentionPolicy.Never && days is null;
+        var targetPolicy = policy ?? (episode.ReclaimAfterDays is > 0 ? RetentionPolicy.Days : RetentionPolicy.Inherit);
+        if (policy is null && episode.RetentionPolicy != RetentionPolicy.Never) targetPolicy = episode.RetentionPolicy;
+        var targetDays = policy == RetentionPolicy.Days ? days : policy is null ? episode.ReclaimAfterDays
+            : policy == RetentionPolicy.Never ? episode.ReclaimAfterDays : null;
+        if (episode.RetentionPolicy != targetPolicy || episode.ReclaimAfterDays != targetDays)
         {
-            episode.RetentionPolicy = RetentionPolicy.Never;
+            var label = $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00}";
+            var (eventType, summary) = targetPolicy switch
+            {
+                RetentionPolicy.Never => ("episode_kept", $"Kept {label} indefinitely"),
+                _ when episode.RetentionPolicy == RetentionPolicy.Never && policy is null =>
+                    ("episode_unkept", $"Stopped keeping {label}"),
+                RetentionPolicy.Days => ("episode_retention_changed", $"{label} is removed {targetDays} days after watching"),
+                _ => ("episode_retention_changed", $"{label} follows its series' retention")
+            };
+            episode.RetentionPolicy = targetPolicy;
+            episode.ReclaimAfterDays = targetDays;
             database.History.Add(new HistoryRecord
             {
                 EntryId = entry.Id,
-                EventType = "episode_kept",
-                Summary = $"Kept S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00} indefinitely",
-                Data = JsonSerializer.Serialize(new { episodeId = episode.Id, episode.SeasonNumber, episode.EpisodeNumber })
+                EventType = eventType,
+                Summary = summary,
+                Data = JsonSerializer.Serialize(new { episodeId = episode.Id, episode.SeasonNumber, episode.EpisodeNumber,
+                    policy = RetentionPolicies.ToWire(targetPolicy), reclaimAfterDays = targetDays })
             });
+            // Anything but a Keep restarts the episode's grace now: a changed window never reuses a deadline computed
+            // under the old one, so shortening it cannot make the episode due at once (P3.T13).
+            if (!keeping)
+            {
+                var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(
+                    item => item.TargetId == episode.Id, cancellationToken).ConfigureAwait(false);
+                if (evaluation is not null && evaluation.State == RetentionEvaluationStates.Scheduled)
+                {
+                    evaluation.State = RetentionEvaluationStates.Waiting;
+                    evaluation.Reason = RetentionEvaluationReasons.WaitingForCompletion;
+                    evaluation.Deadline = null;
+                    evaluation.EligibleAt = null;
+                    evaluation.CompletionBasisAt = null;
+                }
+            }
+
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await retentionEvaluator.EvaluateEpisodeAsync(episode.Id, cancellationToken).ConfigureAwait(false);
-        var policy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
+        var snapshot = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
             item => item.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
-        var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleOrDefaultAsync(
+        var current = await database.RetentionEvaluations.AsNoTracking().SingleOrDefaultAsync(
             item => item.TargetId == episode.Id, cancellationToken).ConfigureAwait(false);
-        return new EpisodeDto(episode, RetentionSummaries.ForTarget(entry, policy, evaluation, episode));
+        return new EpisodeDto(episode, RetentionSummaries.ForTarget(entry, snapshot, current, episode));
+    }
+
+    /// <summary>
+    /// Keeps one file of a movie or an episode while its other versions may go (PHASE10 Q3, answered 2026-09-24).
+    /// Administrators only; idempotent, one history event on change. The Keep follows the file's path and identity.
+    /// </summary>
+    [HttpPost("{id:guid}/Versions/{bindingId:guid}/Keep"), Authorize(Policy = Policies.RequiresElevation)]
+    public Task<ActionResult<VersionKeepResult>> KeepVersion(Guid id, Guid bindingId, CancellationToken cancellationToken) =>
+        ChangeVersionKeepAsync(id, bindingId, true, cancellationToken);
+
+    /// <summary>Stops keeping one file; it follows its title's retention again (PHASE10 Q3, Q4).</summary>
+    [HttpDelete("{id:guid}/Versions/{bindingId:guid}/Keep"), Authorize(Policy = Policies.RequiresElevation)]
+    public Task<ActionResult<VersionKeepResult>> UnkeepVersion(Guid id, Guid bindingId, CancellationToken cancellationToken) =>
+        ChangeVersionKeepAsync(id, bindingId, false, cancellationToken);
+
+    private async Task<ActionResult<VersionKeepResult>> ChangeVersionKeepAsync(Guid id, Guid bindingId, bool keep,
+        CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
+        var visible = await database.Entries.AsNoTracking().SingleOrDefaultAsync(
+            entry => entry.Id == id, cancellationToken).ConfigureAwait(false);
+        if (visible is null || !access.CanManage(user, visible)) return NotFound();
+        if (!visible.TargetLibraryId.HasValue) return BadRequest();
+
+        await using var executionLease = await retentionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        await using var libraryLease = await libraryLock.AcquireAsync(
+            visible.TargetLibraryId.Value, cancellationToken).ConfigureAwait(false);
+        database.ChangeTracker.Clear();
+        var entry = await database.Entries.SingleOrDefaultAsync(candidate => candidate.Id == id, cancellationToken)
+            .ConfigureAwait(false);
+        if (entry is null || !access.CanRead(user, entry)) return NotFound();
+        string? path;
+        Episode? episode = null;
+        if (entry.MediaType == "movie")
+        {
+            path = await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == bindingId && binding.EntryId == id)
+                .Select(binding => binding.MediaPath).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            var binding = await database.EpisodeBindings.AsNoTracking().SingleOrDefaultAsync(
+                candidate => candidate.Id == bindingId, cancellationToken).ConfigureAwait(false);
+            episode = binding is null ? null : await database.Episodes.AsNoTracking().SingleOrDefaultAsync(
+                candidate => candidate.Id == binding.EpisodeId && candidate.EntryId == id, cancellationToken).ConfigureAwait(false);
+            if (episode is not null && !access.CanReadEpisode(user, episode)) episode = null;
+            path = episode is null ? null : binding!.MediaPath;
+        }
+
+        if (string.IsNullOrEmpty(path)) return NotFound();
+        var inspector = files ?? new UnixFileInspector();
+        var identity = inspector.TryInspect(path, out var observed) ? observed.PhysicalIdentity : null;
+        var existing = await database.VersionKeeps.Where(candidate => candidate.EntryId == id && (candidate.MediaPath == path ||
+                identity != null && candidate.PhysicalIdentity == identity)).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var name = Path.GetFileName(path);
+        if (keep && existing.Count == 0)
+        {
+            database.VersionKeeps.Add(new VersionKeep { EntryId = id, EpisodeId = episode?.Id, MediaPath = path,
+                PhysicalIdentity = identity, CreatedAt = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime });
+            database.History.Add(new HistoryRecord { EntryId = id, EventType = "version_kept", Summary = $"Kept {name} indefinitely",
+                Data = JsonSerializer.Serialize(new { episodeId = episode?.Id, bindingId }) });
+            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else if (!keep && existing.Count > 0)
+        {
+            database.VersionKeeps.RemoveRange(existing);
+            database.History.Add(new HistoryRecord { EntryId = id, EventType = "version_unkept", Summary = $"Stopped keeping {name}",
+                Data = JsonSerializer.Serialize(new { episodeId = episode?.Id, bindingId }) });
+            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        return new VersionKeepResult(bindingId, keep);
     }
 
     /// <summary>Updates an individual episode's future monitoring, restricted to administrators.</summary>
@@ -409,9 +551,11 @@ public sealed class EntriesController(
         if (!access.CanRead(user, existing)) return NotFound();
         var tracked = await database.Episodes.Where(episode => episode.EntryId == existing.Id).ToListAsync(cancellationToken);
         var episodes = tracked.Where(episode => !episode.IsPositionIdentity).ToDictionary(episode => episode.TmdbId);
-        // An episode tracked by its position (P10.E1) takes the TMDB episode listed at the same position.
-        var byPosition = tracked.Where(episode => episode.IsPositionIdentity)
-            .ToDictionary(episode => (episode.SeasonNumber, episode.EpisodeNumber));
+        // An episode tracked by its position (P10.E1) came from a library file whose numbering may not be TMDB's. An Add
+        // is no evidence that the TMDB episode listed at that position is that file, and adding an existing title is no
+        // wish to search for it (RET-R2): the position row is left exactly as it is, and no second row is created there.
+        var heldPositions = tracked.Where(episode => episode.IsPositionIdentity)
+            .Select(episode => (episode.SeasonNumber, episode.EpisodeNumber)).ToHashSet();
         // Only the request which observed no entry initially completes its requested episode set.
         // A later duplicate request still returns early without changing administrator settings.
         foreach (var remote in snapshot)
@@ -420,17 +564,7 @@ public sealed class EntriesController(
             {
                 local.Monitored = true;
             }
-            else if (byPosition.Remove((remote.SeasonNumber, remote.EpisodeNumber), out var positional))
-            {
-                positional.TmdbId = remote.TmdbId;
-                positional.Title = remote.Title;
-                positional.Overview = remote.Overview;
-                positional.StillPath = remote.StillPath;
-                positional.AirDate = remote.AirDate;
-                positional.RuntimeMinutes = remote.RuntimeMinutes;
-                positional.Monitored = true;
-            }
-            else
+            else if (!heldPositions.Contains((remote.SeasonNumber, remote.EpisodeNumber)))
             {
                 remote.EntryId = existing.Id;
                 database.Episodes.Add(remote);

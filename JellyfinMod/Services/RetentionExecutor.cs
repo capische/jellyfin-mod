@@ -109,7 +109,7 @@ public sealed class RetentionExecutor(
 
     /// <summary>
     /// Replaces the superseded version of a completed upgrade (P6.M5) through the same executor, locks and checks as a
-    /// reclaim, except that the watched rule does not apply: storage identity, the shared-inode group, active sessions,
+    /// reclaim, except that the retention window does not apply; the watched rule does (RET-R2): storage identity, the shared-inode group, active sessions,
     /// resume, favourites, Keep and seeding all still protect the file. The operation's provenance is
     /// <c>upgrade_replaced</c>, so reconciliation attributes the disappearance to the plugin.
     /// </summary>
@@ -247,7 +247,8 @@ public sealed class RetentionExecutor(
         Guid requestedBindingId,
         CancellationToken cancellationToken)
     {
-        // An upgrade replacement skips only the watched-rule schedule; every physical check below still runs (P6.M5).
+        // An upgrade replacement skips only the retention window; the watched rule (RET-R2) and every physical check
+        // below still run (P6.M5).
         var replacement = operations.All(operation => operation.Provenance == RetentionProvenances.UpgradeReplaced);
         var currentPreview = await preview.PreviewAsync(cancellationToken,
             replacement ? operations.Select(operation => operation.BindingId).ToHashSet() : null).ConfigureAwait(false);
@@ -286,7 +287,7 @@ public sealed class RetentionExecutor(
         // playing another version. Re-read live Jellyfin state for every affected target last.
         foreach (var operation in operations)
         {
-            var liveReason = await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken, requireCompletion: !replacement)
+            var liveReason = await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken, requireCompletion: true)
                 .ConfigureAwait(false);
             if (liveReason is not null)
                 return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
@@ -368,6 +369,16 @@ public sealed class RetentionExecutor(
                 .FirstOrDefault(candidate => candidate.JellyfinItemId == episode.JellyfinItemId)?.JellyfinItemId ??
                 remaining.FirstOrDefault()?.JellyfinItemId;
             episode.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
+            // Episodes a multi-episode file covered without files of their own went with it (PHASE10 Q5).
+            foreach (var covered in await database.Episodes.Where(candidate => candidate.EntryId == entryId &&
+                         candidate.Id != episode.Id && candidate.JellyfinItemId == operation.JellyfinItemId &&
+                         !database.EpisodeBindings.Any(binding => binding.EpisodeId == candidate.Id))
+                         .ToListAsync(cancellationToken).ConfigureAwait(false))
+            {
+                covered.JellyfinItemId = null;
+                covered.State = FileState.Reclaimed;
+            }
+
             if (remaining.Length == 0)
             {
                 await RetentionTargetReset.ResetAsync(database, entryId, episode.Id,
