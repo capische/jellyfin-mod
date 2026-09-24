@@ -272,6 +272,54 @@ public sealed class EntriesController(
         return new EntryDto(entry);
     }
 
+    /// <summary>
+    /// Exempts one episode, every version of it, from automatic retention (P10.E2). Administrators only; one action, no
+    /// confirmation, idempotent, one history event on change. Keep on the series already covers every episode.
+    /// </summary>
+    [HttpPost("{id:guid}/Episodes/{episodeId:guid}/Keep"), Authorize(Policy = Policies.RequiresElevation)]
+    public async Task<ActionResult<EpisodeDto>> KeepEpisode(Guid id, Guid episodeId, CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
+        var visible = await database.Entries.AsNoTracking().SingleOrDefaultAsync(
+            entry => entry.Id == id, cancellationToken).ConfigureAwait(false);
+        if (visible is null || !access.CanManage(user, visible) || visible.MediaType != "series") return NotFound();
+        if (!visible.TargetLibraryId.HasValue) return BadRequest();
+
+        // Serialized with retention and reconciliation like entry Keep, so a Keep that returns has won any race
+        // with an unlink of this episode.
+        await using var executionLease = await retentionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        await using var libraryLease = await libraryLock.AcquireAsync(
+            visible.TargetLibraryId.Value, cancellationToken).ConfigureAwait(false);
+        database.ChangeTracker.Clear();
+        var entry = await database.Entries.SingleOrDefaultAsync(candidate => candidate.Id == id, cancellationToken)
+            .ConfigureAwait(false);
+        if (entry is null || !access.CanRead(user, entry)) return NotFound();
+        var episode = await database.Episodes.SingleOrDefaultAsync(candidate => candidate.EntryId == id &&
+            candidate.Id == episodeId, cancellationToken).ConfigureAwait(false);
+        if (episode is null || !access.CanReadEpisode(user, episode)) return NotFound();
+        if (episode.RetentionPolicy != RetentionPolicy.Never)
+        {
+            episode.RetentionPolicy = RetentionPolicy.Never;
+            database.History.Add(new HistoryRecord
+            {
+                EntryId = entry.Id,
+                EventType = "episode_kept",
+                Summary = $"Kept S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00} indefinitely",
+                Data = JsonSerializer.Serialize(new { episodeId = episode.Id, episode.SeasonNumber, episode.EpisodeNumber })
+            });
+            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await retentionEvaluator.EvaluateEpisodeAsync(episode.Id, cancellationToken).ConfigureAwait(false);
+        var policy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
+            item => item.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
+        var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleOrDefaultAsync(
+            item => item.TargetId == episode.Id, cancellationToken).ConfigureAwait(false);
+        return new EpisodeDto(episode, RetentionSummaries.ForTarget(entry, policy, evaluation, episode));
+    }
+
     /// <summary>Updates an individual episode's future monitoring, restricted to administrators.</summary>
     [HttpPatch("{id:guid}/Episodes/{episodeId:guid}"), Authorize(Policy = Policies.RequiresElevation)]
     public async Task<ActionResult<EpisodeDto>> PatchEpisode(Guid id, Guid episodeId, PatchEntryRequest request, CancellationToken cancellationToken)
@@ -359,8 +407,11 @@ public sealed class EntriesController(
         CancellationToken cancellationToken)
     {
         if (!access.CanRead(user, existing)) return NotFound();
-        var episodes = await database.Episodes.Where(episode => episode.EntryId == existing.Id)
-            .ToDictionaryAsync(episode => episode.TmdbId, cancellationToken);
+        var tracked = await database.Episodes.Where(episode => episode.EntryId == existing.Id).ToListAsync(cancellationToken);
+        var episodes = tracked.Where(episode => !episode.IsPositionIdentity).ToDictionary(episode => episode.TmdbId);
+        // An episode tracked by its position (P10.E1) takes the TMDB episode listed at the same position.
+        var byPosition = tracked.Where(episode => episode.IsPositionIdentity)
+            .ToDictionary(episode => (episode.SeasonNumber, episode.EpisodeNumber));
         // Only the request which observed no entry initially completes its requested episode set.
         // A later duplicate request still returns early without changing administrator settings.
         foreach (var remote in snapshot)
@@ -368,6 +419,16 @@ public sealed class EntriesController(
             if (episodes.TryGetValue(remote.TmdbId, out var local))
             {
                 local.Monitored = true;
+            }
+            else if (byPosition.Remove((remote.SeasonNumber, remote.EpisodeNumber), out var positional))
+            {
+                positional.TmdbId = remote.TmdbId;
+                positional.Title = remote.Title;
+                positional.Overview = remote.Overview;
+                positional.StillPath = remote.StillPath;
+                positional.AirDate = remote.AirDate;
+                positional.RuntimeMinutes = remote.RuntimeMinutes;
+                positional.Monitored = true;
             }
             else
             {
@@ -442,7 +503,7 @@ public sealed class EntriesController(
         var episodeDtos = new List<EpisodeDto>();
         foreach (var e in readableEpisodes)
             episodeDtos.Add(new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,
-                evaluations.GetValueOrDefault(e.Id)), isAdmin), Summary(e.Id), projections.GetValueOrDefault(e.Id))
+                evaluations.GetValueOrDefault(e.Id), e), isAdmin), Summary(e.Id), projections.GetValueOrDefault(e.Id))
             {
                 Versions = e.State == FileState.OnDisk
                     ? await versions.ForAsync(entry.Id, e.Id, evaluations.GetValueOrDefault(e.Id), isAdmin, cancellationToken)
@@ -453,7 +514,7 @@ public sealed class EntriesController(
         var entryRetention = RetentionSummaries.ForViewer(RetentionSummaries.ForEntry(entry, policy,
             evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
         return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id)), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
-            DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc))).ToArray(), episodeDtos, entryRetention,
+            DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc)) { EpisodeId = HistoryDto.EpisodeOf(h.Data) }).ToArray(), episodeDtos, entryRetention,
             entry.MediaType == "movie" ? Summary(null) : null)
         {
             Versions = entry.MediaType == "movie" && entry.State == FileState.OnDisk

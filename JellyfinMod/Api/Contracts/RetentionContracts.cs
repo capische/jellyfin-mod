@@ -127,15 +127,18 @@ internal static class RetentionSummaries
     public static RetentionSummaryDto ForTarget(
         Entry entry,
         RetentionPolicySnapshot? policy,
-        RetentionEvaluation? evaluation)
+        RetentionEvaluation? evaluation,
+        Episode? episode = null)
     {
-        if (entry.RetentionPolicy == RetentionPolicy.Never)
-            return new(policy?.Enabled == true, RetentionPolicies.ToWire(entry.RetentionPolicy),
-                "blocked", "kept", null);
+        // An episode reports its effective policy: kept by itself or its series, its own window, else the series' (P10.E2).
+        var wirePolicy = RetentionOverrides.IsKept(entry, episode) ? RetentionPolicies.ToWire(RetentionPolicy.Never)
+            : episode?.RetentionPolicy == RetentionPolicy.Days ? RetentionPolicies.ToWire(RetentionPolicy.Days)
+            : RetentionPolicies.ToWire(entry.RetentionPolicy);
+        if (RetentionOverrides.IsKept(entry, episode))
+            return new(policy?.Enabled == true, wirePolicy, "blocked", "kept", null);
         if (policy?.Enabled != true)
-            return new(false, RetentionPolicies.ToWire(entry.RetentionPolicy),
-                "disabled", "retention_disabled", null);
-        return new(true, RetentionPolicies.ToWire(entry.RetentionPolicy),
+            return new(false, wirePolicy, "disabled", "retention_disabled", null);
+        return new(true, wirePolicy,
             evaluation?.State ?? "waiting", evaluation?.Reason ?? "evaluation_missing",
             evaluation?.Deadline is { } deadline ? DateTime.SpecifyKind(deadline, DateTimeKind.Utc) : null);
     }

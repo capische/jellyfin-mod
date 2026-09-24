@@ -37,6 +37,11 @@ public sealed class RetentionLiveCheck(
             candidate => candidate.Id == operation.EntryId, cancellationToken).ConfigureAwait(false);
         if (entry is null) return RetentionLiveReasons.BindingUnavailable;
         if (entry.RetentionPolicy == RetentionPolicy.Never) return RetentionLiveReasons.Kept;
+        // An episode's own Keep is read again here, the last check before the unlink (P10.E2).
+        if (operation.EpisodeId is { } keptEpisodeId && await database.Episodes.AsNoTracking()
+                .AnyAsync(episode => episode.Id == keptEpisodeId && episode.RetentionPolicy == RetentionPolicy.Never,
+                    cancellationToken).ConfigureAwait(false))
+            return RetentionLiveReasons.Kept;
 
         Guid[] versionItemIds;
         Guid? seriesItemId = null;

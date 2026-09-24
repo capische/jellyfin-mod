@@ -163,10 +163,16 @@ try
             [new(firstEpisode, multiSeries, 5551, 1, 1, true, "One"),
                 new(doubleEpisode, multiSeries, null, 1, 3, true, "Three-Four", EpisodeNumberEnd: 4)]), default);
         database.ChangeTracker.Clear();
-        database.Episodes.Add(new JellyfinMod.Data.Episode
-        {
-            EntryId = multiResult.EntryId!.Value, TmdbId = 5553, SeasonNumber = 1, EpisodeNumber = 3, Title = "Three"
-        });
+        // P10.E1: the TMDB-less double episode is tracked by its position at once, bound to its own file and unmonitored.
+        var positionEpisode = await database.Episodes.SingleAsync(episode => episode.EntryId == multiResult.EntryId &&
+            episode.TmdbId == 0 && episode.SeasonNumber == 1 && episode.EpisodeNumber == 3);
+        Assert(positionEpisode.JellyfinItemId == doubleEpisode && !positionEpisode.Monitored &&
+            await database.EpisodeBindings.AnyAsync(binding => binding.EpisodeId == positionEpisode.Id &&
+                binding.JellyfinItemId == doubleEpisode),
+            "A numbered native episode without a TMDB id is tracked by its position (P10.E1)");
+        // A series Refresh adopts the position row for the TMDB episode listed there, as SeriesMetadataRefresher does.
+        positionEpisode.TmdbId = 5553;
+        positionEpisode.Title = "Three";
         database.Episodes.Add(new JellyfinMod.Data.Episode
         {
             EntryId = multiResult.EntryId!.Value, TmdbId = 5554, SeasonNumber = 1, EpisodeNumber = 4, Title = "Four"

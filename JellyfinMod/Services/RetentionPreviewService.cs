@@ -220,11 +220,11 @@ public sealed class RetentionPreviewService(
         return movies.Select(row => new PreviewTarget(row.Binding.Id, row.Entry.Id, null,
                 row.Binding.JellyfinItemId, row.Binding.VersionGroupId, row.Binding.TargetLibraryId, row.Binding.MediaPath,
                 row.Binding.StorageIdentity, null, row.Entry,
-                evaluations.GetValueOrDefault(row.Entry.Id)))
+                evaluations.GetValueOrDefault(row.Entry.Id), RetentionOverrides.IsKept(row.Entry, (Episode?)null)))
             .Concat(episodes.Select(row => new PreviewTarget(row.Binding.Id, row.Entry.Id, row.Episode.Id,
                 row.Binding.JellyfinItemId, row.Binding.JellyfinItemId, row.Binding.TargetLibraryId, row.Binding.MediaPath,
                 row.Binding.StorageIdentity, row.Binding.SeriesItemId, row.Entry,
-                evaluations.GetValueOrDefault(row.Episode.Id))))
+                evaluations.GetValueOrDefault(row.Episode.Id), RetentionOverrides.IsKept(row.Entry, row.Episode))))
             .ToArray();
     }
 
@@ -238,7 +238,7 @@ public sealed class RetentionPreviewService(
         if (replacement)
         {
             // An upgrade replacement does not wait for the watched rule; Keep still protects the title (PHASE6 M5).
-            if (target.Entry.RetentionPolicy == RetentionPolicy.Never)
+            if (target.Kept)
                 return PreviewCandidate.Blocked(target, RetentionEvaluationReasons.Kept, evaluation?.Deadline);
         }
         else
@@ -338,7 +338,8 @@ public sealed class RetentionPreviewService(
         string? StorageIdentity,
         Guid? SeriesItemId,
         Entry Entry,
-        RetentionEvaluation? Evaluation);
+        RetentionEvaluation? Evaluation,
+        bool Kept);
 
     private sealed class PreviewCandidate(
         PreviewTarget target,

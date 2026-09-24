@@ -120,8 +120,11 @@ public sealed class UpgradeService(
             return;
         }
 
-        // Keep protects the whole title: a kept title only gains versions (PHASE6 open question 2).
-        if (entry.RetentionPolicy == RetentionPolicy.Never)
+        // Keep protects the whole title: a kept title only gains versions (PHASE6 open question 2). A kept episode is
+        // protected the same way (P10.E2).
+        if (entry.RetentionPolicy == RetentionPolicy.Never || upgrade.EpisodeId is { } upgradeEpisodeId &&
+            await database.Episodes.AsNoTracking().AnyAsync(episode => episode.Id == upgradeEpisodeId &&
+                episode.RetentionPolicy == RetentionPolicy.Never, cancellationToken).ConfigureAwait(false))
         {
             database.AutomationDecisions.Add(new AutomationDecision
             {

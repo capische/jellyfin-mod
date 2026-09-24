@@ -29,4 +29,19 @@ public sealed class Episode
     public FileState State { get; set; }
     /// <summary>Gets or sets an accessible native episode binding.</summary>
     public Guid? JellyfinItemId { get; set; }
+
+    /// <summary>
+    /// Gets or sets this episode's own retention override (P10.E2). Keep on the series or on the episode protects it;
+    /// otherwise the episode's days, then the series' days, then the global window apply.
+    /// </summary>
+    public RetentionPolicy RetentionPolicy { get; set; }
+
+    /// <summary>Gets or sets this episode's own retention window in days, used with <see cref="RetentionPolicy.Days"/>.</summary>
+    public int? ReclaimAfterDays { get; set; }
+
+    /// <summary>
+    /// Gets a value indicating whether this row is identified by its season and episode position rather than a TMDB
+    /// episode id (P10.E1). Libraries scraped from TVDB carry no TMDB episode ids; <see cref="TmdbId"/> is then zero.
+    /// </summary>
+    public bool IsPositionIdentity => TmdbId <= 0;
 }

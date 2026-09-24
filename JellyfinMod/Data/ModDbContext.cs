@@ -109,7 +109,12 @@ public class ModDbContext : DbContext
         b.Entity<Episode>(e =>
         {
             e.HasIndex(x => new { x.EntryId, x.SeasonNumber, x.EpisodeNumber });
-            e.HasIndex(x => new { x.EntryId, x.TmdbId }).IsUnique();
+            // TMDB is an episode's identity when it has one; an episode known only from a TVDB-scraped library is
+            // identified by its position instead (P10.E1). Either way one row per identity.
+            e.HasIndex(x => new { x.EntryId, x.TmdbId }).IsUnique().HasFilter("\"TmdbId\" <> 0");
+            e.HasIndex(x => new { x.EntryId, x.SeasonNumber, x.EpisodeNumber }, "IX_Episodes_EntryId_Position")
+                .IsUnique().HasFilter("\"TmdbId\" = 0");
+            e.Ignore(x => x.IsPositionIdentity);
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
         });
 

@@ -27,7 +27,7 @@ public sealed class RetentionEvaluator(
             .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id,
                 (_, episode) => episode)
             .Join(database.Entries.AsNoTracking(), episode => episode.EntryId, entry => entry.Id,
-                (episode, entry) => new Target(entry, episode.Id))
+                (episode, entry) => new Target(entry, episode.Id, episode.RetentionPolicy, episode.ReclaimAfterDays))
             .Distinct()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
         foreach (var target in targets)
@@ -47,7 +47,7 @@ public sealed class RetentionEvaluator(
             .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id,
                 (_, episode) => episode)
             .Join(database.Entries.AsNoTracking(), episode => episode.EntryId, entry => entry.Id,
-                (episode, entry) => new Target(entry, episode.Id))
+                (episode, entry) => new Target(entry, episode.Id, episode.RetentionPolicy, episode.ReclaimAfterDays))
             .Distinct()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
@@ -55,6 +55,18 @@ public sealed class RetentionEvaluator(
             await EvaluateAsync(new Target(entry, null), cancellationToken).ConfigureAwait(false);
         foreach (var target in episodeTargets)
             await EvaluateAsync(target, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Re-evaluates one tracked episode, for example after its own Keep changed (P10.E2).</summary>
+    public async Task EvaluateEpisodeAsync(Guid episodeId, CancellationToken cancellationToken)
+    {
+        database.ChangeTracker.Clear();
+        var target = await database.Episodes.AsNoTracking().Where(episode => episode.Id == episodeId &&
+                database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id))
+            .Join(database.Entries.AsNoTracking(), episode => episode.EntryId, entry => entry.Id,
+                (episode, entry) => new Target(entry, episode.Id, episode.RetentionPolicy, episode.ReclaimAfterDays))
+            .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (target is not null) await EvaluateAsync(target, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Re-evaluates the stable target represented by a native movie or episode.</summary>
@@ -66,7 +78,7 @@ public sealed class RetentionEvaluator(
             .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, item => item.Id,
                 (_, item) => item)
             .Join(database.Entries.AsNoTracking(), item => item.EntryId, entry => entry.Id,
-                (item, entry) => new Target(entry, item.Id))
+                (item, entry) => new Target(entry, item.Id, item.RetentionPolicy, item.ReclaimAfterDays))
             .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         if (episode is not null)
         {
@@ -109,12 +121,16 @@ public sealed class RetentionEvaluator(
         {
             // A target's grace never starts before it was first evaluated, which is at or after its
             // binding. Historical native play dates must not make newly bound media due at once.
+            // An episode additionally needs a completion after that first evaluation (P10.E1, proposed default for
+            // PHASE10 question 1): tracking a library's episodes must not turn its whole watched backlog into one wave
+            // of reclamation. Only watching, or marking played, after tracking began counts.
             result = new RetentionEvaluation
             {
                 EntryId = target.Entry.Id,
                 EpisodeId = target.EpisodeId,
                 TargetId = targetId,
-                BaselineAt = now
+                BaselineAt = now,
+                RequiresFreshCompletion = target.EpisodeId.HasValue
             };
             database.RetentionEvaluations.Add(result);
         }
@@ -133,7 +149,8 @@ public sealed class RetentionEvaluator(
             return;
         }
 
-        if (target.Entry.RetentionPolicy == RetentionPolicy.Never)
+        // Keep on the series or on the episode itself protects an episode (P10.E2).
+        if (target.IsKept)
         {
             Set(result, RetentionEvaluationStates.Blocked, RetentionEvaluationReasons.Kept);
             await SaveAsync(result, cancellationToken).ConfigureAwait(false);
@@ -293,9 +310,7 @@ public sealed class RetentionEvaluator(
         if (!priorDeadline.HasValue && (accessChanged || policyChanged ||
             (hadPriorEvaluation && priorState != RetentionEvaluationStates.Disabled)))
             eligibleAt = Latest(eligibleAt, now);
-        var days = target.Entry.RetentionPolicy == RetentionPolicy.Days && target.Entry.ReclaimAfterDays is > 0
-            ? Math.Clamp(target.Entry.ReclaimAfterDays.Value, 1, 3650)
-            : policy.ReclaimAfterDays;
+        var days = target.WindowDays(policy.ReclaimAfterDays);
         // An isolated test instance can shorten every window to minutes; production leaves this at zero.
         var deadline = policy.TestWindowMinutes > 0 ? eligibleAt.AddMinutes(policy.TestWindowMinutes) : eligibleAt.AddDays(days);
         if (priorDeadline > deadline) deadline = priorDeadline.Value;
@@ -361,10 +376,11 @@ public sealed class RetentionEvaluator(
     {
         if (!observation.Played || observation.PlaybackPositionTicks != 0 || !observation.CompletedAt.HasValue) return null;
         if (!result.RequiresFreshCompletion) return observation.CompletedAt.Value;
-        if (observation.CompletedAt.Value >= result.BaselineAt) return observation.CompletedAt.Value;
-        return observation.LastPlayedAt is { } lastPlayed && lastPlayed >= result.BaselineAt && lastPlayed <= now
-            ? lastPlayed
-            : null;
+        // A fresh completion must carry Jellyfin's own last-played instant at or after the baseline. A played state with
+        // no last-played date (an imported or synced watched flag) has no evidence of when it happened; the stored start
+        // of the completed state is then only the time the plugin first read it, which is not a new completion (P10.E1).
+        if (observation.LastPlayedAt is not { } lastPlayed || lastPlayed < result.BaselineAt || lastPlayed > now) return null;
+        return observation.CompletedAt.Value >= result.BaselineAt ? observation.CompletedAt.Value : lastPlayed;
     }
 
     private static void Set(RetentionEvaluation result, string state, string reason)
@@ -376,5 +392,12 @@ public sealed class RetentionEvaluator(
         result.Deadline = null;
     }
 
-    private sealed record Target(Entry Entry, Guid? EpisodeId);
+    private sealed record Target(Entry Entry, Guid? EpisodeId, RetentionPolicy EpisodePolicy = RetentionPolicy.Inherit,
+        int? EpisodeDays = null)
+    {
+        public bool IsKept => RetentionOverrides.IsKept(Entry, EpisodeId.HasValue ? EpisodePolicy : null);
+
+        public int WindowDays(int globalDays) =>
+            RetentionOverrides.WindowDays(Entry, EpisodeId.HasValue ? EpisodePolicy : null, EpisodeDays, globalDays);
+    }
 }

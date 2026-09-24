@@ -112,3 +112,26 @@ internal static class RetentionTargetReset
         evaluation.RequiresFreshCompletion = true;
     }
 }
+
+/// <summary>
+/// How a movie's or an episode's own retention override combines with its entry's (P10.E2). Keep on the entry or on the
+/// episode protects the episode; an episode's own window wins over its series' window, which wins over the global one.
+/// </summary>
+internal static class RetentionOverrides
+{
+    /// <summary>Whether the target is kept. <paramref name="episodePolicy"/> is null for a movie.</summary>
+    public static bool IsKept(Entry entry, RetentionPolicy? episodePolicy) =>
+        entry.RetentionPolicy == RetentionPolicy.Never || episodePolicy == RetentionPolicy.Never;
+
+    /// <summary>Whether a tracked episode or its series is kept.</summary>
+    public static bool IsKept(Entry entry, Episode? episode) => IsKept(entry, episode?.RetentionPolicy);
+
+    /// <summary>The target's retention window in days.</summary>
+    public static int WindowDays(Entry entry, RetentionPolicy? episodePolicy, int? episodeDays, int globalDays)
+    {
+        if (episodePolicy == RetentionPolicy.Days && episodeDays is > 0) return Math.Clamp(episodeDays.Value, 1, 3650);
+        if (entry.RetentionPolicy == RetentionPolicy.Days && entry.ReclaimAfterDays is > 0)
+            return Math.Clamp(entry.ReclaimAfterDays.Value, 1, 3650);
+        return globalDays;
+    }
+}

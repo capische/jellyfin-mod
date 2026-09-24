@@ -521,6 +521,8 @@ static async Task VerifyPreviewHttpAsync(
             "Ordinary users cannot read physical retention paths or activity diagnostics");
         Assert((await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Keep", null)).StatusCode ==
             HttpStatusCode.Forbidden, "Ordinary users cannot write Keep through the real authorization policy");
+        Assert((await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Episodes/{episode.Id}/Keep", null)).StatusCode ==
+            HttpStatusCode.Forbidden, "Ordinary users cannot keep an episode through the real authorization policy (P10.E2)");
         http.DefaultRequestHeaders.Add("X-Preview-Role", "admin");
         using var response = await http.GetAsync("/JellyfinMod/Retention/Preview");
         var body = await response.Content.ReadAsStringAsync();
@@ -607,6 +609,34 @@ static async Task VerifyPreviewHttpAsync(
         }
         Assert(episodeRow.GetProperty("reason").GetString() == "favorite_series",
             "A favorite series protects its otherwise eligible episode representation");
+
+        // P10.E2: an administrator keeps one episode; repeating it is idempotent and writes one history event that
+        // names the episode (P10.E3).
+        using (var anonymous = new HttpClient { BaseAddress = http.BaseAddress })
+            Assert((await anonymous.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Episodes/{episode.Id}/Keep", null))
+                .StatusCode == HttpStatusCode.Unauthorized, "Anonymous episode Keep is rejected");
+        using var episodeKept = await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Episodes/{episode.Id}/Keep", null);
+        var episodeKeptBody = await episodeKept.Content.ReadAsStringAsync();
+        Assert(episodeKept.IsSuccessStatusCode && episodeKeptBody.Contains("\"retentionPolicy\":\"never\"") &&
+            episodeKeptBody.Contains("\"reason\":\"kept\""),
+            "An administrator can keep one episode: " + episodeKept.StatusCode + " " + episodeKeptBody);
+        Assert((await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Episodes/{episode.Id}/Keep", null)).IsSuccessStatusCode,
+            "Keeping an already-kept episode is idempotent");
+        using (var episodeDetail = await http.GetFromJsonAsync<JsonDocument>($"/JellyfinMod/Entries/{seriesEntry.Id}"))
+        {
+            var keptEpisode = episodeDetail!.RootElement.GetProperty("episodes")[0];
+            var keptEvents = episodeDetail.RootElement.GetProperty("history").EnumerateArray()
+                .Where(item => item.GetProperty("eventType").GetString() == "episode_kept").ToArray();
+            Assert(keptEpisode.GetProperty("retentionPolicy").GetString() == "never" &&
+                keptEpisode.GetProperty("retention").GetProperty("reason").GetString() == "kept" &&
+                episodeDetail.RootElement.GetProperty("entry").GetProperty("retentionPolicy").GetString() == "inherit" &&
+                keptEvents.Length == 1 && keptEvents[0].GetProperty("episodeId").GetGuid() == episode.Id,
+                "Episode Keep protects only that episode, is recorded once and names the episode: " +
+                episodeDetail.RootElement.GetRawText());
+        }
+        using (var keptPreview = await http.GetFromJsonAsync<JsonDocument>("/JellyfinMod/Retention/Preview"))
+            Assert(FindRow(keptPreview!.RootElement, nativeEpisode.Id).GetProperty("state").GetString() == "blocked",
+                "A kept episode's representation is never due");
 
         using var kept = await http.PostAsync($"/JellyfinMod/Entries/{seriesEntry.Id}/Keep", null);
         var keptBody = await kept.Content.ReadAsStringAsync();

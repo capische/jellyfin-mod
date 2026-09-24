@@ -94,7 +94,32 @@ public sealed record HistoryDto([property: JsonPropertyName("id")] Guid Id,
     [property: JsonPropertyName("entryId")] Guid EntryId,
     [property: JsonPropertyName("eventType")] string EventType,
     [property: JsonPropertyName("summary")] string Summary,
-    [property: JsonPropertyName("createdAt")] DateTime CreatedAt);
+    [property: JsonPropertyName("createdAt")] DateTime CreatedAt)
+{
+    /// <summary>Gets the episode the event is about, or null for an event about the title (P10.E3).</summary>
+    [JsonPropertyName("episodeId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public Guid? EpisodeId { get; init; }
+
+    /// <summary>Reads the episode identity episode events carry in their structured data.</summary>
+    public static Guid? EpisodeOf(string? data)
+    {
+        if (string.IsNullOrWhiteSpace(data)) return null;
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(data);
+            if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object) return null;
+            foreach (var property in document.RootElement.EnumerateObject())
+                if (property.Name.Equals("episodeId", StringComparison.OrdinalIgnoreCase) &&
+                    property.Value.ValueKind == System.Text.Json.JsonValueKind.String && property.Value.TryGetGuid(out var id))
+                    return id;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+        }
+
+        return null;
+    }
+}
 
 /// <summary>One correctly paginated entry query.</summary>
 public sealed record EntriesResult([property: JsonPropertyName("items")] IReadOnlyList<EntryDto> Items,

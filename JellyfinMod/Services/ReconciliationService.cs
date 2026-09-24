@@ -325,7 +325,20 @@ public sealed class ReconciliationService(
                 episode.TmdbId, episode.SeasonNumber, episode.EpisodeNumber, owner.Id, owner.MediaType,
                 owner.TmdbId, owner.TargetLibraryId, episode.Id))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var conflict in FindDurableEpisodeConflicts(snapshot, boundEpisodes.Concat(canonicalEpisodes)))
+        // A position-identity episode (P10.E1) whose native episode gained a TMDB id adopts it instead of conflicting,
+        // unless another episode of the same entry already holds that TMDB id.
+        var observedTmdbIds = snapshot.Episodes.Where(episode => episode.TmdbId is > 0)
+            .Select(episode => episode.TmdbId!.Value).ToHashSet();
+        var positionOwners = boundEpisodes.Concat(canonicalEpisodes).Where(binding => binding.EpisodeTmdbId == 0)
+            .Select(binding => binding.EntryId).ToHashSet();
+        var heldTmdbIds = positionOwners.Count == 0 || observedTmdbIds.Count == 0
+            ? []
+            : (await database.Episodes.AsNoTracking()
+                .Where(episode => positionOwners.Contains(episode.EntryId) && observedTmdbIds.Contains(episode.TmdbId))
+                .Select(episode => new { episode.EntryId, episode.TmdbId })
+                .ToListAsync(cancellationToken).ConfigureAwait(false))
+            .Select(held => (held.EntryId, held.TmdbId)).ToHashSet();
+        foreach (var conflict in FindDurableEpisodeConflicts(snapshot, boundEpisodes.Concat(canonicalEpisodes), heldTmdbIds))
         {
             skipped.TryAdd(conflict.Observation.JellyfinItemId, conflict.Detail);
             if (conflict.RebindableEpisodeId is { } trackedId)
@@ -453,8 +466,14 @@ public sealed class ReconciliationService(
             }
 
             var usable = snapshot.Episodes.Where(observation => !skipped.ContainsKey(observation.JellyfinItemId)).ToArray();
+            var evaluatedEpisodes = created
+                ? []
+                : (await database.RetentionEvaluations.AsNoTracking()
+                    .Where(evaluation => evaluation.EntryId == entry.Id && evaluation.EpisodeId != null)
+                    .Select(evaluation => evaluation.TargetId).ToListAsync(cancellationToken).ConfigureAwait(false))
+                .ToHashSet();
             episodeChanges = ReconcileEpisodes(entry.Id, snapshot.TargetLibraryId, episodes, episodeBindings,
-                usable, created);
+                usable, created, evaluatedEpisodes);
             await RecordEpisodeConflictsAsync(entry.Id, usable, rebindable, skipped, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -711,7 +730,8 @@ public sealed class ReconciliationService(
 
     private static IEnumerable<DurableEpisodeConflict> FindDurableEpisodeConflicts(
         NativeTitleSnapshot snapshot,
-        IEnumerable<ExistingEpisodeBinding> bindings)
+        IEnumerable<ExistingEpisodeBinding> bindings,
+        IReadOnlySet<(Guid EntryId, int TmdbId)> heldTmdbIds)
     {
         var byNativeId = bindings.GroupBy(binding => binding.JellyfinItemId).ToDictionary(group => group.Key, group => group.First());
         foreach (var observation in snapshot.Episodes)
@@ -726,6 +746,11 @@ public sealed class ReconciliationService(
                 yield return new(observation, "A native episode is already bound to a different catalog identity.", null);
                 continue;
             }
+
+            // A position-identity episode at the same position adopts a TMDB id its native episode gained (P10.E1).
+            if (IsAdoptable(binding.EpisodeTmdbId, binding.SeasonNumber, binding.EpisodeNumber, observation) &&
+                !heldTmdbIds.Contains((binding.EntryId, observation.TmdbId!.Value)))
+                continue;
 
             // TMDB is identity: a changed position with the same provider id is renumbering, not a conflict.
             if (observation.TmdbId is > 0 && binding.EpisodeTmdbId != observation.TmdbId)
@@ -742,10 +767,21 @@ public sealed class ReconciliationService(
     {
         var trackedByNativeId = episodes.Where(episode => episode.JellyfinItemId.HasValue)
             .GroupBy(episode => episode.JellyfinItemId!.Value).ToDictionary(group => group.Key, group => group.First());
+        var trackedTmdbIds = episodes.Where(episode => !episode.IsPositionIdentity).Select(episode => episode.TmdbId).ToHashSet();
         foreach (var observation in observations.Where(observation => observation.TmdbId is > 0))
-            if (trackedByNativeId.TryGetValue(observation.JellyfinItemId, out var bound) && bound.TmdbId != observation.TmdbId)
+            if (trackedByNativeId.TryGetValue(observation.JellyfinItemId, out var bound) && bound.TmdbId != observation.TmdbId &&
+                !(IsAdoptable(bound.TmdbId, bound.SeasonNumber, bound.EpisodeNumber, observation) &&
+                  !trackedTmdbIds.Contains(observation.TmdbId!.Value)))
                 yield return (observation, bound.Id);
     }
+
+    /// <summary>
+    /// Whether a position-identity episode (TMDB id zero, P10.E1) may take the TMDB id its native episode now reports:
+    /// only at the very same season and episode, so a renumbered native episode is never folded into another one.
+    /// </summary>
+    private static bool IsAdoptable(int trackedTmdbId, int seasonNumber, int episodeNumber, NativeEpisodeSnapshot observation) =>
+        trackedTmdbId <= 0 && observation.TmdbId is > 0 &&
+        observation.SeasonNumber == seasonNumber && observation.EpisodeNumber == episodeNumber;
 
     private int ReconcileEpisodes(
         Guid entryId,
@@ -753,10 +789,26 @@ public sealed class ReconciliationService(
         IReadOnlyList<Episode> episodes,
         IReadOnlyList<EpisodeBinding> episodeBindings,
         IReadOnlyList<NativeEpisodeSnapshot> observations,
-        bool backfilled)
+        bool backfilled,
+        IReadOnlySet<Guid> evaluatedEpisodes)
     {
         var changedEpisodeIds = new HashSet<Guid>();
+        var boundBefore = episodeBindings.Select(binding => binding.EpisodeId).ToHashSet();
         var knownBindings = episodeBindings.ToDictionary(binding => binding.JellyfinItemId);
+
+        // A native episode that gained a TMDB id (the library switched scraper) keeps its position-identity row, which
+        // takes the id, rather than leaving the row behind and tracking the same file twice (P10.E1).
+        var heldTmdbIds = episodes.Where(episode => !episode.IsPositionIdentity).Select(episode => episode.TmdbId).ToHashSet();
+        foreach (var episode in episodes.Where(episode => episode.IsPositionIdentity))
+        {
+            var gained = observations.Where(observation => knownBindings.TryGetValue(observation.JellyfinItemId, out var bound) &&
+                    bound.EpisodeId == episode.Id && IsAdoptable(episode.TmdbId, episode.SeasonNumber, episode.EpisodeNumber, observation))
+                .Select(observation => observation.TmdbId!.Value).Distinct().ToArray();
+            if (gained.Length != 1 || !heldTmdbIds.Add(gained[0])) continue;
+            episode.TmdbId = gained[0];
+            changedEpisodeIds.Add(episode.Id);
+        }
+
         foreach (var episode in episodes)
         {
             var allCandidates = observations.Where(observation => observation.TmdbId == episode.TmdbId).ToArray();
@@ -766,6 +818,10 @@ public sealed class ReconciliationService(
                     observation.SeasonNumber == episode.SeasonNumber && observation.EpisodeNumber == episode.EpisodeNumber).ToArray();
             }
 
+            // One native episode belongs to one tracked episode: a copy another row already binds is never claimed by
+            // position here as well (P10.E1).
+            allCandidates = allCandidates.Where(candidate => !knownBindings.TryGetValue(candidate.JellyfinItemId, out var owner) ||
+                owner.EpisodeId == episode.Id).ToArray();
             foreach (var candidate in allCandidates)
             {
                 if (knownBindings.TryGetValue(candidate.JellyfinItemId, out var existingBinding))
@@ -826,7 +882,8 @@ public sealed class ReconciliationService(
                 }
             }
 
-            var providerCandidate = allCandidates.Where(candidate => candidate.TmdbId is > 0)
+            // A position-identity episode takes its display metadata from the native episodes at its position (P10.E1).
+            var providerCandidate = allCandidates.Where(candidate => candidate.TmdbId is > 0 || episode.IsPositionIdentity)
                 .OrderBy(candidate => candidate.JellyfinItemId).FirstOrDefault();
             if (providerCandidate is not null && UpdateEpisodeMetadata(episode, providerCandidate))
                 changedEpisodeIds.Add(episode.Id);
@@ -860,10 +917,17 @@ public sealed class ReconciliationService(
         }
 
         var trackedProviderIds = episodes.Select(episode => episode.TmdbId).ToHashSet();
+        var createdProviderPositions = new List<(int SeasonNumber, int EpisodeNumber)>();
         foreach (var providerGroup in observations.Where(observation => observation.TmdbId is > 0 &&
                      !trackedProviderIds.Contains(observation.TmdbId.Value)).GroupBy(observation => observation.TmdbId!.Value))
         {
             var representative = providerGroup.OrderBy(observation => observation.JellyfinItemId).First();
+            // A position-identity episode already holds this position (P10.E1). Another copy there is not folded into
+            // it, and a second row cannot take the position (older databases keep that index unique): the copy stays
+            // untracked until the position row adopts the TMDB id through its own native episode or a Refresh.
+            if (episodes.Any(episode => episode.IsPositionIdentity && episode.SeasonNumber == representative.SeasonNumber &&
+                    episode.EpisodeNumber == representative.EpisodeNumber))
+                continue;
             var playable = providerGroup.Where(observation => observation.IsPlayable)
                 .OrderBy(observation => observation.JellyfinItemId).FirstOrDefault();
             var newEpisode = new Episode
@@ -898,6 +962,75 @@ public sealed class ReconciliationService(
             }
 
             changedEpisodeIds.Add(newEpisode.Id);
+            createdProviderPositions.Add((newEpisode.SeasonNumber, newEpisode.EpisodeNumber));
+        }
+
+        // A numbered native episode without a TMDB id is tracked by its position (P10.E1). Libraries scraped from TVDB
+        // carry no TMDB episode ids at all, and without this row the episode could have no retention, Keep or detail of
+        // its own. A row is created only where no tracked episode of this entry holds that position already, so an
+        // unclaimed copy is never folded into an episode that might differ; every copy at a new position becomes a
+        // version of the one row. Discovered, not wanted: the row is not monitored.
+        var trackedPositions = episodes.Select(episode => (episode.SeasonNumber, episode.EpisodeNumber))
+            .Concat(createdProviderPositions).ToHashSet();
+        foreach (var positionGroup in observations.Where(observation => observation.TmdbId is null &&
+                         !knownBindings.ContainsKey(observation.JellyfinItemId))
+                     .GroupBy(observation => (observation.SeasonNumber, observation.EpisodeNumber))
+                     .Where(group => !trackedPositions.Contains(group.Key)))
+        {
+            var representative = positionGroup.OrderBy(observation => observation.JellyfinItemId).First();
+            var playable = positionGroup.Where(observation => observation.IsPlayable)
+                .OrderBy(observation => observation.JellyfinItemId).FirstOrDefault();
+            var positionEpisode = new Episode
+            {
+                EntryId = entryId,
+                TmdbId = 0,
+                SeasonNumber = positionGroup.Key.SeasonNumber,
+                EpisodeNumber = positionGroup.Key.EpisodeNumber,
+                Title = representative.Title ?? string.Empty,
+                Overview = representative.Overview,
+                AirDate = representative.AirDate,
+                RuntimeMinutes = representative.RuntimeMinutes,
+                Monitored = false,
+                JellyfinItemId = playable?.JellyfinItemId,
+                State = playable is null ? FileState.None : FileState.OnDisk
+            };
+            database.Episodes.Add(positionEpisode);
+            foreach (var observation in positionGroup)
+            {
+                var binding = new EpisodeBinding
+                {
+                    EpisodeId = positionEpisode.Id,
+                    JellyfinItemId = observation.JellyfinItemId,
+                    SeriesItemId = observation.SeriesItemId,
+                    TargetLibraryId = targetLibraryId,
+                    MediaPath = observation.MediaPath,
+                    StorageIdentity = observation.StorageIdentity
+                };
+                database.EpisodeBindings.Add(binding);
+                knownBindings.Add(observation.JellyfinItemId, binding);
+            }
+
+            trackedPositions.Add(positionGroup.Key);
+            changedEpisodeIds.Add(positionEpisode.Id);
+        }
+
+        // An episode's retention baseline is the moment it gains its first representation (P10.E1): only a completion
+        // after it counts, whether the user plays the episode or just marks it played, and a watched state Jellyfin
+        // already held for the file does not. Episodes evaluated before keep their evaluation untouched.
+        var now = _clock.GetUtcNow().UtcDateTime;
+        foreach (var episodeId in knownBindings.Values.Select(binding => binding.EpisodeId).Distinct()
+                     .Where(episodeId => !boundBefore.Contains(episodeId) && !evaluatedEpisodes.Contains(episodeId)))
+        {
+            database.RetentionEvaluations.Add(new RetentionEvaluation
+            {
+                EntryId = entryId,
+                EpisodeId = episodeId,
+                TargetId = episodeId,
+                State = RetentionEvaluationStates.Waiting,
+                Reason = RetentionEvaluationReasons.WaitingForCompletion,
+                BaselineAt = now,
+                RequiresFreshCompletion = true
+            });
         }
 
         return changedEpisodeIds.Count;

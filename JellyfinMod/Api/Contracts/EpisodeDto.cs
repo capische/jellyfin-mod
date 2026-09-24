@@ -40,6 +40,12 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     /// <summary>Gets runtimeMinutes.</summary>
     [JsonPropertyName("runtimeMinutes")]
     public int? RuntimeMinutes { get; } = episode.RuntimeMinutes;
+    /// <summary>Gets the episode's own retention override: inherit, days or never (P10.E3).</summary>
+    [JsonPropertyName("retentionPolicy")]
+    public string RetentionPolicy { get; } = RetentionPolicies.ToWire(episode.RetentionPolicy);
+    /// <summary>Gets the episode's own retention window when <see cref="RetentionPolicy"/> is days.</summary>
+    [JsonPropertyName("reclaimAfterDays")]
+    public int? ReclaimAfterDays { get; } = episode.ReclaimAfterDays;
     /// <summary>Gets monitored.</summary>
     [JsonPropertyName("monitored")]
     public bool Monitored { get; } = episode.Monitored;

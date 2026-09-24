@@ -121,6 +121,8 @@ public class HealthController : ControllerBase
         "browse.dueWithinDays",
         "browse.features",
         "retention.summary",
+        // Episodes are tracked by position and carry their own Keep (P10.E1-E2).
+        "retention.episodes",
         "discover.skipped",
         "reconciliation.conflicts",
         "reconciliation.orphans",
