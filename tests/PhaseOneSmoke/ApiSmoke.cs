@@ -47,6 +47,8 @@ internal static class ApiSmoke
         var nativeById = new Dictionary<Guid, BaseItem>();
         var library = Stub<ILibraryManager>.Create((method, args) => method.Name switch
         {
+            "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
+            "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
             "GetUserRootFolder" => root,
             "GetItemById" when args?[0] is Guid id => nativeById.GetValueOrDefault(id),
             "GetVirtualFolders" => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }

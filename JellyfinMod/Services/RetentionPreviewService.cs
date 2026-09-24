@@ -78,8 +78,14 @@ public sealed class RetentionPreviewService(
         var activeGroups = activeItemIds is null ? null : targets
             .Where(target => activeItemIds.Contains(target.JellyfinItemId) || activeItemIds.Contains(target.VersionGroupId))
             .Select(target => target.VersionGroupId).ToHashSet();
+        // Every file bound to each movie or episode, to compare with the files Jellyfin plays as its versions. Files, not
+        // item ids: Jellyfin 12 derives an extra version's id differently from 10.11 (analysis C3).
+        var trackedItems = targets.GroupBy(target => target.EpisodeId ?? target.EntryId)
+            .ToDictionary(group => group.Key, group => (IReadOnlySet<string>)group.Where(target => target.Path is not null)
+                .Select(target => target.Path!).ToHashSet(StringComparer.Ordinal));
         var inspected = targets.Select(target => Inspect(target, libraryRoots, now,
-            replacementBindingIds?.Contains(target.BindingId) == true, keptPaths, keptIdentities)).ToArray();
+            replacementBindingIds?.Contains(target.BindingId) == true, keptPaths, keptIdentities,
+            trackedItems[target.EpisodeId ?? target.EntryId])).ToArray();
         await ApplyMultiEpisodeRuleAsync(inspected, policy, evaluations, now, cancellationToken).ConfigureAwait(false);
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
@@ -240,7 +246,8 @@ public sealed class RetentionPreviewService(
         DateTime now,
         bool replacement,
         IReadOnlySet<string> keptPaths,
-        IReadOnlySet<string> keptIdentities)
+        IReadOnlySet<string> keptIdentities,
+        IReadOnlySet<string> trackedItems)
     {
         var evaluation = target.Evaluation;
         // A kept file is never reclaimed or replaced, whatever its title's schedule says (PHASE10 Q3).
@@ -302,13 +309,15 @@ public sealed class RetentionPreviewService(
                 return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiEpisodeUnsupported, evaluation?.Deadline);
             covered = (season, firstEpisode, lastEpisode);
         }
-        // Jellyfin 10.11 merges several files of one episode into one item with alternate media sources. Episode
-        // observations list only the item, so its other files are not bound: reclaiming the primary would leave them
-        // behind untracked and re-resolved as a new item. Such an episode stays blocked until its versions are tracked
-        // like a movie's (P10, PHASE10 task E7).
-        if (target.EpisodeId.HasValue && native is Video episodeVideo &&
-            (episodeVideo.LocalAlternateVersions is { Length: > 0 } || episodeVideo.LinkedAlternateVersions is { Length: > 0 }))
-            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.EpisodeVersionsUntracked, evaluation?.Deadline);
+        // Jellyfin 12.0.0 (the runtime host) groups several files of one movie, and now of one episode, as versions of
+        // one main item, and it groups S01E01-E02 with S01E01 because its episode key ignores the ending number. Only
+        // what the plugin binds is checked, watched and kept, so while Jellyfin plays a version the plugin does not
+        // track, or the bound item has itself become an extra version, nothing of that title is reclaimed (PHASE10 S17,
+        // Jellyfin 12 analysis C1, C7, C10), until versions are enumerated (task V1) and tracked (E7).
+        if (native is Video video && VersionsUntracked(video, trackedItems, target.EpisodeId.HasValue))
+            return PreviewCandidate.Blocked(target, target.EpisodeId.HasValue
+                ? RetentionPreviewReasons.EpisodeVersionsUntracked
+                : RetentionPreviewReasons.VersionsUntracked, evaluation?.Deadline);
         try
         {
             if (new FileInfo(native.Path).LinkTarget is not null)
@@ -434,6 +443,43 @@ public sealed class RetentionPreviewService(
     }
 
     private static DateTime Latest(DateTime left, DateTime right) => left > right ? left : right;
+
+    /// <summary>
+    /// Whether Jellyfin plays a version of this title that the plugin does not track: the bound item is an extra
+    /// version whose main item cannot be read, or a file of the main item or of any of its versions is not bound.
+    /// An episode with any other version is untracked until E7. Anything that cannot be read counts as untracked.
+    /// </summary>
+    /// <remarks>
+    /// The versions are the union of every list Jellyfin 12 keeps: the paths in the item (<c>LocalAlternateVersions</c>),
+    /// the linked children (<c>LinkedAlternateVersions</c>, each resolved by its item id; one that cannot be resolved
+    /// counts as untracked), and the ids its library manager uses to build media sources
+    /// (<c>GetLocalAlternateVersionIds</c>, <c>GetLinkedAlternateVersions</c>). A movie whose every file is bound passes;
+    /// one untracked file blocks the whole title (RET3-R2).
+    /// </remarks>
+    private bool VersionsUntracked(Video video, IReadOnlySet<string> trackedPaths, bool episode)
+    {
+        try
+        {
+            if (episode && (video.LocalAlternateVersions is { Length: > 0 } || video.LinkedAlternateVersions is { Length: > 0 } ||
+                    JellyfinNativeTitleSource.PrimaryVersionId(video).HasValue ||
+                    library.GetLocalAlternateVersionIds(video).Any() || library.GetLinkedAlternateVersions(video).Any()))
+                return true;
+            var primaryId = JellyfinNativeTitleSource.PrimaryVersionId(video);
+            var primary = primaryId is { } id ? library.GetItemById(id) as Video : video;
+            if (primary is null || string.IsNullOrEmpty(primary.Path)) return true;
+            var played = new List<string?> { primary.Path };
+            played.AddRange(primary.LocalAlternateVersions ?? []);
+            played.AddRange((primary.LinkedAlternateVersions ?? [])
+                .Select(link => link.ItemId is { } linked ? library.GetItemById(linked)?.Path : null));
+            played.AddRange(library.GetLocalAlternateVersionIds(primary).Select(version => library.GetItemById(version)?.Path));
+            played.AddRange(library.GetLinkedAlternateVersions(primary).Select(version => version?.Path));
+            return played.Any(path => string.IsNullOrEmpty(path) || !trackedPaths.Contains(path));
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return true;
+        }
+    }
 
     private bool IsSeriesFavorite(PreviewTarget target)
     {
@@ -563,6 +609,7 @@ internal static class RetentionPreviewReasons
     public const string MultiEpisodeNotAllDue = "multi_episode_not_all_due";
     public const string VersionKept = "version_kept";
     public const string EpisodeVersionsUntracked = "episode_versions_untracked";
+    public const string VersionsUntracked = "versions_untracked";
     public const string SeedingIncomplete = "seeding_incomplete";
     public const string SeedGoalUnbounded = "seed_goal_unbounded";
     public const string SeedGoalUnmet = "seed_goal_unmet";

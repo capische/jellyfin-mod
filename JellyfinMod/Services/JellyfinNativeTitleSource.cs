@@ -316,7 +316,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
     }
 
     /// <summary>The main item of a version group, or null for a video that is its own main item.</summary>
-    private static Guid? PrimaryVersionId(Video video) =>
+    internal static Guid? PrimaryVersionId(Video video) =>
         video.PrimaryVersionId is { } id && !id.Equals(Guid.Empty) ? id : null;
 
     private static bool IsPlayable(BaseItem item) => !string.IsNullOrWhiteSpace(item.Path);

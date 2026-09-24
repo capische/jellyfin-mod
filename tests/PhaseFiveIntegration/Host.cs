@@ -311,6 +311,7 @@ internal sealed partial class NativeWorld
                 var video = (Video)arguments![0]!;
                 return video.LocalAlternateVersions.Select(path => NewItemId(path, video.GetType()))
                     .Where(versionId => _items.ContainsKey(versionId)).ToArray();
+            case "GetLinkedAlternateVersions": return Array.Empty<Video>();
             case "GetItemById":
                 var id = (Guid)arguments![0]!;
                 return Libraries.FirstOrDefault(library => library.Id == id) as BaseItem ?? _items.GetValueOrDefault(id);

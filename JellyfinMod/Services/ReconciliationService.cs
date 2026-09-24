@@ -151,15 +151,22 @@ public sealed class ReconciliationService(
         {
             var entry = entries.Single(candidate => candidate.Id == entryId);
             if (entry.MediaType == "movie" && bindings.All(binding => binding.EntryId != entryId || absentBindings.Contains(binding)))
+            {
                 await RetentionTargetReset.ResetAsync(database, entryId, null, now, cancellationToken).ConfigureAwait(false);
+                RecordRetentionReset(entryId, null, absentBindings.Where(binding => binding.EntryId == entryId).Select(binding => binding.MediaPath));
+            }
         }
 
         foreach (var episodeId in absentEpisodeBindings.Select(binding => binding.EpisodeId).Distinct())
         {
             if (episodeBindings.All(binding => binding.EpisodeId != episodeId || absentEpisodeBindings.Contains(binding)))
-                await RetentionTargetReset.ResetAsync(database,
-                    episodes.Single(episode => episode.Id == episodeId).EntryId, episodeId, now, cancellationToken)
+            {
+                var ownerEntryId = episodes.Single(episode => episode.Id == episodeId).EntryId;
+                await RetentionTargetReset.ResetAsync(database, ownerEntryId, episodeId, now, cancellationToken)
                     .ConfigureAwait(false);
+                RecordRetentionReset(ownerEntryId, episodeId,
+                    absentEpisodeBindings.Where(binding => binding.EpisodeId == episodeId).Select(binding => binding.MediaPath));
+            }
         }
 
         var missingItems = 0;
@@ -233,6 +240,22 @@ public sealed class ReconciliationService(
 
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return new(missingItems, true, null, excluded.Count, unverified);
+    }
+
+    /// <summary>
+    /// Records that a target's retention clock and evidence were reset because Jellyfin no longer reported its last
+    /// file (Jellyfin 12 analysis C5): the reset is never silent, and History names the files that were not observed.
+    /// </summary>
+    private void RecordRetentionReset(Guid entryId, Guid? episodeId, IEnumerable<string?> paths)
+    {
+        var files = paths.Where(path => !string.IsNullOrEmpty(path)).Select(path => Path.GetFileName(path!)).ToArray();
+        database.History.Add(new HistoryRecord
+        {
+            EntryId = entryId,
+            EventType = "retention_reset",
+            Summary = "Retention restarted: Jellyfin no longer reports " + (files.Length == 1 ? files[0] : $"{files.Length} files"),
+            Data = JsonSerializer.Serialize(new { episodeId, reason = "binding_not_observed", files })
+        });
     }
 
     private bool IsProvenAbsent(string? path, string? identity, IReadOnlyList<string> locations, out string detail)

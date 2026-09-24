@@ -94,6 +94,8 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     });
     var library = Stub<ILibraryManager>.Create((method, arguments) => method.Name switch
     {
+        "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
+        "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
         "GetUserRootFolder" => root,
         "GetItemById" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
         _ => null
