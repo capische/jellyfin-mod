@@ -12,7 +12,8 @@ FROM ${JELLYFIN_IMAGE}
 
 LABEL org.opencontainers.image.title="JellyfinMod" \
       org.opencontainers.image.description="Stock Jellyfin with the JellyfinMod plugin preinstalled" \
-      org.opencontainers.image.licenses="GPL-2.0-only"
+      org.opencontainers.image.licenses="GPL-2.0-only" \
+      org.opencontainers.image.source="https://github.com/capische/jellyfin-mod"
 
 COPY package/ /opt/jellyfinmod/plugin/
 COPY jellyfinmod-entrypoint.sh /usr/local/bin/jellyfinmod-entrypoint

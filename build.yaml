@@ -21,4 +21,7 @@ artifacts:
 # plugin installs the interface (P7.S3). Built by jellyfin-sync --test --plugin-web.
 - "jellyfinmod-web.zip"
 changelog: >
-  0.1.0.0 - Phase 0: plugin loads, health endpoint, configuration page.
+  0.1.0.0 - First public release, for Jellyfin 12.0.0: the catalog of titles with or without a
+  file, acquisition through Torznab indexers and Prowlarr sync into Transmission, hardlink import,
+  retention, automation, the settings area and first-run wizard, and the JellyfinMod interface
+  served by the plugin at /web.
