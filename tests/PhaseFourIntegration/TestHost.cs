@@ -79,7 +79,7 @@ internal sealed class PluginHost : IAsyncDisposable
     public T Service<T>() where T : notnull => App.Services.GetRequiredService<T>();
 
     public static async Task<PluginHost> StartAsync(World world, string dbPath, ShiftedTimeProvider time,
-        CapturingLoggerProvider logs, TimeSpan hold, PluginConfiguration configuration)
+        CapturingLoggerProvider logs, TimeSpan hold, PluginConfiguration configuration, Action<IServiceCollection>? configure = null)
     {
         var users = Stub<IUserManager>.Create((method, args) => method.Name == "GetUserById"
             ? new[] { world.Admin, world.SecondAdmin, world.RestrictedAdmin, world.Ordinary }.SingleOrDefault(user => user.Id == (Guid)args![0]!)
@@ -149,6 +149,8 @@ internal sealed class PluginHost : IAsyncDisposable
         AcquisitionServices.AddHostedServices(builder.Services);
         builder.Services.AddSingleton(new GrabHoldOptions(hold));
         builder.Services.AddSingleton(new TorznabOptions(TimeSpan.FromSeconds(2), 5, 4));
+        // A later suite may add or replace registrations; the last registration of a service wins.
+        configure?.Invoke(builder.Services);
 
         var app = builder.Build();
         app.UseAuthentication();

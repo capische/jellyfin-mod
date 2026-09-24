@@ -113,7 +113,8 @@ public class HealthController : ControllerBase
     /// <remarks>
     /// <c>ui</c> is the switch the web fork reads to decide whether to show the JellyfinMod interface at all
     /// (P7.S2); <c>ui.web</c> says this build also serves that interface's bundle itself (P7.S3);
-    /// <c>ui.takeover</c> says it can replace the host's own document at <c>/web</c> (P7.S4).
+    /// <c>ui.takeover</c> says it can replace the host's own document at <c>/web</c> (P7.S4). The <c>settings.*</c>
+    /// names and <c>setup</c> are the typed settings contract and first-run state of P7.S7.
     /// </remarks>
     public static readonly IReadOnlyList<string> Capabilities =
     [
@@ -135,6 +136,11 @@ public class HealthController : ControllerBase
         "versions",
         "ui",
         "ui.web",
-        "ui.takeover"
+        "ui.takeover",
+        "settings.overview",
+        "settings.discovery",
+        "settings.seedProtection",
+        "settings.retention",
+        "setup"
     ];
 }

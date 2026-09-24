@@ -34,7 +34,13 @@ public sealed class TransmissionSeedClient(
     public async Task<TransmissionSeedSnapshot> GetSnapshotAsync(CancellationToken cancellationToken, ModDbContext? database = null)
     {
         var settings = configuration();
-        if (!Uri.TryCreate(settings.TransmissionRpcUrl, UriKind.Absolute, out var endpoint) ||
+        // The XML endpoint is the pre-P7.S7 location and wins while it is set; otherwise the SQLite settings row
+        // decides: the selected acquisition client (the default) or a separate endpoint.
+        var source = settings.TransmissionRpcUrl.Length > 0 || database is null
+            ? new SeedEndpoint(settings.TransmissionRpcUrl, settings.TransmissionUsername, settings.TransmissionPassword,
+                settings.TransmissionPasswordRef)
+            : await SeedEndpoint.ResolveAsync(database, cancellationToken).ConfigureAwait(false);
+        if (source is null || !Uri.TryCreate(source.RpcUrl, UriKind.Absolute, out var endpoint) ||
             endpoint.Scheme is not ("http" or "https"))
             return TransmissionSeedSnapshot.Unavailable("transmission_unconfigured");
 
@@ -42,14 +48,14 @@ public sealed class TransmissionSeedClient(
         {
             var context = database is null
                 ? SeedContext.Empty
-                : await SeedContext.LoadAsync(database, settings.TransmissionRpcUrl, cancellationToken).ConfigureAwait(false);
+                : await SeedContext.LoadAsync(database, source.RpcUrl, cancellationToken).ConfigureAwait(false);
             // The saved password lives in the secret store (user decision 3); a value on the object is used as given.
-            var password = settings.TransmissionPassword.Length > 0 || secrets is null
-                ? settings.TransmissionPassword
-                : await secrets.GetAsync(settings.TransmissionPasswordRef, cancellationToken).ConfigureAwait(false) ?? string.Empty;
+            var password = source.Password.Length > 0 || secrets is null
+                ? source.Password
+                : await secrets.GetAsync(source.PasswordRef, cancellationToken).ConfigureAwait(false) ?? string.Empty;
             using var client = httpClientFactory.CreateClient(NamedClient.Default);
             using var sessionResponse = await SendAsync(client, endpoint, "session-get",
-                new { fields = SessionFields }, settings, password, cancellationToken).ConfigureAwait(false);
+                new { fields = SessionFields }, source.Username, password, cancellationToken).ConfigureAwait(false);
             if (!sessionResponse.IsSuccessStatusCode)
                 return TransmissionSeedSnapshot.Unavailable("transmission_unreachable");
             using var sessionDocument = await JsonDocument.ParseAsync(
@@ -59,7 +65,7 @@ public sealed class TransmissionSeedClient(
                 return TransmissionSeedSnapshot.Unavailable("transmission_invalid_response");
 
             using var torrentResponse = await SendAsync(client, endpoint, "torrent-get",
-                new { fields = TorrentFields }, settings, password, cancellationToken).ConfigureAwait(false);
+                new { fields = TorrentFields }, source.Username, password, cancellationToken).ConfigureAwait(false);
             if (!torrentResponse.IsSuccessStatusCode)
                 return TransmissionSeedSnapshot.Unavailable("transmission_unreachable");
             using var torrentDocument = await JsonDocument.ParseAsync(
@@ -127,10 +133,10 @@ public sealed class TransmissionSeedClient(
         Uri endpoint,
         string method,
         object arguments,
-        PluginConfiguration settings,
+        string username,
         string password,
         CancellationToken cancellationToken) => TransmissionRpc.SendAsync(client, endpoint, method, arguments,
-        settings.TransmissionUsername, password, cancellationToken);
+        username, password, cancellationToken);
 
     private static bool Success(JsonElement root, out JsonElement arguments) => TransmissionRpc.Success(root, out arguments);
 

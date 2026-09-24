@@ -4,10 +4,13 @@ using Microsoft.EntityFrameworkCore;
 namespace JellyfinMod.Services;
 
 /// <summary>Reads the host's current XML configuration at each retention safety boundary.</summary>
-public sealed class RetentionConfigurationSource(Func<PluginConfiguration> current)
+public sealed class RetentionConfigurationSource(Func<PluginConfiguration> current, Action<PluginConfiguration>? save = null)
 {
     /// <summary>Gets the configuration currently held by the plugin host.</summary>
     public PluginConfiguration Current => current();
+
+    /// <summary>Persists <see cref="Current"/> after a typed settings endpoint changed it (P7.S7).</summary>
+    public void Save() => save?.Invoke(current());
 }
 
 /// <summary>Persists the effective retention policy and advances its revision only on change.</summary>

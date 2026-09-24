@@ -359,9 +359,11 @@ public sealed partial class AcquisitionSettingsController(
     private async Task<AcquisitionSettingsDto> ToDtoAsync(CancellationToken cancellationToken)
     {
         var state = await configuration.GetStateAsync(database, cancellationToken);
-        var seedMatches = state.Client is { Kind: TransmissionDriver.DriverKind } client &&
-            AcquisitionConfiguration.NormalizeEndpoint(client.BaseUrl) ==
-            AcquisitionConfiguration.NormalizeEndpoint(pluginConfiguration.Current.TransmissionRpcUrl);
+        // Seed protection reads the XML endpoint while one is left there, else the P7.S7 settings row.
+        var legacySeedUrl = pluginConfiguration.Current.TransmissionRpcUrl;
+        var seedUrl = legacySeedUrl.Length > 0 ? legacySeedUrl : (await SeedEndpoint.ResolveAsync(database, cancellationToken))?.RpcUrl;
+        var seedMatches = state.Client is { Kind: TransmissionDriver.DriverKind } client && seedUrl is not null &&
+            AcquisitionConfiguration.NormalizeEndpoint(client.BaseUrl) == AcquisitionConfiguration.NormalizeEndpoint(seedUrl);
         return new AcquisitionSettingsDto(state.Settings.Enabled, state.Settings.DownloadClientId, state.Settings.DefaultQualityProfileId,
             state.Settings.Revision, state.Ready, state.Blockers, (int)Math.Ceiling(hold.Hold.TotalSeconds), seedMatches,
             QualityCatalog.All.Select(quality => new QualityDefinitionDto(quality.Id, quality.Source, quality.Resolution)).ToArray());

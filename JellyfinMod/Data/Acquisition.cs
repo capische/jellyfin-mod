@@ -274,6 +274,50 @@ public sealed class AcquisitionSettings
     /// <summary>Gets or sets how many decisions the log keeps.</summary>
     public int DecisionLogCap { get; set; } = 2000;
 
+    /// <summary>Gets or sets the secret-store reference for the TMDB Read Access Token (P7.S7).</summary>
+    [MaxLength(64)]
+    public string? TmdbReadAccessTokenRef { get; set; }
+
+    /// <summary>Gets or sets the discovery settings revision.</summary>
+    public int DiscoveryRevision { get; set; } = 1;
+
+    /// <summary>Gets or sets the discovery revision the last passing TMDB test verified.</summary>
+    public int? DiscoveryVerifiedRevision { get; set; }
+
+    /// <summary>Gets or sets when the TMDB test last passed.</summary>
+    public DateTime? DiscoveryVerifiedAt { get; set; }
+
+    /// <summary>
+    /// Gets or sets where seed protection reads Transmission from: <c>acquisitionClient</c> (the selected download
+    /// client, PHASE7 default 12) or <c>separate</c> (its own endpoint below).
+    /// </summary>
+    [MaxLength(32)]
+    public string SeedProtectionSource { get; set; } = SeedProtectionSources.AcquisitionClient;
+
+    /// <summary>Gets or sets the separate seed-protection RPC endpoint.</summary>
+    [MaxLength(2048)]
+    public string? SeedProtectionRpcUrl { get; set; }
+
+    /// <summary>Gets or sets the separate seed-protection RPC username.</summary>
+    [MaxLength(256)]
+    public string? SeedProtectionUsername { get; set; }
+
+    /// <summary>Gets or sets the secret-store reference for the separate seed-protection password.</summary>
+    [MaxLength(64)]
+    public string? SeedProtectionPasswordRef { get; set; }
+
+    /// <summary>Gets or sets the seed-protection settings revision.</summary>
+    public int SeedProtectionRevision { get; set; } = 1;
+
+    /// <summary>Gets or sets the revision of the XML-held retention settings edited through the typed endpoint.</summary>
+    public int RetentionRevision { get; set; } = 1;
+
+    /// <summary>Gets or sets when the first-run setup was first observed complete (P7.S10).</summary>
+    public DateTime? SetupCompletedAt { get; set; }
+
+    /// <summary>Gets or sets when an administrator dismissed the first-run setup banner.</summary>
+    public DateTime? SetupDismissedAt { get; set; }
+
     /// <summary>
     /// Gets or sets a value indicating whether episodes may be upgraded or gain versions. Off until the host is shown to
     /// group episode versions (PHASE6 M1 / open question 5).
@@ -288,6 +332,16 @@ public sealed class AcquisitionSettings
 
     /// <summary>Gets or sets the automation settings revision.</summary>
     public int AutomationRevision { get; set; } = 1;
+}
+
+/// <summary>Where seed protection reads Transmission state from (P7.S7).</summary>
+public static class SeedProtectionSources
+{
+    /// <summary>The selected acquisition download client.</summary>
+    public const string AcquisitionClient = "acquisitionClient";
+
+    /// <summary>A separately configured endpoint.</summary>
+    public const string Separate = "separate";
 }
 
 /// <summary>Documented import defaults.</summary>

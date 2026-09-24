@@ -6,14 +6,43 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using MediaBrowser.Common.Net;
 using JellyfinMod.Data;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace JellyfinMod.Services;
 
 /// <summary>Fetches metadata from TMDB without exposing credentials or remote response bodies.</summary>
+/// <remarks>
+/// The Read Access Token lives in the SQLite settings row since P7.S7. A value or reference still on the XML
+/// configuration wins, because it is newer: the one-time import moves it at the next startup.
+/// </remarks>
 public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfiguration> configuration, ILogger<TmdbClient> logger,
-    AcquisitionSecretStore? secrets = null)
+    AcquisitionSecretStore? secrets = null, Func<ModDbContext>? database = null, TmdbEndpoint? endpoint = null)
 {
+    /// <summary>
+    /// Checks the configured credential against TMDB without reading any title (P7.S7 Discovery Test).
+    /// </summary>
+    /// <returns>A stable code and a sentence; never the credential or a raw exception.</returns>
+    public async Task<(string Code, string Message)> TestAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var _ = await GetAsync("configuration", cancellationToken).ConfigureAwait(false);
+            return ("ok", "TMDB accepted the token.");
+        }
+        catch (TmdbException failure)
+        {
+            return (failure.Code, failure.Code switch
+            {
+                "not_configured" => "No TMDB Read Access Token is saved yet.",
+                "unauthorized" => "TMDB rejected the token. Check it was copied completely.",
+                "timeout" => "TMDB did not answer in time.",
+                "unreachable" => "TMDB could not be reached from this server.",
+                _ => "TMDB answered with an error."
+            });
+        }
+    }
+
     /// <summary>Fetches a movie or series and its regional content certifications.</summary>
     public async Task<TmdbMetadata> GetDetailsAsync(string mediaType, int id, CancellationToken cancellationToken)
     {
@@ -84,6 +113,14 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         return episodes.OrderBy(episode => episode.SeasonNumber).ThenBy(episode => episode.EpisodeNumber).ToArray();
     }
 
+    private async Task<string?> StoredTokenRefAsync(CancellationToken cancellationToken)
+    {
+        if (database is null) return null;
+        await using var context = database();
+        return await context.AcquisitionSettings.AsNoTracking().Where(row => row.Id == AcquisitionSettings.SingletonId)
+            .Select(row => row.TmdbReadAccessTokenRef).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task<string> ReadSecretAsync(string? reference, CancellationToken cancellationToken) =>
         secrets is null ? string.Empty : await secrets.GetAsync(reference, cancellationToken).ConfigureAwait(false) ?? string.Empty;
 
@@ -92,25 +129,30 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         var config = configuration();
         // Saved credentials live in the secret store; a value on the configuration object is used as given.
         var token = (config.TmdbReadAccessToken.Length > 0 ? config.TmdbReadAccessToken
-            : await ReadSecretAsync(config.TmdbReadAccessTokenRef, cancellationToken).ConfigureAwait(false)).Trim();
+            : await ReadSecretAsync(config.TmdbReadAccessTokenRef ?? await StoredTokenRefAsync(cancellationToken).ConfigureAwait(false),
+                cancellationToken).ConfigureAwait(false)).Trim();
         var key = (config.TmdbApiKey.Length > 0 ? config.TmdbApiKey
             : await ReadSecretAsync(config.TmdbApiKeyRef, cancellationToken).ConfigureAwait(false)).Trim();
         if (token.Length == 0 && key.Length == 0)
-            throw new TmdbException("An administrator must configure a TMDB API Read Access Token or API key.", HttpStatusCode.ServiceUnavailable);
+            throw new TmdbException("An administrator must configure a TMDB API Read Access Token or API key.", HttpStatusCode.ServiceUnavailable,
+                "not_configured");
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(15));
         try
         {
             var credential = key.Length > 0 ? $"&api_key={Uri.EscapeDataString(key)}" : string.Empty;
             var separator = path.Contains('?') ? "&" : "?";
-            using var request = new HttpRequestMessage(HttpMethod.Get, $"https://api.themoviedb.org/3/{path}{separator}language=en-US{credential}");
+            var root = (endpoint?.BaseAddress ?? TmdbEndpoint.Default).ToString().TrimEnd('/');
+            using var request = new HttpRequestMessage(HttpMethod.Get, $"{root}/3/{path}{separator}language=en-US{credential}");
             if (token.Length > 0) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             using var response = await clients.CreateClient(NamedClient.Default).SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
             if (!response.IsSuccessStatusCode)
             {
                 logger.LogWarning("TMDB request {Path} returned {StatusCode}", path.Split('?', 2)[0], (int)response.StatusCode);
                 throw new TmdbException(response.StatusCode == HttpStatusCode.NotFound ? "Title not found on TMDB." : "TMDB is temporarily unavailable.",
-                    response.StatusCode == HttpStatusCode.NotFound ? HttpStatusCode.NotFound : HttpStatusCode.BadGateway);
+                    response.StatusCode == HttpStatusCode.NotFound ? HttpStatusCode.NotFound : HttpStatusCode.BadGateway,
+                    response.StatusCode == HttpStatusCode.Unauthorized ? "unauthorized"
+                    : response.StatusCode == HttpStatusCode.NotFound ? "not_found" : "tmdb_error");
             }
 
             await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
@@ -124,12 +166,12 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new TmdbException("TMDB request timed out.", HttpStatusCode.GatewayTimeout);
+            throw new TmdbException("TMDB request timed out.", HttpStatusCode.GatewayTimeout, "timeout");
         }
         catch (HttpRequestException error)
         {
-            logger.LogWarning(error, "TMDB request {Path} failed", path.Split('?', 2)[0]);
-            throw new TmdbException("TMDB is temporarily unavailable.", HttpStatusCode.BadGateway);
+            logger.LogWarning("TMDB request {Path} failed: {ErrorType}", path.Split('?', 2)[0], error.GetType().Name);
+            throw new TmdbException("TMDB is temporarily unavailable.", HttpStatusCode.BadGateway, "unreachable");
         }
         catch (JsonException)
         {
@@ -223,8 +265,18 @@ public sealed record TmdbSeason(
     [property: JsonPropertyName("posterPath")] string? PosterPath);
 
 /// <summary>A sanitized failure safe to return to an authenticated client.</summary>
-public sealed class TmdbException(string message, HttpStatusCode statusCode) : Exception(message)
+public sealed class TmdbException(string message, HttpStatusCode statusCode, string code = "tmdb_error") : Exception(message)
 {
     /// <summary>Gets the HTTP status to return.</summary>
     public HttpStatusCode StatusCode { get; } = statusCode;
+
+    /// <summary>Gets the stable failure code a connection test reports.</summary>
+    public string Code { get; } = code;
+}
+
+/// <summary>Where TMDB is reached. Only an integration host changes it, to point at its boundary server.</summary>
+public sealed record TmdbEndpoint(Uri BaseAddress)
+{
+    /// <summary>The public TMDB API.</summary>
+    public static Uri Default { get; } = new("https://api.themoviedb.org/");
 }

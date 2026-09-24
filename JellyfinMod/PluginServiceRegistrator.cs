@@ -41,7 +41,9 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<CatalogBackfillRunner>();
         services.AddTransient<JellyfinItemReconciliationRunner>();
         services.AddTransient<RetentionPolicyService>();
-        services.AddSingleton(_ => new RetentionConfigurationSource(() => Plugin.Instance!.Configuration));
+        services.AddSingleton(_ => new RetentionConfigurationSource(() => Plugin.Instance!.Configuration,
+            configuration => Plugin.Instance!.UpdateConfiguration(configuration)));
+        services.AddSingleton(provider => new SettingsXmlImportSource(provider.GetRequiredService<RetentionConfigurationSource>()));
         services.AddTransient<RetentionCompletionService>();
         services.AddTransient<RetentionEvaluator>();
         services.AddTransient<RetentionPreviewService>();
@@ -55,7 +57,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton(TimeProvider.System);
         services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
             () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>(),
-            provider.GetRequiredService<AcquisitionSecretStore>()));
+            provider.GetRequiredService<AcquisitionSecretStore>(), () => provider.GetRequiredService<ModDbContext>()));
         AcquisitionServices.Add(services, () => Plugin.Instance!.DataPath);
         ImportServices.Add(services);
         AutomationServices.Add(services);

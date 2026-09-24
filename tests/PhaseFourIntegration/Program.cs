@@ -362,8 +362,8 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         settings = await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Acquisition",
             new { enabled = true, downloadClientId = clientId, defaultQualityProfileId = hdId, revision = 1 }), 200, "Administrator enables grabs");
         Assert(settings.GetProperty("enabled").GetBoolean() && settings.GetProperty("ready").GetBoolean() &&
-            settings.GetProperty("holdSeconds").GetInt32() == 2 && !settings.GetProperty("seedProtectionMatchesClient").GetBoolean(),
-            "Enabled acquisition reports its hold and that seed protection does not read this client yet");
+            settings.GetProperty("holdSeconds").GetInt32() == 2 && settings.GetProperty("seedProtectionMatchesClient").GetBoolean(),
+            "Enabled acquisition reports its hold, and with no XML endpoint seed protection reads the selected client (P7.S7 default 12)");
         configuration.TransmissionRpcUrl = transmission.Endpoint.ToString();
         settings = await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition settings read");
         Assert(settings.GetProperty("seedProtectionMatchesClient").GetBoolean(), "Seed protection reading the same Transmission is reported: " + settings.GetRawText());

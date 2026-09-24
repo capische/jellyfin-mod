@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../JellyfinMod/JellyfinMod.csproj" />
+    <!-- The same real Kestrel host and boundary servers as Phase 4, linked rather than copied. -->
+    <Compile Include="../PhaseFourIntegration/TestHost.cs" Link="TestHost.cs" />
+    <Compile Include="../PhaseFourIntegration/Boundaries.cs" Link="Boundaries.cs" />
+  </ItemGroup>
+</Project>

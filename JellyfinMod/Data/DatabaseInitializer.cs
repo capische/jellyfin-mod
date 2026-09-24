@@ -42,6 +42,7 @@ public sealed class DatabaseInitializer(
                 (entry.MetadataJson == null && entry.JellyfinItemId == null), cancellationToken).ConfigureAwait(false);
             if (quarantined > 0)
                 logger.LogWarning("JellyfinMod preserved {Count} legacy entries without library scope or metadata. They are quarantined from browsing; an administrator must repair these records before they can be shown. No destination library was guessed.", quarantined);
+            await ImportXmlSettingsAsync(scope.ServiceProvider, database, cancellationToken).ConfigureAwait(false);
             IsReady = true;
             logger.LogInformation("JellyfinMod database migrations applied");
         }
@@ -49,6 +50,27 @@ public sealed class DatabaseInitializer(
         {
             // A plugin database failure must not prevent Jellyfin and its library from starting.
             logger.LogError(exception, "JellyfinMod database initialization failed; plugin health is unavailable");
+        }
+    }
+
+    /// <summary>
+    /// Moves discovery and seed-protection settings out of the XML configuration (P7.S7). A failure here is
+    /// logged and leaves both stores as they were: readers still honour a value left in the XML.
+    /// </summary>
+    private async Task ImportXmlSettingsAsync(IServiceProvider services, ModDbContext database, CancellationToken cancellationToken)
+    {
+        if (services.GetService<JellyfinMod.Services.SettingsXmlImportSource>() is not { } source ||
+            services.GetService<JellyfinMod.Services.AcquisitionSecretStore>() is not { } secrets)
+            return;
+        try
+        {
+            if (await JellyfinMod.Services.SettingsXmlImport.RunAsync(database, source.Configuration.Current, secrets, logger, cancellationToken)
+                    .ConfigureAwait(false))
+                source.Configuration.Save();
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            logger.LogError(exception, "JellyfinMod could not move settings out of the plugin XML; they stay where they are");
         }
     }
 

@@ -252,6 +252,10 @@
         <form data-save="discovery">
           <div class="jfmod-group">
             <div data-secret-slot="TmdbReadAccessToken"></div>
+            <div class="jfmod-testline">
+              <button is="emby-button" type="button" class="raised jfmod-btn-sm" id="TestDiscovery"><span>Test</span></button>
+              <span class="fieldDescription">Asks TMDB whether it accepts the saved token. Save a new token first.</span>
+            </div>
             <div class="fieldDescription jfmod-lead">
               Recommended. Used for JellyfinMod discovery only; Jellyfin's own TMDb metadata provider
               keeps its separate key, so a discovery result and the item Jellyfin later creates can
@@ -546,13 +550,25 @@
           <div class="jfmod-group">
             <h3 class="jfmod-grouptitle">Seed protection</h3>
             <div data-notice="seedprotection"></div>
-            <div class="inputContainer">
-              <input is="emby-input" type="url" id="TransmissionRpcUrl" autocomplete="off" label="Transmission RPC URL" />
-              <div class="fieldDescription">Read-only seed checks. Leave blank to block reclamation, because non-torrent status cannot be verified.</div>
+            <div class="selectContainer">
+              <select is="emby-select" id="SeedProtectionSource" label="Read seeding state from">
+                <option value="acquisitionClient">The download client</option>
+                <option value="separate">A separate Transmission</option>
+              </select>
+              <div class="fieldDescription">Read-only seed checks, so a file that is still seeding is never reclaimed. Without one, reclamation is blocked.</div>
             </div>
-            <div class="jfmod-two">
-              <div class="inputContainer"><input is="emby-input" type="text" id="TransmissionUsername" autocomplete="off" label="Username" /></div>
-              <div data-secret-slot="TransmissionPassword"></div>
+            <div id="SeedProtectionSeparate">
+              <div class="inputContainer">
+                <input is="emby-input" type="url" id="TransmissionRpcUrl" autocomplete="off" label="Transmission RPC URL" />
+              </div>
+              <div class="jfmod-two">
+                <div class="inputContainer"><input is="emby-input" type="text" id="TransmissionUsername" autocomplete="off" label="Username" /></div>
+                <div data-secret-slot="TransmissionPassword"></div>
+              </div>
+            </div>
+            <div class="jfmod-testline">
+              <button is="emby-button" type="button" class="raised jfmod-btn-sm" id="TestSeedProtection"><span>Test</span></button>
+              <span class="fieldDescription" id="SeedProtectionEffective"></span>
             </div>
           </div>
           <button is="emby-button" type="submit" class="jfmod-visually-hidden">Save</button>
@@ -798,7 +814,7 @@
       var state = {
         config: null, acquisition: null, indexers: [], clients: [], profiles: [], client: null,
         mappings: [], importSettings: null, automation: null, automationStatus: null, decisions: [],
-        iface: null, health: null, preview: null, lastRun: null,
+        iface: null, health: null, preview: null, lastRun: null, discovery: null, seed: null, retention: null,
         reconciliation: null, conflicts: [], orphans: [], users: [], failed: {}, clearSecrets: {}
       };
 
@@ -1088,10 +1104,14 @@
         if (state.failed[id]) return { kind: 'off', words: 'Unavailable in this plugin build' };
         switch (id) {
           case 'discovery': {
-            var config = state.config;
-            if (!config) return { kind: 'off', words: 'Not loaded' };
-            if (config.TmdbReadAccessTokenRef) return { kind: 'ok', words: 'Read access token configured' };
-            if (config.TmdbApiKeyRef) return { kind: 'warn', words: 'Only the v3 API key is configured' };
+            var discovery = state.discovery;
+            if (!discovery) return { kind: 'off', words: 'Not loaded' };
+            if (discovery.tokenConfigured) {
+              return discovery.verified
+                ? { kind: 'ok', words: 'Read access token configured · tested ' + when(discovery.verifiedAt) }
+                : { kind: 'warn', words: 'Read access token configured · not tested since it changed' };
+            }
+            if (discovery.apiKeyConfigured) return { kind: 'warn', words: 'Only the v3 API key is configured' };
             return { kind: 'warn', words: 'No TMDB credential configured' };
           }
           case 'client': {
@@ -1145,11 +1165,12 @@
             };
           }
           case 'retention': {
-            var configuration = state.config;
-            if (!configuration) return { kind: 'off', words: 'Not loaded' };
-            if (!configuration.RetentionEnabled) return { kind: 'off', words: 'Off · nothing is deleted' };
-            var base = 'On · ' + configuration.ReclaimAfterDays + ' days after it is finished';
-            if (!configuration.TransmissionRpcUrl) return { kind: 'warn', words: base + ' · no seed check, so reclamation is blocked' };
+            var retention = state.retention;
+            if (!retention) return { kind: 'off', words: 'Not loaded' };
+            if (!retention.enabled) return { kind: 'off', words: 'Off · nothing is deleted' };
+            var base = 'On · ' + retention.reclaimAfterDays + ' days after it is finished';
+            if (retention.selectedUserMissing) return { kind: 'err', words: base + ' · the selected user is unavailable' };
+            if (!state.seed || !state.seed.effectiveRpcUrl) return { kind: 'warn', words: base + ' · no seed check, so reclamation is blocked' };
             if (state.acquisition && !state.acquisition.seedProtectionMatchesClient && state.acquisition.downloadClientId) {
               return { kind: 'warn', words: base + ' · seed protection points elsewhere' };
             }
@@ -1428,24 +1449,35 @@
       // ---------------------------------------------------------------------
       function renderDiscovery() {
         var config = state.config || {};
-        renderSecret('TmdbReadAccessToken', 'TMDB API Read Access Token', !!config.TmdbReadAccessTokenRef);
+        var discovery = state.discovery || {};
+        renderSecret('TmdbReadAccessToken', 'TMDB API Read Access Token', !!discovery.tokenConfigured);
         renderSecret('TmdbApiKey', 'TMDB API key (v3)', !!config.TmdbApiKeyRef);
+        refuse($('#TestDiscovery'), discovery.tokenConfigured || discovery.apiKeyConfigured ? null : 'Save a token before testing it.');
         var summary = summarise('discovery');
         setState($('[data-secstate="discovery"]'), summary.kind, summary.words);
-        text($('[data-savemeta="discovery"]'), 'Stored in the plugin configuration.');
+        text($('[data-savemeta="discovery"]'), state.discovery ? 'Revision ' + state.discovery.revision + '.' : '');
       }
 
       function saveDiscovery() {
         Dashboard.showLoadingMsg();
-        return ApiClient.getPluginConfiguration(pluginId).then(function (config) {
-          config.TmdbReadAccessToken = secretXmlValue('TmdbReadAccessToken');
-          config.TmdbApiKey = secretXmlValue('TmdbApiKey');
-          return ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
-            Dashboard.processPluginConfigurationUpdateResult(result);
-            forgetSecrets(['TmdbReadAccessToken', 'TmdbApiKey']);
-            clearNotice('discovery');
-            return loadAll();
+        // The token goes through the typed, revisioned endpoint (P7.S7); the optional v3 key is still XML.
+        var token = secretChange('TmdbReadAccessToken');
+        var key = secretXmlValue('TmdbApiKey');
+        var typed = token.action === 'unchanged' ? Promise.resolve() : settingsRequest('PATCH', 'Discovery', {
+          token: token, revision: state.discovery ? state.discovery.revision : null
+        });
+        return typed.then(function () {
+          if (!key) return null;
+          return ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+            config.TmdbApiKey = key;
+            return ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
+              Dashboard.processPluginConfigurationUpdateResult(result);
+            });
           });
+        }).then(function () {
+          forgetSecrets(['TmdbReadAccessToken', 'TmdbApiKey']);
+          clearNotice('discovery');
+          return loadAll();
         }).catch(function (error) { return fail('discovery', error); });
       }
 
@@ -2207,23 +2239,36 @@
         $('#RetentionSelectedUserId').disabled = !visible;
       }
       $('#RetentionWatchedUserMode').addEventListener('change', updateSelectedUserVisibility);
+      function updateSeedSourceVisibility() {
+        $('#SeedProtectionSeparate').hidden = $('#SeedProtectionSource').value !== 'separate';
+      }
+      $('#SeedProtectionSource').addEventListener('change', updateSeedSourceVisibility);
 
       function watchedUserModeValue(value) {
-        if (value === 1 || value === 'SelectedUser') return '1';
-        if (value === 2 || value === 'AnyUser') return '2';
+        if (value === 1 || value === 'SelectedUser' || value === 'selectedUser') return '1';
+        if (value === 2 || value === 'AnyUser' || value === 'anyUser') return '2';
         return '0';
       }
 
       function renderRetention() {
-        var config = state.config;
-        if (!config) return;
-        $('#RetentionEnabled').checked = !!config.RetentionEnabled;
-        $('#ReclaimAfterDays').value = config.ReclaimAfterDays;
-        $('#RetentionWatchedUserMode').value = watchedUserModeValue(config.RetentionWatchedUserMode);
-        $('#ExemptFavourites').checked = !!config.ExemptFavourites;
-        $('#TransmissionRpcUrl').value = config.TransmissionRpcUrl || '';
-        $('#TransmissionUsername').value = config.TransmissionUsername || '';
-        renderSecret('TransmissionPassword', 'Password', !!config.TransmissionPasswordRef);
+        var retention = state.retention;
+        var seed = state.seed;
+        if (!retention || !seed) {
+          notice('retention', 'warn', 'Retention settings are unavailable in this plugin build.');
+          return;
+        }
+        $('#RetentionEnabled').checked = !!retention.enabled;
+        $('#ReclaimAfterDays').value = retention.reclaimAfterDays;
+        $('#RetentionWatchedUserMode').value = watchedUserModeValue(retention.watchedUserMode);
+        $('#ExemptFavourites').checked = !!retention.exemptFavourites;
+        $('#SeedProtectionSource').value = seed.source;
+        $('#TransmissionRpcUrl').value = seed.rpcUrl || '';
+        $('#TransmissionUsername').value = seed.username || '';
+        renderSecret('TransmissionPassword', 'Password', !!seed.passwordConfigured);
+        updateSeedSourceVisibility();
+        text($('#SeedProtectionEffective'), seed.effectiveRpcUrl
+          ? 'Reads ' + seed.effectiveRpcUrl + (seed.source === 'acquisitionClient' ? ' with the download client\'s account.' : '.')
+          : 'Nothing to read yet: select a download client or enter a separate Transmission.');
         renderUsers();
         updateSelectedUserVisibility();
 
@@ -2245,19 +2290,17 @@
           : 'No retention run has been recorded yet.');
 
         // Seed protection: the connection retention reads to decide a file is not still seeding.
-        if (!config.TransmissionRpcUrl) {
+        if (!seed.effectiveRpcUrl) {
           notice('seedprotection', 'warn',
             'No seed-check URL. Reclamation is blocked for anything whose torrent status cannot be verified, rather than deleting a file that is still seeding.');
         } else if (state.acquisition && state.acquisition.downloadClientId && !state.acquisition.seedProtectionMatchesClient) {
           notice('seedprotection', 'warn',
             "This URL differs from the download client's. Grabbed torrents are not seed-protected until they match.",
-            "Use the download client's URL", function () {
-              var client = state.clients.filter(function (candidate) { return candidate.id === state.acquisition.downloadClientId; })[0];
-              if (!client) return;
-              $('#TransmissionRpcUrl').value = client.baseUrl;
-              $('#TransmissionUsername').value = client.username || '';
-              notice('seedprotection', 'ok', "Filled in from the download client. Save to apply it; if the client has a password, set it here too.");
-              $('#TransmissionRpcUrl').focus();
+            "Use the download client", function () {
+              $('#SeedProtectionSource').value = 'acquisitionClient';
+              updateSeedSourceVisibility();
+              notice('seedprotection', 'ok', "Seed protection will read the download client with its own account. Save to apply it.");
+              $('#SeedProtectionSource').focus();
             });
         } else {
           clearNotice('seedprotection');
@@ -2265,19 +2308,19 @@
 
         var summary = summarise('retention');
         setState($('[data-secstate="retention"]'), summary.kind, summary.words);
-        text($('[data-savemeta="retention"]'), 'Stored in the plugin configuration.');
+        text($('[data-savemeta="retention"]'), 'Retention revision ' + retention.revision + ' · seed protection revision ' + seed.revision + '.');
       }
 
       // A disabled or deleted Selected user stays stored until an administrator picks another; the
       // select never falls back to the first enabled user (P3.T13).
       function renderUsers() {
         var select = $('#RetentionSelectedUserId');
-        var configured = ((state.config && state.config.RetentionSelectedUserId) || '').replace(/-/g, '').toLowerCase();
+        var configured = ((state.retention && state.retention.selectedUserId) || '').replace(/-/g, '').toLowerCase();
         select.innerHTML = '';
         var enabled = state.users.filter(function (user) { return !user.Policy || !user.Policy.IsDisabled; });
         if (configured && !enabled.some(function (user) { return user.Id.replace(/-/g, '').toLowerCase() === configured; })) {
           var missing = document.createElement('option');
-          missing.value = state.config.RetentionSelectedUserId;
+          missing.value = state.retention.selectedUserId;
           missing.textContent = 'Unavailable user';
           missing.disabled = true;
           missing.selected = true;
@@ -2300,22 +2343,29 @@
           selected.focus();
           return Promise.resolve();
         }
+        if (!state.retention || !state.seed) return Promise.resolve();
         Dashboard.showLoadingMsg();
-        return ApiClient.getPluginConfiguration(pluginId).then(function (config) {
-          config.RetentionEnabled = $('#RetentionEnabled').checked;
-          config.ReclaimAfterDays = parseInt($('#ReclaimAfterDays').value, 10);
-          config.RetentionWatchedUserMode = parseInt(mode.value, 10);
-          config.RetentionSelectedUserId = mode.value === '1' ? selected.value : null;
-          config.ExemptFavourites = $('#ExemptFavourites').checked;
-          config.TransmissionRpcUrl = $('#TransmissionRpcUrl').value.trim();
-          config.TransmissionUsername = $('#TransmissionUsername').value;
-          config.TransmissionPassword = secretXmlValue('TransmissionPassword');
-          return ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
-            Dashboard.processPluginConfigurationUpdateResult(result);
-            forgetSecrets(['TransmissionPassword']);
-            clearNotice('retention');
-            return loadAll();
+        // Both halves go through the typed, revisioned endpoints (P7.S7); each 409 says which one refused.
+        var source = $('#SeedProtectionSource').value;
+        return settingsRequest('PATCH', 'Retention', {
+          enabled: $('#RetentionEnabled').checked,
+          reclaimAfterDays: parseInt($('#ReclaimAfterDays').value, 10),
+          watchedUserMode: ['allUsers', 'selectedUser', 'anyUser'][parseInt(mode.value, 10)],
+          selectedUserId: mode.value === '1' ? selected.value : null,
+          exemptFavourites: $('#ExemptFavourites').checked,
+          revision: state.retention.revision
+        }).then(function () {
+          return settingsRequest('PATCH', 'SeedProtection', {
+            source: source,
+            rpcUrl: source === 'separate' ? $('#TransmissionRpcUrl').value.trim() : null,
+            username: source === 'separate' ? $('#TransmissionUsername').value : null,
+            password: source === 'separate' ? secretChange('TransmissionPassword') : { action: 'unchanged', value: null },
+            revision: state.seed.revision
           });
+        }).then(function () {
+          forgetSecrets(['TransmissionPassword']);
+          clearNotice('retention');
+          return loadAll();
         }).catch(function (error) { return fail('retention', error); });
       }
 
@@ -2638,7 +2688,10 @@
           optional(modRequest('GET', 'Retention/Runs/Latest'), 'lastRun', null),
           optional(modRequest('GET', 'Reconciliation/Latest'), 'reconciliation', null),
           optional(modRequest('GET', 'Reconciliation/Conflicts'), 'conflicts', []),
-          optional(modRequest('GET', 'Reconciliation/Orphans'), 'orphans', [])
+          optional(modRequest('GET', 'Reconciliation/Orphans'), 'orphans', []),
+          optional(settingsRequest('GET', 'Discovery'), 'discovery', null),
+          optional(settingsRequest('GET', 'SeedProtection'), 'seed', null),
+          optional(settingsRequest('GET', 'Retention'), 'retention', null)
         ]).then(function (values) {
           state.config = values[0];
           state.users = values[1] || [];
@@ -2657,6 +2710,9 @@
           state.reconciliation = values[14];
           state.conflicts = values[15] || [];
           state.orphans = values[16] || [];
+          state.discovery = values[17];
+          state.seed = values[18];
+          state.retention = values[19];
 
           var chosen = state.client
             ? state.clients.filter(function (client) { return client.id === state.client.id; })[0]
@@ -2729,6 +2785,25 @@
             return loadAll();
           }, function (error) { return fail('client', error); });
         });
+      });
+      function connectionTest(control, path, section) {
+        if (refused(control)) return;
+        busy(control, true, 'Testing…');
+        settingsRequest('POST', path).then(function (result) {
+          busy(control, false);
+          notice(section, result.ok ? 'ok' : 'err', result.message + ' (' + result.code + ')' +
+            (result.version ? ' · Transmission ' + result.version : ''));
+          return loadAll();
+        }, function (error) {
+          busy(control, false);
+          return fail(section, error);
+        });
+      }
+      $('#TestDiscovery').addEventListener('click', function (event) {
+        connectionTest(event.currentTarget, 'Discovery/Test', 'discovery');
+      });
+      $('#TestSeedProtection').addEventListener('click', function (event) {
+        connectionTest(event.currentTarget, 'SeedProtection/Test', 'seedprotection');
       });
       $('#TestClient').addEventListener('click', function (event) {
         var control = event.currentTarget;
