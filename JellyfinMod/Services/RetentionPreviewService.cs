@@ -248,14 +248,11 @@ public sealed class RetentionPreviewService(
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.VersionKept, evaluation?.Deadline);
         if (replacement)
         {
-            // An upgrade replacement does not wait for the retention window, but it does wait for the watched rule
-            // (RET-R2, 2026-09-24): an upgrade never deletes a version nobody has watched. Keep still protects it.
+            // An upgrade replaces the older version straight away, without the watched rule or the window (PHASE6 M5,
+            // confirmed by the user as PHASE10 Q10 on 2026-09-24). Keep, a per-file Keep, seeding and read-only media
+            // still protect it.
             if (target.Kept)
                 return PreviewCandidate.Blocked(target, RetentionEvaluationReasons.Kept, evaluation?.Deadline);
-            if (evaluation is null)
-                return PreviewCandidate.Blocked(target, RetentionPreviewReasons.EvaluationMissing, null);
-            if (evaluation.State != RetentionEvaluationStates.Scheduled)
-                return new(target, evaluation.State, evaluation.Reason, evaluation.Deadline, null);
         }
         else
         {
@@ -382,14 +379,14 @@ public sealed class RetentionPreviewService(
                 continue;
             }
 
-            var completion = FileCompletion(candidate, policy, Latest(evaluation.BaselineAt, policy.EnabledAt ?? evaluation.BaselineAt), now);
+            var completion = FileCompletion(candidate, policy, Latest(evaluation.BaselineAt, policy.GraceStartAt ?? evaluation.BaselineAt), now);
             if (completion is not { } completedAt)
             {
                 candidate.Block(RetentionPreviewReasons.MultiEpisodeNotAllDue);
                 continue;
             }
 
-            var eligibleAt = Latest(Latest(completedAt, policy.EnabledAt ?? completedAt), evaluation.BaselineAt);
+            var eligibleAt = Latest(Latest(completedAt, policy.GraceStartAt ?? completedAt), evaluation.BaselineAt);
             var deadline = policy.TestWindowMinutes > 0
                 ? eligibleAt.AddMinutes(policy.TestWindowMinutes)
                 : eligibleAt.AddDays(coveredRows.Append(ownRow).Max(row =>

@@ -25,7 +25,7 @@ public sealed class RetentionLiveCheck(
     /// <param name="policy">The live policy.</param>
     /// <param name="cancellationToken">Cancels the check.</param>
     /// <param name="requireCompletion">
-    /// True for every caller since RET-R2 (2026-09-24): an upgrade replacement also needs the watched rule.
+    /// False for an upgrade replacement (P6.M5, PHASE10 Q10): the watched rule does not apply, every other live protection does.
     /// </param>
     public async Task<string?> BlockReasonAsync(
         RetentionOperation operation,

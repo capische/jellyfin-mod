@@ -44,6 +44,7 @@ public sealed class RetentionPolicyService(ModDbContext database, TimeProvider c
                 TestWindowMinutes = testWindowMinutes,
                 ExemptFavourites = configuration.ExemptFavourites,
                 EnabledAt = configuration.RetentionEnabled ? now : null,
+                FirstEnabledAt = configuration.RetentionEnabled ? now : null,
                 UpdatedAt = now
             };
             database.RetentionPolicySnapshots.Add(snapshot);
@@ -59,7 +60,12 @@ public sealed class RetentionPolicyService(ModDbContext database, TimeProvider c
             snapshot.ExemptFavourites != configuration.ExemptFavourites;
         if (!changed) return snapshot;
 
-        if (!snapshot.Enabled && configuration.RetentionEnabled) snapshot.EnabledAt = now;
+        if (!snapshot.Enabled && configuration.RetentionEnabled)
+        {
+            snapshot.EnabledAt = now;
+            snapshot.FirstEnabledAt ??= now;
+        }
+
         if (snapshot.Enabled && !configuration.RetentionEnabled) snapshot.EnabledAt = null;
         snapshot.Enabled = configuration.RetentionEnabled;
         snapshot.WatchedUserMode = configuration.RetentionWatchedUserMode;

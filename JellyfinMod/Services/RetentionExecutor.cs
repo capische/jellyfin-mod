@@ -109,7 +109,7 @@ public sealed class RetentionExecutor(
 
     /// <summary>
     /// Replaces the superseded version of a completed upgrade (P6.M5) through the same executor, locks and checks as a
-    /// reclaim, except that the retention window does not apply; the watched rule does (RET-R2): storage identity, the shared-inode group, active sessions,
+    /// reclaim, except that the watched rule and the window do not apply (PHASE10 Q10): a per-file Keep, storage identity, the shared-inode group, active sessions,
     /// resume, favourites, Keep and seeding all still protect the file. The operation's provenance is
     /// <c>upgrade_replaced</c>, so reconciliation attributes the disappearance to the plugin.
     /// </summary>
@@ -247,8 +247,8 @@ public sealed class RetentionExecutor(
         Guid requestedBindingId,
         CancellationToken cancellationToken)
     {
-        // An upgrade replacement skips only the retention window; the watched rule (RET-R2) and every physical check
-        // below still run (P6.M5).
+        // An upgrade replacement skips the watched rule and the window (P6.M5, PHASE10 Q10); every physical check below
+        // still runs.
         var replacement = operations.All(operation => operation.Provenance == RetentionProvenances.UpgradeReplaced);
         var currentPreview = await preview.PreviewAsync(cancellationToken,
             replacement ? operations.Select(operation => operation.BindingId).ToHashSet() : null).ConfigureAwait(false);
@@ -287,7 +287,7 @@ public sealed class RetentionExecutor(
         // playing another version. Re-read live Jellyfin state for every affected target last.
         foreach (var operation in operations)
         {
-            var liveReason = await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken, requireCompletion: true)
+            var liveReason = await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken, requireCompletion: !replacement)
                 .ConfigureAwait(false);
             if (liveReason is not null)
                 return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,

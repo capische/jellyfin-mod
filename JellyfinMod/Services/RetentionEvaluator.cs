@@ -278,10 +278,11 @@ public sealed class RetentionEvaluator(
             }
         }
 
-        // Only a new watch counts for an episode (PHASE10 Q1, answered 2026-09-24): a completion must carry Jellyfin's own
-        // last-played instant at or after the later of when the episode was first tracked and when retention was last
-        // enabled, so nothing watched before per-episode retention existed, or while it was off, ever becomes due.
-        var freshFloor = target.EpisodeId.HasValue && policy.EnabledAt is { } enabledAt
+        // Only a new watch counts for an episode (PHASE10 Q1 and Q9, answered 2026-09-24): a completion must carry
+        // Jellyfin's own last-played instant at or after the later of when the episode was first tracked and when
+        // retention was first ever enabled, so nothing watched before per-episode retention existed becomes due. A later
+        // switch-off and switch-on moves nothing.
+        var freshFloor = target.EpisodeId.HasValue && policy.GraceStartAt is { } enabledAt
             ? Latest(result.BaselineAt, enabledAt)
             : result.BaselineAt;
         var requiresFresh = result.RequiresFreshCompletion || target.EpisodeId.HasValue;
@@ -313,7 +314,10 @@ public sealed class RetentionEvaluator(
         // change recomputes as before and still never shortens the prior deadline.
         if (priorBasis is { } keptBasis && !policyChanged && !accessChanged && keptBasis < completionBasis.Value)
             completionBasis = keptBasis;
-        var eligibleAt = Latest(Latest(completionBasis.Value, policy.EnabledAt ?? now), result.BaselineAt);
+        // Grace starts no earlier than the first switch-on (PHASE10 Q9): switching retention off and on again does not
+        // restart a countdown that was running, and neither does the policy revision that switch bumps.
+        var eligibleAt = Latest(Latest(completionBasis.Value, policy.GraceStartAt ?? now), result.BaselineAt);
+        if (priorState == RetentionEvaluationStates.Disabled) policyChanged = false;
         if (!priorDeadline.HasValue && (accessChanged || policyChanged ||
             (hadPriorEvaluation && priorState != RetentionEvaluationStates.Disabled)))
             eligibleAt = Latest(eligibleAt, now);

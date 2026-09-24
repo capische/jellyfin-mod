@@ -30,6 +30,15 @@ public sealed class RetentionPolicySnapshot
     /// <summary>Gets or sets when the current enabled period began.</summary>
     public DateTime? EnabledAt { get; set; }
 
+    /// <summary>
+    /// Gets or sets when retention was first ever enabled (PHASE10 Q9, 2026-09-24). Switching retention off and on
+    /// again never moves it, so a later switch-on neither moves the episode floor nor restarts a running countdown.
+    /// </summary>
+    public DateTime? FirstEnabledAt { get; set; }
+
+    /// <summary>Gets the instant grace starts from at the earliest: the first switch-on, else the current one.</summary>
+    public DateTime? GraceStartAt => FirstEnabledAt ?? EnabledAt;
+
     /// <summary>Gets or sets when this snapshot was persisted.</summary>
     public DateTime UpdatedAt { get; set; }
 }

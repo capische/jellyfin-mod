@@ -397,9 +397,11 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
             ReclaimAfterDays = 14,
             ExemptFavourites = false
         });
+        // PHASE10 Q9 (2026-09-24): switching retention off and on keeps the countdown that was running; grace still
+        // counts from the first switch-on, with the current per-entry window.
         await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "scheduled" &&
-            evaluation.EligibleAt == clock.GetUtcNow().UtcDateTime && evaluation.Deadline == clock.GetUtcNow().UtcDateTime.AddDays(3),
-            "Re-enable did not start a fresh full per-entry grace period");
+            evaluation.EligibleAt < clock.GetUtcNow().UtcDateTime && evaluation.Deadline == evaluation.EligibleAt!.Value.AddDays(3),
+            "Re-enable restarted the countdown instead of keeping the first switch-on");
 
         // P3.T11: a favourite series is persisted as blocked/favorite_series, and an unresolvable series blocks.
         states[(firstUser.Id, nativeEpisode.Id)] = State(true, 0, clock.GetUtcNow().UtcDateTime);
