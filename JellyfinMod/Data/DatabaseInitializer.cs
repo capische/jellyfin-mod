@@ -54,8 +54,9 @@ public sealed class DatabaseInitializer(
     }
 
     /// <summary>
-    /// Moves discovery and seed-protection settings out of the XML configuration (P7.S7). A failure here is
-    /// logged and leaves both stores as they were: readers still honour a value left in the XML.
+    /// Moves discovery and seed-protection settings out of the XML configuration (P7.S7). A failure is logged;
+    /// the import writes the database first and empties the XML only after that save succeeded, so readers keep
+    /// finding every value in one store or the other, and the next start tries again.
     /// </summary>
     private async Task ImportXmlSettingsAsync(IServiceProvider services, ModDbContext database, CancellationToken cancellationToken)
     {
@@ -64,13 +65,15 @@ public sealed class DatabaseInitializer(
             return;
         try
         {
-            if (await JellyfinMod.Services.SettingsXmlImport.RunAsync(database, source.Configuration.Current, secrets, logger, cancellationToken)
-                    .ConfigureAwait(false))
-                source.Configuration.Save();
+            await JellyfinMod.Services.SettingsXmlImport.RunAsync(database, source.Configuration.Current, source.Configuration.Save,
+                secrets, logger, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            logger.LogError(exception, "JellyfinMod could not move settings out of the plugin XML; they stay where they are");
+            // Log the type only: a provider message may quote a value it was writing.
+            logger.LogError("JellyfinMod could not move the TMDB token and seed-protection settings out of the plugin XML ({Error}); " +
+                "they stay in the XML, where discovery and seed protection keep reading them, and the move is tried again at the next start",
+                exception.GetType().Name);
         }
     }
 

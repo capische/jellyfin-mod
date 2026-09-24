@@ -90,6 +90,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
     secrets.Add(tmdb.Token);
     secrets.Add(transmission.Password);
 
+    // ---- The import's failure paths (REVIEW-2026-09-24 S7-R1, S7-R2, S7-R3) on a database of their own.
+    await ImportFailureScenariosAsync(world, folder, logs, secrets, bodies, tmdb, transmission);
+
     // ---- The pre-Phase-7 XML holds the token reference and a seed-protection endpoint of its own.
     var store = new AcquisitionSecretStore(folder);
     var configuration = new PluginConfiguration
@@ -415,6 +418,219 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         await host.DisposeAsync();
     }
 }
+
+/// <summary>
+/// The XML import never loses a value: a real SQLite failure during the settings save, then a real filesystem
+/// failure during the XML save, then the re-run with the same references in both places, then an address carrying
+/// credentials. Each step restarts a real host against the same database file and XML file.
+/// </summary>
+static async Task ImportFailureScenariosAsync(World world, string folder, CapturingLoggerProvider logs, List<string> secrets,
+    List<string> bodies, TmdbBoundary tmdb, TransmissionBoundary transmission)
+{
+    var dbPath = Path.Combine(folder, "import.db");
+    var xmlPath = Path.Combine(folder, "import-plugin.xml");
+    var serializer = new System.Xml.Serialization.XmlSerializer(typeof(PluginConfiguration));
+    var store = new AcquisitionSecretStore(folder);
+    var token = "tmdb-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+    secrets.Add(token);
+    var xml = new PluginConfiguration
+    {
+        TmdbReadAccessTokenRef = await store.AddAsync(token, default),
+        TransmissionRpcUrl = transmission.Endpoint.ToString(),
+        TransmissionUsername = transmission.Username,
+        TransmissionPasswordRef = await store.AddAsync(transmission.Password, default)
+    };
+    var tokenRef = xml.TmdbReadAccessTokenRef;
+    var passwordRef = xml.TransmissionPasswordRef;
+    void WriteXml()
+    {
+        using var file = File.Create(xmlPath);
+        serializer.Serialize(file, xml);
+    }
+
+    WriteXml();
+    await using (var database = new ModDbContext(dbPath))
+    {
+        await database.Database.MigrateAsync();
+        await database.Database.ExecuteSqlInterpolatedAsync(
+            $"INSERT INTO AcquisitionSettings (Id, Enabled, Revision) VALUES ({AcquisitionSettings.SingletonId}, 0, 1)");
+        // A real SQLite error raised by the engine at the settings write, on the real file: the import's save fails.
+        await database.Database.ExecuteSqlRawAsync(
+            "CREATE TRIGGER jfmod_import_fails BEFORE UPDATE ON AcquisitionSettings BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;");
+    }
+
+    void Configure(IServiceCollection services)
+    {
+        var source = new RetentionConfigurationSource(() => xml, configuration =>
+        {
+            using var file = File.Create(xmlPath);
+            serializer.Serialize(file, configuration);
+        });
+        services.AddSingleton(source);
+        services.AddSingleton(new SettingsXmlImportSource(source));
+        services.AddSingleton(new TmdbEndpoint(tmdb.Address));
+        services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(), () => xml,
+            provider.GetRequiredService<ILogger<TmdbClient>>(), provider.GetRequiredService<AcquisitionSecretStore>(),
+            () => new ModDbContext(dbPath), provider.GetRequiredService<TmdbEndpoint>()));
+    }
+
+    async Task<JsonElement> Get(HttpClient client, string path)
+    {
+        var body = await client.GetStringAsync(path);
+        bodies.Add(body);
+        return Json.Parse(body);
+    }
+
+    async Task<JsonElement> Post(HttpClient client, string path)
+    {
+        using var response = await client.PostAsync(path, null);
+        var body = await response.Content.ReadAsStringAsync();
+        bodies.Add(body);
+        return Json.Parse(body);
+    }
+
+    async Task<AcquisitionSettings> Row()
+    {
+        await using var database = new ModDbContext(dbPath);
+        return await database.AcquisitionSettings.AsNoTracking().SingleAsync();
+    }
+
+    int Failures() => logs.Lines.Count(line => line.Contains("could not move the TMDB token and seed-protection settings", StringComparison.Ordinal));
+    var time = new ShiftedTimeProvider();
+    tmdb.Token = token;
+
+    // ---- 1. The database save fails: nothing anywhere changes, and everything keeps working from the XML.
+    var xmlBytes = await File.ReadAllBytesAsync(xmlPath);
+    var failuresBefore = Failures();
+    var host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(2), xml, Configure);
+    try
+    {
+        Assert(Failures() == failuresBefore + 1, "A failed settings save is logged as a failed move that leaves the values in the XML");
+        Assert(xml.TmdbReadAccessTokenRef == tokenRef && xml.TransmissionRpcUrl == transmission.Endpoint.ToString() &&
+            xml.TransmissionUsername == transmission.Username && xml.TransmissionPasswordRef == passwordRef,
+            "S7-R1: after a failed database save the in-memory configuration still holds the token and seed-protection values");
+        Assert((await File.ReadAllBytesAsync(xmlPath)).SequenceEqual(xmlBytes), "S7-R1: the XML file is byte-identical after a failed database save");
+        Assert(await store.GetAsync(tokenRef, default) == token && await store.GetAsync(passwordRef, default) == transmission.Password,
+            "S7-R1: the secret store still holds both secrets");
+        var row = await Row();
+        Assert(row.TmdbReadAccessTokenRef is null && row.SeedProtectionPasswordRef is null && row.DiscoveryRevision == 1 && row.SeedProtectionRevision == 1,
+            "S7-R1: the settings row is unchanged by the failed save");
+        // The failure was at startup; the running server carries on (a Test records its verification in the row).
+        await using (var database = new ModDbContext(dbPath))
+            await database.Database.ExecuteSqlRawAsync("DROP TRIGGER jfmod_import_fails;");
+        using var admin = host.Client(world.Admin, true);
+        Assert((await Get(admin, "/JellyfinMod/Settings/Discovery")).GetProperty("tokenConfigured").GetBoolean(),
+            "S7-R1: discovery still reports the token configured, read from the XML reference");
+        var test = await Post(admin, "/JellyfinMod/Settings/Discovery/Test");
+        Assert(test.GetProperty("ok").GetBoolean() && tmdb.LastAuthorization == "Bearer " + token,
+            "S7-R1: discovery still works: TMDB receives the XML-referenced token");
+        var seed = await Get(admin, "/JellyfinMod/Settings/SeedProtection");
+        Assert(seed.GetProperty("legacyXmlEndpoint").GetBoolean() && seed.GetProperty("effectiveRpcUrl").GetString() == transmission.Endpoint.ToString(),
+            "S7-R1: seed protection still reads the XML endpoint");
+        Assert((await Post(admin, "/JellyfinMod/Settings/SeedProtection/Test")).GetProperty("ok").GetBoolean(),
+            "S7-R1: the XML endpoint still reaches Transmission with its stored password");
+    }
+    finally
+    {
+        await host.DisposeAsync();
+    }
+
+    // ---- 2. The database save succeeds and the XML save fails (the file's path is a directory): the row holds the
+    //         values, the live configuration is put back as it is on disk, and no secret is removed.
+    File.Delete(xmlPath);
+    Directory.CreateDirectory(xmlPath);
+    failuresBefore = Failures();
+    host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(2), xml, Configure);
+    int discoveryRevision, seedRevision;
+    try
+    {
+        var row = await Row();
+        Assert(Failures() == failuresBefore + 1, "A failed XML save is logged");
+        Assert(row.TmdbReadAccessTokenRef == tokenRef && row.SeedProtectionSource == SeedProtectionSources.Separate &&
+            row.SeedProtectionRpcUrl == transmission.Endpoint.ToString() && row.SeedProtectionPasswordRef == passwordRef &&
+            row.DiscoveryRevision == 2 && row.SeedProtectionRevision == 2,
+            "The database holds both references once its save succeeded");
+        Assert(xml.TmdbReadAccessTokenRef == tokenRef && xml.TransmissionPasswordRef == passwordRef && xml.TransmissionRpcUrl.Length > 0,
+            "A failed XML save puts the live configuration back as it is on disk");
+        Assert(await store.GetAsync(tokenRef, default) == token && await store.GetAsync(passwordRef, default) == transmission.Password,
+            "No secret is removed when the XML could not be saved");
+        (discoveryRevision, seedRevision) = (row.DiscoveryRevision, row.SeedProtectionRevision);
+    }
+    finally
+    {
+        await host.DisposeAsync();
+    }
+
+    Directory.Delete(xmlPath);
+    WriteXml();
+
+    // ---- 3. The re-run finds the same references in the XML and the row (S7-R2): it only clears the XML.
+    host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(2), xml, Configure);
+    try
+    {
+        var row = await Row();
+        Assert(await store.GetAsync(passwordRef, default) == transmission.Password && await store.GetAsync(tokenRef, default) == token,
+            "S7-R2: a re-run with the same references in both places keeps both secrets");
+        Assert(row.TmdbReadAccessTokenRef == tokenRef && row.SeedProtectionPasswordRef == passwordRef &&
+            row.DiscoveryRevision == discoveryRevision && row.SeedProtectionRevision == seedRevision,
+            "S7-R2: the re-run changes nothing in the row and advances no revision");
+        PluginConfiguration onDisk;
+        await using (var file = File.OpenRead(xmlPath))
+            onDisk = (PluginConfiguration)serializer.Deserialize(file)!;
+        Assert(xml.TmdbReadAccessTokenRef is null && xml.TransmissionRpcUrl.Length == 0 && onDisk.TmdbReadAccessTokenRef is null &&
+            onDisk.TransmissionRpcUrl.Length == 0 && onDisk.TransmissionPasswordRef is null,
+            "The re-run empties the XML, in memory and on disk");
+        using var admin = host.Client(world.Admin, true);
+        Assert((await Post(admin, "/JellyfinMod/Settings/SeedProtection/Test")).GetProperty("ok").GetBoolean() &&
+            (await Post(admin, "/JellyfinMod/Settings/Discovery/Test")).GetProperty("ok").GetBoolean(),
+            "After the clean import seed protection and discovery both work from the database");
+    }
+    finally
+    {
+        await host.DisposeAsync();
+    }
+
+    // ---- 4. An address with credentials in it (S7-R3): stored and returned without them.
+    var withCredentials = new UriBuilder(transmission.Endpoint) { UserName = transmission.Username, Password = transmission.Password }.Uri.ToString();
+    xml.TransmissionRpcUrl = withCredentials;
+    xml.TransmissionUsername = string.Empty;
+    xml.TransmissionPasswordRef = null;
+    WriteXml();
+    host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(2), xml, Configure);
+    try
+    {
+        var row = await Row();
+        Assert(row.SeedProtectionRpcUrl is { } stored && !stored.Contains('@', StringComparison.Ordinal) &&
+            new Uri(stored).UserInfo.Length == 0 && AcquisitionConfigurationNormalize(stored) == AcquisitionConfigurationNormalize(transmission.Endpoint.ToString()),
+            "S7-R3: the imported address is stored without its credentials");
+        var newRef = row.SeedProtectionPasswordRef;
+        Assert(row.SeedProtectionUsername == transmission.Username && newRef is not null && newRef != passwordRef &&
+            await store.GetAsync(newRef, default) == transmission.Password,
+            "S7-R3: the user name and password from the address are kept apart from it, the password in the store");
+        Assert(await store.GetAsync(passwordRef, default) is null, "The password reference the row no longer holds is removed");
+        Assert(logs.Lines.Any(line => line.Contains("removed credentials from the imported seed-protection address", StringComparison.Ordinal)),
+            "S7-R3: the cleaning is logged");
+        using var admin = host.Client(world.Admin, true);
+        var seed = await Get(admin, "/JellyfinMod/Settings/SeedProtection");
+        Assert(!seed.GetProperty("rpcUrl").GetString()!.Contains('@', StringComparison.Ordinal) &&
+            !seed.GetProperty("effectiveRpcUrl").GetString()!.Contains('@', StringComparison.Ordinal),
+            "S7-R3: neither the stored nor the effective address is returned with credentials");
+        Assert((await Post(admin, "/JellyfinMod/Settings/SeedProtection/Test")).GetProperty("ok").GetBoolean(),
+            "S7-R3: the cleaned endpoint still reaches Transmission");
+        await store.RemoveAsync(newRef, default);
+        await store.RemoveAsync(tokenRef, default);
+    }
+    finally
+    {
+        await host.DisposeAsync();
+    }
+
+    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+    File.Delete(dbPath);
+    File.Delete(xmlPath);
+}
+
+static string AcquisitionConfigurationNormalize(string value) => JellyfinMod.Services.Acquisition.AcquisitionConfiguration.NormalizeEndpoint(value);
 
 static void Assert(bool condition, string message)
 {

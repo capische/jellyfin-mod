@@ -342,11 +342,17 @@ public sealed class SettingsController(
         var matches = effective is not null && client is { Kind: TransmissionDriver.DriverKind } &&
             AcquisitionConfiguration.NormalizeEndpoint(client.BaseUrl) == AcquisitionConfiguration.NormalizeEndpoint(effective.RpcUrl);
         var separate = settings.SeedProtectionSource == SeedProtectionSources.Separate;
-        return new SeedProtectionSettingsDto(settings.SeedProtectionSource, separate ? settings.SeedProtectionRpcUrl : null,
+        return new SeedProtectionSettingsDto(settings.SeedProtectionSource, separate ? WithoutCredentials(settings.SeedProtectionRpcUrl) : null,
             separate ? settings.SeedProtectionUsername : null,
             separate && await secrets.HasAsync(settings.SeedProtectionPasswordRef, cancellationToken),
-            effective?.RpcUrl, matches, legacy, settings.SeedProtectionRevision);
+            WithoutCredentials(effective?.RpcUrl), matches, legacy, settings.SeedProtectionRevision);
     }
+
+    /// <summary>An address as an administrator may see it: never with user information (§5, S7-R3).</summary>
+    private static string? WithoutCredentials(string? value) =>
+        value is not null && Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.UserInfo.Length > 0
+            ? new UriBuilder(uri) { UserName = string.Empty, Password = string.Empty }.Uri.ToString()
+            : value;
 
     private async Task<SeedEndpoint?> EffectiveSeedEndpointAsync(CancellationToken cancellationToken)
     {
