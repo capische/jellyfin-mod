@@ -1,5 +1,9 @@
 using System.Diagnostics;
+using System.Text.Json;
+using JellyfinMod.Data;
 using JellyfinMod.Services.Web;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -98,7 +102,56 @@ try
     Check((await afterCrash.ReconcileAsync(false, Path.GetDirectoryName(childIndex), "setting", default)).Status == "stock", "restore after process death");
     Check(File.ReadAllText(childIndex) == interrupted.Stock, "interrupted original bytes restored");
 
-    Console.WriteLine("PASS: real filesystem patch, URL prefix, both write failures, process death, restart and exact restore");
+    // ---- History rows (REVIEW-2026-09-24 S4-R4): every patch and restore leaves exactly one row in a real, migrated
+    //      SQLite database, with ids, hashes and who applied it, and never a path.
+    var historyDb = Path.Combine(root, "history.db");
+    await using (var database = new ModDbContext(historyDb))
+        await database.Database.MigrateAsync();
+    await using var services = new ServiceCollection().AddTransient(_ => new ModDbContext(historyDb)).BuildServiceProvider();
+    var history = new TakeoverHistory(services.GetRequiredService<IServiceScopeFactory>());
+    var recorded = Scenario("history");
+    var historyWeb = Path.GetDirectoryName(recorded.Index)!;
+    var historyData = Path.Combine(root, "history", "data");
+    WebRootTakeover Engine() => new(historyData, store, NullLogger<WebRootTakeover>.Instance, "", history.RecordAsync);
+    async Task<List<HistoryRecord>> Rows()
+    {
+        await using var database = new ModDbContext(historyDb);
+        return await database.History.AsNoTracking().OrderBy(row => row.CreatedAt).ToListAsync();
+    }
+
+    string Field(HistoryRecord row, string name) =>
+        JsonDocument.Parse(row.Data!).RootElement.TryGetProperty(name, out var value) ? value.GetString() ?? "" : "";
+    var engine = Engine();
+    Check((await engine.ReconcileAsync(true, historyWeb, "startup", default)).PatchedBy == "automatic", "fresh install reports automatic");
+    var rows = await Rows();
+    Check(rows.Count == 1 && rows[0].EventType == "interface_patched" && Field(rows[0], "patchedBy") == "automatic" &&
+        Field(rows[0], "bundleId") == store.Current!.BundleId && Field(rows[0], "stockSha256").Length == 64 &&
+        Field(rows[0], "patchedSha256").Length == 64 && rows[0].EntryId == Guid.Empty, "fresh install writes one interface_patched row, automatic");
+    Check((await Engine().ReconcileAsync(true, historyWeb, "startup", default)).Status == "patched" && (await Rows()).Count == 1,
+        "a restart with nothing to change writes no row");
+    await engine.ReconcileAsync(false, historyWeb, "setting", default);
+    rows = await Rows();
+    Check(rows.Count == 2 && rows[1].EventType == "interface_restored" && Field(rows[1], "restoredBy") == "setting" &&
+        Field(rows[1], "stockSha256") == Field(rows[0], "stockSha256"), "takeover off writes one interface_restored row");
+    Check((await engine.ReconcileAsync(true, historyWeb, "setting", default)).PatchedBy == "setting", "takeover on reports setting");
+    rows = await Rows();
+    Check(rows.Count == 3 && rows[2].EventType == "interface_patched" && Field(rows[2], "patchedBy") == "setting", "takeover on writes one row, setting");
+    // A bundle change: the record names the bundle the page was rendered for; a different one is installed now.
+    var statePath = Path.Combine(historyData, "web-root", "state.json");
+    File.WriteAllText(statePath, File.ReadAllText(statePath).Replace(store.Current.BundleId, "0123456789ab", StringComparison.Ordinal));
+    Check((await Engine().ReconcileAsync(true, historyWeb, "startup", default)).PatchedBy == "bundle", "a bundle change reports bundle");
+    rows = await Rows();
+    Check(rows.Count == 4 && Field(rows[3], "patchedBy") == "bundle" && Field(rows[3], "previousBundleId") == "0123456789ab" &&
+        Field(rows[3], "bundleId") == store.Current.BundleId, "a bundle change writes one row naming both bundles");
+    await Engine().ReconcileAsync(false, historyWeb, "restoreStock", default);
+    rows = await Rows();
+    Check(rows.Count == 5 && rows[4].EventType == "interface_restored" && Field(rows[4], "restoredBy") == "restoreStock" &&
+        File.ReadAllText(recorded.Index) == recorded.Stock, "Restore stock now writes one row and restores the original bytes");
+    Check(rows.All(row => !row.Data!.Contains(root, StringComparison.Ordinal) && !row.Summary.Contains(root, StringComparison.Ordinal)),
+        "no history row carries a path");
+    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
+    Console.WriteLine("PASS: real filesystem patch, URL prefix, both write failures, process death, restart, exact restore and history rows");
 }
 
 finally

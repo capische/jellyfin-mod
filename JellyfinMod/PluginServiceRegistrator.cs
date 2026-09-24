@@ -65,18 +65,21 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
             Plugin.Instance!.DataPath,
             Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? Plugin.Instance!.DataPath,
             provider.GetRequiredService<ILogger<WebBundleStore>>()));
+        services.AddSingleton<TakeoverHistory>();
         services.AddSingleton(provider => new WebRootTakeover(
             Plugin.Instance!.DataPath,
             provider.GetRequiredService<WebBundleStore>(),
             provider.GetRequiredService<ILogger<WebRootTakeover>>(),
-            provider.GetRequiredService<IServerConfigurationManager>().GetNetworkConfiguration().BaseUrl));
+            provider.GetRequiredService<IServerConfigurationManager>().GetNetworkConfiguration().BaseUrl,
+            provider.GetRequiredService<TakeoverHistory>().RecordAsync));
         services.AddSingleton(provider => new PluginRepository(
             Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? Plugin.Instance!.DataPath,
             Plugin.Instance!.DataPath,
             provider.GetRequiredService<ILogger<PluginRepository>>()));
-        services.AddSingleton<IHostedService, WebBundleInstaller>();
+        // The database first: the takeover's first patch writes its history row (§4.6 "after the database is ready").
         services.AddSingleton<DatabaseInitializer>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<DatabaseInitializer>());
+        services.AddSingleton<IHostedService, WebBundleInstaller>();
         AcquisitionServices.AddHostedServices(services);
         ImportServices.AddHostedServices(services);
         services.AddSingleton<LibraryEventListener>();

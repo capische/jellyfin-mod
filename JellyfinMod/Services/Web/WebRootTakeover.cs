@@ -40,15 +40,24 @@ public sealed class WebRootTakeover
     private readonly WebBundleStore _bundles;
     private readonly ILogger<WebRootTakeover> _logger;
     private readonly string _baseUrl;
+    private readonly Func<TakeoverEvent, CancellationToken, Task>? _record;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private TakeoverEvent? _change;
 
     /// <summary>Initializes a new instance of the <see cref="WebRootTakeover"/> class.</summary>
     /// <param name="dataPath">The plugin's version-independent data directory.</param>
     /// <param name="bundles">The installed bundles.</param>
     /// <param name="logger">The logger.</param>
     /// <param name="baseUrl">The host's configured URL prefix.</param>
-    public WebRootTakeover(string dataPath, WebBundleStore bundles, ILogger<WebRootTakeover> logger, string baseUrl = "")
+    /// <param name="record">
+    /// Called once after every patch and every restore, outside the file work, to put it on the durable record
+    /// (the <c>interface_patched</c> / <c>interface_restored</c> history rows of §4.6). Its failure is logged and
+    /// never undoes or blocks the file change.
+    /// </param>
+    public WebRootTakeover(string dataPath, WebBundleStore bundles, ILogger<WebRootTakeover> logger, string baseUrl = "",
+        Func<TakeoverEvent, CancellationToken, Task>? record = null)
     {
+        _record = record;
         _stateDirectory = Path.Combine(dataPath, "web-root");
         _bundles = bundles;
         _logger = logger;
@@ -63,7 +72,10 @@ public sealed class WebRootTakeover
     /// </summary>
     /// <param name="enabled">Whether the takeover is wanted.</param>
     /// <param name="webRoot">The host's web directory.</param>
-    /// <param name="reason">What prompted this run, recorded so an administrator can see why the page changed.</param>
+    /// <param name="reason">
+    /// What prompted this run: <c>startup</c> (the plugin itself), <c>setting</c> (an administrator changed the switch)
+    /// or <c>restoreStock</c> (an administrator asked for the stock page without changing the switch).
+    /// </param>
     /// <param name="cancellationToken">A cancellation token.</param>
     public async Task<TakeoverState> ReconcileAsync(
         bool enabled, string? webRoot, string reason, CancellationToken cancellationToken)
@@ -71,7 +83,17 @@ public sealed class WebRootTakeover
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            State = Reconcile(enabled, webRoot, reason);
+            _change = null;
+            try
+            {
+                State = Reconcile(enabled, webRoot, reason);
+            }
+            finally
+            {
+                // Recorded even when a later step failed: the file change it describes did happen.
+                if (_change is { } change) await RecordAsync(change).ConfigureAwait(false);
+            }
+
             return State;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
@@ -118,7 +140,7 @@ public sealed class WebRootTakeover
 
         if (!enabled)
         {
-            return marked ? Restore(webRoot, indexPath, record, reason) : new TakeoverState
+            return marked ? Restore(webRoot, indexPath, record, reason == "restoreStock" ? "restoreStock" : "setting") : new TakeoverState
             {
                 Status = "stock",
                 WebRoot = "writable",
@@ -132,7 +154,7 @@ public sealed class WebRootTakeover
             // Nothing to patch with. If a previous patch is still in place it must come out, or the page points
             // at a bundle that is no longer served.
             return marked
-                ? Restore(webRoot, indexPath, record, "no bundle to serve")
+                ? Restore(webRoot, indexPath, record, "noBundle")
                 : new TakeoverState { Status = "stock", WebRoot = "writable", Blocker = _bundles.Blocker ?? "web_bundle_missing" };
         }
 
@@ -168,7 +190,10 @@ public sealed class WebRootTakeover
                     "JellyfinMod found its patched index.html modified since it was written; re-rendering it from the pristine copy");
             }
 
-            return Patch(webRoot, indexPath, record.StockSha256, bundle, reason: "bundle", record);
+            // A new bundle or renderer is "bundle"; a hand edit or a changed prefix is the plugin repairing itself.
+            var rerender = record.BundleId != bundle.BundleId || record.RendererVersion != WebDocumentRenderer.Version
+                ? "bundle" : "startup";
+            return Patch(webRoot, indexPath, record.StockSha256, bundle, rerender, record);
         }
 
         // Unmarked. Either the first patch, or the host replaced its own index.html.
@@ -253,6 +278,7 @@ public sealed class WebRootTakeover
         WriteState(updated);
         WriteAtomic(indexPath, patched);
 
+        _change = new TakeoverEvent("interface_patched", updated.PatchedBy!, bundle.BundleId, record?.BundleId, stockHash, patchedHash);
         _logger.LogInformation(
             "JellyfinMod replaced the Jellyfin web interface at /web with bundle {BundleId} ({Reason}). "
             + "Original sha256 {StockHash}, patched sha256 {PatchedHash}. {Recovery}",
@@ -285,6 +311,7 @@ public sealed class WebRootTakeover
         var stockCopy = Path.Combine(webRoot, WebDocumentRenderer.StockCopyName);
         if (File.Exists(stockCopy)) File.Delete(stockCopy);
 
+        _change = new TakeoverEvent("interface_restored", reason, null, record.BundleId, record.StockSha256, record.PatchedSha256);
         WriteState(record with { PatchedSha256 = null, BundleId = null, PatchedAt = null, PatchedBy = null });
         _logger.LogInformation(
             "JellyfinMod restored the original Jellyfin web interface at /web ({Reason}); sha256 {Hash} matches the original",
@@ -293,13 +320,31 @@ public sealed class WebRootTakeover
         return new TakeoverState { Status = "stock", WebRoot = "writable", StockSha256 = record.StockSha256 };
     }
 
+    /// <summary>
+    /// The contract's three values (§4.6): <c>setting</c> when an administrator turned the switch on, <c>bundle</c>
+    /// when a new bundle or renderer re-rendered an existing patch, and <c>automatic</c> for everything the plugin
+    /// did by itself — the first patch after an install, a re-patch after a host upgrade or a container recreate.
+    /// </summary>
     private static string PatchedBy(string reason, TakeoverRecord? record) => reason switch
     {
         "bundle" => "bundle",
         "setting" => "setting",
-        // The first patch after an install nobody asked for is the one worth naming as automatic.
-        _ => record is null ? "automatic" : reason
+        _ => "automatic"
     };
+
+    private async Task RecordAsync(TakeoverEvent change)
+    {
+        if (_record is null) return;
+        try
+        {
+            await _record(change, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            // The page already changed; the log line above is the record of last resort.
+            _logger.LogWarning("JellyfinMod could not write the {Event} history row ({Error})", change.EventType, error.GetType().Name);
+        }
+    }
 
     private TakeoverState Patched(TakeoverRecord record, string webRoot) => new()
     {
@@ -384,6 +429,19 @@ public sealed class WebRootTakeover
     private void WriteState(TakeoverRecord record) =>
         WriteAtomic(Path.Combine(_stateDirectory, StateName), JsonSerializer.Serialize(record));
 }
+
+/// <summary>One patch or restore, as the history row records it: ids and hashes, never a path.</summary>
+/// <param name="EventType"><c>interface_patched</c> or <c>interface_restored</c>.</param>
+/// <param name="By">
+/// For a patch, <c>automatic</c>, <c>setting</c> or <c>bundle</c>; for a restore, <c>setting</c> (the switch is off),
+/// <c>restoreStock</c> (an administrator asked, the switch unchanged) or <c>noBundle</c> (nothing left to serve).
+/// </param>
+/// <param name="BundleId">The bundle now in place, for a patch.</param>
+/// <param name="PreviousBundleId">The bundle the replaced document pointed at, if any.</param>
+/// <param name="StockSha256">The host's own <c>index.html</c> hash.</param>
+/// <param name="PatchedSha256">The patched document's hash: the new one for a patch, the removed one for a restore.</param>
+public sealed record TakeoverEvent(string EventType, string By, string? BundleId, string? PreviousBundleId, string StockSha256,
+    string? PatchedSha256);
 
 /// <summary>What the engine recorded about the web root, kept outside the database.</summary>
 public sealed record TakeoverRecord

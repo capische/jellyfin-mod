@@ -72,7 +72,7 @@ public class InterfaceSettingsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     public async Task<ActionResult<object>> RestoreStock()
     {
-        await _takeover.ReconcileAsync(false, WebPath, "restore requested", HttpContext.RequestAborted)
+        await _takeover.ReconcileAsync(false, WebPath, "restoreStock", HttpContext.RequestAborted)
             .ConfigureAwait(false);
         return Describe();
     }
