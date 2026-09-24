@@ -467,6 +467,7 @@ static async Task VerifyPreviewHttpAsync(
             ReclaimAfterDays = 1,
             ExemptFavourites = true,
             EnabledAt = now.AddDays(-3),
+            FirstEnabledAt = now.AddDays(-3),
             UpdatedAt = now.AddDays(-3)
         });
         database.CompletionObservations.Add(new CompletionObservation
@@ -1007,7 +1008,8 @@ static async Task VerifyReclamationAsync(
         var completion = await database.CompletionObservations.SingleAsync(candidate =>
             candidate.TargetId == sharedEntry.Id);
         completion.Played = true;
-        completion.CompletedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3);
+        // A new watch now: under decision 12 only a watch after a movie's floor counts.
+        completion.CompletedAt = clock.GetUtcNow().UtcDateTime;
         completion.LastPlayedAt = completion.CompletedAt;
         completion.ObservedAt = clock.GetUtcNow().UtcDateTime;
         await database.SaveChangesAsync();
@@ -1765,8 +1767,9 @@ static async Task VerifyReacquiredMediaStartsFreshAsync(
 
     nativeItems.Remove(reacquired.Id);
 
-    // A title bound only now, whose native last-played date predates the retention baseline, gets a
-    // full window from its first evaluation instead of being due at once.
+    // A title bound only now, whose native last-played date predates the retention baseline, is not scheduled at all:
+    // under decision 12 (2026-09-24) movies follow the episode rule and only a watch after the floor counts. Before it,
+    // the Phase 3 rule gave such a movie a full window from its first evaluation.
     var newlyBound = new Movie { Id = Guid.NewGuid(), Name = "Newly bound", Path = "/fixture/newly-bound.mkv" };
     var newEntryId = Guid.NewGuid();
     await using (var database = new ModDbContext(databasePath))
@@ -1796,9 +1799,9 @@ static async Task VerifyReacquiredMediaStartsFreshAsync(
     await using (var database = new ModDbContext(databasePath))
     {
         var evaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == newEntryId);
-        Assert(evaluation.State == "scheduled" && evaluation.BaselineAt == firstEvaluatedAt &&
-            evaluation.EligibleAt >= firstEvaluatedAt && evaluation.Deadline >= firstEvaluatedAt.AddDays(1),
-            $"A newly bound target's grace starts no earlier than its first evaluation: {evaluation.EligibleAt}/{evaluation.Deadline}");
+        Assert(evaluation.State == "waiting" && evaluation.Reason == "waiting_for_completion" &&
+            evaluation.BaselineAt == firstEvaluatedAt && evaluation.RequiresFreshCompletion && evaluation.Deadline is null,
+            $"A newly bound movie watched before it was tracked waits for a new watch (decision 12): {evaluation.State}/{evaluation.Reason}/{evaluation.Deadline}");
         database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == newEntryId));
         await database.SaveChangesAsync();
     }

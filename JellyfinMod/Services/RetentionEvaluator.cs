@@ -158,15 +158,15 @@ public sealed class RetentionEvaluator(
         {
             // A target's grace never starts before it was first evaluated, which is at or after its
             // binding. Historical native play dates must not make newly bound media due at once.
-            // An episode additionally needs a completion after that first evaluation and after retention was enabled
-            // (P10.E1, PHASE10 question 1 answered 2026-09-24): only a new watch counts.
+            // A movie or an episode additionally needs a completion after that first evaluation and after retention was
+            // first enabled: only a new watch counts (PHASE10 Q1 for episodes; decision 12, 2026-09-24, for movies).
             result = new RetentionEvaluation
             {
                 EntryId = target.Entry.Id,
                 EpisodeId = target.EpisodeId,
                 TargetId = targetId,
                 BaselineAt = now,
-                RequiresFreshCompletion = target.EpisodeId.HasValue
+                RequiresFreshCompletion = true
             };
             database.RetentionEvaluations.Add(result);
         }
@@ -315,14 +315,12 @@ public sealed class RetentionEvaluator(
             }
         }
 
-        // Only a new watch counts for an episode (PHASE10 Q1 and Q9, answered 2026-09-24): a completion must carry
-        // Jellyfin's own last-played instant at or after the later of when the episode was first tracked and when
-        // retention was first ever enabled, so nothing watched before per-episode retention existed becomes due. A later
-        // switch-off and switch-on moves nothing.
-        var freshFloor = target.EpisodeId.HasValue && policy.GraceStartAt is { } enabledAt
-            ? Latest(result.BaselineAt, enabledAt)
-            : result.BaselineAt;
-        var requiresFresh = result.RequiresFreshCompletion || target.EpisodeId.HasValue;
+        // Only a new watch counts (PHASE10 Q1 and Q9 for episodes; decision 12, 2026-09-24, the same rule for movies): a
+        // completion must carry Jellyfin's own last-played instant at or after the later of when the title was first
+        // tracked and when retention was first ever enabled, so no backlog watched before that becomes due by switching
+        // retention on. A later switch-off and switch-on moves nothing.
+        var freshFloor = FreshFloor(result, policy);
+        const bool requiresFresh = true;
         var completed = observations.Values
             .Select(observation => (observation.UserId,
                 CompletedAt: CompletionInstant(observation, requiresFresh, freshFloor, now)))
@@ -464,6 +462,14 @@ public sealed class RetentionEvaluator(
     }
 
     private static DateTime Latest(DateTime left, DateTime right) => left > right ? left : right;
+
+    /// <summary>
+    /// The instant a watch must be at or after to count for a target (PHASE10 Q1/Q9, decision 12): the later of its
+    /// first evaluation (or its last reset) and the first time retention was ever enabled. The live check before an
+    /// unlink applies the same floor (RET3-R4).
+    /// </summary>
+    internal static DateTime FreshFloor(RetentionEvaluation evaluation, RetentionPolicySnapshot policy) =>
+        policy.GraceStartAt is { } enabledAt ? Latest(evaluation.BaselineAt, enabledAt) : evaluation.BaselineAt;
 
     /// <summary>Loads each user's observation, ignoring evidence read from a representation that is no longer bound.</summary>
     private async Task<Dictionary<Guid, CompletionObservation>> LoadCurrentObservationsAsync(
