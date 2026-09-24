@@ -46,6 +46,9 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     /// <summary>Gets the episode's own retention window when <see cref="RetentionPolicy"/> is days.</summary>
     [JsonPropertyName("reclaimAfterDays")]
     public int? ReclaimAfterDays { get; } = episode.ReclaimAfterDays;
+    /// <summary>Gets the episode's retention warning when its window is running (PHASE10 Q8, Q11); null otherwise.</summary>
+    [JsonPropertyName("retentionWarning"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public RetentionWarningDto? RetentionWarning { get; init; }
     /// <summary>Gets monitored.</summary>
     [JsonPropertyName("monitored")]
     public bool Monitored { get; } = episode.Monitored;

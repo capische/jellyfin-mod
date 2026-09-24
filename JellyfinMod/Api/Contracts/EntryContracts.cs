@@ -140,6 +140,10 @@ public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto 
     [JsonPropertyName("versions")]
     public IReadOnlyList<VersionDto> Versions { get; init; } = [];
 
+    /// <summary>Gets a movie's retention warning when its window is running (PHASE10 Q8, Q11); null otherwise.</summary>
+    [JsonPropertyName("retentionWarning"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public RetentionWarningDto? RetentionWarning { get; init; }
+
     /// <summary>Gets a movie's upgrade state; administrators only, null otherwise.</summary>
     [JsonPropertyName("upgrade"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public UpgradeStateDto? Upgrade { get; init; }
@@ -208,6 +212,14 @@ public sealed class EpisodeRetentionRequest
     [JsonPropertyName("reclaimAfterDays")]
     public int? ReclaimAfterDays { get; set; }
 }
+
+/// <summary>
+/// A running retention window, shown to everyone who can see the title (PHASE10 Q8 and Q11, 2026-09-24): when its files
+/// will be deleted unless kept, why the window started, and which files it applies to.
+/// </summary>
+public sealed record RetentionWarningDto([property: JsonPropertyName("deadline")] DateTime Deadline,
+    [property: JsonPropertyName("cause")] string Cause,
+    [property: JsonPropertyName("files")] IReadOnlyList<string> Files);
 
 /// <summary>Whether one file is now kept (PHASE10 Q3).</summary>
 public sealed record VersionKeepResult([property: JsonPropertyName("bindingId")] Guid BindingId,

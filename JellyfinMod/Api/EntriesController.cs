@@ -605,6 +605,62 @@ public sealed class EntriesController(
     private async Task<bool> IsAdministratorAsync() => authorization is not null &&
         (await authorization.AuthorizeAsync(User, Policies.RequiresElevation)).Succeeded;
 
+    /// <summary>
+    /// The running retention windows of a title's movie or episodes (PHASE10 Q8): a scheduled evaluation whose target is not
+    /// kept, with the cause the window-start event recorded and the files that will go, which leaves out kept files. Every
+    /// viewer gets the date (PHASE10 Q11 overrides the T15 date hiding for this warning only).
+    /// </summary>
+    private async Task<Dictionary<Guid, RetentionWarningDto>> RetentionWarningsAsync(Entry entry, IReadOnlyList<Episode> episodes,
+        RetentionPolicySnapshot? policy, IReadOnlyDictionary<Guid, RetentionEvaluation> evaluations, IReadOnlyList<HistoryRecord> history,
+        CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<Guid, RetentionWarningDto>();
+        if (policy?.Enabled != true) return result;
+        var running = evaluations.Values.Where(evaluation => evaluation.State == RetentionEvaluationStates.Scheduled &&
+            evaluation.Deadline.HasValue).ToArray();
+        if (running.Length == 0) return result;
+        var episodeIds = episodes.Select(episode => episode.Id).ToArray();
+        var paths = entry.MediaType == "movie"
+            ? (await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entry.Id)
+                .Select(binding => new { TargetId = binding.EntryId, binding.MediaPath }).ToListAsync(cancellationToken).ConfigureAwait(false))
+            : (await database.EpisodeBindings.AsNoTracking().Where(binding => episodeIds.Contains(binding.EpisodeId))
+                .Select(binding => new { TargetId = binding.EpisodeId, binding.MediaPath }).ToListAsync(cancellationToken).ConfigureAwait(false));
+        var kept = (await database.VersionKeeps.AsNoTracking().Where(keep => keep.EntryId == entry.Id)
+            .Select(keep => keep.MediaPath).ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet(StringComparer.Ordinal);
+        foreach (var evaluation in running)
+        {
+            var episode = episodes.FirstOrDefault(candidate => candidate.Id == evaluation.TargetId);
+            if (evaluation.TargetId != entry.Id && episode is null) continue;
+            if (RetentionOverrides.IsKept(entry, episode)) continue;
+            var files = paths.Where(path => path.TargetId == evaluation.TargetId && path.MediaPath is not null && !kept.Contains(path.MediaPath))
+                .Select(path => Path.GetFileName(path.MediaPath!)).Order(StringComparer.Ordinal).ToArray();
+            if (files.Length == 0) continue;
+            var started = history.Where(record => record.EventType == "retention_started" &&
+                    HistoryDto.EpisodeOf(record.Data) == episode?.Id)
+                .OrderByDescending(record => record.CreatedAt).FirstOrDefault();
+            result[evaluation.TargetId] = new RetentionWarningDto(DateTime.SpecifyKind(evaluation.Deadline!.Value, DateTimeKind.Utc),
+                CauseOf(started?.Data) ?? "watched", files);
+        }
+
+        return result;
+    }
+
+    private static string? CauseOf(string? data)
+    {
+        if (string.IsNullOrWhiteSpace(data)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(data);
+            return document.RootElement.TryGetProperty("cause", out var cause) && cause.ValueKind == JsonValueKind.String
+                ? cause.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     private async Task<EntryDetail> BuildDetail(Entry entry, CancellationToken cancellationToken)
     {
         var user = access.GetUser(User)!;
@@ -634,11 +690,13 @@ public sealed class EntriesController(
         var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots, [entry.Id], cancellationToken)
             .ConfigureAwait(false);
         var versions = new JellyfinMod.Services.Automation.VersionReader(database, mediaSources, files ?? new UnixFileInspector());
+        var warnings = await RetentionWarningsAsync(entry, episodes, policy, evaluations, history, cancellationToken).ConfigureAwait(false);
         var episodeDtos = new List<EpisodeDto>();
         foreach (var e in readableEpisodes)
             episodeDtos.Add(new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,
                 evaluations.GetValueOrDefault(e.Id), e), isAdmin), Summary(e.Id), projections.GetValueOrDefault(e.Id))
             {
+                RetentionWarning = warnings.GetValueOrDefault(e.Id),
                 Versions = e.State == FileState.OnDisk
                     ? await versions.ForAsync(entry.Id, e.Id, evaluations.GetValueOrDefault(e.Id), isAdmin, cancellationToken)
                     : []
@@ -654,7 +712,8 @@ public sealed class EntriesController(
             Versions = entry.MediaType == "movie" && entry.State == FileState.OnDisk
                 ? await versions.ForAsync(entry.Id, null, evaluations.GetValueOrDefault(entry.Id), isAdmin, cancellationToken)
                 : [],
-            Upgrade = isAdmin && entry.MediaType == "movie" ? await versions.UpgradeAsync(entry, cancellationToken) : null
+            Upgrade = isAdmin && entry.MediaType == "movie" ? await versions.UpgradeAsync(entry, cancellationToken) : null,
+            RetentionWarning = entry.MediaType == "movie" ? warnings.GetValueOrDefault(entry.Id) : null
         };
     }
 }
