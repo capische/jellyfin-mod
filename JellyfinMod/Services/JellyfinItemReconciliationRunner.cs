@@ -17,6 +17,7 @@ public sealed class JellyfinItemReconciliationRunner(
     public async Task<NativeReconciliationResult> ReconcileAsync(NativeTitleWorkItem work, CancellationToken cancellationToken)
     {
         await using var lease = await libraryLock.AcquireAsync(work.TargetLibraryId, cancellationToken).ConfigureAwait(false);
+        using var operation = JellyfinMod.Data.SqliteWriteDiagnostics.Operation("reconciliation");
         var observation = source.GetObservation(work, cancellationToken);
         var result = observation.Snapshot is { } snapshot
             ? await reconciliation.ReconcileUnderLeaseAsync(snapshot, cancellationToken).ConfigureAwait(false) : null;

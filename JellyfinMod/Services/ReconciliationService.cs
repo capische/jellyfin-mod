@@ -103,6 +103,7 @@ public sealed class ReconciliationService(
         ConfirmedLibrarySnapshot observation,
         CancellationToken cancellationToken)
     {
+        using var operation = SqliteWriteDiagnostics.Operation("absence confirmation");
         await RebaselineStorageUnderLeaseAsync(observation.LibraryId, observation.LibraryLocations, cancellationToken)
             .ConfigureAwait(false);
         var entries = await database.Entries.Where(entry => entry.TargetLibraryId == observation.LibraryId)

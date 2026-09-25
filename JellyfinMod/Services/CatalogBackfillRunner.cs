@@ -29,6 +29,7 @@ public sealed class CatalogBackfillRunner(
     {
         if (readiness is { IsReady: false })
             throw new InvalidOperationException("The JellyfinMod database is not ready; reconciliation made no changes.");
+        using var operation = JellyfinMod.Data.SqliteWriteDiagnostics.Operation("catalog run");
         var run = await RunOnceAsync(progress, cancellationToken, confirmAbsence).ConfigureAwait(false);
         if (runGate.TakeAbsenceRequest())
         {
