@@ -435,6 +435,22 @@ internal static class Phase6
         Assert(flaky.SearchQueries == flakyQueries && torznab.SearchQueries == healthyQueries + 1 &&
             afterBreaker.GetProperty("indexers").EnumerateArray().Any(item => item.GetProperty("status").GetString() == "breaker_open"),
             "A broken indexer is skipped while the other keeps being queried");
+        status = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Automation/Status"));
+        Assert(!Strings(status.GetProperty("pausedReasons")).Contains("breaker_open"),
+            "One open breaker does not pause automation while another enabled indexer answers");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            (await database.AcquisitionIndexers.SingleAsync(value => value.Id == indexerId)).Enabled = false;
+            await database.SaveChangesAsync();
+        }
+        status = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Automation/Status"));
+        Assert(Strings(status.GetProperty("pausedReasons")).Contains("breaker_open"),
+            "With every enabled indexer behind an open breaker, the status and queue banner report breaker_open (P7.S11)");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            (await database.AcquisitionIndexers.SingleAsync(value => value.Id == indexerId)).Enabled = true;
+            await database.SaveChangesAsync();
+        }
         await ReadAsync(await admin.DeleteAsync($"/JellyfinMod/Settings/Indexers/{flakyIndexer.GetProperty("id").AsGuid()}"), 204, "Remove flaky");
 
         // ---- M3 free-space floor: nothing is searched or grabbed below it.

@@ -34,6 +34,13 @@ public sealed class AutomationStatusService(
         var budgets = await database.IndexerBudgets.AsNoTracking().ToDictionaryAsync(budget => budget.IndexerId, cancellationToken)
             .ConfigureAwait(false);
         var paused = PausedReasons(settings, grabsToday, openImports, free, floor, lastRun);
+        // Automation searches only enabled indexers, and an open breaker skips its indexer while the others carry on. When
+        // every enabled indexer is behind an open breaker nothing can be searched, so the queue banner says so (P6 checklist
+        // item 5, found in P7.S11).
+        var enabledIndexers = indexers.Where(indexer => indexer.Enabled).ToList();
+        if (enabledIndexers.Count > 0 && enabledIndexers.All(indexer =>
+                budgets.GetValueOrDefault(indexer.Id)?.BreakerOpenUntil is { } open && open > now))
+            paused.Add(AutomationReasons.BreakerOpen);
         // The hourly native trigger starts a run once the interval has passed since the last one.
         DateTime? next = null;
         if (settings.AutomationEnabled)
