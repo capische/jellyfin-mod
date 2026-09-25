@@ -1,6 +1,8 @@
 using System.Net.Mime;
 using JellyfinMod.Data;
+using JellyfinMod.Services.Trakt;
 using JellyfinMod.Services.Web;
+using MediaBrowser.Common.Api;
 using MediaBrowser.Controller;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -44,15 +46,30 @@ public class HealthController : ControllerBase
     [HttpGet("Health")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
-    public ActionResult<object> GetHealth() => StatusCode(
+    public async Task<ActionResult<object>> GetHealth() => StatusCode(
         _database.IsReady ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable, new
     {
         Name = Plugin.Instance?.Name,
         Version = Plugin.Instance?.Version.ToString(),
         Ok = _database.IsReady,
         Capabilities = Capabilities,
-        Web = DescribeWeb()
+        Web = DescribeWeb(),
+        Trakt = await DescribeTraktAsync().ConfigureAwait(false)
     });
+
+    /// <summary>
+    /// Whether the stock Trakt plugin is installed and active (P7.Q16, PHASE7 §7.1.3). Its version is an administrator's
+    /// detail — which third-party plugin build a server runs — so only an administrator sees it.
+    /// </summary>
+    private async Task<object?> DescribeTraktAsync()
+    {
+        var info = _services.GetService<TraktPluginState>()?.Describe();
+        if (info is null) return null;
+        var authorization = _services.GetService<IAuthorizationService>();
+        var administrator = authorization is not null &&
+            (await authorization.AuthorizeAsync(User, Policies.RequiresElevation).ConfigureAwait(false)).Succeeded;
+        return administrator ? new { info.Installed, info.Version } : new { info.Installed };
+    }
 
     /// <summary>
     /// What the plugin knows about the interface it serves (P7.S3), so the settings area and the acceptance
@@ -114,7 +131,8 @@ public class HealthController : ControllerBase
     /// <c>ui</c> is the switch the web fork reads to decide whether to show the JellyfinMod interface at all
     /// (P7.S2); <c>ui.web</c> says this build also serves that interface's bundle itself (P7.S3);
     /// <c>ui.takeover</c> says it can replace the host's own document at <c>/web</c> (P7.S4). The <c>settings.*</c>
-    /// names and <c>setup</c> are the typed settings contract and first-run state of P7.S7.
+    /// names and <c>setup</c> are the typed settings contract and first-run state of P7.S7. <c>trakt.history</c> is
+    /// <c>GET /JellyfinMod/Trakt/Items/{itemId}</c>, the detail page's Trakt indicator (P7.Q16).
     /// </remarks>
     public static readonly IReadOnlyList<string> Capabilities =
     [
@@ -147,6 +165,7 @@ public class HealthController : ControllerBase
         "settings.seedProtection",
         "settings.retention",
         "setup",
-        "acquisition.prowlarr"
+        "acquisition.prowlarr",
+        "trakt.history"
     ];
 }

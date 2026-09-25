@@ -87,7 +87,7 @@ static DatabaseInitializer NewInitializer(ServiceProvider services) => new(
 // The container is passed rather than the individual services: Health asks it for the interface subsystem and
 // reports whatever it cannot find as absent, which is exactly the case this smoke host exercises.
 static int? HealthStatus(DatabaseInitializer initializer, IServiceProvider services) =>
-    ((ObjectResult)new HealthController(initializer, services).GetHealth().Result!).StatusCode;
+    ((ObjectResult)new HealthController(initializer, services).GetHealth().GetAwaiter().GetResult().Result!).StatusCode;
 
 static void Assert(bool condition, string message)
 {

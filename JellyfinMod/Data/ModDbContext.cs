@@ -95,6 +95,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets upgrade operations (P6.M5).</summary>
     public DbSet<UpgradeOperation> UpgradeOperations => Set<UpgradeOperation>();
 
+    /// <summary>Gets titles whose watch history arrived from Trakt, per user (P7.Q16).</summary>
+    public DbSet<TraktObservation> TraktObservations => Set<TraktObservation>();
+
     /// <summary>
     /// Saves, and saves again after a pause when SQLite reported the database busy (another writer held the write lock past
     /// the busy timeout). A failed save wrote nothing and leaves every tracked change in place, so the retry is the same
@@ -295,5 +298,11 @@ public class ModDbContext : DbContext
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
         });
         b.Entity<GrabOperation>(e => e.HasIndex(x => new { x.Automatic, x.CreatedAt }));
+        b.Entity<TraktObservation>(e =>
+        {
+            e.HasIndex(x => new { x.UserId, x.JellyfinItemId }).IsUnique();
+            e.HasIndex(x => new { x.UserId, x.SeriesId });
+            e.HasIndex(x => new { x.UserId, x.SeasonId });
+        });
     }
 }

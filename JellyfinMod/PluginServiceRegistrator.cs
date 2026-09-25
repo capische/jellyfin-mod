@@ -3,6 +3,7 @@ using JellyfinMod.Services;
 using JellyfinMod.Services.Acquisition;
 using JellyfinMod.Services.Automation;
 using JellyfinMod.Services.Import;
+using JellyfinMod.Services.Trakt;
 using JellyfinMod.Services.Web;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller;
@@ -86,5 +87,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<LibraryEventListener>());
         services.AddSingleton<RetentionEventListener>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<RetentionEventListener>());
+        // The Trakt indicator (P7.Q16): the host's plugin list, and a listener of its own for Trakt's history imports.
+        services.AddSingleton<TraktPluginState>();
+        services.AddSingleton<IHostedService, TraktObservationListener>();
     }
 }
