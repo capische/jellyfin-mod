@@ -432,11 +432,11 @@ public sealed class RetentionPreviewService(
             if (eligible.Length == 0) return null;
             var completed = new Dictionary<Guid, DateTime>();
             // Read as stored, not from the cached item a Trakt or NFO import leaves stale (Q16 review P2-2).
-            var stored = StoredUserData.Item(library, native.Id);
-            if (stored is null) return null;
+            // Missing or unreadable, the file is not shown finished and stays (multi_episode_not_all_due).
+            if (StoredUserData.TryItem(library, native.Id, out var stored, out _) != StoredRead.Found) return null;
             foreach (var user in eligible)
             {
-                var state = StoredUserData.For(userData, user, stored);
+                var state = userData.GetUserData(user, stored!);
                 if (state is null) return null;
                 if (state.PlaybackPositionTicks > 0) return null;
                 if (state.Played && state.LastPlayedDate is { } played)

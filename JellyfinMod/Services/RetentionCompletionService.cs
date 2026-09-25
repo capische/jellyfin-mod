@@ -20,21 +20,50 @@ public sealed class RetentionCompletionService(
     /// Refreshes one native movie or episode for one user. Returns false when a playback-progress update
     /// changed nothing but the position, which is then not written (P3.T11).
     /// </summary>
-    public async Task<bool> RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason, CancellationToken cancellationToken)
+    /// <remarks>
+    /// An item that cannot be read (as opposed to one Jellyfin no longer has) throws and leaves the stored observation as
+    /// it is: a passing read error must not turn recorded evidence into "unavailable", which would clear a running
+    /// deadline and later make an elapsed window due with no new warning (review P3-1).
+    /// </remarks>
+    public Task<bool> RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason, CancellationToken cancellationToken) =>
+        RefreshAsync(userId, jellyfinItemId, sourceReason, null, cancellationToken);
+
+    private async Task<bool> RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason,
+        Dictionary<Guid, BaseItem?>? loaded, CancellationToken cancellationToken)
     {
         try
         {
-            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, cancellationToken).ConfigureAwait(false);
+            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, loaded, cancellationToken).ConfigureAwait(false);
         }
         catch (DbUpdateException error) when (error.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 })
         {
             // A concurrent writer (listener, repair, evaluation) created the row first; re-read it once.
             database.ChangeTracker.Clear();
-            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, cancellationToken).ConfigureAwait(false);
+            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, loaded, cancellationToken).ConfigureAwait(false);
         }
     }
 
-    private async Task<bool> RefreshCoreAsync(Guid userId, Guid jellyfinItemId, string sourceReason, CancellationToken cancellationToken)
+    /// <summary>
+    /// The stored item, or null when Jellyfin has no such item; throws when it cannot be read. A repair pass shares the
+    /// items it loaded between users (review P3-2).
+    /// </summary>
+    private BaseItem? StoredItem(Guid itemId, Dictionary<Guid, BaseItem?>? loaded)
+    {
+        if (loaded is not null && loaded.TryGetValue(itemId, out var known)) return known;
+        var read = StoredUserData.TryItem(library, itemId, out var item, out var error);
+        if (read == StoredRead.Error)
+        {
+            logger.LogWarning(error, "JellyfinMod could not read item {ItemId} for retention evidence; the recorded evidence is kept",
+                itemId);
+            throw new InvalidOperationException($"Item {itemId} could not be read for retention evidence", error);
+        }
+
+        if (loaded is not null) loaded[itemId] = item;
+        return item;
+    }
+
+    private async Task<bool> RefreshCoreAsync(Guid userId, Guid jellyfinItemId, string sourceReason,
+        Dictionary<Guid, BaseItem?>? loaded, CancellationToken cancellationToken)
     {
         var user = users.GetUserById(userId);
         if (user is null)
@@ -50,6 +79,16 @@ public sealed class RetentionCompletionService(
             return false;
         }
 
+        // One observation covers every bound version of the target: a resume or favourite on any
+        // version protects it, and finishing any version completes it (plugin-retention-policy#4).
+        // The state is read as stored, never from Jellyfin's cached item, which a Trakt or NFO import does not update
+        // (Q16 review P2-2). The event that queued this read is not used for the state: the listener coalesces events per
+        // user and item, so the stored state is the newest one, at least as new as any event.
+        var boundItemIds = await BoundItemIdsAsync(target, cancellationToken).ConfigureAwait(false);
+        if (!boundItemIds.Contains(jellyfinItemId)) boundItemIds = [.. boundItemIds, jellyfinItemId];
+        // Read everything before changing the tracked observation, so an item that cannot be read leaves it as it was.
+        var states = boundItemIds.Select(id => StoredItem(id, loaded) is { } item ? userData.GetUserData(user, item) : null)
+            .ToArray();
         var now = clock.GetUtcNow().UtcDateTime;
         var observation = await database.CompletionObservations.SingleOrDefaultAsync(
             candidate => candidate.TargetId == target.TargetId && candidate.UserId == userId,
@@ -68,15 +107,6 @@ public sealed class RetentionCompletionService(
             database.CompletionObservations.Add(observation);
         }
 
-        // One observation covers every bound version of the target: a resume or favourite on any
-        // version protects it, and finishing any version completes it (plugin-retention-policy#4).
-        // The state is read as stored, never from Jellyfin's cached item, which a Trakt or NFO import does not update
-        // (Q16 review P2-2). The event that queued this read is not used for the state: the listener coalesces events per
-        // user and item, so the stored state is the newest one, at least as new as any event.
-        var boundItemIds = await BoundItemIdsAsync(target, cancellationToken).ConfigureAwait(false);
-        if (!boundItemIds.Contains(jellyfinItemId)) boundItemIds = [.. boundItemIds, jellyfinItemId];
-        var states = boundItemIds.Select(id => StoredUserData.For(userData, user, StoredUserData.Item(library, id)))
-            .ToArray();
         observation.JellyfinItemId = jellyfinItemId;
         observation.ObservedAt = now;
         observation.SourceReason = sourceReason;
@@ -138,10 +168,22 @@ public sealed class RetentionCompletionService(
         var completed = 0;
         foreach (var itemId in itemIds)
         {
+            // Each item, with the other versions of its target, is loaded once for every user.
+            var loaded = new Dictionary<Guid, BaseItem?>();
             foreach (var userId in userIds)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await RefreshAsync(userId, itemId, "Repair", cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await RefreshAsync(userId, itemId, "Repair", loaded, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception error) when (error is not OperationCanceledException)
+                {
+                    logger.LogDebug(error, "Retention evidence repair skipped item {ItemId} for now", itemId);
+                    // Unreadable now: the recorded evidence stays, and the next repair or event reads it again.
+                    database.ChangeTracker.Clear();
+                }
+
                 progress.Report(total == 0 ? 100 : 100d * ++completed / total);
             }
         }

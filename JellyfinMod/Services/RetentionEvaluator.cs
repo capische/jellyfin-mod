@@ -409,8 +409,19 @@ public sealed class RetentionEvaluator(
         {
             // A user who never touched the item has no event to record; read their live state now
             // instead of blocking Any and Selected mode until a manual repair (prior-H1).
-            foreach (var userId in missingUserIds)
-                await completion.RefreshAsync(userId, boundItemIds[0], "Evaluate", cancellationToken).ConfigureAwait(false);
+            try
+            {
+                foreach (var userId in missingUserIds)
+                    await completion.RefreshAsync(userId, boundItemIds[0], "Evaluate", cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is not OperationCanceledException && error is not DbUpdateException &&
+                                          !SqliteBusy.IsBusy(error))
+            {
+                // Jellyfin's item could not be read just now (review P3-1): this evaluation stays as it was, deadline
+                // included, and the next evaluation reads the user again.
+                database.ChangeTracker.Clear();
+                return;
+            }
             observations = await LoadCurrentObservationsAsync(targetId, userIds, boundItemIds, cancellationToken)
                 .ConfigureAwait(false);
             // Evidence read just now may carry a last-played instant after the start of this evaluation; it is not

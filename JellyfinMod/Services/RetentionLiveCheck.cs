@@ -89,9 +89,21 @@ public sealed class RetentionLiveCheck(
         // Played, resume and favourite state is read as stored, never from Jellyfin's cached items: a Trakt or NFO import
         // (for example a title marked unwatched) saves through another instance and leaves the cached one stale (Q16
         // review P2-2).
-        var items = versionItemIds.Select(id => StoredUserData.Item(library, id)).OfType<BaseItem>().ToArray();
-        if (items.Length == 0) return RetentionLiveReasons.LiveStateUnavailable;
-        var series = seriesItemId is { } seriesId ? StoredUserData.Item(library, seriesId) : null;
+        // A version Jellyfin no longer has is skipped, as before; one that cannot be read is unknown state, and a version
+        // with a resume or a favourite could be among them, so nothing is unlinked (review P2-1).
+        var items = new List<BaseItem>();
+        foreach (var id in versionItemIds)
+        {
+            var read = StoredUserData.TryItem(library, id, out var stored, out _);
+            if (read == StoredRead.Error) return RetentionLiveReasons.LiveStateUnavailable;
+            if (read == StoredRead.Found) items.Add(stored!);
+        }
+
+        if (items.Count == 0) return RetentionLiveReasons.LiveStateUnavailable;
+        BaseItem? series = null;
+        if (seriesItemId is { } seriesId &&
+            StoredUserData.TryItem(library, seriesId, out series, out _) == StoredRead.Error)
+            return RetentionLiveReasons.LiveStateUnavailable;
         if (operation.EpisodeId.HasValue && policy.ExemptFavourites && series is null)
             return RetentionLiveReasons.LiveStateUnavailable;
 
@@ -131,15 +143,27 @@ public sealed class RetentionLiveCheck(
         var fileCompletedBy = new HashSet<Guid>();
         foreach (var user in eligibleUsers)
         {
-            var states = items.Select(item => StoredUserData.For(userData, user, item)).ToArray();
+            UserItemData?[] states;
+            UserItemData? seriesState = null, fileState = null;
+            try
+            {
+                states = items.Select(item => userData.GetUserData(user, item)).ToArray();
+                if (series is not null) seriesState = userData.GetUserData(user, series);
+                if (coversSeveral) fileState = userData.GetUserData(user, multi!);
+            }
+            catch (Exception error) when (error is not OperationCanceledException)
+            {
+                return RetentionLiveReasons.LiveStateUnavailable;
+            }
+
             if (states.Any(state => state is null)) return RetentionLiveReasons.LiveStateUnavailable;
             var current = states.OfType<UserItemData>().ToArray();
             if (current.Any(state => state.PlaybackPositionTicks > 0)) return RetentionLiveReasons.ActiveResume;
             if (policy.ExemptFavourites && current.Any(state => state.IsFavorite)) return RetentionLiveReasons.Favorite;
-            if (policy.ExemptFavourites && series is not null && StoredUserData.For(userData, user, series)?.IsFavorite == true)
+            if (policy.ExemptFavourites && seriesState?.IsFavorite == true)
                 return RetentionLiveReasons.FavoriteSeries;
             if (current.Any(Counts)) completedBy.Add(user.Id);
-            if (coversSeveral && Counts(StoredUserData.For(userData, user, multi))) fileCompletedBy.Add(user.Id);
+            if (coversSeveral && Counts(fileState)) fileCompletedBy.Add(user.Id);
         }
 
         if (!requireCompletion) return null;

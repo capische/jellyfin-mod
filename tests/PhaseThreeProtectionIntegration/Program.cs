@@ -303,6 +303,19 @@ static async Task VerifyPreviewHttpAsync(
     // the state the cached instance still holds in cachedInstanceStates and the stored item in storedCopies.
     var cachedInstanceStates = new Dictionary<BaseItem, UserItemData>(ReferenceEqualityComparer.Instance);
     var storedCopies = new Dictionary<Guid, BaseItem>();
+    // Items whose database read fails, with how many more reads fail (review P2-1, P3-1).
+    var retrieveFailures = new Dictionary<Guid, int>();
+    object? Retrieve(Guid id)
+    {
+        if (retrieveFailures.TryGetValue(id, out var left) && left > 0)
+        {
+            retrieveFailures[id] = left - 1;
+            throw new InvalidOperationException("injected: the item could not be read");
+        }
+
+        return storedCopies.GetValueOrDefault(id) ?? items.GetValueOrDefault(id);
+    }
+
     var library = Stub<ILibraryManager>.Create((method, arguments) => method.Name switch
     {
         "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
@@ -310,7 +323,7 @@ static async Task VerifyPreviewHttpAsync(
         "GetUserRootFolder" => root,
         "GetVirtualFolders" => virtualFolders,
         "GetItemById" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
-        "RetrieveItem" when arguments?[0] is Guid id => storedCopies.GetValueOrDefault(id) ?? items.GetValueOrDefault(id),
+        "RetrieveItem" when arguments?[0] is Guid id => Retrieve(id),
         "DeleteItem" when arguments?[0] is BaseItem item => items.Remove(item.Id),
         _ => null
     });
@@ -904,7 +917,7 @@ static async Task VerifyPreviewHttpAsync(
         await VerifyReclamationAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings,
             entry, movie, secondVersion, sharedEntry, sharedMovie, user.Id, libraryFolder.Id, items);
         await VerifyLiveStateRevalidationAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
-            user.Id, libraryFolder.Id, liveStates, sessionRows, sessionManager, cachedInstanceStates, storedCopies);
+            user.Id, libraryFolder.Id, liveStates, sessionRows, sessionManager, cachedInstanceStates, storedCopies, retrieveFailures);
         await VerifyHonestRecoveryAsync(api.Services, databasePath, libraryPath, storage, clock, items,
             user.Id, libraryFolder.Id);
         await VerifyRemoveGuardsAsync(api.Services, http, databasePath, libraryPath, storage, clock, items,
@@ -1817,7 +1830,8 @@ static async Task VerifyLiveStateRevalidationAsync(
     List<SessionInfo> sessionRows,
     ISessionManager sessionManager,
     Dictionary<BaseItem, UserItemData> cachedInstanceStates,
-    Dictionary<Guid, BaseItem> storedCopies)
+    Dictionary<Guid, BaseItem> storedCopies,
+    Dictionary<Guid, int> retrieveFailures)
 {
     var executor = services.GetRequiredService<RetentionExecutor>();
     var fixtures = new List<RecoveryFixture>();
@@ -1912,6 +1926,68 @@ static async Task VerifyLiveStateRevalidationAsync(
 
     cachedInstanceStates.Clear();
     storedCopies.Clear();
+
+    // Review P2-1: one of two bound versions cannot be read at the last check, while the other reads played after the
+    // floor. The unreadable version might hold a resume or a favourite the stored evidence has not seen yet, so its
+    // state is unknown, not absent: nothing is unlinked.
+    var unreadable = await SeedAsync(900215, "p2-1-version-unreadable");
+    var unreadableB = new Movie { Id = Guid.NewGuid(), Name = "p2-1-version-b", Path = Path.Combine(libraryPath, "p2-1-version-b.mkv") };
+    await File.WriteAllBytesAsync(unreadableB.Path, new byte[256]);
+    nativeItems[unreadableB.Id] = unreadableB;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.EntryBindings.Add(new EntryBinding
+        {
+            EntryId = unreadable.EntryId, JellyfinItemId = unreadableB.Id, TargetLibraryId = libraryId,
+            VersionGroupId = unreadable.ItemId, MediaPath = unreadableB.Path
+        });
+        await database.SaveChangesAsync();
+    }
+
+    retrieveFailures[unreadableB.Id] = int.MaxValue;
+    var unreadableBytes = await File.ReadAllBytesAsync(unreadable.Fixture.MediaPath);
+    var unreadableResult = await RecoverAsync(unreadable.Fixture);
+    retrieveFailures.Clear();
+    Assert(unreadableResult.State == "blocked" && unreadableResult.Reason == "live_state_unavailable" &&
+        (await File.ReadAllBytesAsync(unreadable.Fixture.MediaPath)).SequenceEqual(unreadableBytes),
+        $"A version whose state cannot be read blocks the unlink and the file is byte-identical (review P2-1): " +
+        $"{unreadableResult.State}/{unreadableResult.Reason}");
+    File.Delete(unreadableB.Path);
+
+    // Review P3-1: a read error while recording evidence leaves the recorded evidence and the schedule as they were.
+    var transient = await SeedAsync(900216, "p3-1-transient-read");
+    var evaluator = services.GetRequiredService<RetentionEvaluator>();
+    await evaluator.EvaluateAllAsync(default);
+    (bool Played, DateTime? LastPlayed, DateTime? Completed, bool Available, DateTime Observed, string State, DateTime? Deadline)
+        Snapshot()
+    {
+        using var database = new ModDbContext(databasePath);
+        var observation = database.CompletionObservations.AsNoTracking().Single(candidate =>
+            candidate.TargetId == transient.EntryId && candidate.UserId == userId);
+        var evaluation = database.RetentionEvaluations.AsNoTracking().Single(candidate => candidate.TargetId == transient.EntryId);
+        return (observation.Played, observation.LastPlayedAt, observation.CompletedAt, observation.EvidenceAvailable,
+            observation.ObservedAt, evaluation.State, evaluation.Deadline);
+    }
+
+    var settled = Snapshot();
+    retrieveFailures[transient.ItemId] = 1;
+    Exception? refreshError = null;
+    try
+    {
+        await services.GetRequiredService<RetentionCompletionService>().RefreshAsync(userId, transient.ItemId, "Import", default);
+    }
+    catch (Exception error)
+    {
+        refreshError = error;
+    }
+
+    await evaluator.EvaluateAllAsync(default);
+    var afterError = Snapshot();
+    Assert(refreshError is not null && retrieveFailures[transient.ItemId] == 0 && afterError == settled &&
+        settled.State == "scheduled" && settled.Deadline is not null,
+        $"A read error while recording evidence throws and leaves the observation and the deadline as they were " +
+        $"(review P3-1): {settled} -> {afterError}, error {refreshError?.GetType().Name}");
+    retrieveFailures.Clear();
 
     // Another version of the same title playing, reported only through its media source, protects every version.
     var grouped = await SeedAsync(900203, "live-version");
