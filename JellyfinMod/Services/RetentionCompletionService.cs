@@ -70,9 +70,12 @@ public sealed class RetentionCompletionService(
 
         // One observation covers every bound version of the target: a resume or favourite on any
         // version protects it, and finishing any version completes it (plugin-retention-policy#4).
+        // The state is read as stored, never from Jellyfin's cached item, which a Trakt or NFO import does not update
+        // (Q16 review P2-2). The event that queued this read is not used for the state: the listener coalesces events per
+        // user and item, so the stored state is the newest one, at least as new as any event.
         var boundItemIds = await BoundItemIdsAsync(target, cancellationToken).ConfigureAwait(false);
         if (!boundItemIds.Contains(jellyfinItemId)) boundItemIds = [.. boundItemIds, jellyfinItemId];
-        var states = boundItemIds.Select(id => library.GetItemById(id) is { } item ? userData.GetUserData(user, item) : null)
+        var states = boundItemIds.Select(id => StoredUserData.For(userData, user, StoredUserData.Item(library, id)))
             .ToArray();
         observation.JellyfinItemId = jellyfinItemId;
         observation.ObservedAt = now;

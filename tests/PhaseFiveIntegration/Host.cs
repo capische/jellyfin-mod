@@ -313,6 +313,8 @@ internal sealed partial class NativeWorld
                     .Where(versionId => _items.ContainsKey(versionId)).ToArray();
             case "GetLinkedAlternateVersions": return Array.Empty<Video>();
             case "GetItemById":
+            // The stored item: these fixtures keep one instance per item, so it is the same one (Q16 review P2-2).
+            case "RetrieveItem":
                 var id = (Guid)arguments![0]!;
                 return Libraries.FirstOrDefault(library => library.Id == id) as BaseItem ?? _items.GetValueOrDefault(id);
             case "GetItemList": return Query((InternalItemsQuery)arguments![0]!);

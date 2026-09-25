@@ -298,6 +298,11 @@ static async Task VerifyPreviewHttpAsync(
             Locations = [libraryPath]
         }
     };
+    // Jellyfin 12's item cache (Q16 review P2-2): GetItemById returns the library manager's cached instance, whose loaded
+    // user data rows GetUserData reads; RetrieveItem loads the item from the database as a new instance. A scenario puts
+    // the state the cached instance still holds in cachedInstanceStates and the stored item in storedCopies.
+    var cachedInstanceStates = new Dictionary<BaseItem, UserItemData>(ReferenceEqualityComparer.Instance);
+    var storedCopies = new Dictionary<Guid, BaseItem>();
     var library = Stub<ILibraryManager>.Create((method, arguments) => method.Name switch
     {
         "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
@@ -305,6 +310,7 @@ static async Task VerifyPreviewHttpAsync(
         "GetUserRootFolder" => root,
         "GetVirtualFolders" => virtualFolders,
         "GetItemById" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
+        "RetrieveItem" when arguments?[0] is Guid id => storedCopies.GetValueOrDefault(id) ?? items.GetValueOrDefault(id),
         "DeleteItem" when arguments?[0] is BaseItem item => items.Remove(item.Id),
         _ => null
     });
@@ -322,6 +328,7 @@ static async Task VerifyPreviewHttpAsync(
     Action<Guid>? userDataRead = null;
     var userData = Stub<IUserDataManager>.Create((method, arguments) =>
         method.Name != "GetUserData" || arguments?[1] is not BaseItem item ? null
+        : cachedInstanceStates.TryGetValue(item, out var cachedState) ? cachedState
         : Observe(userDataRead, item.Id) && liveStates.TryGetValue(item.Id, out var live) ? live
         : item.Id == series.Id ? new UserItemData { Key = "favorite-series", IsFavorite = true }
         : new UserItemData { Key = item.Id.ToString("N"), Played = true,
@@ -897,7 +904,7 @@ static async Task VerifyPreviewHttpAsync(
         await VerifyReclamationAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings,
             entry, movie, secondVersion, sharedEntry, sharedMovie, user.Id, libraryFolder.Id, items);
         await VerifyLiveStateRevalidationAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
-            user.Id, libraryFolder.Id, liveStates, sessionRows, sessionManager);
+            user.Id, libraryFolder.Id, liveStates, sessionRows, sessionManager, cachedInstanceStates, storedCopies);
         await VerifyHonestRecoveryAsync(api.Services, databasePath, libraryPath, storage, clock, items,
             user.Id, libraryFolder.Id);
         await VerifyRemoveGuardsAsync(api.Services, http, databasePath, libraryPath, storage, clock, items,
@@ -1808,7 +1815,9 @@ static async Task VerifyLiveStateRevalidationAsync(
     Guid libraryId,
     Dictionary<Guid, UserItemData> liveStates,
     List<SessionInfo> sessionRows,
-    ISessionManager sessionManager)
+    ISessionManager sessionManager,
+    Dictionary<BaseItem, UserItemData> cachedInstanceStates,
+    Dictionary<Guid, BaseItem> storedCopies)
 {
     var executor = services.GetRequiredService<RetentionExecutor>();
     var fixtures = new List<RecoveryFixture>();
@@ -1850,6 +1859,59 @@ static async Task VerifyLiveStateRevalidationAsync(
     Assert(unwatchedResult.State == "blocked" && unwatchedResult.Reason == "live_not_completed" &&
         File.Exists(unwatched.Fixture.MediaPath),
         $"A live unwatched state blocks the unlink: {unwatchedResult.State}/{unwatchedResult.Reason}");
+
+    // Q16 review P2-2: the Trakt plugin's history sync (and the NFO importer) saves user data through a fresh instance of
+    // the item, so the instance Jellyfin caches keeps the old state. Trakt marks the title unwatched: the cached instance
+    // still says played an hour ago, the stored item says unwatched. The last check reads the stored state and refuses.
+    var importedUnwatched = await SeedAsync(900213, "p2-2-trakt-unwatched");
+    var cachedItem = nativeItems[importedUnwatched.ItemId];
+    cachedInstanceStates[cachedItem] = new UserItemData
+    {
+        Key = "p2-2-cached", Played = true, LastPlayedDate = clock.GetUtcNow().UtcDateTime.AddHours(-1)
+    };
+    storedCopies[cachedItem.Id] = new Movie { Id = cachedItem.Id, Name = cachedItem.Name, Path = cachedItem.Path };
+    liveStates[importedUnwatched.ItemId] = new UserItemData { Key = "p2-2-stored", Played = false };
+    var importedBytes = await File.ReadAllBytesAsync(importedUnwatched.Fixture.MediaPath);
+    var importedResult = await RecoverAsync(importedUnwatched.Fixture);
+    Assert(importedResult.State == "blocked" && importedResult.Reason == "live_not_completed" &&
+        (await File.ReadAllBytesAsync(importedUnwatched.Fixture.MediaPath)).SequenceEqual(importedBytes),
+        $"A title an import marked unwatched is refused although Jellyfin's cached item still says played, and the file " +
+        $"is byte-identical (Q16 review P2-2): {importedResult.State}/{importedResult.Reason}");
+
+    // The other direction: Trakt imports a watch. The cached instance still says unwatched; the evidence the listener
+    // records for the Import is the stored one, played with the imported date, with no restart.
+    var importedWatch = await SeedAsync(900214, "p2-2-trakt-watched");
+    var cachedWatchItem = nativeItems[importedWatch.ItemId];
+    cachedInstanceStates[cachedWatchItem] = new UserItemData { Key = "p2-2-cached-unwatched", Played = false };
+    storedCopies[cachedWatchItem.Id] = new Movie { Id = cachedWatchItem.Id, Name = cachedWatchItem.Name, Path = cachedWatchItem.Path };
+    await using (var database = new ModDbContext(databasePath))
+    {
+        // Before the import the title was recorded as not watched.
+        var before = await database.CompletionObservations.SingleAsync(candidate =>
+            candidate.TargetId == importedWatch.EntryId && candidate.UserId == userId);
+        before.Played = false;
+        before.LastPlayedAt = null;
+        before.CompletedAt = null;
+        await database.SaveChangesAsync();
+    }
+
+    var importedAt = clock.GetUtcNow().UtcDateTime.AddMinutes(-30);
+    liveStates[importedWatch.ItemId] = new UserItemData { Key = "p2-2-stored-watched", Played = true, PlayCount = 1, LastPlayedDate = importedAt };
+    await services.GetRequiredService<RetentionCompletionService>().RefreshAsync(userId, importedWatch.ItemId, "Import", default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var observation = await database.CompletionObservations.AsNoTracking().SingleAsync(candidate =>
+            candidate.TargetId == importedWatch.EntryId && candidate.UserId == userId);
+        Assert(observation is { Played: true, SourceReason: "Import", PlaybackPositionTicks: 0 } &&
+            observation.LastPlayedAt is { } recorded && Math.Abs((recorded - importedAt).TotalSeconds) < 1 &&
+            observation.CompletedAt is { } completed && Math.Abs((completed - importedAt).TotalSeconds) < 1,
+            $"An imported watch is recorded as played with its date although Jellyfin's cached item still says unwatched " +
+            $"(Q16 review P2-2): played {observation.Played}, last played {observation.LastPlayedAt:o}, completed " +
+            $"{observation.CompletedAt:o}, imported {importedAt:o}");
+    }
+
+    cachedInstanceStates.Clear();
+    storedCopies.Clear();
 
     // Another version of the same title playing, reported only through its media source, protects every version.
     var grouped = await SeedAsync(900203, "live-version");

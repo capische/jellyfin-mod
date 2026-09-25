@@ -50,7 +50,7 @@ internal static class ApiSmoke
             "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
             "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
             "GetUserRootFolder" => root,
-            "GetItemById" when args?[0] is Guid id => nativeById.GetValueOrDefault(id),
+            "GetItemById" or "RetrieveItem" when args?[0] is Guid id => nativeById.GetValueOrDefault(id),
             "GetVirtualFolders" => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }
                 .Select(folder => new VirtualFolderInfo { ItemId = folder.Id.ToString(), Name = folder.Id.ToString("N") })
                 .ToList(),

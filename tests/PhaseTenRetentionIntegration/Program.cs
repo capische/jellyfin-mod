@@ -141,7 +141,7 @@ static async Task RunAsync(string folder, int targetCount, int rounds)
     {
         "GetUserRootFolder" => root,
         "GetVirtualFolders" => virtualFolders,
-        "GetItemById" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
+        "GetItemById" or "RetrieveItem" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
         "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
         "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
         _ => null

@@ -431,9 +431,12 @@ public sealed class RetentionPreviewService(
                 .ToArray();
             if (eligible.Length == 0) return null;
             var completed = new Dictionary<Guid, DateTime>();
+            // Read as stored, not from the cached item a Trakt or NFO import leaves stale (Q16 review P2-2).
+            var stored = StoredUserData.Item(library, native.Id);
+            if (stored is null) return null;
             foreach (var user in eligible)
             {
-                var state = userData.GetUserData(user, native);
+                var state = StoredUserData.For(userData, user, stored);
                 if (state is null) return null;
                 if (state.PlaybackPositionTicks > 0) return null;
                 if (state.Played && state.LastPlayedDate is { } played)

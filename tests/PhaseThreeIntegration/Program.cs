@@ -97,7 +97,7 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
         "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
         "GetUserRootFolder" => root,
-        "GetItemById" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
+        "GetItemById" or "RetrieveItem" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
         _ => null
     });
     var localization = Stub<ILocalizationManager>.Create((_, _) => null);
