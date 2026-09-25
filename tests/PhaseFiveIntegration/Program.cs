@@ -836,6 +836,11 @@ internal static partial class Phase5
             var operation = await ImportFor(dbPath, grabL);
             return operation.State == ImportStates.Scanning ? operation : null;
         }, "The late import reaches scanning");
+        // The host acts on a reported change only after its library monitor delay (60 s by default), so the escalation
+        // waits past it: 70 s after the request nothing is re-requested yet.
+        time.Offset += TimeSpan.FromSeconds(70);
+        await Tick();
+        Assert((await ImportFor(dbPath, grabL)).ScanAttempts == 1, "No escalation before the host's library monitor delay has passed");
         time.Offset += TimeSpan.FromMinutes(11);
         await Tick();
         Assert((await ImportFor(dbPath, grabL)).ScanAttempts == 2, "A timed-out scan is requested once more");

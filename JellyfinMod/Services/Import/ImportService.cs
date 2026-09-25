@@ -1,6 +1,7 @@
 using System.Text.Json;
 using JellyfinMod.Data;
 using JellyfinMod.Services.Acquisition;
+using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
 using Microsoft.Data.Sqlite;
@@ -50,6 +51,7 @@ public sealed class ImportService(
     MediaStorageIdentity mounts,
     ILibraryManager library,
     ILibraryMonitor libraryMonitor,
+    IServerConfigurationManager serverConfiguration,
     ReconciliationLibraryLock libraryLock,
     SeedReleaseService seedReleases,
     TimeProvider time,
@@ -549,12 +551,45 @@ public sealed class ImportService(
             return;
         }
 
-        if (operation.State != ImportStates.Scanning) return;
-        var timeout = TimeSpan.FromMinutes(Math.Max(1, settings.ScanTimeoutMinutes));
-        // The reported change is cheap and usually enough; a minute later the escalation to a library scan is
-        // worth its cost, and only after the full window does the operation give up (P5.I5).
-        var wait = operation.ScanAttempts < 2 ? TimeSpan.FromSeconds(Math.Min(60, timeout.TotalSeconds)) : timeout;
-        if (operation.ScanRequestedAt is not { } requested || Now - requested < wait) return;
+        if (operation.State != ImportStates.Scanning || operation.ScanRequestedAt is not { } requested) return;
+        if (operation.ScanAttempts >= 2)
+        {
+            // After the escalation, the operation gives up only once the configured scan timeout has passed (P5.I5).
+            if (Now - requested < TimeSpan.FromMinutes(Math.Max(1, settings.ScanTimeoutMinutes))) return;
+        }
+        else
+        {
+            // The reported change is cheap and usually enough, but the host acts on it only once its library monitor delay
+            // has passed since the last related change, and every related change restarts that delay (v12.0
+            // LibraryMonitor.CreateRefresher and FileRefresher.RestartTimer). Firing at the delay itself turned every import
+            // into a full scan (seen live, 2026-09-25). So the escalation to a library scan waits for the delay plus a
+            // margin, at least a minute, counted from the latest scan request on a related path: the same path, a parent
+            // or child, or a sibling in the same folder, as upstream groups them. Requests count whatever the state of the
+            // import that made them now is (a cancelled or finished import's report still restarted the host's timer), and
+            // they are read from SQLite, so a restart keeps them. The deferral is bounded: three of those waits after this
+            // import's own request the escalation happens regardless, so a busy folder cannot starve it. The scan timeout
+            // is not applied here: a short timeout must not bring the escalation forward.
+            var monitorDelay = Math.Max(0, serverConfiguration.Configuration.LibraryMonitorDelay);
+            var firstWait = TimeSpan.FromSeconds(Math.Max(60, monitorDelay + 30));
+            var cap = requested + firstWait * 3;
+            if (Now < cap && operation.DestinationPath is { } destination)
+            {
+                var windowStart = requested - firstWait;
+                var recent = await database.ImportOperations.AsNoTracking()
+                    .Where(other => other.Id != operation.Id && other.TargetLibraryId == operation.TargetLibraryId &&
+                        other.ScanRequestedAt != null && other.ScanRequestedAt >= windowStart && other.DestinationPath != null)
+                    .Select(other => new { other.ScanRequestedAt, other.DestinationPath })
+                    .ToListAsync(cancellationToken).ConfigureAwait(false);
+                var reference = recent.Where(other => RelatedRefreshPaths(destination, other.DestinationPath!))
+                    .Select(other => other.ScanRequestedAt!.Value).Append(requested).Max();
+                if (Now - reference < firstWait) return;
+            }
+            else if (Now - requested < firstWait)
+            {
+                return;
+            }
+        }
+
         if (operation.ScanAttempts < 2)
         {
             await RequestScanAsync(operation).ConfigureAwait(false);
@@ -564,6 +599,30 @@ public sealed class ImportService(
         // The hardlink stays; a later full scan still binds it and completes the operation.
         await BlockAsync(operation, ImportReasons.BindingNotObserved,
             "Jellyfin did not bind the imported file after two targeted scans.").ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether the host's library monitor would fold two reported paths into one refresher, restarting its timer: the
+    /// same path, one inside the other, or siblings in one folder (v12.0 <c>LibraryMonitor.CreateRefresher</c>). A
+    /// refresher rebased to a folder also takes that folder's other children, so a path inside the other's folder counts.
+    /// Imports into two new title folders are related too: the host's own file watcher reports each new folder, and two
+    /// sibling folders rebase one refresher to their parent (seen live, 2026-09-26: two new movie folders refreshed as
+    /// the library root). The bounded deferral keeps this conservative grouping from starving an import.
+    /// </summary>
+    private static bool RelatedRefreshPaths(string first, string second)
+    {
+        static string Normal(string path) => Path.TrimEndingDirectorySeparator(path);
+        static bool Contains(string parent, string child) => child.StartsWith(parent + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+        var a = Normal(first);
+        var b = Normal(second);
+        if (string.Equals(a, b, StringComparison.Ordinal) || Contains(a, b) || Contains(b, a)) return true;
+        var parentA = Path.GetDirectoryName(a);
+        var parentB = Path.GetDirectoryName(b);
+        if (parentA is null || parentB is null) return false;
+        if (string.Equals(parentA, parentB, StringComparison.Ordinal) || Contains(parentA, b) || Contains(parentB, a)) return true;
+        var folderParentA = Path.GetDirectoryName(parentA);
+        var folderParentB = Path.GetDirectoryName(parentB);
+        return folderParentA is not null && string.Equals(folderParentA, folderParentB, StringComparison.Ordinal);
     }
 
     private async Task<(Guid BindingId, Guid NativeItemId)?> FindBindingAsync(ImportOperation operation, CancellationToken cancellationToken)

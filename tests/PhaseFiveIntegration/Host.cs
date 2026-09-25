@@ -427,6 +427,8 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Services.AddSingleton(localization);
         builder.Services.AddTransient(_ => new LibraryAccess(users, world.Native.Library, localization));
         builder.Services.AddTransient(_ => new CatalogSortName(serverConfiguration));
+        // The importer reads the host's library monitor delay to time its scan escalation (P5.I5).
+        builder.Services.AddSingleton(serverConfiguration);
         builder.Services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
             () => configuration, provider.GetRequiredService<ILogger<TmdbClient>>()));
         builder.Services.AddSingleton(new RetentionConfigurationSource(() => configuration));
