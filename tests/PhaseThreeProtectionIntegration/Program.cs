@@ -1939,6 +1939,42 @@ static async Task VerifyLiveStateRevalidationAsync(
         $"A live played flag without a date (Jellyfin 12's propagated version flag) is not a completion either: " +
         $"{undatedResult.Result.State}/{undatedResult.Result.Reason}");
 
+    // C2, found live on 18096: Jellyfin 12 records a merge ("Group versions") only on the main item, so the file merged
+    // into another tracked title still looks like a title of its own. Due and watched, it is blocked all the same, because
+    // that other title plays it as one of its versions; the file stays.
+    var mergedAway = await SeedAsync(900208, "c2-merged-away");
+    var mainTitle = new Movie { Id = Guid.NewGuid(), Name = "c2-main", Path = Path.Combine(libraryPath, "c2-main.mkv") };
+    mainTitle.LinkedAlternateVersions = [new LinkedChild { ItemId = mergedAway.ItemId, Type = MediaBrowser.Controller.Entities.LinkedChildType.LinkedAlternateVersion }];
+    nativeItems[mainTitle.Id] = mainTitle;
+    var mainEntryId = Guid.NewGuid();
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.Entries.Add(new Entry
+        {
+            Id = mainEntryId, MediaType = "movie", TmdbId = 900209, Title = "c2-main", State = FileState.OnDisk,
+            TargetLibraryId = libraryId, JellyfinItemId = mainTitle.Id
+        });
+        database.EntryBindings.Add(new EntryBinding
+        {
+            EntryId = mainEntryId, JellyfinItemId = mainTitle.Id, TargetLibraryId = libraryId, VersionGroupId = mainTitle.Id,
+            MediaPath = mainTitle.Path
+        });
+        await database.SaveChangesAsync();
+    }
+
+    var mergedBytes = await File.ReadAllBytesAsync(mergedAway.Fixture.MediaPath);
+    var mergedResult = await RecoverAsync(mergedAway.Fixture);
+    Assert(mergedResult.State == "blocked" && mergedResult.Reason == "versions_untracked" &&
+        (await File.ReadAllBytesAsync(mergedAway.Fixture.MediaPath)).SequenceEqual(mergedBytes),
+        $"A file another tracked title plays as a merged version is blocked and byte-identical (C2): {mergedResult.State}/{mergedResult.Reason}");
+    nativeItems.Remove(mainTitle.Id);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == mainEntryId));
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == mergedAway.EntryId));
+        await database.SaveChangesAsync();
+    }
+
     // P3.T16: a stacked multi-part movie is never reclaimed; unlinking one part would strand the rest.
     var multiPart = await SeedAsync(900205, "t16-multipart");
     var secondPart = Path.Combine(libraryPath, "t16-multipart-cd2.mkv");

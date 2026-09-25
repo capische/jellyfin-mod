@@ -90,9 +90,10 @@ public sealed class RetentionPreviewService(
         var trackedItems = targets.GroupBy(target => target.EpisodeId ?? target.EntryId)
             .ToDictionary(group => group.Key, group => (IReadOnlySet<string>)group.Where(target => target.Path is not null)
                 .Select(target => target.Path!).ToHashSet(StringComparer.Ordinal));
+        var mergedElsewhere = FilesMergedIntoOtherTitles(targets);
         var inspected = targets.Select(target => Inspect(target, libraryRoots, now,
             replacementBindingIds?.Contains(target.BindingId) == true, keptPaths, keptIdentities,
-            trackedItems[target.EpisodeId ?? target.EntryId])).ToArray();
+            trackedItems[target.EpisodeId ?? target.EntryId], mergedElsewhere)).ToArray();
         await ApplyMultiEpisodeRuleAsync(inspected, policy, evaluations, now, cancellationToken).ConfigureAwait(false);
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
@@ -254,7 +255,8 @@ public sealed class RetentionPreviewService(
         bool replacement,
         IReadOnlySet<string> keptPaths,
         IReadOnlySet<string> keptIdentities,
-        IReadOnlySet<string> trackedItems)
+        IReadOnlySet<string> trackedItems,
+        IReadOnlyDictionary<string, HashSet<Guid>> mergedElsewhere)
     {
         var evaluation = target.Evaluation;
         // A kept file is never reclaimed or replaced, whatever its title's schedule says (PHASE10 Q3).
@@ -319,6 +321,14 @@ public sealed class RetentionPreviewService(
         // what the plugin binds is checked, watched and kept, so while Jellyfin plays a version the plugin does not
         // track, or the bound item has itself become an extra version, nothing of that title is reclaimed (PHASE10 S17,
         // Jellyfin 12 analysis C1, C7, C10), until versions are enumerated (task V1) and tracked (E7).
+        // Jellyfin 12 records a merge ("Group versions") only on the main item: the file merged into it still looks like a
+        // title of its own. A file that another tracked title plays as one of its versions is part of a title whose other
+        // files this target does not track, so it is blocked like any other untracked version (C2, found live).
+        if (target.Path is { } mergedPath && mergedElsewhere.TryGetValue(mergedPath, out var mergers) &&
+            mergers.Any(owner => owner != (target.EpisodeId ?? target.EntryId)))
+            return PreviewCandidate.Blocked(target, target.EpisodeId.HasValue
+                ? RetentionPreviewReasons.EpisodeVersionsUntracked
+                : RetentionPreviewReasons.VersionsUntracked, evaluation?.Deadline);
         if (native is Video video && VersionsUntracked(video, trackedItems, target.EpisodeId.HasValue))
             return PreviewCandidate.Blocked(target, target.EpisodeId.HasValue
                 ? RetentionPreviewReasons.EpisodeVersionsUntracked
@@ -484,6 +494,36 @@ public sealed class RetentionPreviewService(
         {
             return true;
         }
+    }
+
+    /// <summary>
+    /// The files each tracked title plays as merged (linked) versions of its own, keyed by path, with the targets (movie or
+    /// episode) whose bound item lists them. Anything that cannot be read is left out here; the per-target check then still
+    /// reads the item itself.
+    /// </summary>
+    private Dictionary<string, HashSet<Guid>> FilesMergedIntoOtherTitles(IEnumerable<PreviewTarget> targets)
+    {
+        var result = new Dictionary<string, HashSet<Guid>>(StringComparer.Ordinal);
+        foreach (var target in targets)
+        {
+            try
+            {
+                if (library.GetItemById(target.JellyfinItemId) is not Video video) continue;
+                var paths = (video.LinkedAlternateVersions ?? [])
+                    .Select(link => link.ItemId is { } linked ? library.GetItemById(linked)?.Path : null)
+                    .Concat(library.GetLinkedAlternateVersions(video).Select(version => version?.Path));
+                foreach (var path in paths.Where(path => !string.IsNullOrEmpty(path)))
+                {
+                    if (!result.TryGetValue(path!, out var owners)) result[path!] = owners = [];
+                    owners.Add(target.EpisodeId ?? target.EntryId);
+                }
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+            }
+        }
+
+        return result;
     }
 
     private bool IsSeriesFavorite(PreviewTarget target)
