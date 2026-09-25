@@ -78,7 +78,7 @@ Copy all three generated files (`JellyfinMod.dll`, `logo.png`, `meta.json`) from
 into the plugin's own folder under the server's persistent `plugins/` directory, then restart
 Jellyfin. The helper reads `build.yaml` and adds the `imagePath` field Jellyfin 12.0.0 reads;
 copying only the DLL leaves the installed plugin card without its logo.
-The assembly version matches `build.yaml` (`0.1.0.0`).
+The assembly version matches `build.yaml` (`0.1.0.1`).
 Jellyfin 12.0.0 already supplies EF Core 10 and SQLite, including the native SQLite library; do
 not copy the host assemblies or a second database stack into the plugin directory.
 
@@ -193,6 +193,16 @@ In that shape "disable → stock" is the operator's own swap back to the host's 
 
 A manual install registers no repository; add `<your-server>/JellyfinMod/Repository` in Dashboard →
 Plugins → Manage Repositories to get the details panel and the update path.
+
+### Troubleshooting: one repository error at each start
+
+Each start of the image logs one line like
+`[ERR] … InstallationManager: An error occurred while accessing the plugin manifest: http://localhost:8096/JellyfinMod/Repository`
+with a 503 inside it, before `Core startup complete`. It is harmless and upstream timing, not a fault: Jellyfin's
+plugin-update task has a startup trigger that fires after 3 s, core startup takes longer on a small host, and until it
+completes the server answers every request, its own repository included, with 503 "loading". The catalog and the
+daily update check read the repository with 200 afterwards. A 503 **after** `Core startup complete`, or any other
+status, is a real error.
 
 ## Database and local validation
 
