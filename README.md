@@ -108,14 +108,29 @@ it (or with `buildx` for another platform).
 
 ### Docker image (preferred)
 
+Published at **`ghcr.io/capische/jellyfinmod`** for `linux/amd64` and `linux/arm64`:
+
+```bash
+docker pull ghcr.io/capische/jellyfinmod:0.1.0.0   # or :latest
+```
+
+**Tags.** Each release is published as its plugin version (`0.1.0.0`, the first public release, for
+Jellyfin 12.0.0) and as `latest`. A version tag is never overwritten: a broken release is fixed by
+publishing the next version (`0.1.0.1`) and moving `latest` to it. Pin a version tag in production.
+
+To build it yourself from a release directory:
+
 ```bash
 docker build -t capische/jellyfinmod:<version> artifacts/release/image
+# both architectures, as published (reproducible layer timestamps):
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) docker buildx build --platform linux/amd64,linux/arm64 \
+  --provenance=false -t ghcr.io/capische/jellyfinmod:<version> artifacts/release/image
 ```
 
 ```yaml
 services:
   jellyfin:
-    image: capische/jellyfinmod:<version>
+    image: ghcr.io/capische/jellyfinmod:<version>
     user: "1000:1000"
     ports: ["8096:8096"]
     volumes:
