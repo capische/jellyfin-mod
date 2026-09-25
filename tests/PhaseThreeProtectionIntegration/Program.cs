@@ -1055,9 +1055,28 @@ static async Task VerifyFileIdentityAsync(
     await ReconcileAsync(native.Id, renamed);
     Assert(await KeptAsync() == true, "A renamed file is still kept (same device and inode)");
     await using (var database = new ModDbContext(databasePath))
+        Assert(await database.VersionKeeps.AnyAsync(keep => keep.EntryId == entryId && keep.MediaPath == renamed),
+            "The Keep follows its renamed file to its new path");
+
+    // RET4-R6: Jellyfin stops listing the kept file while it is still on disk (here it lists another copy instead, as a
+    // merged copy hidden until the next scan leaves it). The administrator's Keep stays, and applies again when the file is
+    // listed again; nothing is detached.
+    var otherCopy = Path.Combine(folder, "Identity S01E01 other copy.mkv");
+    File.Copy(renamed, otherCopy);
+    native.Path = otherCopy;
+    await ReconcileAsync(native.Id, otherCopy);
+    Assert(await KeptAsync() == false, "The other copy Jellyfin lists now is not kept: nobody kept it");
+    await using (var database = new ModDbContext(databasePath))
+        Assert(await database.VersionKeeps.AnyAsync(keep => keep.EntryId == entryId && keep.MediaPath == renamed),
+            "A Keep whose file is still on disk survives while Jellyfin does not list that file (RET4-R6)");
+    native.Path = renamed;
+    await ReconcileAsync(native.Id, renamed);
+    Assert(await KeptAsync() == true, "Listed again, the kept file is kept again (RET4-R6)");
+    File.Delete(otherCopy);
+    await using (var database = new ModDbContext(databasePath))
     {
         Assert(await database.History.CountAsync(history => history.EntryId == entryId && history.EventType == "version_keep_detached") == 1,
-            "A rename detaches nothing");
+            "A rename, or a kept file Jellyfin stopped listing while it stayed on disk, detaches nothing");
         database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == entryId));
         await database.SaveChangesAsync();
     }

@@ -272,8 +272,8 @@ public sealed class ReconciliationService(
     }
 
     /// <summary>
-    /// Removes a per-file Keep that no longer matches any file of its title, by path or by physical identity, and says so
-    /// in History (RET3-R7). Left in place it would keep protecting its old path forever, so a different file that lands
+    /// Removes a per-file Keep that no longer matches any file of its title, by path or by physical identity, once its file
+    /// is provably gone or replaced at its path, and says so in History (RET3-R7, RET4-R6). Left in place it would keep protecting its old path forever, so a different file that lands
     /// there later would be kept without anyone having kept it. The file it kept went (a move to another filesystem, a
     /// copy-and-delete, a removal); the new file, if any, starts over and can be kept again.
     /// </summary>
@@ -292,25 +292,52 @@ public sealed class ReconciliationService(
                     (binding, episode) => new { episode.EntryId, binding.MediaPath, binding.FileFingerprint }))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         var detached = 0;
+        var moved = 0;
         foreach (var keep in keeps)
         {
-            var matches = files.Any(file => file.EntryId == keep.EntryId &&
-                (string.Equals(file.MediaPath, keep.MediaPath, StringComparison.Ordinal) ||
-                 keep.PhysicalIdentity is { Length: > 0 } identity && file.FileFingerprint is { } fingerprint &&
-                 fingerprint.StartsWith(identity + "|", StringComparison.Ordinal)));
-            if (matches) continue;
+            if (files.Any(file => file.EntryId == keep.EntryId && string.Equals(file.MediaPath, keep.MediaPath, StringComparison.Ordinal)))
+                continue;
+            var sameFile = keep.PhysicalIdentity is { Length: > 0 } identity
+                ? files.FirstOrDefault(file => file.EntryId == keep.EntryId && file.FileFingerprint is { } fingerprint &&
+                    fingerprint.StartsWith(identity + "|", StringComparison.Ordinal))
+                : null;
+            if (sameFile is not null)
+            {
+                // Renamed within its filesystem: the Keep follows its file, so it is judged at the file's path from now on.
+                if (sameFile.MediaPath is { Length: > 0 } newPath &&
+                    !keeps.Any(other => other.EntryId == keep.EntryId && string.Equals(other.MediaPath, newPath, StringComparison.Ordinal)))
+                {
+                    keep.MediaPath = newPath;
+                    moved++;
+                }
+                continue;
+            }
+            // Jellyfin can stop listing a file that is still there (a merged copy hidden until the next scan): the
+            // administrator's Keep stays while the kept file itself is on disk, and applies again when the file is bound
+            // again (RET4-R6). It goes only when that file is provably gone, or when another file now sits at its path.
+            string reason;
+            if (_files.TryInspect(keep.MediaPath, out var present))
+            {
+                if (keep.PhysicalIdentity is not { Length: > 0 } kept || kept == present.PhysicalIdentity) continue;
+                reason = "file_replaced";
+            }
+            else if (MediaStorageIdentity.IsProvablyAbsent(keep.MediaPath, out _))
+                reason = "file_gone";
+            else
+                continue;
+
             database.VersionKeeps.Remove(keep);
             database.History.Add(new HistoryRecord
             {
                 EntryId = keep.EntryId,
                 EventType = "version_keep_detached",
                 Summary = $"Stopped keeping {Path.GetFileName(keep.MediaPath)}: that file is no longer part of this title",
-                Data = JsonSerializer.Serialize(new { episodeId = keep.EpisodeId, mediaPath = keep.MediaPath, reason = "file_gone" })
+                Data = JsonSerializer.Serialize(new { episodeId = keep.EpisodeId, mediaPath = keep.MediaPath, reason })
             });
             detached++;
         }
 
-        if (detached > 0) await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        if (detached > 0 || moved > 0) await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return detached;
     }
 
