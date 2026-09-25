@@ -29,17 +29,18 @@ public sealed class RetentionPreviewService(
     /// Bindings being replaced by an upgrade (P6.M5): they skip the watched-completion schedule but keep every physical
     /// protection (storage, native item, path, active session, favourite series, seeding and the shared-inode group).
     /// </param>
-    /// <param name="evaluateEntries">
-    /// Null re-evaluates every target first (the administrator's preview and the start of a run). Otherwise only the
-    /// targets of these entries are re-evaluated, which the executor passes under its locks for the titles an action
-    /// touches (RET3-R6); every other row is reported from its stored evaluation and cannot be acted on by that action.
+    /// <param name="evaluateTargets">
+    /// Null re-evaluates every target first (the administrator's preview and the start of a run). Otherwise only these
+    /// targets (a movie's entry id, an episode's id) are re-evaluated, with the episodes a multi-episode file among them
+    /// covers, which the executor passes under its locks for what an action touches (RET3-R6, RET4-R5); every other row is
+    /// reported from its stored evaluation and cannot be acted on by that action.
     /// </param>
     public async Task<RetentionPreviewDto> PreviewAsync(CancellationToken cancellationToken,
-        IReadOnlySet<Guid>? replacementBindingIds = null, IReadOnlyCollection<Guid>? evaluateEntries = null)
+        IReadOnlySet<Guid>? replacementBindingIds = null, IReadOnlyCollection<Guid>? evaluateTargets = null)
     {
         using var operation = SqliteWriteDiagnostics.Operation("retention preview");
-        if (evaluateEntries is null) await retention.EvaluateAllAsync(cancellationToken).ConfigureAwait(false);
-        else await retention.EvaluateEntriesAsync(evaluateEntries, cancellationToken).ConfigureAwait(false);
+        if (evaluateTargets is null) await retention.EvaluateAllAsync(cancellationToken).ConfigureAwait(false);
+        else await retention.EvaluateTargetsAsync(evaluateTargets, cancellationToken).ConfigureAwait(false);
         var now = clock.GetUtcNow().UtcDateTime;
         var policy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
             snapshot => snapshot.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);

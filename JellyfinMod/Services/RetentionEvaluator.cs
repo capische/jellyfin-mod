@@ -93,6 +93,64 @@ public sealed class RetentionEvaluator(
             await EvaluateAsync(target, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Re-evaluates the given targets (a movie's entry id, an episode's id) and, for an episode whose file holds several
+    /// episodes, every episode that file covers, whose evaluations the multi-episode rule reads. The executor uses it under
+    /// its locks for what an action touches, so an action's cost does not grow with the length of its series (RET4-R5).
+    /// </summary>
+    public async Task EvaluateTargetsAsync(IReadOnlyCollection<Guid> targetIds, CancellationToken cancellationToken)
+    {
+        if (targetIds.Count == 0) return;
+        database.ChangeTracker.Clear();
+        var ids = targetIds.ToHashSet();
+        var bindings = await database.EpisodeBindings.AsNoTracking().Where(binding => ids.Contains(binding.EpisodeId))
+            .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id,
+                (binding, episode) => new { binding.JellyfinItemId, episode.EntryId })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var binding in bindings)
+        {
+            if (Covered(binding.JellyfinItemId) is not var (season, first, last)) continue;
+            var covered = await database.Episodes.AsNoTracking()
+                .Where(episode => episode.EntryId == binding.EntryId && episode.SeasonNumber == season &&
+                    episode.EpisodeNumber >= first && episode.EpisodeNumber <= last)
+                .Select(episode => episode.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
+            ids.UnionWith(covered);
+        }
+
+        var list = ids.ToArray();
+        var movieTargets = await database.Entries.AsNoTracking()
+            .Where(entry => list.Contains(entry.Id) && entry.MediaType == "movie" &&
+                database.EntryBindings.Any(binding => binding.EntryId == entry.Id))
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        var episodeTargets = await database.EpisodeBindings.AsNoTracking()
+            .Join(database.Episodes.AsNoTracking().Where(episode => list.Contains(episode.Id)),
+                binding => binding.EpisodeId, episode => episode.Id, (_, episode) => episode)
+            .Join(database.Entries.AsNoTracking(), episode => episode.EntryId, entry => entry.Id,
+                (episode, entry) => new Target(entry, episode.Id, episode.RetentionPolicy, episode.ReclaimAfterDays))
+            .Distinct()
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var entry in movieTargets)
+            await EvaluateAsync(new Target(entry, null), cancellationToken).ConfigureAwait(false);
+        foreach (var target in episodeTargets)
+            await EvaluateAsync(target, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>The season and episode range a multi-episode file holds; null for any other item or one not readable.</summary>
+    private (int Season, int First, int Last)? Covered(Guid itemId)
+    {
+        try
+        {
+            return library?.GetItemById(itemId) is MediaBrowser.Controller.Entities.TV.Episode
+            {
+                IndexNumber: { } first, IndexNumberEnd: { } last, ParentIndexNumber: { } season
+            } && last > first ? (season, first, last) : null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
+    }
+
     private async Task EvaluateAllCoreAsync(CancellationToken cancellationToken)
     {
         database.ChangeTracker.Clear();

@@ -45,10 +45,10 @@ public sealed class RetentionExecutor(
         }
 
         await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
-        // Only the titles this action can touch are re-evaluated; the run evaluated every title once before it started
-        // (RET3-R6).
-        var entryIds = await EntriesOfBindingsAsync([bindingId], cancellationToken).ConfigureAwait(false);
-        var initialPreview = await preview.PreviewAsync(cancellationToken, null, entryIds).ConfigureAwait(false);
+        // Only the targets this action can touch are re-evaluated; the run evaluated every title once before it started
+        // (RET3-R6, RET4-R5).
+        var targetIds = await TargetsOfBindingsAsync([bindingId], cancellationToken).ConfigureAwait(false);
+        var initialPreview = await preview.PreviewAsync(cancellationToken, null, targetIds).ConfigureAwait(false);
         var initial = Find(initialPreview, bindingId);
         if (initial is null)
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
@@ -60,10 +60,10 @@ public sealed class RetentionExecutor(
         lockedLibraryIds.UnionWith(LibrariesContaining(initial.CanonicalPath));
         await using var libraryLease = await AcquireLibrariesAsync(
             lockedLibraryIds, cancellationToken).ConfigureAwait(false);
-        var groupEntries = initialGroup.Select(item => item.EntryId).Concat(entryIds)
-            .Concat(await EntriesOfBindingsAsync([.. await CurrentBindingSetAsync(initial.CanonicalPath!, cancellationToken)
+        var groupTargets = initialGroup.Select(item => item.EpisodeId ?? item.EntryId).Concat(targetIds)
+            .Concat(await TargetsOfBindingsAsync([.. await CurrentBindingSetAsync(initial.CanonicalPath!, cancellationToken)
                 .ConfigureAwait(false)], cancellationToken).ConfigureAwait(false)).ToHashSet();
-        var currentPreview = await preview.PreviewAsync(cancellationToken, null, groupEntries).ConfigureAwait(false);
+        var currentPreview = await preview.PreviewAsync(cancellationToken, null, groupTargets).ConfigureAwait(false);
         var candidate = Find(currentPreview, bindingId);
         if (candidate is null || candidate.State != RetentionPreviewStates.Due)
             return RetentionExecutionResult.NotStarted(bindingId,
@@ -146,8 +146,8 @@ public sealed class RetentionExecutor(
         if (await IdentityUnverifiedAsync(bindingId, cancellationToken).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.IdentityUnverified);
         var replacement = new HashSet<Guid> { bindingId };
-        var replacedEntries = await EntriesOfBindingsAsync([bindingId], cancellationToken).ConfigureAwait(false);
-        var initialPreview = await preview.PreviewAsync(cancellationToken, replacement, replacedEntries).ConfigureAwait(false);
+        var replacedTargets = await TargetsOfBindingsAsync([bindingId], cancellationToken).ConfigureAwait(false);
+        var initialPreview = await preview.PreviewAsync(cancellationToken, replacement, replacedTargets).ConfigureAwait(false);
         var initial = Find(initialPreview, bindingId);
         if (initial is null)
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
@@ -158,7 +158,8 @@ public sealed class RetentionExecutor(
         lockedLibraryIds.UnionWith(LibrariesContaining(initial.CanonicalPath));
         await using var libraryLease = await AcquireLibrariesAsync(lockedLibraryIds, cancellationToken).ConfigureAwait(false);
         var currentPreview = await preview.PreviewAsync(cancellationToken, replacement,
-            SamePathGroup(initialPreview, initial).Select(item => item.EntryId).Concat(replacedEntries).ToHashSet()).ConfigureAwait(false);
+            SamePathGroup(initialPreview, initial).Select(item => item.EpisodeId ?? item.EntryId).Concat(replacedTargets).ToHashSet())
+            .ConfigureAwait(false);
         var candidate = Find(currentPreview, bindingId);
         if (candidate is null || candidate.State != RetentionPreviewStates.Due)
             return RetentionExecutionResult.NotStarted(bindingId, candidate?.Reason ?? RetentionExecutionReasons.BindingUnavailable);
@@ -264,14 +265,15 @@ public sealed class RetentionExecutor(
         // An upgrade replacement skips the watched rule and the window (P6.M5, PHASE10 Q10); every physical check below
         // still runs.
         var replacement = operations.All(operation => operation.Provenance == RetentionProvenances.UpgradeReplaced);
-        // The action's titles, and every title with a binding at the file now (one added since prepare included), are
+        // The action's targets, and every target with a binding at the file now (one added since prepare included), are
         // evaluated afresh: the same set a full evaluation would have refreshed for this file.
         var bindingsAtFile = await CurrentBindingSetAsync(operations[0].MediaPath, cancellationToken).ConfigureAwait(false);
-        var actionEntries = (await EntriesOfBindingsAsync(operations.Select(operation => operation.BindingId).Concat(bindingsAtFile)
-            .ToArray(), cancellationToken).ConfigureAwait(false)).Concat(operations.Where(operation => operation.EntryId.HasValue)
-            .Select(operation => operation.EntryId!.Value)).ToHashSet();
+        var actionTargets = (await TargetsOfBindingsAsync(operations.Select(operation => operation.BindingId).Concat(bindingsAtFile)
+            .ToArray(), cancellationToken).ConfigureAwait(false)).Concat(operations
+            .Where(operation => (operation.EpisodeId ?? operation.EntryId).HasValue)
+            .Select(operation => (operation.EpisodeId ?? operation.EntryId)!.Value)).ToHashSet();
         var currentPreview = await preview.PreviewAsync(cancellationToken,
-            replacement ? operations.Select(operation => operation.BindingId).ToHashSet() : null, actionEntries).ConfigureAwait(false);
+            replacement ? operations.Select(operation => operation.BindingId).ToHashSet() : null, actionTargets).ConfigureAwait(false);
         foreach (var operation in operations)
         {
             var candidate = Find(currentPreview, operation.BindingId);
@@ -527,13 +529,13 @@ public sealed class RetentionExecutor(
     }
 
     /// <summary>The entries that own these movie or episode bindings.</summary>
-    private async Task<HashSet<Guid>> EntriesOfBindingsAsync(IReadOnlyCollection<Guid> bindingIds, CancellationToken cancellationToken)
+    /// <summary>The retention targets of these bindings: a movie binding's entry, an episode binding's episode.</summary>
+    private async Task<HashSet<Guid>> TargetsOfBindingsAsync(IReadOnlyCollection<Guid> bindingIds, CancellationToken cancellationToken)
     {
         var movies = await database.EntryBindings.AsNoTracking().Where(binding => bindingIds.Contains(binding.Id))
             .Select(binding => binding.EntryId).ToListAsync(cancellationToken).ConfigureAwait(false);
         var episodes = await database.EpisodeBindings.AsNoTracking().Where(binding => bindingIds.Contains(binding.Id))
-            .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id, (_, episode) => episode.EntryId)
-            .ToListAsync(cancellationToken).ConfigureAwait(false);
+            .Select(binding => binding.EpisodeId).ToListAsync(cancellationToken).ConfigureAwait(false);
         return movies.Concat(episodes).ToHashSet();
     }
 
