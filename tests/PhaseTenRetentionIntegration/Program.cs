@@ -486,13 +486,15 @@ static async Task VerifyDecisionTwelveMigrationAsync(string folder)
     var firstEnabled = new DateTime(2026, 9, 20, 10, 0, 0, DateTimeKind.Utc);
     var backlogMovie = new Entry { Id = Guid.NewGuid(), MediaType = "movie", TmdbId = 920001, Title = "Backlog movie", State = FileState.OnDisk };
     var freshMovie = new Entry { Id = Guid.NewGuid(), MediaType = "movie", TmdbId = 920002, Title = "Fresh movie", State = FileState.OnDisk };
+    // RET4-R3: the Phase 3 rule stored the time it read an undated played flag as the basis, which can lie after the floor.
+    var undatedMovie = new Entry { Id = Guid.NewGuid(), MediaType = "movie", TmdbId = 920005, Title = "Undated movie", State = FileState.OnDisk };
     var series = new Entry { Id = Guid.NewGuid(), MediaType = "series", TmdbId = 920003, Title = "Series", State = FileState.OnDisk };
     var episode = new JellyfinMod.Data.Episode { Id = Guid.NewGuid(), EntryId = series.Id, TmdbId = 920004, SeasonNumber = 1, EpisodeNumber = 1 };
     await using (var database = new ModDbContext(path))
     {
         // The database as the previous release left it: every migration up to PhaseTenRetentionFixes.
         await database.GetService<IMigrator>().MigrateAsync("20260924110006_PhaseTenRetentionFixes");
-        database.Entries.AddRange(backlogMovie, freshMovie, series);
+        database.Entries.AddRange(backlogMovie, freshMovie, undatedMovie, series);
         database.Episodes.Add(episode);
         database.RetentionPolicySnapshots.Add(new RetentionPolicySnapshot
         {
@@ -509,7 +511,16 @@ static async Task VerifyDecisionTwelveMigrationAsync(string folder)
         database.RetentionEvaluations.AddRange(
             Scheduled(backlogMovie.Id, null, firstEnabled.AddDays(-100)),
             Scheduled(freshMovie.Id, null, firstEnabled.AddDays(1)),
+            Scheduled(undatedMovie.Id, null, firstEnabled.AddDays(1)),
             Scheduled(series.Id, episode.Id, firstEnabled.AddDays(-100)));
+        CompletionObservation Observed(Guid entryId, DateTime? lastPlayed, DateTime observed) => new()
+        {
+            EntryId = entryId, TargetId = entryId, UserId = Guid.NewGuid(), JellyfinItemId = Guid.NewGuid(), EvidenceAvailable = true,
+            Played = true, LastPlayedAt = lastPlayed, CompletedAt = lastPlayed ?? observed, ObservedAt = observed, SourceReason = "Import"
+        };
+        database.CompletionObservations.AddRange(
+            Observed(freshMovie.Id, firstEnabled.AddDays(1), firstEnabled.AddDays(1)),
+            Observed(undatedMovie.Id, null, firstEnabled.AddDays(1)));
         await database.SaveChangesAsync();
     }
 
@@ -520,18 +531,22 @@ static async Task VerifyDecisionTwelveMigrationAsync(string folder)
         var evaluations = await database.RetentionEvaluations.AsNoTracking().ToDictionaryAsync(evaluation => evaluation.TargetId);
         var backlog = evaluations[backlogMovie.Id];
         var fresh = evaluations[freshMovie.Id];
+        var undated = evaluations[undatedMovie.Id];
         var episodic = evaluations[episode.Id];
         Assert(backlog is { State: "waiting", Reason: "waiting_for_completion", Deadline: null, CompletionBasisAt: null, RequiresFreshCompletion: true },
             $"A movie scheduled from a watch before its floor is no longer due after the migration (decision 12): {backlog.State} {backlog.Deadline}");
         Assert(fresh is { State: "scheduled", RequiresFreshCompletion: true } && fresh.Deadline == firstEnabled.AddDays(15),
             $"A movie scheduled from a watch after its floor keeps its schedule: {fresh.State} {fresh.Deadline}");
+        Assert(undated is { State: "waiting", Deadline: null },
+            $"A movie scheduled from an undated played flag read after its floor is no longer due either (RET4-R3): {undated.State} {undated.Deadline}");
         Assert(episodic is { State: "scheduled" } && episodic.Deadline == firstEnabled.AddDays(-86),
             "Episodes are untouched by the movie back-fill");
         var history = await database.History.AsNoTracking().Where(record => record.EventType == "retention_rule_changed").ToListAsync();
-        Assert(history.Count == 1 && history[0].EntryId == backlogMovie.Id && history[0].Summary.Contains("decision 12", StringComparison.Ordinal) &&
-            JsonDocument.Parse(history[0].Data!).RootElement.GetProperty("reason").GetString() == "decision_12_movie_backlog" &&
-            history[0].CreatedAt > DateTime.UtcNow.AddMinutes(-5),
-            "History records the rule change once, on the movie it took out of the schedule");
+        Assert(history.Count == 2 && history.Select(record => record.EntryId).ToHashSet().SetEquals([backlogMovie.Id, undatedMovie.Id]) &&
+            history.All(record => record.Summary.Contains("decision 12", StringComparison.Ordinal) &&
+                JsonDocument.Parse(record.Data!).RootElement.GetProperty("reason").GetString() == "decision_12_movie_backlog" &&
+                record.CreatedAt > DateTime.UtcNow.AddMinutes(-5)),
+            "History records the rule change once on each movie it took out of the schedule");
     }
 
     Console.WriteLine("PASS: decision 12 migration takes the watched movie backlog out of the schedule and records it");
