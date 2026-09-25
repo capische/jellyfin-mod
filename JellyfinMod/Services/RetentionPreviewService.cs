@@ -497,9 +497,11 @@ public sealed class RetentionPreviewService(
     }
 
     /// <summary>
-    /// The files each tracked title plays as merged (linked) versions of its own, keyed by path, with the targets (movie or
-    /// episode) whose bound item lists them. Anything that cannot be read is left out here; the per-target check then still
-    /// reads the item itself.
+    /// The files each tracked title plays as merged (linked) versions of its own, with each linked version's local
+    /// alternates, keyed by path, with the targets (movie or episode) whose bound item lists them. Anything that cannot be
+    /// read is left out here; the per-target check then still reads the item itself. A merge whose main item the plugin
+    /// does not bind is seen only through the merged item's own <c>PrimaryVersionId</c> (<see cref="VersionsUntracked"/>);
+    /// once a later scan clears that, only the version enumeration of task V1 can find it (RET4-R2).
     /// </summary>
     private Dictionary<string, HashSet<Guid>> FilesMergedIntoOtherTitles(IEnumerable<PreviewTarget> targets)
     {
@@ -509,9 +511,16 @@ public sealed class RetentionPreviewService(
             try
             {
                 if (library.GetItemById(target.JellyfinItemId) is not Video video) continue;
-                var paths = (video.LinkedAlternateVersions ?? [])
-                    .Select(link => link.ItemId is { } linked ? library.GetItemById(linked)?.Path : null)
-                    .Concat(library.GetLinkedAlternateVersions(video).Select(version => version?.Path));
+                // Jellyfin plays each linked version together with that version's own local alternates (Video
+                // GetAllItemsForMediaSources): a copy merged in from a folder that holds two files brings both (RET4-R2).
+                var linkedVersions = (video.LinkedAlternateVersions ?? [])
+                    .Select(link => link.ItemId is { } linked ? library.GetItemById(linked) as Video : null)
+                    .Concat(library.GetLinkedAlternateVersions(video))
+                    .OfType<Video>()
+                    .ToArray();
+                var paths = linkedVersions.SelectMany(linked => new[] { linked.Path }
+                    .Concat(linked.LocalAlternateVersions ?? [])
+                    .Concat(library.GetLocalAlternateVersionIds(linked).Select(version => library.GetItemById(version)?.Path)));
                 foreach (var path in paths.Where(path => !string.IsNullOrEmpty(path)))
                 {
                     if (!result.TryGetValue(path!, out var owners)) result[path!] = owners = [];

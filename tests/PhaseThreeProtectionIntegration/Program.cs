@@ -1977,6 +1977,74 @@ static async Task VerifyLiveStateRevalidationAsync(
         await database.SaveChangesAsync();
     }
 
+    // RET4-R2 (a): a tracked title plays a copy merged in from another library whose folder holds two files, L and its
+    // local alternate A. Jellyfin plays A as one of the main title's versions too, although only L is listed by it. A's
+    // own entry tracks both of its files; due and watched, A is blocked and byte-identical all the same.
+    var alternate = await SeedAsync(900210, "ret4-r2-alternate");
+    var linkedCopy = new Movie { Id = Guid.NewGuid(), Name = "ret4-r2-linked", Path = Path.Combine(libraryPath, "ret4-r2-linked.mkv") };
+    await File.WriteAllBytesAsync(linkedCopy.Path, new byte[512]);
+    linkedCopy.LocalAlternateVersions = [alternate.Fixture.MediaPath];
+    nativeItems[linkedCopy.Id] = linkedCopy;
+    var linkingTitle = new Movie { Id = Guid.NewGuid(), Name = "ret4-r2-main", Path = Path.Combine(libraryPath, "ret4-r2-main.mkv") };
+    linkingTitle.LinkedAlternateVersions = [new LinkedChild { ItemId = linkedCopy.Id, Type = MediaBrowser.Controller.Entities.LinkedChildType.LinkedAlternateVersion }];
+    nativeItems[linkingTitle.Id] = linkingTitle;
+    var linkingEntryId = Guid.NewGuid();
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.EntryBindings.Add(new EntryBinding
+        {
+            EntryId = alternate.EntryId, JellyfinItemId = linkedCopy.Id, TargetLibraryId = libraryId, VersionGroupId = linkedCopy.Id,
+            MediaPath = linkedCopy.Path
+        });
+        database.Entries.Add(new Entry
+        {
+            Id = linkingEntryId, MediaType = "movie", TmdbId = 900211, Title = "ret4-r2-main", State = FileState.OnDisk,
+            TargetLibraryId = libraryId, JellyfinItemId = linkingTitle.Id
+        });
+        database.EntryBindings.Add(new EntryBinding
+        {
+            EntryId = linkingEntryId, JellyfinItemId = linkingTitle.Id, TargetLibraryId = libraryId, VersionGroupId = linkingTitle.Id,
+            MediaPath = linkingTitle.Path
+        });
+        await database.SaveChangesAsync();
+    }
+
+    var alternateBytes = await File.ReadAllBytesAsync(alternate.Fixture.MediaPath);
+    var alternateResult = await RecoverAsync(alternate.Fixture);
+    Assert(alternateResult.State == "blocked" && alternateResult.Reason == "versions_untracked" &&
+        (await File.ReadAllBytesAsync(alternate.Fixture.MediaPath)).SequenceEqual(alternateBytes),
+        $"A local alternate of a copy merged into another tracked title is blocked and byte-identical (RET4-R2): " +
+        $"{alternateResult.State}/{alternateResult.Reason}");
+    nativeItems.Remove(linkingTitle.Id);
+    nativeItems.Remove(linkedCopy.Id);
+    File.Delete(linkedCopy.Path);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == linkingEntryId));
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == alternate.EntryId));
+        await database.SaveChangesAsync();
+    }
+
+    // RET4-R2 (b): the main title of a merge is not tracked (its library is not bound); the merged copy, tracked, records
+    // the merge in its own PrimaryVersionId, as Jellyfin's MergeVersions sets it. Due and watched, it is blocked.
+    var mergedIntoUnbound = await SeedAsync(900212, "ret4-r2-unbound-main");
+    var unboundMain = new Movie { Id = Guid.NewGuid(), Name = "ret4-r2-unbound", Path = Path.Combine(libraryPath, "ret4-r2-unbound.mkv") };
+    unboundMain.LinkedAlternateVersions = [new LinkedChild { ItemId = mergedIntoUnbound.ItemId, Type = MediaBrowser.Controller.Entities.LinkedChildType.LinkedAlternateVersion }];
+    nativeItems[unboundMain.Id] = unboundMain;
+    ((Movie)nativeItems[mergedIntoUnbound.ItemId]).PrimaryVersionId = unboundMain.Id;
+    var unboundBytes = await File.ReadAllBytesAsync(mergedIntoUnbound.Fixture.MediaPath);
+    var unboundResult = await RecoverAsync(mergedIntoUnbound.Fixture);
+    Assert(unboundResult.State == "blocked" && unboundResult.Reason == "versions_untracked" &&
+        (await File.ReadAllBytesAsync(mergedIntoUnbound.Fixture.MediaPath)).SequenceEqual(unboundBytes),
+        $"A copy merged into a title the plugin does not track is blocked through its own primary and byte-identical " +
+        $"(RET4-R2): {unboundResult.State}/{unboundResult.Reason}");
+    nativeItems.Remove(unboundMain.Id);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.Entries.Remove(await database.Entries.SingleAsync(candidate => candidate.Id == mergedIntoUnbound.EntryId));
+        await database.SaveChangesAsync();
+    }
+
     // P3.T16: a stacked multi-part movie is never reclaimed; unlinking one part would strand the rest.
     var multiPart = await SeedAsync(900205, "t16-multipart");
     var secondPart = Path.Combine(libraryPath, "t16-multipart-cd2.mkv");
