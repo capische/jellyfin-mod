@@ -1,7 +1,7 @@
 ---
 name: "JellyfinMod"
 guid: "6f1a2b3c-4d5e-4f60-9a71-8b2c3d4e5f60"
-version: "0.1.0.0"
+version: "0.1.0.1"
 targetAbi: "12.0.0.0"
 framework: "net10.0"
 overview: "Track what you want to watch, get it, and reclaim the disk when you are done."
@@ -21,7 +21,9 @@ artifacts:
 # plugin installs the interface (P7.S3). Built by jellyfin-sync --test --plugin-web.
 - "jellyfinmod-web.zip"
 changelog: >
-  0.1.0.0 - First public release, for Jellyfin 12.0.0: the catalog of titles with or without a
+  0.1.0.1 - The Trakt indicator: with the stock Trakt plugin installed, a movie, episode, season or
+  series page shows when that user's watch history arrived from a Trakt sync (one new table,
+  TraktObservations). 0.1.0.0 - First public release, for Jellyfin 12.0.0: the catalog of titles with or without a
   file, acquisition through Torznab indexers and Prowlarr sync into Transmission, hardlink import,
   retention, automation, the settings area and first-run wizard, and the JellyfinMod interface
   served by the plugin at /web.
