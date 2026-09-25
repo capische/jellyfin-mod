@@ -32,7 +32,8 @@ public sealed class RetentionEventListener(
         SingleReader = true,
         SingleWriter = false
     });
-    private readonly ConcurrentDictionary<string, byte> pending = new(StringComparer.Ordinal);
+    /// <summary>Queued work keys, each with the save reason to record when it runs (review P3-3).</summary>
+    private readonly ConcurrentDictionary<string, string?> pending = new(StringComparer.Ordinal);
     private CancellationTokenSource? stopping;
     private Task? worker;
 
@@ -143,7 +144,16 @@ public sealed class RetentionEventListener(
 
     private void Enqueue(RetentionWork work)
     {
-        if (pending.TryAdd(work.Key, 0)) queue.Writer.TryWrite(work);
+        // Events for one user and item are coalesced into one read of the stored state. The reason recorded with it is
+        // the newest, except that playback progress never replaces another reason: an import (Trakt, NFO) or a mark
+        // played queued behind progress reports is still recorded as that, and its warning names that cause (review P3-3).
+        var added = false;
+        pending.AddOrUpdate(work.Key, _ =>
+        {
+            added = true;
+            return work.SourceReason;
+        }, (_, queued) => work.SourceReason is null || work.SourceReason == ProgressReason ? queued : work.SourceReason);
+        if (added) queue.Writer.TryWrite(work);
     }
 
     private async Task ProcessAsync(CancellationToken cancellationToken)
@@ -152,7 +162,7 @@ public sealed class RetentionEventListener(
         {
             await foreach (var work in queue.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                pending.TryRemove(work.Key, out _);
+                var reason = pending.TryRemove(work.Key, out var latest) ? latest ?? work.SourceReason : work.SourceReason;
                 try
                 {
                     using var scope = scopeFactory.CreateScope();
@@ -178,7 +188,7 @@ public sealed class RetentionEventListener(
                     else if (work.UserId is { } userId && work.JellyfinItemId is { } itemId)
                     {
                         var changed = await scope.ServiceProvider.GetRequiredService<RetentionCompletionService>()
-                            .RefreshAsync(userId, itemId, work.SourceReason!, cancellationToken).ConfigureAwait(false);
+                            .RefreshAsync(userId, itemId, reason!, cancellationToken).ConfigureAwait(false);
                         if (changed)
                             await scope.ServiceProvider.GetRequiredService<RetentionEvaluator>()
                                 .EvaluateNativeItemAsync(itemId, cancellationToken).ConfigureAwait(false);
@@ -198,6 +208,8 @@ public sealed class RetentionEventListener(
         {
         }
     }
+
+    private const string ProgressReason = "PlaybackProgress";
 
     private sealed record RetentionWork(string Key, Guid? UserId, Guid? JellyfinItemId, string? SourceReason);
 }
