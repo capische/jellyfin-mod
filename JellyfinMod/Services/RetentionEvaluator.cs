@@ -444,11 +444,28 @@ public sealed class RetentionEvaluator(
         if (result.GraceNotBefore is { } restarted) eligibleAt = Latest(eligibleAt, restarted);
         if (!priorDeadline.HasValue && (accessChanged || policyChanged ||
             (hadPriorEvaluation && priorState != RetentionEvaluationStates.Disabled)))
+        {
             eligibleAt = Latest(eligibleAt, now);
+            // Remembered like an administrator's restart (RET3-N1): a window that starts now because access or the
+            // policy changed, or because the completion was only now observed, must not start earlier after retention is
+            // switched off and on (Q9), when this schedule is gone and the grace start is computed again.
+            result.GraceNotBefore = result.GraceNotBefore is { } earlier ? Latest(earlier, eligibleAt) : eligibleAt;
+        }
+
         var days = target.WindowDays(policy.ReclaimAfterDays);
         // An isolated test instance can shorten every window to minutes; production leaves this at zero.
         var deadline = policy.TestWindowMinutes > 0 ? eligibleAt.AddMinutes(policy.TestWindowMinutes) : eligibleAt.AddDays(days);
-        if (priorDeadline > deadline) deadline = priorDeadline.Value;
+        if (priorDeadline > deadline)
+        {
+            deadline = priorDeadline.Value;
+            // A schedule pushed out before its grace start was remembered (evaluations from before RET3-N1): remember it
+            // now, while the window that produced it is still the one in force.
+            if (policy.TestWindowMinutes == 0 && !policyChanged && !accessChanged)
+            {
+                var graceStart = deadline.AddDays(-days);
+                result.GraceNotBefore = result.GraceNotBefore is { } earlier ? Latest(earlier, graceStart) : graceStart;
+            }
+        }
 
         // One event per window (RET2-R5): switching retention off and on keeps the countdown (Q9) and does not announce it
         // again; a restarted or new window has another deadline and is announced.

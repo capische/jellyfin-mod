@@ -91,7 +91,8 @@ static async Task RunAsync(string folder, int targetCount, int rounds)
         new User("third", "auth", "reset") { Id = Guid.NewGuid() }];
     var tvLibrary = new FixtureLibrary { Id = Guid.NewGuid(), CollectionType = CollectionType.tvshows };
     var movieLibrary = new FixtureLibrary { Id = Guid.NewGuid(), CollectionType = CollectionType.movies };
-    var root = new FixtureRoot(allUsers.Select(user => user.Id).ToHashSet(), [tvLibrary, movieLibrary]);
+    var withAccess = allUsers.Select(user => user.Id).ToHashSet();
+    var root = new FixtureRoot(withAccess, [tvLibrary, movieLibrary]);
     var series = new FixtureSeries { Id = Guid.NewGuid(), Name = "Concurrency series" };
     tvLibrary.Items.Add(series);
     var mediaRoot = Path.Combine(folder, "media");
@@ -345,6 +346,47 @@ static async Task RunAsync(string folder, int targetCount, int rounds)
             settings.RetentionEnabled = false;
             await EvaluateAllAsync(api.Services, settings, "retention listener policy");
         }
+
+        // RET3-N1 (found live on 18096): an access change starts a scheduled window over from now. Switching retention off
+        // and on must keep that later date and announce nothing again; before the fix the date came back earlier than the
+        // one announced, so a file could go before the date its warning had shown.
+        async Task<(DateTime? Deadline, int Started)> FreshMovieAsync()
+        {
+            await using var database = new ModDbContext(databasePath);
+            var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(item => item.TargetId == freshMovieEntryId);
+            var started = await database.History.AsNoTracking()
+                .CountAsync(history => history.EntryId == freshMovieEntryId && history.EventType == "retention_started");
+            return (evaluation.State == "scheduled" ? evaluation.Deadline : null, started);
+        }
+
+        settings.RetentionEnabled = true;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        var before = await FreshMovieAsync();
+        Assert(before.Deadline is not null, "The movie watched after the switch-on is scheduled again");
+        // Access changes while retention is off (a user added), so the next switch-on starts the window over from then.
+        settings.RetentionEnabled = false;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        await Task.Delay(1500);
+        var newcomer = new User("newcomer", "auth", "reset") { Id = Guid.NewGuid() };
+        allUsers.Add(newcomer);
+        withAccess.Add(newcomer.Id);
+        settings.RetentionEnabled = true;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        var pushed = await FreshMovieAsync();
+        Assert(pushed.Deadline > before.Deadline && pushed.Started == before.Started + 1,
+            $"An access change while retention was off starts the window over from the switch-on and announces it: " +
+            $"{before.Deadline:o}/{before.Started} -> {pushed.Deadline:o}/{pushed.Started}");
+        settings.RetentionEnabled = false;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        settings.RetentionEnabled = true;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        var again = await FreshMovieAsync();
+        Assert(again.Deadline == pushed.Deadline && again.Started == pushed.Started,
+            $"Switching retention off and on keeps the date the window was announced with and announces nothing again (RET3-N1): " +
+            $"{pushed.Deadline:o}/{pushed.Started} -> {again.Deadline:o}/{again.Started}");
+        settings.RetentionEnabled = false;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        Console.WriteLine($"  RET3-N1: the deadline {again.Deadline:o} survived an access change and a switch-off and on");
     }
     finally
     {
