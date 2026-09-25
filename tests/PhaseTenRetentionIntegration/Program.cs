@@ -85,7 +85,8 @@ static async Task RunAsync(string folder, int targetCount, int rounds)
 {
     var databasePath = Path.Combine(folder, "concurrency.db");
     var now = DateTime.UtcNow;
-    var clock = TimeProvider.System;
+    // The plugin's clock; decision 13's check moves it past a window that ran out while retention was off.
+    var clock = new ShiftedClock();
     var admin = new User("admin", "auth", "reset") { Id = Guid.NewGuid() };
     List<User> allUsers = [admin, new User("second", "auth", "reset") { Id = Guid.NewGuid() },
         new User("third", "auth", "reset") { Id = Guid.NewGuid() }];
@@ -130,6 +131,7 @@ static async Task RunAsync(string folder, int targetCount, int rounds)
     items[movieLibrary.Id] = movieLibrary;
     var freshMovie = movies[^1];
     DateTime? freshWatch = null;
+    var watchedWhileOff = new Dictionary<Guid, DateTime>();
     var virtualFolders = new List<VirtualFolderInfo>
     {
         new() { Name = "Concurrency movies", ItemId = movieLibrary.Id.ToString(), CollectionType = CollectionTypeOptions.movies, Locations = [movieRoot] },
@@ -154,7 +156,8 @@ static async Task RunAsync(string folder, int targetCount, int rounds)
     var userData = Stub<IUserDataManager>.Create((method, arguments) =>
         method.Name != "GetUserData" || arguments?[1] is not BaseItem item ? null
         : new UserItemData { Key = item.Id.ToString("N"), Played = true,
-            LastPlayedDate = item.Id == freshMovie.Id && freshWatch is { } watched ? watched : now.AddDays(-7) });
+            LastPlayedDate = item.Id == freshMovie.Id && freshWatch is { } watched ? watched
+                : watchedWhileOff.TryGetValue(item.Id, out var offWatch) ? offWatch : now.AddDays(-7) });
     var sessionManager = Stub<ISessionManager>.Create((method, _) => method.Name == "get_Sessions" ? Array.Empty<SessionInfo>() : null);
     var taskManager = Stub<ITaskManager>.Create((_, _) => null);
     var localization = Stub<ILocalizationManager>.Create((_, _) => null);
@@ -186,7 +189,7 @@ static async Task RunAsync(string folder, int targetCount, int rounds)
             ? new MediaBrowser.Model.Configuration.ServerConfiguration { SortRemoveWords = ["the", "a"], SortRemoveCharacters = [], SortReplaceCharacters = [] }
             : null);
     apiBuilder.Services.AddTransient(_ => new CatalogSortName(serverConfiguration));
-    apiBuilder.Services.AddSingleton(clock);
+    apiBuilder.Services.AddSingleton<TimeProvider>(clock);
     apiBuilder.Services.AddSingleton<MediaStorageIdentity>();
     apiBuilder.Services.AddSingleton<UnixFileInspector>();
     apiBuilder.Services.AddSingleton<ReconciliationLibraryLock>();
@@ -387,6 +390,88 @@ static async Task RunAsync(string folder, int targetCount, int rounds)
         settings.RetentionEnabled = false;
         await EvaluateAllAsync(api.Services, settings, "retention listener policy");
         Console.WriteLine($"  RET3-N1: the deadline {again.Deadline:o} survived an access change and a switch-off and on");
+
+        // Decision 13 (RET4-R1, 2026-09-25): a title finished while retention is off gets a full window from the next
+        // switch-on, announced, and is never due at once, however long ago it was watched; a countdown announced before the
+        // switch-off keeps its date while it has not run out (Q9).
+        var offMovie = movies[^2];
+        var offMovieLate = movies[^3];
+        var offEpisode = episodes[0];
+        var offEpisodeNative = natives[0];
+        Guid EntryOf(MediaBrowser.Controller.Entities.Movies.Movie movie)
+        {
+            using var database = new ModDbContext(databasePath);
+            return database.EntryBindings.AsNoTracking().Single(binding => binding.JellyfinItemId == movie.Id).EntryId;
+        }
+        var offMovieEntry = EntryOf(offMovie);
+        var offMovieLateEntry = EntryOf(offMovieLate);
+        async Task<(string State, DateTime? Deadline, int Started)> TargetAsync(Guid targetId, Guid entryId)
+        {
+            await using var database = new ModDbContext(databasePath);
+            var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(item => item.TargetId == targetId);
+            var started = (await database.History.AsNoTracking()
+                    .Where(history => history.EntryId == entryId && history.EventType == "retention_started").ToListAsync())
+                .Count(history => targetId == entryId || (history.Data ?? "").Contains(targetId.ToString(), StringComparison.OrdinalIgnoreCase));
+            return (evaluation.State, evaluation.Deadline, started);
+        }
+        async Task WatchWhileOffAsync(BaseItem item, DateTime at)
+        {
+            watchedWhileOff[item.Id] = at;
+            using var scope = api.Services.CreateScope();
+            foreach (var user in allUsers)
+                await scope.ServiceProvider.GetRequiredService<RetentionCompletionService>()
+                    .RefreshAsync(user.Id, item.Id, "PlaybackFinished", CancellationToken.None);
+            await scope.ServiceProvider.GetRequiredService<RetentionEvaluator>().EvaluateNativeItemAsync(item.Id, CancellationToken.None);
+        }
+
+        // (1) Watched while off, the switch-on soon after: one window from the switch-on, announced once; the countdown
+        // announced before the switch-off (the fresh movie) keeps its date and is not announced again.
+        await WatchWhileOffAsync(offMovie, DateTime.UtcNow);
+        await WatchWhileOffAsync(offEpisodeNative, DateTime.UtcNow);
+        var disabledRow = await TargetAsync(offMovieEntry, offMovieEntry);
+        Assert(disabledRow is { State: "disabled", Started: 0 }, $"A watch while retention is off starts nothing: {disabledRow}");
+        var switchOn = clock.GetUtcNow().UtcDateTime;
+        settings.RetentionEnabled = true;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        var movieOn = await TargetAsync(offMovieEntry, offMovieEntry);
+        var episodeOn = await TargetAsync(offEpisode.Id, entry.Id);
+        foreach (var (label, row) in new[] { ("movie", movieOn), ("episode", episodeOn) })
+            Assert(row.State == "scheduled" && row.Deadline >= switchOn.AddDays(14).AddSeconds(-1) && row.Started == 1,
+                $"A {label} finished while retention was off is scheduled one full window from the switch-on and announced once " +
+                $"(decision 13): {row}");
+        var freshKept = await FreshMovieAsync();
+        Assert(freshKept.Deadline == again.Deadline && freshKept.Started == again.Started,
+            $"A countdown announced before the switch-off keeps its date (Q9): {again.Deadline:o} -> {freshKept.Deadline:o}");
+
+        // (2) Off for longer than the window: every window above runs out while off, and a movie is finished during the off
+        // period. At the switch-on none is due: each gets a full window from the switch-on, announced.
+        settings.RetentionEnabled = false;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        await WatchWhileOffAsync(offMovieLate, DateTime.UtcNow);
+        clock.Offset = TimeSpan.FromDays(20);
+        switchOn = clock.GetUtcNow().UtcDateTime;
+        settings.RetentionEnabled = true;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        var rows = new[]
+        {
+            ("movie watched while off, window run out", await TargetAsync(offMovieLateEntry, offMovieLateEntry), 1),
+            ("movie whose announced window ran out while off", await TargetAsync(offMovieEntry, offMovieEntry), 2),
+            ("episode whose announced window ran out while off", await TargetAsync(offEpisode.Id, entry.Id), 2),
+            ("fresh movie whose announced window ran out while off", await TargetAsync(freshMovieEntryId, freshMovieEntryId), again.Started + 1)
+        };
+        foreach (var (label, row, started) in rows)
+            Assert(row.State == "scheduled" && row.Deadline >= switchOn.AddDays(14).AddSeconds(-1) && row.Started == started,
+                $"The {label} is not due at the switch-on: a full window from it, announced (decision 13): {row}, expected {started} announcements");
+        using (var scope = api.Services.CreateScope())
+        {
+            var preview = await scope.ServiceProvider.GetRequiredService<RetentionPreviewService>().PreviewAsync(CancellationToken.None);
+            Assert(preview.Due == 0, $"Nothing is due right after the switch-on (decision 13): {preview.Due} due");
+        }
+        settings.RetentionEnabled = false;
+        await EvaluateAllAsync(api.Services, settings, "retention listener policy");
+        clock.Offset = TimeSpan.Zero;
+        Console.WriteLine($"  decision 13: watched while off and run out while off -> scheduled from the switch-on, " +
+            $"{string.Join(", ", rows.Select(row => $"{row.Item2.Deadline:o}"))}");
     }
     finally
     {
@@ -546,4 +631,11 @@ internal class Stub<T> : DispatchProxy where T : class
     }
 
     protected override object? Invoke(MethodInfo? targetMethod, object?[]? arguments) => callback(targetMethod!, arguments);
+}
+
+internal sealed class ShiftedClock : TimeProvider
+{
+    public TimeSpan Offset { get; set; }
+
+    public override DateTimeOffset GetUtcNow() => base.GetUtcNow() + Offset;
 }

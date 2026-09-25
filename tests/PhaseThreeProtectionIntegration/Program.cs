@@ -501,19 +501,17 @@ static async Task VerifyPreviewHttpAsync(
             ObservedAt = now.AddDays(-3)
         });
         // Both targets were already tracked when retention was enabled three days ago (P3.T7 grace
-        // floors at a target's first evaluation, so the fixture records that earlier evaluation).
-        database.RetentionEvaluations.AddRange(
-            new RetentionEvaluation
-            {
-                EntryId = entry.Id, TargetId = entry.Id, State = "disabled", Reason = "retention_disabled",
-                PolicyVersion = 1, EvaluatedAt = now.AddDays(-3), BaselineAt = now.AddDays(-3)
-            },
-            new RetentionEvaluation
-            {
-                EntryId = seriesEntry.Id, EpisodeId = episode.Id, TargetId = episode.Id, State = "disabled",
-                Reason = "retention_disabled", PolicyVersion = 1, EvaluatedAt = now.AddDays(-3),
-                BaselineAt = now.AddDays(-3)
-            });
+        // floors at a target's first evaluation), and the watch then was scheduled and announced while retention was on:
+        // the window ran out two days ago. (A window never announced before would start at the next switch-on instead,
+        // decision 13.)
+        RetentionEvaluation Announced(Guid entryId, Guid? episodeId) => new()
+        {
+            EntryId = entryId, EpisodeId = episodeId, TargetId = episodeId ?? entryId, State = "scheduled",
+            Reason = "completion_policy_satisfied", PolicyVersion = 1, EvaluatedAt = now.AddDays(-3), BaselineAt = now.AddDays(-3),
+            CompletionBasisAt = now.AddDays(-3), EligibleAt = now.AddDays(-3), Deadline = now.AddDays(-2),
+            AnnouncedDeadline = now.AddDays(-2)
+        };
+        database.RetentionEvaluations.AddRange(Announced(entry.Id, null), Announced(seriesEntry.Id, episode.Id));
         await database.SaveChangesAsync();
     }
 
@@ -1451,12 +1449,14 @@ static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
         ObservedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
     });
     // A prepared operation implies the target was already tracked and due (P3.T7 floors grace at the
-    // target's first evaluation), so record that earlier evaluation under the operation's policy.
+    // target's first evaluation): record that earlier evaluation, scheduled and announced under the operation's policy.
+    var seededAt = clock.GetUtcNow().UtcDateTime;
     database.RetentionEvaluations.Add(new RetentionEvaluation
     {
-        EntryId = entry.Id, TargetId = entry.Id, State = "disabled", Reason = "retention_disabled",
-        PolicyVersion = operation.PolicyVersion, EvaluatedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
-        BaselineAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
+        EntryId = entry.Id, TargetId = entry.Id, State = "scheduled", Reason = "completion_policy_satisfied",
+        PolicyVersion = operation.PolicyVersion, EvaluatedAt = seededAt.AddDays(-3), BaselineAt = seededAt.AddDays(-3),
+        CompletionBasisAt = seededAt.AddDays(-3), EligibleAt = seededAt.AddDays(-3), Deadline = seededAt.AddDays(-2),
+        AnnouncedDeadline = seededAt.AddDays(-2)
     });
     database.RetentionOperations.Add(operation);
     await database.SaveChangesAsync();
@@ -1645,11 +1645,13 @@ static async Task VerifyPinnedExecutionAsync(
             EvidenceAvailable = true, Played = true, CompletedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
             LastPlayedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3), ObservedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
         });
+        var overlapAt = clock.GetUtcNow().UtcDateTime;
         database.RetentionEvaluations.Add(new RetentionEvaluation
         {
-            EntryId = overlapEntry.Id, TargetId = overlapEntry.Id, State = "disabled", Reason = "retention_disabled",
-            PolicyVersion = policy.Version, EvaluatedAt = clock.GetUtcNow().UtcDateTime.AddDays(-3),
-            BaselineAt = clock.GetUtcNow().UtcDateTime.AddDays(-3)
+            EntryId = overlapEntry.Id, TargetId = overlapEntry.Id, State = "scheduled", Reason = "completion_policy_satisfied",
+            PolicyVersion = policy.Version, EvaluatedAt = overlapAt.AddDays(-3), BaselineAt = overlapAt.AddDays(-3),
+            CompletionBasisAt = overlapAt.AddDays(-3), EligibleAt = overlapAt.AddDays(-3), Deadline = overlapAt.AddDays(-2),
+            AnnouncedDeadline = overlapAt.AddDays(-2)
         });
         var preparedOperation = await database.RetentionOperations.SingleAsync(candidate => candidate.Id == prepared.OperationId);
         preparedOperation.PolicyVersion = policy.Version;

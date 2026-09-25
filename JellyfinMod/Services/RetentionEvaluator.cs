@@ -454,7 +454,20 @@ public sealed class RetentionEvaluator(
 
         var days = target.WindowDays(policy.ReclaimAfterDays);
         // An isolated test instance can shorten every window to minutes; production leaves this at zero.
-        var deadline = policy.TestWindowMinutes > 0 ? eligibleAt.AddMinutes(policy.TestWindowMinutes) : eligibleAt.AddDays(days);
+        DateTime DeadlineFrom(DateTime start) =>
+            policy.TestWindowMinutes > 0 ? start.AddMinutes(policy.TestWindowMinutes) : start.AddDays(days);
+        var deadline = DeadlineFrom(eligibleAt);
+        // Decision 13 (RET4-R1, 2026-09-25): at the switch-on, a title whose window was never announced (it was finished
+        // while retention was off) or whose window has run out gets a full window from now, announced below: it is never due
+        // at once and never deleted without a warning. A countdown announced before the switch-off that has not run out keeps
+        // counting from the first switch-on with the current window (Q9). Remembered like RET3-N1, so a later off and on
+        // keeps the date this window is announced with.
+        if (priorState == RetentionEvaluationStates.Disabled && (result.AnnouncedDeadline is null || deadline <= now))
+        {
+            eligibleAt = Latest(eligibleAt, now);
+            result.GraceNotBefore = result.GraceNotBefore is { } earlier ? Latest(earlier, eligibleAt) : eligibleAt;
+            deadline = DeadlineFrom(eligibleAt);
+        }
         if (priorDeadline > deadline)
         {
             deadline = priorDeadline.Value;
