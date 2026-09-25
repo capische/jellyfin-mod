@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Image test for the entrypoint's system.xml rewrite (REVIEW-2026-09-24 S5-R1), in disposable containers.
 #
-#   tests/image/entrypoint-rewrite.sh [image]      (default capische/jellyfinmod:0.1.0.0; needs Docker)
+#   tests/image/entrypoint-rewrite.sh [image]      (default capische/jellyfin-mod:0.1.0.0; needs Docker)
 #
 # Runs this checkout's docker/jellyfinmod-entrypoint.sh inside the image against a scratch config volume, with the
 # server binary replaced by a stub that exits at once, so nothing but the entrypoint touches system.xml:
@@ -13,7 +13,7 @@
 # Leaves nothing behind: every container is --rm and every scratch directory is removed.
 set -euo pipefail
 
-image="${1:-capische/jellyfinmod:0.1.0.0}"
+image="${1:-capische/jellyfin-mod:0.1.0.0}"
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/jfmod-entrypoint.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
