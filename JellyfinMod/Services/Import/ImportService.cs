@@ -292,6 +292,9 @@ public sealed class ImportService(
         return true;
     }
 
+    /// <summary>How long after the client reports completion a missing or short file is still expected to appear.</summary>
+    private static readonly TimeSpan SourceSettleGrace = TimeSpan.FromMinutes(10);
+
     /// <summary>Identifies the one file that belongs to the grab and records its physical identity (P5.I3).</summary>
     private async Task IdentifyAsync(ImportOperation operation, ClientSnapshot snapshot, AcquisitionSettings settings, Entry entry,
         Episode? episode, CancellationToken cancellationToken)
@@ -302,6 +305,21 @@ public sealed class ImportService(
         {
             await BlockAsync(operation, ImportReasons.TorrentMissing, "The download client no longer holds this torrent.")
                 .ConfigureAwait(false);
+            return;
+        }
+
+        // Completion is required on every identifying attempt, not only on entry: a client recheck can find missing pieces
+        // after it first reported completion, and a preallocated file already has its full length (review P2-o). The
+        // operation then goes back to watching the download, and a later completion starts a fresh settling grace.
+        if (!torrent.Complete)
+        {
+            operation.State = ImportStates.Waiting;
+            operation.CompletedDownloadAt = null;
+            operation.Error = null;
+            operation.UpdatedAt = Now;
+            await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+            logger.LogInformation("Import {Operation} went back to watching: the client no longer reports the download complete",
+                operation.Id);
             return;
         }
 
@@ -332,19 +350,36 @@ public sealed class ImportService(
             return;
         }
 
-        if (!files.TryInspect(localPath, out var source))
+        var found = files.TryInspect(localPath, out var source);
+        if (!found || (long)source.LogicalBytes != file.Length)
         {
-            await BlockAsync(operation, ImportReasons.SourceMissing, "The downloaded file cannot be found at its mapped path.")
-                .ConfigureAwait(false);
+            // Transmission reports a torrent complete before it has moved the files out of its incomplete folder, so the
+            // file can be absent, or still growing, for a moment after completion (seen live, 2026-09-26: blocked as
+            // source_missing, then present with the right size). Both are required for completion (P5.I3), so the import
+            // keeps identifying for a grace period after the client reported completion, and only then blocks.
+            if (operation.CompletedDownloadAt is { } completed && Now - completed < SourceSettleGrace)
+            {
+                const string settling = "Waiting for the download client to put the finished file in place.";
+                if (operation.Error != settling)
+                {
+                    operation.Error = settling;
+                    operation.UpdatedAt = Now;
+                    await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+
+                return;
+            }
+
+            if (!found)
+                await BlockAsync(operation, ImportReasons.SourceMissing, "The downloaded file cannot be found at its mapped path.")
+                    .ConfigureAwait(false);
+            else
+                await BlockAsync(operation, ImportReasons.SourceSizeMismatch,
+                    $"The file has {source.LogicalBytes} bytes but the client reports {file.Length}.").ConfigureAwait(false);
             return;
         }
 
-        if ((long)source.LogicalBytes != file.Length)
-        {
-            await BlockAsync(operation, ImportReasons.SourceSizeMismatch,
-                $"The file has {source.LogicalBytes} bytes but the client reports {file.Length}.").ConfigureAwait(false);
-            return;
-        }
+        operation.Error = null;
 
         operation.SourceLocalPath = source.CanonicalPath;
         operation.SourcePhysicalIdentity = source.PhysicalIdentity;

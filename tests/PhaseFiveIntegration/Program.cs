@@ -859,6 +859,51 @@ internal static partial class Phase5
         Assert(lateL.Id == scanningL.Id, "A later scan still binds the file and completes the same operation");
         world.Native.AutoScan = true;
 
+        // ================= Review P2-o / live finding 8: a missing file after completion settles; a completion that regresses
+        // goes back to watching, and the file is linked only once the client reports it complete again.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            AddEntry(database, ids, "movieR", "movie", 121, "Regress Movie", 2021, "tt0000121", null, world.Movies.Id);
+            await database.SaveChangesAsync();
+        }
+
+        var fixtureR = TorrentFixture.Single("Regress.Movie.2021.1080p.WEB-DL-GRP.mkv", Size);
+        torznab.Torrents["movieR"] = fixtureR.Bytes;
+        transmission.Register(fixtureR);
+        lock (torznab.MovieItems)
+            torznab.MovieItems.Add(new("Regress.Movie.2021.1080p.WEB-DL-GRP", "guid-movieR", torznab.Download("movieR"), Size, 25,
+                new() { ["imdbid"] = "0000121" }));
+        var (grabR, hashR) = await GrabAsync(admin, ids["movieR"], null, fixtureR);
+        transmission.Progress(hashR, 1.0);
+        var heldR = transmission.Torrents[hashR];
+        var fileR = heldR.Files.Single(file => file.Wanted);
+        var localR = transmission.Local(heldR.DownloadDir + "/" + fileR.Name);
+        File.Delete(localR); // reported complete, but not yet moved into place
+        await Tick();
+        var settlingR = await ImportFor(dbPath, grabR);
+        Assert(settlingR.State == ImportStates.Identifying && settlingR.Reason is null && settlingR.CompletedDownloadAt is not null,
+            "A file missing just after completion keeps the import identifying instead of blocking it");
+        fileR.Completed = fileR.Length / 2; // a recheck finds missing pieces
+        await Tick();
+        var regressedR = await ImportFor(dbPath, grabR);
+        Assert(regressedR.State == ImportStates.Waiting && regressedR.CompletedDownloadAt is null && regressedR.LinkedAt is null,
+            "When the client stops reporting the download complete, the import goes back to watching and links nothing");
+        await File.WriteAllBytesAsync(localR, new byte[fileR.Length / 2]); // a preallocated, incomplete file of half length
+        using (var stream = new FileStream(localR, FileMode.Open, FileAccess.Write)) stream.SetLength(fileR.Length); // full length, still incomplete
+        await Tick();
+        Assert((await ImportFor(dbPath, grabR)).LinkedAt is null, "A full-length preallocated file is not linked while the client reports it incomplete");
+        File.Delete(localR);
+        transmission.Progress(hashR, 1.0);
+        var doneR = await WaitAsync(async () =>
+        {
+            await Tick();
+            var operation = await ImportFor(dbPath, grabR);
+            return operation.State == ImportStates.Completed ? operation : null;
+        }, "The import completes once the client reports completion again");
+        Assert(doneR.Id == settlingR.Id && await HistoryCount(dbPath, ids["movieR"], "imported") == 1 &&
+            await HistoryCount(dbPath, ids["movieR"], "import_blocked") == 0,
+            "The same operation completes with one imported event and was never blocked");
+
         // ================= P4.A6 (b): the Phase 3 seed reader reads the same daemon and sees its paths through the mappings.
         configuration.TransmissionRpcUrl = transmission.Endpoint.ToString();
         configuration.TransmissionUsername = transmission.Username;
