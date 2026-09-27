@@ -78,7 +78,7 @@ Copy all three generated files (`JellyfinMod.dll`, `logo.png`, `meta.json`) from
 into the plugin's own folder under the server's persistent `plugins/` directory, then restart
 Jellyfin. The helper reads `build.yaml` and adds the `imagePath` field Jellyfin 12.0.0 reads;
 copying only the DLL leaves the installed plugin card without its logo.
-The assembly version matches `build.yaml` (`0.1.0.1`).
+The assembly version matches `build.yaml` (`0.1.0.0`).
 Jellyfin 12.0.0 already supplies EF Core 10 and SQLite, including the native SQLite library; do
 not copy the host assemblies or a second database stack into the plugin directory.
 
@@ -118,6 +118,9 @@ docker pull ghcr.io/capische/jellyfin-mod:0.1.0.0   # or :latest
 **Tags.** Each release is published as its plugin version (`0.1.0.0`, the first public release, for
 Jellyfin 12.0.0) and as `latest`. A version tag is never overwritten: a broken release is fixed by
 publishing the next version (`0.1.0.1`) and moving `latest` to it. Pin a version tag in production.
+The one exception, by the user's decision: `0.1.0.0` was republished on 2026-09-27 with the Trakt
+indicator and the import fixes (see the changelog in `build.yaml`). A volume that already ran the
+first `0.1.0.0` picks the new build up on the next start (see *Plugin install* below).
 
 To build it yourself from a release directory:
 

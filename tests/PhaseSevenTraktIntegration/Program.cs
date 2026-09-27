@@ -57,7 +57,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         Folder = folder
     };
 
-    // ---- Migration: the released 0.1.0.0 schema (last migration PhaseSevenProwlarr) upgrades and keeps its rows.
+    // ---- Migration: the first 0.1.0.0 build's schema (2026-09-25; last migration PhaseSevenProwlarr) upgrades and keeps its rows.
     var dbPath = Path.Combine(folder, "jellyfinmod.db");
     await using (var database = new ModDbContext(dbPath))
     {
@@ -69,7 +69,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
             INSERT INTO Entries (Id, MediaType, TmdbId, Title, State, Monitored, AddedAt, TargetLibraryId)
             VALUES ({entryId}, 'movie', 1, 'Existing', 4, 1, '2026-09-01T00:00:00', {world.Movies.Id})
             """);
-        Assert(!(await TableNamesAsync(database)).Contains("TraktObservations"), "The 0.1.0.0 schema has no Trakt table");
+        Assert(!(await TableNamesAsync(database)).Contains("TraktObservations"), "The first 0.1.0.0 build's schema has no Trakt table");
         await database.Database.MigrateAsync();
         // Later phases add migrations after Q16's, so it is found by name, not as the last one applied.
         var applied = (await database.Database.GetAppliedMigrationsAsync()).ToList();
