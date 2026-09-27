@@ -486,6 +486,9 @@ public sealed class ImportService(
                     return;
                 }
 
+                // The host's watcher reports the topmost folder this link created; its refresher groups this import
+                // under that folder, or under the file when the folders already existed (P5.I5 scan wait).
+                operation.RefreshAnchorPath = created.Count > 0 ? created[0] : plan.Path;
                 await MarkLinkedAsync(operation, linked).ConfigureAwait(false);
                 logger.LogInformation("Import {Operation} hardlinked the download into library {Library}", operation.Id,
                     operation.TargetLibraryId);
@@ -607,17 +610,29 @@ public sealed class ImportService(
             var monitorDelay = Math.Max(0, serverConfiguration.Configuration.LibraryMonitorDelay);
             var firstWait = TimeSpan.FromSeconds(Math.Max(60, monitorDelay + 30));
             var cap = requested + firstWait * 3;
-            if (Now < cap && operation.DestinationPath is { } destination)
+            if (Now < cap && (operation.RefreshAnchorPath ?? operation.DestinationPath) is { } anchor)
             {
                 var windowStart = requested - firstWait;
                 var recent = await database.ImportOperations.AsNoTracking()
                     .Where(other => other.Id != operation.Id && other.TargetLibraryId == operation.TargetLibraryId &&
                         other.ScanRequestedAt != null && other.ScanRequestedAt >= windowStart && other.DestinationPath != null)
-                    .Select(other => new { other.ScanRequestedAt, other.DestinationPath })
+                    .Select(other => new { other.ScanRequestedAt, Anchor = other.RefreshAnchorPath ?? other.DestinationPath })
                     .ToListAsync(cancellationToken).ConfigureAwait(false);
-                var reference = recent.Where(other => RelatedRefreshPaths(destination, other.DestinationPath!))
+                var root = operation.DestinationRoot;
+                var reference = recent.Where(other => RelatedRefreshPaths(anchor, other.Anchor!, root))
                     .Select(other => other.ScanRequestedAt!.Value).Append(requested).Max();
-                if (Now - reference < firstWait) return;
+                var now = Now;
+                if (now - reference < firstWait)
+                {
+                    // Past its own first wait and still unbound: without the related request this would escalate now.
+                    // The line lets a live run see that decision for this operation (P5.I5 review P2-x).
+                    if (now - requested >= firstWait)
+                        logger.LogDebug(
+                            "Import {Operation} defers its library scan {Elapsed:F0} s after its request: a related scan request came {Quiet:F0} s ago (wait {Wait:F0} s, cap {Cap:F0} s)",
+                            operation.Id, (now - requested).TotalSeconds, (now - reference).TotalSeconds, firstWait.TotalSeconds,
+                            (firstWait * 3).TotalSeconds);
+                    return;
+                }
             }
             else if (Now - requested < firstWait)
             {
@@ -637,27 +652,32 @@ public sealed class ImportService(
     }
 
     /// <summary>
-    /// Whether the host's library monitor would fold two reported paths into one refresher, restarting its timer: the
-    /// same path, one inside the other, or siblings in one folder (v12.0 <c>LibraryMonitor.CreateRefresher</c>). A
-    /// refresher rebased to a folder also takes that folder's other children, so a path inside the other's folder counts.
-    /// Imports into two new title folders are related too: the host's own file watcher reports each new folder, and two
-    /// sibling folders rebase one refresher to their parent (seen live, 2026-09-26: two new movie folders refreshed as
-    /// the library root). The bounded deferral keeps this conservative grouping from starving an import.
+    /// Whether the host's library monitor can fold two imports' changes into one refresher, restarting its timer (v12.0
+    /// <c>LibraryMonitor.CreateRefresher</c>): the same path, one inside the other, or siblings in one folder, compared
+    /// on each import's refresh anchor (the topmost folder its link created, else its file). Siblings rebase a refresher to
+    /// their parent, so a path inside either anchor's parent folder is related too; that parent is never taken above the
+    /// library root. Two new series or title folders are therefore related, while episodes of existing series in different
+    /// series folders are not.
     /// </summary>
-    private static bool RelatedRefreshPaths(string first, string second)
+    private static bool RelatedRefreshPaths(string first, string second, string? libraryRoot)
     {
         static string Normal(string path) => Path.TrimEndingDirectorySeparator(path);
         static bool Contains(string parent, string child) => child.StartsWith(parent + Path.DirectorySeparatorChar, StringComparison.Ordinal);
         var a = Normal(first);
         var b = Normal(second);
         if (string.Equals(a, b, StringComparison.Ordinal) || Contains(a, b) || Contains(b, a)) return true;
-        var parentA = Path.GetDirectoryName(a);
-        var parentB = Path.GetDirectoryName(b);
+        var root = libraryRoot is null ? null : Normal(libraryRoot);
+        string? Parent(string path)
+        {
+            var parent = Path.GetDirectoryName(path);
+            return parent is null || root is not null && !string.Equals(parent, root, StringComparison.Ordinal) && !Contains(root, parent)
+                ? null : parent;
+        }
+
+        var parentA = Parent(a);
+        var parentB = Parent(b);
         if (parentA is null || parentB is null) return false;
-        if (string.Equals(parentA, parentB, StringComparison.Ordinal) || Contains(parentA, b) || Contains(parentB, a)) return true;
-        var folderParentA = Path.GetDirectoryName(parentA);
-        var folderParentB = Path.GetDirectoryName(parentB);
-        return folderParentA is not null && string.Equals(folderParentA, folderParentB, StringComparison.Ordinal);
+        return string.Equals(parentA, parentB, StringComparison.Ordinal) || Contains(parentA, b) || Contains(parentB, a);
     }
 
     private async Task<(Guid BindingId, Guid NativeItemId)?> FindBindingAsync(ImportOperation operation, CancellationToken cancellationToken)

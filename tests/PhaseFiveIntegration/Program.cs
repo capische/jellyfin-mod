@@ -904,6 +904,121 @@ internal static partial class Phase5
             await HistoryCount(dbPath, ids["movieR"], "import_blocked") == 0,
             "The same operation completes with one imported event and was never blocked");
 
+        // ================= Review P2-n/P2-q: the escalation to a library scan is deferred only by reports on related refresh
+        // paths (the host folds those into one refresher), and never past three waits after the import's own request. With the
+        // host's default 60 s monitor delay the wait is 90 s and the cap 270 s. The host binds nothing on its own here.
+        world.Native.AutoScan = false;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            foreach (var (key, tmdb, title, tvdb) in new[] { ("other", 201, "Other Show", 301), ("newOne", 202, "New Show One", 302),
+                         ("newTwo", 203, "New Show Two", 303) })
+            {
+                AddEntry(database, ids, key, "series", tmdb, title, 2023, null, tvdb, world.Tv.Id);
+                for (var number = 1; number <= 2; number++)
+                {
+                    var episode = new Episode { EntryId = ids[key], TmdbId = tmdb * 10 + number, SeasonNumber = 1, EpisodeNumber = number,
+                        Title = "Episode " + number, RuntimeMinutes = 45, AirDate = new DateTime(2023, 1, number, 0, 0, 0, DateTimeKind.Utc) };
+                    database.Episodes.Add(episode);
+                    ids[key + number] = episode.Id;
+                }
+            }
+
+            await database.SaveChangesAsync();
+        }
+
+        var otherFolder = Path.Combine(world.Tv.Location, "Other Show (2023)");
+        Directory.CreateDirectory(Path.Combine(otherFolder, "Season 01"));
+        var otherExisting = Path.Combine(otherFolder, "Season 01", "Other Show S01E01.mkv");
+        await File.WriteAllBytesAsync(otherExisting, new byte[2048]);
+        var otherSeries = new TestSeries { Id = Guid.NewGuid(), Name = "Other Show", Path = otherFolder };
+        otherSeries.ProviderIds["Tmdb"] = "201";
+        world.Native.Add(world.Tv, otherSeries);
+        world.Native.Scan(otherExisting);
+        await WaitAsync(async () =>
+        {
+            await using var database = new ModDbContext(dbPath);
+            return await database.EpisodeBindings.AnyAsync(value => value.EpisodeId == ids["other1"]) ? true : (bool?)null;
+        }, "The other series' existing episode is bound");
+
+        async Task<(Guid Grab, ImportOperation Scanning)> ScanningEpisodeAsync(string entryKey, string episodeKey, string release, string tvdb)
+        {
+            var fixture = TorrentFixture.Single(release + ".mkv", Size);
+            torznab.Torrents[episodeKey] = fixture.Bytes;
+            transmission.Register(fixture);
+            lock (torznab.MovieItems)
+                torznab.TvItems.Add(new(release, "guid-" + episodeKey, torznab.Download(episodeKey), Size, 25, new() { ["tvdbid"] = tvdb }));
+            var (grab, hash) = await GrabAsync(admin, ids[entryKey], ids[episodeKey], fixture);
+            transmission.Progress(hash, 1.0);
+            var scanning = await WaitAsync(async () =>
+            {
+                await Tick();
+                var operation = await ImportFor(dbPath, grab);
+                return operation.State == ImportStates.Scanning ? operation : null;
+            }, release + " reaches scanning");
+            return (grab, scanning);
+        }
+
+        // Moves the shifted clock to `seconds` after `origin`, however long the steps before took in real time.
+        void At(DateTime origin, int seconds) => time.Offset += origin.AddSeconds(seconds) - time.GetUtcNow().UtcDateTime;
+        async Task<int> AttemptsAsync(Guid grab) => (await ImportFor(dbPath, grab)).ScanAttempts;
+
+        // Unrelated: episodes of two existing series, each in its own season folder.
+        var (grabX, scanningX) = await ScanningEpisodeAsync("series", "e4", "Example.Show.S01E04.1080p.WEB-DL-GRP", "300");
+        var originX = scanningX.ScanRequestedAt!.Value;
+        Assert(scanningX.RefreshAnchorPath == scanningX.DestinationPath &&
+            Path.GetDirectoryName(scanningX.DestinationPath) == Path.Combine(seriesFolder, "Season 01"),
+            "An episode linked into an existing season folder anchors on its own file");
+        At(originX, 50);
+        var (grabU, scanningU) = await ScanningEpisodeAsync("other", "other2", "Other.Show.S01E02.1080p.WEB-DL-GRP", "301");
+        Assert(Path.GetDirectoryName(scanningU.DestinationPath) == Path.Combine(otherFolder, "Season 01") &&
+            (scanningU.ScanRequestedAt!.Value - originX).TotalSeconds is >= 50 and < 90,
+            "Another series' episode reports its change inside the first import's wait");
+        At(originX, 95);
+        await Tick();
+        Assert(await AttemptsAsync(grabX) == 2 && await AttemptsAsync(grabU) == 1,
+            "A report 45 s ago in another series' folder does not postpone the escalation (review P2-q)");
+        Assert(!logs.Lines.Any(line => line.Contains($"Import {scanningX.Id} defers its library scan", StringComparison.Ordinal)),
+            "An escalation that is not deferred logs no deferral");
+
+        // Related: two new series folders are siblings under the library root; later reports come from inside them.
+        var (grabN1, scanningN1) = await ScanningEpisodeAsync("newOne", "newOne1", "New.Show.One.S01E01.1080p.WEB-DL-GRP", "302");
+        var originN1 = scanningN1.ScanRequestedAt!.Value;
+        var folderOne = Path.GetDirectoryName(Path.GetDirectoryName(scanningN1.DestinationPath)!)!;
+        Assert(scanningN1.RefreshAnchorPath == folderOne && Path.GetDirectoryName(folderOne) == world.Tv.Location,
+            "An episode of a new series anchors on the series folder its link created");
+        At(originN1, 50);
+        var (grabN2, scanningN2) = await ScanningEpisodeAsync("newTwo", "newTwo1", "New.Show.Two.S01E01.1080p.WEB-DL-GRP", "303");
+        Assert(scanningN2.RefreshAnchorPath != folderOne && Path.GetDirectoryName(scanningN2.RefreshAnchorPath) == world.Tv.Location,
+            "A second new series anchors on its own series folder, a sibling of the first");
+        At(originN1, 95);
+        await Tick();
+        Assert(await AttemptsAsync(grabN1) == 1, "A sibling new series folder's report 45 s ago postpones the escalation (review P2-n)");
+        Assert(logs.Lines.Any(line => line.StartsWith("Debug", StringComparison.Ordinal) &&
+                System.Text.RegularExpressions.Regex.IsMatch(line,
+                    $@"Import {scanningN1.Id} defers its library scan 9[5-7] s after its request: a related scan request came [34][0-9] s ago \(wait 90 s, cap 270 s\)")),
+            "The deferral past the first wait is logged for that operation, with its timing (review P2-x)");
+        At(originN1, 130);
+        var (grabN3, _) = await ScanningEpisodeAsync("newOne", "newOne2", "New.Show.One.S01E02.1080p.WEB-DL-GRP", "302");
+        At(originN1, 210);
+        var (grabN4, scanningN4) = await ScanningEpisodeAsync("newTwo", "newTwo2", "New.Show.Two.S01E02.1080p.WEB-DL-GRP", "303");
+        At(originN1, 265);
+        await Tick();
+        Assert(await AttemptsAsync(grabN1) == 1 && (originN1.AddSeconds(265) - scanningN4.ScanRequestedAt!.Value).TotalSeconds < 90,
+            "Related reports less than one wait apart keep deferring it");
+        At(originN1, 275);
+        await Tick();
+        Assert(await AttemptsAsync(grabN1) == 2, "At the cap, three waits after its own request, it escalates although a related report is recent");
+
+        world.Native.AutoScan = true;
+        foreach (var grab in new[] { grabX, grabU, grabN1, grabN2, grabN3, grabN4 })
+            world.Native.Scan((await ImportFor(dbPath, grab)).DestinationPath!);
+        foreach (var grab in new[] { grabX, grabU, grabN1, grabN2, grabN3, grabN4 })
+            await WaitAsync(async () =>
+            {
+                await Tick();
+                return (await ImportFor(dbPath, grab)).State == ImportStates.Completed ? true : (bool?)null;
+            }, "Every import of the escalation scenario completes once its file is scanned");
+
         // ================= P4.A6 (b): the Phase 3 seed reader reads the same daemon and sees its paths through the mappings.
         configuration.TransmissionRpcUrl = transmission.Endpoint.ToString();
         configuration.TransmissionUsername = transmission.Username;

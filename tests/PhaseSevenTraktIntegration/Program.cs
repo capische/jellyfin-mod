@@ -71,9 +71,12 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
             """);
         Assert(!(await TableNamesAsync(database)).Contains("TraktObservations"), "The 0.1.0.0 schema has no Trakt table");
         await database.Database.MigrateAsync();
+        // Later phases add migrations after Q16's, so it is found by name, not as the last one applied.
+        var applied = (await database.Database.GetAppliedMigrationsAsync()).ToList();
+        var trakt = applied.FindIndex(name => name.EndsWith("_PhaseSevenTraktObservations", StringComparison.Ordinal));
         Assert((await TableNamesAsync(database)).Contains("TraktObservations") &&
-            (await database.Database.GetAppliedMigrationsAsync()).Last().EndsWith("_PhaseSevenTraktObservations", StringComparison.Ordinal),
-            "The Q16 migration applies on top of the released schema as its newest migration");
+            trakt > applied.IndexOf("20260924050103_PhaseSevenProwlarr"),
+            "The Q16 migration applies on top of the released schema");
         Assert(await database.Entries.AnyAsync(entry => entry.Id == entryId), "Existing rows survive the Q16 migration");
         var indexes = await database.Database.SqlQueryRaw<string>(
             "SELECT name AS Value FROM pragma_index_list('TraktObservations') WHERE \"unique\" = 1").ToListAsync();

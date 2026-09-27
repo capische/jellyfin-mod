@@ -215,6 +215,13 @@ public sealed class ImportOperation
     [MaxLength(4096)]
     public string? DestinationPath { get; set; }
 
+    /// <summary>
+    /// Gets or sets the path the host's library monitor groups this import's change under: the topmost folder the link
+    /// created, or the file itself when its folders already existed (P5.I5 scan wait).
+    /// </summary>
+    [MaxLength(4096)]
+    public string? RefreshAnchorPath { get; set; }
+
     /// <summary>Gets or sets the destination's device and inode identity after linking.</summary>
     [MaxLength(96)]
     public string? DestinationPhysicalIdentity { get; set; }
