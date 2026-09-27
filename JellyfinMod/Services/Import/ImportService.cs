@@ -54,6 +54,7 @@ public sealed class ImportService(
     IServerConfigurationManager serverConfiguration,
     ReconciliationLibraryLock libraryLock,
     SeedReleaseService seedReleases,
+    ImportHostSession session,
     TimeProvider time,
     ILogger<ImportService> logger)
 {
@@ -551,12 +552,13 @@ public sealed class ImportService(
     /// host acts on it, but on the deployed host a brand-new folder stayed unindexed until a library scan ran,
     /// so the second attempt escalates to one rather than repeating a call that already did nothing (P5.I5).
     /// </summary>
-    private async Task RequestScanAsync(ImportOperation operation)
+    private async Task RequestScanAsync(ImportOperation operation, bool repeat = false)
     {
         try
         {
             libraryMonitor.ReportFileSystemChanged(operation.DestinationPath!);
-            if (operation.ScanAttempts >= 1) library.QueueLibraryScan();
+            // The second request is the escalation to a library scan; a repeat after a restart asks for what was lost.
+            if (operation.ScanAttempts >= (repeat ? 2 : 1)) library.QueueLibraryScan();
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
@@ -568,7 +570,7 @@ public sealed class ImportService(
         }
 
         operation.State = ImportStates.Scanning;
-        operation.ScanAttempts++;
+        if (!repeat) operation.ScanAttempts++;
         operation.ScanRequestedAt = Now;
         operation.Reason = null;
         operation.UpdatedAt = Now;
@@ -590,6 +592,16 @@ public sealed class ImportService(
         }
 
         if (operation.State != ImportStates.Scanning || operation.ScanRequestedAt is not { } requested) return;
+        if (requested < session.StartedAt)
+        {
+            // Requested before this process started: the host's pending refresh (and any queued library scan) went with the
+            // previous process, so waiting would only end in a full scan or a timeout (live finding 12). Repeat the same
+            // request once; it counts as no new attempt, and the waits start again from it.
+            logger.LogInformation("Import {Operation} repeats its scan request after a restart", operation.Id);
+            await RequestScanAsync(operation, repeat: true).ConfigureAwait(false);
+            return;
+        }
+
         if (operation.ScanAttempts >= 2)
         {
             // After the escalation, the operation gives up only once the configured scan timeout has passed (P5.I5).

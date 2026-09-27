@@ -751,6 +751,27 @@ internal static partial class Phase5
             var operation = await ImportFor(dbPath, grabJ);
             return operation.State == ImportStates.Scanning ? operation : null;
         }, "A second import reaches scanning");
+        // Live finding 12: an import still scanning when the process stops lost the host's pending refresh with it.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            AddEntry(database, ids, "movieS", "movie", 122, "Restart Scan Movie", 2021, "tt0000122", null, world.Movies.Id);
+            await database.SaveChangesAsync();
+        }
+
+        var fixtureS = TorrentFixture.Single("Restart.Scan.Movie.2021.1080p.WEB-DL-GRP.mkv", Size);
+        torznab.Torrents["movieS"] = fixtureS.Bytes;
+        transmission.Register(fixtureS);
+        lock (torznab.MovieItems)
+            torznab.MovieItems.Add(new("Restart.Scan.Movie.2021.1080p.WEB-DL-GRP", "guid-movieS", torznab.Download("movieS"), Size, 25,
+                new() { ["imdbid"] = "0000122" }));
+        var (grabS, hashS) = await GrabAsync(admin, ids["movieS"], null, fixtureS);
+        transmission.Progress(hashS, 1.0);
+        var scanningS = await WaitAsync(async () =>
+        {
+            await Tick();
+            var operation = await ImportFor(dbPath, grabS);
+            return operation.State == ImportStates.Scanning ? operation : null;
+        }, "A third import reaches scanning and stays unbound across the restart");
         await StopAsync();
         // As if the process died between creating the link and recording it, and between linking and scanning.
         await using (var database = new ModDbContext(dbPath))
@@ -781,6 +802,11 @@ internal static partial class Phase5
             "After a restart each interrupted import completes once, with one hardlink and no duplicate file");
         Assert(await HistoryCount(dbPath, ids["movieI"], "imported") == 1 && await HistoryCount(dbPath, ids["movieJ"], "imported") == 1,
             "Recovery writes one imported event each");
+        // No time passes on the shifted clock here, so without a repeated report this import would never bind.
+        var repeatedS = await CompleteAsync(dbPath, grabS, Tick);
+        Assert(repeatedS.Id == scanningS.Id && repeatedS.ScanAttempts == 1 &&
+            world.Native.ScanRequests.Count(path => path == scanningS.DestinationPath) == 2 && repeatedS.ScanRequestedAt > scanningS.ScanRequestedAt,
+            "A scan requested before a restart is reported once more after it and completes without escalating (live finding 12)");
 
         // A seed release that died between asking the client and inspecting the result ends once, with one event.
         await StopAsync();

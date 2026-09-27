@@ -10,6 +10,7 @@ public static class ImportServices
     public static void Add(IServiceCollection services)
     {
         services.AddSingleton<ImportTickGate>();
+        services.AddSingleton<ImportHostSession>();
         services.AddSingleton<ClientSnapshotCache>();
         services.AddTransient<ClientSnapshotReader>();
         services.AddTransient<SeedReleaseService>();
