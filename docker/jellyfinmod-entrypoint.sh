@@ -5,7 +5,8 @@
 # stock entrypoint with exec. Three jobs, each idempotent, none fatal:
 #
 #   1. Install the bundled plugin into the config volume when it is missing or older than the one in
-#      the image. Never downgrade, never touch another plugin.
+#      the image. Never downgrade, never touch another plugin. The same version is replaced only by a
+#      later build of it (0.1.0.0 was republished once, by the user's decision of 2026-09-27).
 #   2. Register the plugin's own repository once (accepted decision 11), on the very first start
 #      too. It points at this server's own address, so nothing external is contacted. Image configuration, not plugin behaviour: the
 #      plugin never edits the repository list itself.
@@ -33,6 +34,21 @@ meta_value() {
     sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$1" | head -n 1
 }
 
+# A build's timestamp from its meta.json as UTC epoch seconds, or nothing when it is absent or not an
+# ISO 8601 date-time with a zone (JPRM writes ...Z; Jellyfin rewrites it with seven fractional
+# digits; an offset is converted). The shape is checked first because GNU date reads almost anything.
+build_seconds() {
+    stamp="$(meta_value "$1" timestamp)"
+    printf '%s\n' "$stamp" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$' ||
+        return 0
+    date -u -d "$stamp" +%s 2>/dev/null | grep -E '^[0-9]+$'
+}
+
+# Epoch seconds as a UTC date-time, for the log.
+utc() {
+    date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
 # True when $1 sorts strictly after $2 as a version.
 version_newer() {
     [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
@@ -58,12 +74,50 @@ install_plugin() {
         fi
     done
 
-    if [ -n "$newest" ] && ! version_newer "$version" "$newest"; then
+    target="$plugins_dir/JellyfinMod_$version"
+    rebuild=0
+    status_dir="$newest_dir"
+    if [ -n "$newest" ] && [ "$newest" = "$version" ]; then
+        # The same version: replace its own folder only with a build strictly later than every build of
+        # this version installed anywhere, when every one of them says when it was made. A folder with an
+        # unreadable time (a hand-deployed build) leaves everything alone, and so does a version that is
+        # only in some other folder. The replaced folder keeps its own status.
+        bundled_seconds="$(build_seconds "$bundled/meta.json")"
+        reason=""
+        if [ -z "$bundled_seconds" ]; then
+            reason="the image's build has no readable timestamp"
+        elif [ ! -f "$target/meta.json" ] || [ "$(meta_value "$target/meta.json" guid)" != "$guid" ] ||
+            [ "$(meta_value "$target/meta.json" version)" != "$version" ]; then
+            reason="that version is not installed in $(basename "$target")"
+        else
+            for meta in "$plugins_dir"/*/meta.json; do
+                [ -f "$meta" ] || continue
+                [ "$(meta_value "$meta" guid)" = "$guid" ] || continue
+                [ "$(meta_value "$meta" version)" = "$version" ] || continue
+                folder="$(basename "$(dirname "$meta")")"
+                found_seconds="$(build_seconds "$meta")"
+                if [ -z "$found_seconds" ]; then
+                    reason="$folder has no readable build timestamp"
+                    break
+                fi
+                if [ "$found_seconds" -ge "$bundled_seconds" ]; then
+                    reason="$folder holds the same build or a later one ($(utc "$found_seconds"))"
+                    break
+                fi
+            done
+        fi
+        if [ -n "$reason" ]; then
+            log "JellyfinMod $newest is installed; the image carries the same version and does not replace it: $reason"
+            return 0
+        fi
+        rebuild=1
+        status_dir="$target"
+        installed_seconds="$(build_seconds "$target/meta.json")"
+    elif [ -n "$newest" ] && ! version_newer "$version" "$newest"; then
         log "JellyfinMod $newest is installed; the image carries $version and does not replace it"
         return 0
     fi
 
-    target="$plugins_dir/JellyfinMod_$version"
     staging="$target.installing"
     mkdir -p "$plugins_dir" || return 0
     rm -rf "$staging"
@@ -74,8 +128,8 @@ install_plugin() {
     fi
 
     # An administrator who disabled the plugin keeps it disabled across an image upgrade.
-    if [ -n "$newest_dir" ]; then
-        status="$(meta_value "$newest_dir/meta.json" status)"
+    if [ -n "$status_dir" ]; then
+        status="$(meta_value "$status_dir/meta.json" status)"
         if [ -n "$status" ] && [ "$status" != "Active" ]; then
             sed -i "1a\\    \"status\": \"$status\"," "$staging/meta.json"
         fi
@@ -83,7 +137,9 @@ install_plugin() {
 
     rm -rf "$target"
     mv "$staging" "$target"
-    if [ -n "$newest" ]; then
+    if [ "$rebuild" = 1 ]; then
+        log "replaced JellyfinMod $version build $(utc "$installed_seconds") with build $(utc "$bundled_seconds")"
+    elif [ -n "$newest" ]; then
         log "upgraded JellyfinMod $newest to $version; Jellyfin keeps the newest and retires the older folder"
     else
         log "installed JellyfinMod $version"

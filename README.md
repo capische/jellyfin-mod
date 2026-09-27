@@ -150,7 +150,11 @@ The image is the pinned `jellyfin/jellyfin` digest (Jellyfin 12.0.0) plus the pl
 
 - **Plugin install.** Copies the plugin into `/config/plugins/JellyfinMod_<version>/` when it is
   missing or older than the image's. It never downgrades and never touches another plugin; an
-  administrator's *Disabled* status is carried over to a newer version.
+  administrator's *Disabled* status is carried over to a newer version. The same version is replaced,
+  in its own `JellyfinMod_<version>` folder and keeping that folder's status, only by a build later
+  than every installed build of that version (the `meta.json` timestamps, compared in UTC). That is how
+  a volume that ran the first `0.1.0.0` picks up the republished one. A missing or unreadable timestamp
+  leaves the plugin alone.
 - **Repository, preconfigured once.** Registers *JellyfinMod (this server)* at
   `http://localhost:8096/JellyfinMod/Repository` — the server's own address, so nothing external is
   contacted — which is what gives Dashboard → Plugins a details panel and an update path instead of
