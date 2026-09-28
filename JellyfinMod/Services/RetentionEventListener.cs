@@ -32,8 +32,11 @@ public sealed class RetentionEventListener(
         SingleReader = true,
         SingleWriter = false
     });
-    /// <summary>Queued work keys, each with the save reason to record when it runs (review P3-3).</summary>
-    private readonly ConcurrentDictionary<string, string?> pending = new(StringComparer.Ordinal);
+    /// <summary>
+    /// Queued work keys, each with the save reason to record when it runs (review P3-3) and whether any of the events it
+    /// stands for reported the item unwatched (review P1-10).
+    /// </summary>
+    private readonly ConcurrentDictionary<string, PendingWork> pending = new(StringComparer.Ordinal);
     private CancellationTokenSource? stopping;
     private Task? worker;
 
@@ -139,7 +142,10 @@ public sealed class RetentionEventListener(
         if (eventArgs.Item is not (Movie or Episode)) return;
         var key = string.Create(System.Globalization.CultureInfo.InvariantCulture,
             $"user:{eventArgs.UserId:N}:{eventArgs.Item.Id:N}");
-        Enqueue(new RetentionWork(key, eventArgs.UserId, eventArgs.Item.Id, eventArgs.SaveReason.ToString()));
+        // An event that reports the item unwatched ends any completion recorded before it, even when a later event for the
+        // same user and item (an NFO or Trakt import marking it played without a date) is what the coalesced read sees.
+        Enqueue(new RetentionWork(key, eventArgs.UserId, eventArgs.Item.Id, eventArgs.SaveReason.ToString(),
+            eventArgs.UserData is { Played: false }));
     }
 
     private void Enqueue(RetentionWork work)
@@ -151,14 +157,16 @@ public sealed class RetentionEventListener(
         // their reason into the pending one.
         while (true)
         {
-            if (pending.TryAdd(work.Key, work.SourceReason))
+            if (pending.TryAdd(work.Key, new PendingWork(work.SourceReason, work.Unwatched)))
             {
                 queue.Writer.TryWrite(work);
                 return;
             }
 
             if (!pending.TryGetValue(work.Key, out var queued)) continue;
-            var merged = work.SourceReason is null || work.SourceReason == ProgressReason ? queued : work.SourceReason;
+            // An unwatched event among the coalesced ones is kept, whichever event comes last (review P1-10).
+            var merged = new PendingWork(work.SourceReason is null || work.SourceReason == ProgressReason ? queued.Reason : work.SourceReason,
+                queued.Unwatched || work.Unwatched);
             if (merged == queued || pending.TryUpdate(work.Key, merged, queued)) return;
         }
     }
@@ -169,7 +177,8 @@ public sealed class RetentionEventListener(
         {
             await foreach (var work in queue.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                var reason = pending.TryRemove(work.Key, out var latest) ? latest ?? work.SourceReason : work.SourceReason;
+                var latest = pending.TryRemove(work.Key, out var queued) ? queued : new PendingWork(work.SourceReason, work.Unwatched);
+                var reason = latest.Reason ?? work.SourceReason;
                 try
                 {
                     using var scope = scopeFactory.CreateScope();
@@ -195,7 +204,7 @@ public sealed class RetentionEventListener(
                     else if (work.UserId is { } userId && work.JellyfinItemId is { } itemId)
                     {
                         var changed = await scope.ServiceProvider.GetRequiredService<RetentionCompletionService>()
-                            .RefreshAsync(userId, itemId, reason!, cancellationToken).ConfigureAwait(false);
+                            .RefreshAsync(userId, itemId, reason!, latest.Unwatched, cancellationToken).ConfigureAwait(false);
                         if (changed)
                             await scope.ServiceProvider.GetRequiredService<RetentionEvaluator>()
                                 .EvaluateNativeItemAsync(itemId, cancellationToken).ConfigureAwait(false);
@@ -219,5 +228,7 @@ public sealed class RetentionEventListener(
 
     private const string ProgressReason = "PlaybackProgress";
 
-    private sealed record RetentionWork(string Key, Guid? UserId, Guid? JellyfinItemId, string? SourceReason);
+    private sealed record RetentionWork(string Key, Guid? UserId, Guid? JellyfinItemId, string? SourceReason, bool Unwatched = false);
+
+    private readonly record struct PendingWork(string? Reason, bool Unwatched);
 }

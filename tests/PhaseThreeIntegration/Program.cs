@@ -84,10 +84,14 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         "GetUserData" when arguments is [User user, BaseItem item] => states.GetValueOrDefault((user.Id, item.Id)),
         _ => null
     });
+    // Review P1-10: reading this user holds the listener's worker until the gate opens, so events queued behind it coalesce.
+    var workerGate = new ManualResetEventSlim(true);
+    var blockerId = Guid.NewGuid();
     var users = Stub<IUserManager>.Create((method, arguments) => method.Name switch
     {
         "add_OnUserUpdated" => AddUserUpdatedHandler(arguments),
         "remove_OnUserUpdated" => RemoveUserUpdatedHandler(arguments),
+        "GetUserById" when arguments?[0] is Guid held && held == blockerId => workerGate.Wait(TimeSpan.FromSeconds(30)) ? null : null,
         "GetUserById" when arguments?[0] is Guid id => allUsers.SingleOrDefault(user => user.Id == id),
         "GetUsers" => allUsers.ToArray(),
         _ => null
@@ -469,6 +473,46 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
                 quiet.ObservedAt == observedAt &&
                 (await after.RetentionEvaluations.SingleAsync(evaluation => evaluation.TargetId == movieEntryId)).EvaluatedAt == evaluatedAt,
                 "Position-only playback progress leaves observation and evaluation rows unchanged");
+
+        // Review P1-10: an unwatched event coalesced with a later one still ends a completion carried from a removed copy. The
+        // worker is held on another read while the first user marks the movie unwatched and an NFO or Trakt import then marks
+        // it played without a date; both events are read once, and that read sees only the undated played state.
+        var carriedAt = clock.GetUtcNow().UtcDateTime.AddDays(-1);
+        await using (var carry = new ModDbContext(path))
+        {
+            var observation = await carry.CompletionObservations.SingleAsync(candidate =>
+                candidate.UserId == firstUser.Id && candidate.TargetId == movieEntryId);
+            observation.SourceReason = "CarriedFromRemovedVersion";
+            observation.EvidenceAvailable = true;
+            observation.Played = true;
+            observation.PlaybackPositionTicks = 0;
+            observation.CompletedAt = carriedAt;
+            observation.LastPlayedAt = carriedAt;
+            await carry.SaveChangesAsync();
+        }
+
+        clock.Advance(TimeSpan.FromMinutes(1));
+        workerGate.Reset();
+        userDataSaved!(null, new UserDataSaveEventArgs
+        {
+            UserId = blockerId, Item = movie, UserData = new UserItemData { Key = "held-worker" }, SaveReason = UserDataSaveReason.TogglePlayed,
+            Keys = []
+        });
+        states[(firstUser.Id, movie.Id)] = State(false, 0, null);
+        Raise(firstUser.Id, movie, UserDataSaveReason.TogglePlayed);
+        states[(firstUser.Id, movie.Id)] = State(true, 0, null);
+        Raise(firstUser.Id, movie, UserDataSaveReason.Import);
+        workerGate.Set();
+        await WaitForObservationAsync(path, firstUser.Id, movie.Id,
+            observation => observation.ObservedAt == clock.GetUtcNow().UtcDateTime);
+        await using (var after = new ModDbContext(path))
+        {
+            var observation = await after.CompletionObservations.SingleAsync(candidate =>
+                candidate.UserId == firstUser.Id && candidate.TargetId == movieEntryId);
+            Assert(observation.SourceReason == "Import" && observation.CompletedAt != carriedAt && observation.LastPlayedAt is null,
+                $"A coalesced unwatched event ends the carried completion ({observation.SourceReason}, completed " +
+                $"{observation.CompletedAt:o}, last played {observation.LastPlayedAt:o})");
+        }
 
         // A user created without any event is noticed by the periodic access fingerprint.
         string accessBefore;

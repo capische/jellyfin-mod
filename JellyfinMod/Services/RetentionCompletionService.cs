@@ -26,20 +26,31 @@ public sealed class RetentionCompletionService(
     /// deadline and later make an elapsed window due with no new warning (review P3-1).
     /// </remarks>
     public Task<bool> RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason, CancellationToken cancellationToken) =>
-        RefreshAsync(userId, jellyfinItemId, sourceReason, null, cancellationToken);
+        RefreshAsync(userId, jellyfinItemId, sourceReason, false, null, cancellationToken);
 
-    private async Task<bool> RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason,
+    /// <summary>
+    /// Refreshes one native movie or episode for one user after events of which at least one reported it unwatched
+    /// (<paramref name="unwatchedSeen"/>). The read sees only the newest state, so an unwatched event coalesced with a later
+    /// one is not visible in it; it still ends any completion recorded before it, a carried one included (review P1-10).
+    /// </summary>
+    public Task<bool> RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason, bool unwatchedSeen,
+        CancellationToken cancellationToken) =>
+        RefreshAsync(userId, jellyfinItemId, sourceReason, unwatchedSeen, null, cancellationToken);
+
+    private async Task<bool> RefreshAsync(Guid userId, Guid jellyfinItemId, string sourceReason, bool unwatchedSeen,
         Dictionary<Guid, BaseItem?>? loaded, CancellationToken cancellationToken)
     {
         try
         {
-            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, loaded, cancellationToken).ConfigureAwait(false);
+            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, unwatchedSeen, loaded, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (DbUpdateException error) when (error.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 })
         {
             // A concurrent writer (listener, repair, evaluation) created the row first; re-read it once.
             database.ChangeTracker.Clear();
-            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, loaded, cancellationToken).ConfigureAwait(false);
+            return await RefreshCoreAsync(userId, jellyfinItemId, sourceReason, unwatchedSeen, loaded, cancellationToken)
+                .ConfigureAwait(false);
         }
     }
 
@@ -62,7 +73,7 @@ public sealed class RetentionCompletionService(
         return item;
     }
 
-    private async Task<bool> RefreshCoreAsync(Guid userId, Guid jellyfinItemId, string sourceReason,
+    private async Task<bool> RefreshCoreAsync(Guid userId, Guid jellyfinItemId, string sourceReason, bool unwatchedSeen,
         Dictionary<Guid, BaseItem?>? loaded, CancellationToken cancellationToken)
     {
         var user = users.GetUserById(userId);
@@ -120,7 +131,8 @@ public sealed class RetentionCompletionService(
         }
 
         var current = states.OfType<UserItemData>().ToArray();
-        var wasCompleted = observation.Played && observation.PlaybackPositionTicks == 0 &&
+        // An unwatched state seen since the last read ended whatever completion was recorded: one read now starts anew.
+        var wasCompleted = !unwatchedSeen && observation.Played && observation.PlaybackPositionTicks == 0 &&
             observation.CompletedAt.HasValue;
         var finished = current.Any(state => state.Played && state.PlaybackPositionTicks == 0);
         var resume = current.Max(state => state.PlaybackPositionTicks);
@@ -141,7 +153,7 @@ public sealed class RetentionCompletionService(
         // The dated completion of a version removed on purpose stands while the remaining copies still read played with no
         // resume and no date of their own (their played flag was copied without one, review P2-4); unwatched, resumed or a
         // dated state replaces it as before.
-        var carried = previousReason == CarriedReason && isCompleted && wasCompleted &&
+        var carried = !unwatchedSeen && previousReason == CarriedReason && isCompleted && wasCompleted &&
             current.All(state => state.LastPlayedDate is null);
         if (carried) observation.SourceReason = CarriedReason;
         observation.LastPlayedAt = Utc(current.Max(state => state.LastPlayedDate)) ?? (carried ? observation.LastPlayedAt : null);
@@ -157,6 +169,12 @@ public sealed class RetentionCompletionService(
     /// (review P2-4); it counts only while the remaining copies read played with no resume and no date of their own.
     /// </summary>
     internal const string CarriedReason = "CarriedFromRemovedVersion";
+
+    /// <summary>
+    /// The source of an observation whose carried completion was revoked because the last check before an unlink saw the
+    /// user with no copy played (review P1-10); the next read of Jellyfin's state replaces it.
+    /// </summary>
+    internal const string UnwatchedReason = "UnwatchedSeenLive";
 
     private async Task<Guid[]> BoundItemIdsAsync(RetentionTarget target, CancellationToken cancellationToken) =>
         target.EpisodeId is { } episodeId
@@ -189,7 +207,7 @@ public sealed class RetentionCompletionService(
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    await RefreshAsync(userId, itemId, "Repair", loaded, cancellationToken).ConfigureAwait(false);
+                    await RefreshAsync(userId, itemId, "Repair", false, loaded, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception error) when (error is not OperationCanceledException)
                 {

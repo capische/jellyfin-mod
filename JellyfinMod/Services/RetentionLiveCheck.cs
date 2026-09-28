@@ -18,7 +18,8 @@ public sealed class RetentionLiveCheck(
     ILibraryManager library,
     IUserDataManager userData,
     ISessionManager sessions,
-    LibraryAccess access)
+    LibraryAccess access,
+    TimeProvider clock)
 {
     /// <summary>Returns a stable blocking reason, or null when live state still permits reclamation.</summary>
     /// <param name="operation">The prepared operation.</param>
@@ -32,6 +33,39 @@ public sealed class RetentionLiveCheck(
         RetentionPolicySnapshot policy,
         CancellationToken cancellationToken,
         bool requireCompletion = true)
+    {
+        var unwatched = new HashSet<Guid>();
+        var reason = await BlockReasonAsync(operation, policy, unwatched, requireCompletion, cancellationToken).ConfigureAwait(false);
+        // A user seen here with no copy played has not finished the target, whatever was carried over from a removed copy:
+        // the carried completion is revoked durably, so a later played flag without a date (an NFO or Trakt import) cannot
+        // bring the old date and deadline back when the unwatched event itself is late or coalesced away (review P1-10).
+        if (unwatched.Count > 0 && (operation.EpisodeId ?? operation.EntryId) is { } targetId)
+            await RevokeCarriedAsync(database, targetId, unwatched, clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
+        return reason;
+    }
+
+    /// <summary>
+    /// Revokes the completions carried from a removed copy for these users of one target (review P1-10): the observation reads
+    /// as not finished until the next read of Jellyfin's state records what is there now, dated or not.
+    /// </summary>
+    internal static Task<int> RevokeCarriedAsync(ModDbContext database, Guid targetId, IReadOnlyCollection<Guid> userIds, DateTime now,
+        CancellationToken cancellationToken) =>
+        database.CompletionObservations
+            .Where(observation => observation.TargetId == targetId && userIds.Contains(observation.UserId) &&
+                observation.SourceReason == RetentionCompletionService.CarriedReason)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(observation => observation.SourceReason, RetentionCompletionService.UnwatchedReason)
+                .SetProperty(observation => observation.Played, false)
+                .SetProperty(observation => observation.CompletedAt, (DateTime?)null)
+                .SetProperty(observation => observation.LastPlayedAt, (DateTime?)null)
+                .SetProperty(observation => observation.ObservedAt, now), cancellationToken);
+
+    private async Task<string?> BlockReasonAsync(
+        RetentionOperation operation,
+        RetentionPolicySnapshot policy,
+        HashSet<Guid> unwatched,
+        bool requireCompletion,
+        CancellationToken cancellationToken)
     {
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(
             candidate => candidate.Id == operation.EntryId, cancellationToken).ConfigureAwait(false);
@@ -143,16 +177,19 @@ public sealed class RetentionLiveCheck(
         // Jellyfin 12 copies the played flag to them without a date, and the copies expire together (decision 1, review
         // P2-4). Only while no remaining copy carries a date of its own: a dated live state is Jellyfin's word and is judged
         // against the floor as before (RET3-R4). Marking the title unwatched clears the flag and so the completion.
+        // The carried completion counts exactly when the evaluator counts it (review P2-11): its own instant at or after the
+        // floor, or, when that predates the floor, a Jellyfin last-played date at or after it (RetentionEvaluator.CompletionInstant).
+        var now = clock.GetUtcNow().UtcDateTime;
         var recorded = requireCompletion && (operation.EpisodeId ?? operation.EntryId) is { } recordedTarget
             ? (await database.CompletionObservations.AsNoTracking()
                     .Where(observation => observation.TargetId == recordedTarget && observation.CompletedAt != null &&
                         observation.SourceReason == RetentionCompletionService.CarriedReason)
-                    .Select(observation => new { observation.UserId, observation.CompletedAt })
                     .ToListAsync(cancellationToken).ConfigureAwait(false))
-                .ToDictionary(observation => observation.UserId, observation => observation.CompletedAt!.Value)
+                .ToDictionary(observation => observation.UserId)
             : [];
         bool Recorded(Guid userId, UserItemData[] states) => floor is { } since &&
-            recorded.TryGetValue(userId, out var at) && DateTime.SpecifyKind(at, DateTimeKind.Utc) >= since &&
+            recorded.TryGetValue(userId, out var observation) &&
+            RetentionEvaluator.CompletionInstant(observation, true, since, now).HasValue &&
             states.Length > 0 && states.All(state => state.PlaybackPositionTicks == 0 && state.LastPlayedDate is null) &&
             states.Any(state => state.Played);
 
@@ -175,6 +212,7 @@ public sealed class RetentionLiveCheck(
 
             if (states.Any(state => state is null)) return RetentionLiveReasons.LiveStateUnavailable;
             var current = states.OfType<UserItemData>().ToArray();
+            if (!current.Any(state => state.Played)) unwatched.Add(user.Id);
             if (current.Any(state => state.PlaybackPositionTicks > 0)) return RetentionLiveReasons.ActiveResume;
             if (policy.ExemptFavourites && current.Any(state => state.IsFavorite)) return RetentionLiveReasons.Favorite;
             if (policy.ExemptFavourites && seriesState?.IsFavorite == true)

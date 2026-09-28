@@ -677,7 +677,7 @@ public sealed class RetentionEvaluator(
     /// baseline counts; the stored start of the completed state may predate it when Jellyfin
     /// reattached old user data, so a later native last-played value is accepted as the fresh one.
     /// </summary>
-    private static DateTime? CompletionInstant(CompletionObservation observation, bool requiresFresh, DateTime floor, DateTime now)
+    internal static DateTime? CompletionInstant(CompletionObservation observation, bool requiresFresh, DateTime floor, DateTime now)
     {
         if (!observation.Played || observation.PlaybackPositionTicks != 0 || !observation.CompletedAt.HasValue) return null;
         if (!requiresFresh) return observation.CompletedAt.Value;

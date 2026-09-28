@@ -1661,6 +1661,69 @@ static async Task VerifyVersionRemovalAsync(
     var second = await executor.ReclaimAsync(together.Bindings[0]!.Value, default);
     Assert(second.State == "completed" && !File.Exists(together.Items[0].Path),
         $"The 1080p keeps the completion that scheduled both and goes with it: {second.State}/{second.Reason}");
+
+    // A two-copy title finished by this user, scheduled and due: the 720p played to the end and dated, the 1080p marked played
+    // by Jellyfin without a date. `completedAt` is the stored start of the completed state, `lastPlayedAt` Jellyfin's date.
+    async Task ScheduleAsync((Guid EntryId, Movie[] Items, Guid?[] Bindings) title, DateTime completedAt, DateTime lastPlayedAt,
+        DateTime baselineAt)
+    {
+        await using var database = new ModDbContext(databasePath);
+        database.CompletionObservations.Add(new CompletionObservation
+        {
+            EntryId = title.EntryId, TargetId = title.EntryId, UserId = userId, JellyfinItemId = title.Items[0].Id,
+            EvidenceAvailable = true, Played = true, CompletedAt = completedAt, LastPlayedAt = lastPlayedAt, ObservedAt = lastPlayedAt,
+            SourceReason = "PlaybackFinished"
+        });
+        var basis = completedAt >= baselineAt ? completedAt : lastPlayedAt;
+        database.RetentionEvaluations.Add(new RetentionEvaluation
+        {
+            EntryId = title.EntryId, TargetId = title.EntryId, State = "scheduled", Reason = "completion_policy_satisfied",
+            PolicyVersion = policy.Version, EvaluatedAt = baselineAt, BaselineAt = baselineAt,
+            CompletionBasisAt = basis, EligibleAt = basis, Deadline = basis, AnnouncedDeadline = basis
+        });
+        await database.SaveChangesAsync();
+        liveStates[title.Items[1].Id] = new UserItemData { Key = title.Items[1].Id.ToString("N"), Played = true, LastPlayedDate = lastPlayedAt };
+        liveStates[title.Items[0].Id] = new UserItemData { Key = title.Items[0].Id.ToString("N"), Played = true };
+    }
+
+    // Review P2-11: the completion's stored start predates the target's floor, but Jellyfin's last-played date is after it, so
+    // the evaluator counts the watch (from that date). Carried to the 1080p after the 720p goes, the last check counts it the
+    // same way, and the copies still expire together.
+    var fresher = await TitleAsync("v1-fresher", 900306, true, true);
+    var now = clock.GetUtcNow().UtcDateTime;
+    await ScheduleAsync(fresher, now.AddHours(-50), now.AddHours(-30), now.AddHours(-40));
+    var fresherFirst = await executor.ReclaimAsync(fresher.Bindings[1]!.Value, default);
+    var fresherSecond = await executor.ReclaimAsync(fresher.Bindings[0]!.Value, default);
+    Assert(fresherFirst.State == "completed" && fresherSecond.State == "completed" && !File.Exists(fresher.Items[0].Path),
+        $"A carried completion counts at the last check exactly as the evaluator counts it, by a last-played date after the floor: " +
+        $"{fresherFirst.State}/{fresherFirst.Reason}, then {fresherSecond.State}/{fresherSecond.Reason}");
+
+    // Review P1-10: after the 720p goes, the 1080p is marked unwatched and its event is late. The last check sees it unwatched
+    // and refuses; it must also end the carried completion, so that an NFO or Trakt import marking it played without a date,
+    // read when the late events are, does not bring back the old completion and its deadline.
+    var revoked = await TitleAsync("v1-revoked", 900307, true, true);
+    await ScheduleAsync(revoked, now.AddHours(-25), now.AddHours(-25), now.AddDays(-3));
+    var revokedFirst = await executor.ReclaimAsync(revoked.Bindings[1]!.Value, default);
+    Assert(revokedFirst.State == "completed", $"The watched 720p is reclaimed: {revokedFirst.State}/{revokedFirst.Reason}");
+    liveStates[revoked.Items[0].Id] = new UserItemData { Key = "v1-revoked-unwatched", Played = false };
+    var whileUnwatched = await executor.ReclaimAsync(revoked.Bindings[0]!.Value, default);
+    Assert(whileUnwatched.State != "completed" && File.Exists(revoked.Items[0].Path),
+        $"The 1080p marked unwatched is not reclaimed: {whileUnwatched.State}/{whileUnwatched.Reason}");
+    liveStates[revoked.Items[0].Id] = new UserItemData { Key = "v1-revoked-imported", Played = true };
+    await services.GetRequiredService<RetentionCompletionService>().RefreshAsync(userId, revoked.Items[0].Id, "Import", default);
+    await services.GetRequiredService<RetentionEvaluator>().EvaluateNativeItemAsync(revoked.Items[0].Id, default);
+    var afterImport = await executor.ReclaimAsync(revoked.Bindings[0]!.Value, default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var observation = await database.CompletionObservations.AsNoTracking().SingleAsync(value => value.TargetId == revoked.EntryId);
+        var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(value => value.TargetId == revoked.EntryId);
+        Assert(afterImport.State != "completed" && File.Exists(revoked.Items[0].Path) &&
+            observation.SourceReason != "CarriedFromRemovedVersion" && evaluation.State != "scheduled",
+            $"An undated played flag after an observed unwatched state does not restore the carried completion: " +
+            $"{afterImport.State}/{afterImport.Reason}; observation {observation.SourceReason} completed {observation.CompletedAt:o}; " +
+            $"evaluation {evaluation.State}/{evaluation.Reason} deadline {evaluation.Deadline:o}");
+    }
+
     settings.RetentionEnabled = false;
     await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
 }
