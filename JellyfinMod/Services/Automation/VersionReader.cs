@@ -90,10 +90,12 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
                 ? new VersionRetentionDto("waiting", administrator ? SeedReleaseReasons.GoalUnmet : "seeding")
                 : evaluation is null ? null
                 : new VersionRetentionDto(evaluation.State, administrator ? evaluation.Reason : null);
-            var native = Native(binding.ItemId);
+            var read = TryNative(binding.ItemId, out var native);
             // A further version hidden from the viewer by its own tags or parental rating is not listed, although its main item
-            // is readable (review P2-12); it still counts above, so no row claims to be the last copy.
-            if (viewer is not null && !LibraryAccess.CanSeeVersion(viewer, native)) continue;
+            // is readable (review P2-12); it still counts above, so no row claims to be the last copy. A version whose item
+            // cannot be read now cannot be shown to be visible, so it is left out too (re-review P-3); Remove and Keep answer
+            // 404 for it through LibraryAccess.CanSeeVersion.
+            if (viewer is not null && (!read || !LibraryAccess.CanSeeVersion(viewer, native))) continue;
             result.Add(new VersionDto(binding.OwnerId, binding.ItemId.ToString("N", CultureInfo.InvariantCulture), binding.BindingId,
                 (binding.Path is null ? null : labels.GetValueOrDefault(binding.Path)) ?? Label(binding.Path),
                 quality, resolution ?? ResolutionOf(video),
@@ -136,15 +138,18 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
         return result.DistinctBy(version => version.Item.Id);
     }
 
-    private BaseItem? Native(Guid itemId)
+    /// <summary>Reads a version's item: false when the read failed, true with null when Jellyfin has no such item.</summary>
+    private bool TryNative(Guid itemId, out BaseItem? item)
     {
         try
         {
-            return library?.GetItemById(itemId);
+            item = library?.GetItemById(itemId);
+            return true;
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
-            return null;
+            item = null;
+            return false;
         }
     }
 

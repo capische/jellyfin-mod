@@ -710,6 +710,22 @@ internal static class Phase6
         Assert(Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}")).GetProperty("versions").GetArrayLength() == 2,
             "Without the blocked tag both versions are listed again");
 
+        // V1 re-review P-3: the further version's item cannot be read, so whether this user may see it is unknown. It is left
+        // out of the rows, and Remove and Keep answer as for a version that does not exist. Nothing is removed or kept.
+        world.Native.FailingRead = id => id == hiddenVersion.Id;
+        var unreadableRows = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}")).GetProperty("versions");
+        var unreadableRemove = (await admin.PostAsync(
+            $"/JellyfinMod/Entries/{ids["up"]}/Versions/{uhdRow.GetProperty("bindingId").AsGuid()}/Remove", null)).StatusCode;
+        var unreadableKeep = (await admin.PostAsync(
+            $"/JellyfinMod/Entries/{ids["up"]}/Versions/{uhdRow.GetProperty("bindingId").AsGuid()}/Keep", null)).StatusCode;
+        world.Native.FailingRead = null;
+        await using (var database = new ModDbContext(dbPath))
+            Assert(unreadableRows.GetArrayLength() == 1 && unreadableRows[0].GetProperty("resolution").GetString() == "1080p" &&
+                unreadableRemove == HttpStatusCode.NotFound && unreadableKeep == HttpStatusCode.NotFound && File.Exists(hiddenVersion.Path!) &&
+                !await database.VersionKeeps.AnyAsync(value => value.EntryId == ids["up"]),
+                $"A further version whose item cannot be read is not listed ({unreadableRows.GetArrayLength()} rows) and Remove " +
+                $"({(int)unreadableRemove}) and Keep ({(int)unreadableKeep}) conceal it");
+
         // ---- M7: within a due title the lowest quality goes first; a seeding higher version does not stop it.
         await host.Service<RetentionPolicyService>().SyncAsync(configuration, CancellationToken.None);
         // The first evaluation records each user's finished state; the next one schedules from it (the stub's play time is "now").

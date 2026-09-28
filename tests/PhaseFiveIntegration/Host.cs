@@ -82,6 +82,9 @@ internal sealed partial class NativeWorld
     public required Func<Guid, BaseItem[]> UserLibraries { get; init; }
     public ConcurrentQueue<string> ScanRequests { get; } = new();
     public bool AutoScan { get; set; } = true;
+
+    /// <summary>Items whose read fails while this says so, as an unreadable database row would (V1 re-review P-3).</summary>
+    public Func<Guid, bool>? FailingRead { get; set; }
     public int Scans;
 
     public IEnumerable<BaseItem> Items => _items.Values;
@@ -316,6 +319,7 @@ internal sealed partial class NativeWorld
             // The stored item: these fixtures keep one instance per item, so it is the same one (Q16 review P2-2).
             case "RetrieveItem":
                 var id = (Guid)arguments![0]!;
+                if (FailingRead?.Invoke(id) == true) throw new InvalidOperationException("injected: the item could not be read");
                 return Libraries.FirstOrDefault(library => library.Id == id) as BaseItem ?? _items.GetValueOrDefault(id);
             case "GetItemList": return Query((InternalItemsQuery)arguments![0]!);
             case "GetCount": return Query((InternalItemsQuery)arguments![0]!).Count;
