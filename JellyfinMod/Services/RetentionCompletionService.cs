@@ -97,6 +97,12 @@ public sealed class RetentionCompletionService(
         // user and item, so the stored state is the newest one, at least as new as any event.
         var boundItemIds = await BoundItemIdsAsync(target, cancellationToken).ConfigureAwait(false);
         if (!boundItemIds.Contains(jellyfinItemId)) boundItemIds = [.. boundItemIds, jellyfinItemId];
+        // An unwatched event ends a completion carried from a removed copy whatever the read below finds, so that revocation
+        // is written first: the listener has already taken this work off its queue, and a read that fails now must not drop
+        // the unwatched state and leave the old date and deadline to a later undated played flag (re-review P-1).
+        if (unwatchedSeen)
+            await RetentionLiveCheck.RevokeCarriedAsync(database, target.TargetId, [userId], clock.GetUtcNow().UtcDateTime,
+                cancellationToken).ConfigureAwait(false);
         // Read everything before changing the tracked observation, so an item that cannot be read leaves it as it was.
         var states = boundItemIds.Select(id => StoredItem(id, loaded) is { } item ? userData.GetUserData(user, item) : null)
             .ToArray();

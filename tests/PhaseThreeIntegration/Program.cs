@@ -96,11 +96,15 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         "GetUsers" => allUsers.ToArray(),
         _ => null
     });
+    Guid? failingRead = null;
     var library = Stub<ILibraryManager>.Create((method, arguments) => method.Name switch
     {
         "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
         "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
         "GetUserRootFolder" => root,
+        // Re-review P-1: a stored read of this item fails while set.
+        "RetrieveItem" when arguments?[0] is Guid failing && failing == failingRead =>
+            throw new InvalidOperationException("injected: the item could not be read"),
         "GetItemById" or "RetrieveItem" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
         _ => null
     });
@@ -511,6 +515,46 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
                 candidate.UserId == firstUser.Id && candidate.TargetId == movieEntryId);
             Assert(observation.SourceReason == "Import" && observation.CompletedAt != carriedAt && observation.LastPlayedAt is null,
                 $"A coalesced unwatched event ends the carried completion ({observation.SourceReason}, completed " +
+                $"{observation.CompletedAt:o}, last played {observation.LastPlayedAt:o})");
+        }
+
+        // Re-review P-1: the read behind an unwatched event fails. The event's unwatched state is not lost with it: the carried
+        // completion is revoked before the read, so a later import marking the movie played without a date does not bring
+        // back the carried date.
+        await using (var carry = new ModDbContext(path))
+        {
+            var observation = await carry.CompletionObservations.SingleAsync(candidate =>
+                candidate.UserId == firstUser.Id && candidate.TargetId == movieEntryId);
+            observation.SourceReason = "CarriedFromRemovedVersion";
+            observation.EvidenceAvailable = true;
+            observation.Played = true;
+            observation.PlaybackPositionTicks = 0;
+            observation.CompletedAt = carriedAt;
+            observation.LastPlayedAt = carriedAt;
+            await carry.SaveChangesAsync();
+        }
+
+        clock.Advance(TimeSpan.FromMinutes(1));
+        failingRead = movie.Id;
+        states[(firstUser.Id, movie.Id)] = State(false, 0, null);
+        Raise(firstUser.Id, movie, UserDataSaveReason.TogglePlayed);
+        // The listener is first in, first out: a later episode event proves the failed read was handled.
+        states[(firstUser.Id, nativeEpisode.Id)] = State(true, 0, clock.GetUtcNow().UtcDateTime);
+        Raise(firstUser.Id, nativeEpisode, UserDataSaveReason.TogglePlayed);
+        await WaitForObservationAsync(path, firstUser.Id, nativeEpisode.Id,
+            observation => observation.ObservedAt == clock.GetUtcNow().UtcDateTime);
+        failingRead = null;
+        clock.Advance(TimeSpan.FromMinutes(1));
+        states[(firstUser.Id, movie.Id)] = State(true, 0, null);
+        Raise(firstUser.Id, movie, UserDataSaveReason.Import);
+        await WaitForObservationAsync(path, firstUser.Id, movie.Id,
+            observation => observation.ObservedAt == clock.GetUtcNow().UtcDateTime);
+        await using (var after = new ModDbContext(path))
+        {
+            var observation = await after.CompletionObservations.SingleAsync(candidate =>
+                candidate.UserId == firstUser.Id && candidate.TargetId == movieEntryId);
+            Assert(observation.SourceReason == "Import" && observation.CompletedAt != carriedAt && observation.LastPlayedAt is null,
+                $"An unwatched event whose read failed still ends the carried completion ({observation.SourceReason}, completed " +
                 $"{observation.CompletedAt:o}, last played {observation.LastPlayedAt:o})");
         }
 
