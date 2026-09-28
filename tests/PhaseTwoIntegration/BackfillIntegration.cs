@@ -40,6 +40,9 @@ internal static class BackfillIntegration
         conflictingAlternate.PrimaryVersionId = conflictingPrimary.Id;
         movies.Add(conflictingPrimary);
         movies.Add(conflictingAlternate);
+        // Jellyfin 12 records a merge on the main item too (LinkedChildren), which is how V1 finds a merged version.
+        foreach (var (main, merged) in new[] { (primary, alternate), (orderedPrimary, orderedAlternate), (conflictingPrimary, conflictingAlternate) })
+            main.LinkedAlternateVersions = [new LinkedChild { ItemId = merged.Id, Type = LinkedChildType.LinkedAlternateVersion }];
         var movieVersionGroups = new Dictionary<Guid, Guid>
         {
             [alternate.Id] = primary.Id,
@@ -123,6 +126,11 @@ internal static class BackfillIntegration
                 case "GetItemById" when (Guid)arguments![0]! == movieLibraryId: return movieLibrary;
                 case "GetItemById" when (Guid)arguments![0]! == tvLibraryId: return tvLibrary;
                 case "GetItemById": return AllItems().FirstOrDefault(item => item.Id == (Guid)arguments![0]!);
+                // Jellyfin 12 lists a merged version through its main item (V1); these fixtures merge by PrimaryVersionId.
+                case "GetLinkedAlternateVersions":
+                    return movies.OfType<Movie>().Where(movie => movie.PrimaryVersionId == ((BaseItem)arguments![0]!).Id)
+                        .Cast<Video>().ToArray();
+                case "GetLocalAlternateVersionIds": return Array.Empty<Guid>();
                 case "add_ItemAdded": itemAdded += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
                 case "remove_ItemAdded": itemAdded -= (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
                 case "add_ItemUpdated": itemUpdated += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;

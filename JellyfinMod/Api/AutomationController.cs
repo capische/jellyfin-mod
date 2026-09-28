@@ -22,7 +22,8 @@ public sealed class AutomationController(
     LibraryAccess access,
     AutomationStatusService status,
     AutomationRunGate runGate,
-    ITaskManager taskManager) : ControllerBase
+    ITaskManager taskManager,
+    MediaBrowser.Controller.Library.ILibraryManager? library = null) : ControllerBase
 {
     /// <summary>Gets whether automation runs, why it is paused, its budgets and the last run.</summary>
     [HttpGet("Automation/Status")]
@@ -91,7 +92,7 @@ public sealed class AutomationController(
         foreach (var targetId in targetIds)
         {
             var episode = episodes.FirstOrDefault(value => value.Id == targetId);
-            var held = await VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken);
+            var held = await VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken, library);
             var assessment = UpgradeAssessment.For(profile, held, episode is not null, settings.EpisodeUpgradesEnabled);
             var row = rows.GetValueOrDefault(targetId);
             string? blocked = !entry.Monitored || episode is { Monitored: false } ? AutomationReasons.Unmonitored

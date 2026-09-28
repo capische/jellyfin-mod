@@ -249,7 +249,7 @@ public sealed class AutomationRunner(
         {
             var search = scope.ServiceProvider.GetRequiredService<ReleaseSearchService>();
             var held = target.IsUpgrade
-                ? (await VersionQuality.HeldAsync(database, target.Entry.Id, target.Episode?.Id, cancellationToken).ConfigureAwait(false))
+                ? (await VersionQuality.HeldAsync(database, target.Entry.Id, target.Episode?.Id, cancellationToken, library).ConfigureAwait(false))
                     .Select(version => version.Quality).OfType<string>().ToHashSet(StringComparer.Ordinal)
                 : new HashSet<string>(StringComparer.Ordinal);
             try
@@ -334,7 +334,8 @@ public sealed class AutomationRunner(
             database.UpgradeOperations.Add(new UpgradeOperation
             {
                 Id = id, EntryId = target.Entry.Id, EpisodeId = target.Episode?.Id, OpenTargetKey = GrabService.TargetKey(target.Entry.Id, target.Episode?.Id),
-                SupersededBindingId = target.Upgrade!.Superseded!.BindingId, SupersededQuality = target.Upgrade.HeldBest,
+                SupersededBindingId = target.Upgrade!.Superseded!.BindingId, SupersededPath = target.Upgrade.Superseded.MediaPath,
+                SupersededQuality = target.Upgrade.HeldBest,
                 NewQuality = best.Parsed.Quality, NewGrabId = grab.Id, Mode = target.Profile.UpgradeMode == "add" ? "add" : "replace",
                 State = UpgradeStates.Planned, CreatedAt = now, UpdatedAt = now
             });
@@ -433,7 +434,7 @@ public sealed class AutomationRunner(
         var targetId = episode?.Id ?? entry.Id;
         if (fileState == FileState.OnDisk)
         {
-            var held = await VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken).ConfigureAwait(false);
+            var held = await VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken, library).ConfigureAwait(false);
             var assessment = UpgradeAssessment.For(profile, held, episode is not null, settings.EpisodeUpgradesEnabled);
             return assessment.Eligible ? new AutomationTarget(targetId, entry, episode, profile, inherited, assessment) : null;
         }

@@ -11,6 +11,12 @@ public sealed class EpisodeBinding
     public Guid JellyfinItemId { get; set; }
     /// <summary>Gets or sets the native series representation containing this episode.</summary>
     public Guid SeriesItemId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the main episode this file is a further version of, or null when the binding is the main episode
+    /// itself (V1). Jellyfin 12 groups an episode's files in one folder and plays them from the main episode.
+    /// </summary>
+    public Guid? OwnerItemId { get; set; }
     /// <summary>Gets or sets the library that owned the native episode when it was observed.</summary>
     public Guid TargetLibraryId { get; set; }
     /// <summary>Gets or sets the native media path observed for this episode representation.</summary>

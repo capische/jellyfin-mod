@@ -141,8 +141,33 @@ public sealed class UpgradeService(
                 .ConfigureAwait(false)
             : await database.EpisodeBindings.AsNoTracking().AnyAsync(binding => binding.Id == upgrade.SupersededBindingId, cancellationToken)
                 .ConfigureAwait(false);
+        if (!superseded && upgrade.SupersededPath is { } supersededPath)
+        {
+            // Jellyfin can re-identify the old file when the new one becomes the main version; its file is still the one to
+            // replace (V1, analysis C6).
+            Guid? rebound = upgrade.EpisodeId is { } supersededEpisode
+                ? await database.EpisodeBindings.AsNoTracking()
+                    .Where(binding => binding.EpisodeId == supersededEpisode && binding.MediaPath == supersededPath)
+                    .Select(binding => (Guid?)binding.Id).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false)
+                : await database.EntryBindings.AsNoTracking()
+                    .Where(binding => binding.EntryId == upgrade.EntryId && binding.MediaPath == supersededPath)
+                    .Select(binding => (Guid?)binding.Id).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            if (rebound is { } reboundId)
+            {
+                upgrade.SupersededBindingId = reboundId;
+                superseded = true;
+            }
+            else if (!MediaStorageIdentity.IsProvablyAbsent(supersededPath, out _))
+            {
+                // Still on disk but not bound: the replacement waits for reconciliation rather than ending as if it had gone.
+                await BlockAsync(upgrade, "superseded_untracked").ConfigureAwait(false);
+                return;
+            }
+        }
+
         if (!superseded)
         {
+            // The old version's file is gone, so there is nothing left to replace.
             await EndAsync(upgrade, UpgradeStates.Completed, "superseded_missing").ConfigureAwait(false);
             return;
         }

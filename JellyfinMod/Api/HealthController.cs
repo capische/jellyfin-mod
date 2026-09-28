@@ -157,6 +157,8 @@ public class HealthController : ControllerBase
         "seedRelease",
         "automation",
         "versions",
+        "versions.v1",
+        "versions.remove",
         "ui",
         "ui.web",
         "ui.takeover",

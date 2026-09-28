@@ -106,33 +106,25 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         var providerId = ProviderTmdbId(representative);
         // An unidentified series is unmatched regardless of incomplete episode metadata.
         if (providerId is null)
-        {
-            try
-            {
-                return new(representative.Id, folder.Id, representative.Name,
-                    Snapshot(work.MediaType, null, folder.Id, representative, copies,
-                        copies.Select(item => item.Id).ToHashSet(), [], _mediaStorage.ReadMountTable()), false, null);
-            }
-            catch (AmbiguousMediaSourceException error)
-            {
-                return new(representative.Id, folder.Id, representative.Name, null, true, error.Message);
-            }
-        }
+            return new(representative.Id, folder.Id, representative.Name,
+                Snapshot(work.MediaType, null, folder.Id, representative, copies,
+                    copies.Select(item => item.Id).ToHashSet(), [], _mediaStorage.ReadMountTable()), false, null);
 
+        // Every version Jellyfin plays for each copy, merged ones included, must be this title; a group whose members
+        // disagree is refused as a whole and keeps its bindings and state (V1, analysis C2).
+        var versionSets = new Dictionary<Guid, NativeVersionSet>();
         if (work.MediaType == "movie")
         {
-            foreach (var movie in copies.Cast<Movie>())
+            foreach (var main in copies.Cast<Movie>().Where(NativeVersions.HasVersions)
+                         .Select(movie => NativeVersions.MainOf(library, movie)).DistinctBy(main => main.Id))
             {
-                var groupId = PrimaryVersionId(movie) ?? movie.Id;
-                var versionsQuery = TitleQuery(folder, "movie");
-                versionsQuery.PresentationUniqueKey = groupId.ToString("N");
-                var versions = ReadPages(versionsQuery, cancellationToken).OfType<Movie>().ToList();
-                if (library.GetItemById(groupId) is Movie primary &&
-                    library.GetCollectionFolders(primary).Any(candidate => candidate.Id == folder.Id))
-                    versions.Add(primary);
-                if (versions.Any(version => ProviderTmdbId(version) is { } id && id != providerId))
-                    return new(groupId, folder.Id, representative.Name, null, true,
-                        "One native version group contains conflicting TMDB identities.");
+                var set = NativeVersions.Read(library, main, folder.Id);
+                if (set.Conflict is null && set.Versions.Select(version => ProviderTmdbId(version.Item)).OfType<int>()
+                        .FirstOrDefault(id => id != providerId) is var other && other != 0)
+                    set = set with { Conflict = $"{NativeVersions.IdentityConflict}: a version has TMDB id {other}, the title {providerId}" };
+                if (set.Conflict is not null)
+                    return new(main.Id, folder.Id, representative.Name, null, true, set.Conflict);
+                versionSets[main.Id] = set;
             }
         }
 
@@ -141,17 +133,11 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             var mounts = _mediaStorage.ReadMountTable();
             var skipped = new List<SkippedNativeEpisode>();
             var episodes = work.MediaType == "series"
-                ? GetEpisodes(copies.Cast<Series>().ToArray(), skipped, mounts, cancellationToken) : [];
+                ? GetEpisodes(copies.Cast<Series>().ToArray(), folder.Id, skipped, mounts, cancellationToken) : [];
             return new(representative.Id, folder.Id, representative.Name,
                 Snapshot(work.MediaType, providerId, folder.Id, representative, copies,
-                    copies.Select(item => item.Id).ToHashSet(), episodes, mounts) with { SkippedEpisodes = skipped },
+                    copies.Select(item => item.Id).ToHashSet(), episodes, mounts, versionSets) with { SkippedEpisodes = skipped },
                 false, null);
-        }
-        catch (AmbiguousMediaSourceException error)
-        {
-            // Nothing is guessed about which file belongs to which media source: the title keeps its bindings
-            // and state, and the run reports it (P6.M6).
-            return new(representative.Id, folder.Id, representative.Name, null, true, error.Message);
         }
         catch (InvalidOperationException error)
         {
@@ -212,7 +198,8 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         IReadOnlyCollection<BaseItem> copies,
         IReadOnlySet<Guid>? movieIds,
         IReadOnlyList<NativeEpisodeSnapshot> episodes,
-        MountTable mounts)
+        MountTable mounts,
+        IReadOnlyDictionary<Guid, NativeVersionSet>? versionSets = null)
     {
         var metadata = new TmdbMetadata(mediaType, tmdbId ?? 0, representative.Name,
             representative.PremiereDate, representative.Overview, null, null, ProviderId(representative, "Imdb"),
@@ -223,10 +210,14 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             var versionGroupId = mediaType == "movie" ? VersionGroup((Movie)copy, movieIds!) : copy.Id;
             representations.Add(new(copy.Id, libraryId, IsPlayable(copy), versionGroupId, copy.Path,
                 mounts.Capture(copy.Path)));
-            if (mediaType != "movie") continue;
-            foreach (var source in AlternateMediaSources((Movie)copy))
-                representations.Add(new(source.Id, libraryId, IsPlayable(source), versionGroupId, source.Path,
-                    mounts.Capture(source.Path), copy.Id));
+            if (mediaType != "movie" || versionSets?.GetValueOrDefault(copy.Id) is not { } versions) continue;
+            // Each further version is a native item of its own with its own path and streams, observed as a representation
+            // owned by the title a user opens (P6.M6, V1). A multi-part version is bound like any other; retention and
+            // Remove this version refuse it on its own (C17). A version that is itself listed as a copy is bound as one.
+            // Versions of a main item outside this observation are not this title's to bind; retention blocks such a copy.
+            foreach (var version in versions.Extras.Where(version => !movieIds!.Contains(version.Item.Id)))
+                representations.Add(new(version.Item.Id, libraryId, IsPlayable(version.Item), versionGroupId, version.Path,
+                    mounts.Capture(version.Path), copy.Id));
         }
 
         return new(mediaType, tmdbId, libraryId, representative.Name, representative.ProductionYear,
@@ -241,6 +232,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
 
     private NativeEpisodeSnapshot[] GetEpisodes(
         IReadOnlyCollection<Series> seriesCopies,
+        Guid libraryId,
         ICollection<SkippedNativeEpisode> skipped,
         MountTable mounts,
         CancellationToken cancellationToken)
@@ -270,43 +262,35 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
                     continue;
                 }
 
-                episodes.Add(new(episode.Id, episode.SeriesId, ProviderTmdbId(episode), episode.ParentIndexNumber.Value,
+                // Jellyfin 12 groups the files of one episode in one folder as versions of one main episode and hides the
+                // others from queries (analysis C4); each is observed here as a version owned by the main episode (V1).
+                var versions = NativeVersions.HasVersions(episode) ? NativeVersions.Read(library, episode, libraryId) : null;
+                if (versions?.Conflict is { } conflict)
+                {
+                    // Two different episodes grouped (C2): refused as a whole, so every file keeps its binding and state.
+                    foreach (var version in versions.Versions)
+                        skipped.Add(new(version.Item.Id, episode.SeriesId, IsPlayable(version.Item), version.Item.Name ?? string.Empty,
+                            conflict));
+                    continue;
+                }
+
+                var episodeTmdbId = ProviderTmdbId(episode);
+                episodes.Add(new(episode.Id, episode.SeriesId, episodeTmdbId, episode.ParentIndexNumber.Value,
                     episode.IndexNumber.Value, IsPlayable(episode), episode.Name, episode.Overview, null,
                     episode.PremiereDate, RuntimeMinutes(episode), episode.Path, mounts.Capture(episode.Path),
                     episode.IndexNumberEnd));
+                // A version carries the main episode's identity (the check above proved they agree) and its own last
+                // episode: S01E01-E02 grouped under S01E01 covers E02 like any multi-episode file (decision 2, C1).
+                foreach (var version in versions?.Extras ?? [])
+                    episodes.Add(new(version.Item.Id, episode.SeriesId, episodeTmdbId, episode.ParentIndexNumber.Value,
+                        episode.IndexNumber.Value, IsPlayable(version.Item), episode.Name, episode.Overview, null,
+                        episode.PremiereDate, RuntimeMinutes(episode), version.Path, mounts.Capture(version.Path),
+                        version.IsMultiEpisode ? version.LastEpisode : null, episode.Id));
             }
         }
 
         return episodes.DistinctBy(episode => episode.JellyfinItemId).OrderBy(episode => episode.SeasonNumber)
             .ThenBy(episode => episode.EpisodeNumber).ThenBy(episode => episode.JellyfinItemId).ToArray();
-    }
-
-    /// <summary>
-    /// The further media sources Jellyfin attaches to one title (P6.M6). The extra video files of a movie folder
-    /// stay one item with several sources; each source is a native item of its own with its own path and streams,
-    /// so each is observed as its own representation of the same version group. A stacked (multi-part) file makes
-    /// the pairing of a source to a file ambiguous, so such a title is reported rather than guessed at.
-    /// </summary>
-    /// <remarks>
-    /// The extra versions are the ones Jellyfin itself links to the title (<c>GetLocalAlternateVersionIds</c>, the
-    /// same list its media sources are built from), so no item id is derived here. Jellyfin 12 types an extra
-    /// version like its main item, not as <c>Video</c> as 10.11 did, and deleted every <c>Video</c>-typed one on
-    /// upgrade. Only the file versions of this folder are read; versions merged from other items are V1's work.
-    /// </remarks>
-    private IEnumerable<Video> AlternateMediaSources(Video video)
-    {
-        // The paths come from the item itself, so a title without extra files costs no further query.
-        if (video.LocalAlternateVersions is not { Length: > 0 }) yield break;
-        if (video.IsStacked)
-            throw new AmbiguousMediaSourceException(video.Path);
-        foreach (var id in library.GetLocalAlternateVersionIds(video))
-        {
-            // Jellyfin drops a source whose item it has not written yet; so does this observation, and the next
-            // event or repair run picks it up.
-            if (library.GetItemById(id) is not Video source || string.IsNullOrWhiteSpace(source.Path)) continue;
-            if (source.IsStacked) throw new AmbiguousMediaSourceException(source.Path);
-            yield return source;
-        }
     }
 
     private static Guid VersionGroup(Movie movie, IReadOnlySet<Guid> movieIds)
@@ -335,11 +319,6 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         ? (int)Math.Round(TimeSpan.FromTicks(ticks).TotalMinutes)
         : null;
 }
-
-/// <summary>A title whose files cannot be matched to its media sources one by one (P6.M6).</summary>
-public sealed class AmbiguousMediaSourceException(string? path)
-    : InvalidOperationException("A multi-part file makes this title's media sources ambiguous: " +
-        (string.IsNullOrWhiteSpace(path) ? "no path" : Path.GetFileName(path)));
 
 /// <summary>One native title work item or a bounded diagnostic produced while inspecting it.</summary>
 public sealed record NativeCatalogObservation(Guid NativeItemId, Guid TargetLibraryId, string Title,

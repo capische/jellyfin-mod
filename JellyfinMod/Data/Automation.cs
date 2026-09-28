@@ -84,6 +84,12 @@ public static class AutomationReasons
     /// <summary>The host does not group episode versions; episode upgrades are off.</summary>
     public const string EpisodeVersionsUnsupported = "episode_versions_unsupported";
 
+    /// <summary>The episode is held as part of a multi-episode file, which an upgrade never replaces (V1).</summary>
+    public const string MultiEpisodeHeld = "multi_episode_held";
+
+    /// <summary>The best held copy is a file Jellyfin plays that the plugin has not bound yet (V1).</summary>
+    public const string VersionsUntracked = "versions_untracked";
+
     /// <summary>The held file's quality cannot be read from its name, so it is not replaced.</summary>
     public const string HeldQualityUnknown = "held_quality_unknown";
 
@@ -332,6 +338,13 @@ public sealed class UpgradeOperation
     /// <summary>Gets or sets the binding the upgrade supersedes.</summary>
     public Guid SupersededBindingId { get; set; }
 
+    /// <summary>
+    /// Gets or sets the superseded version's file when the upgrade was planned (V1, analysis C6): the binding can be
+    /// re-created when Jellyfin re-identifies it, and only this file being gone makes the replacement unnecessary.
+    /// </summary>
+    [MaxLength(4096)]
+    public string? SupersededPath { get; set; }
+
     /// <summary>Gets or sets the quality it supersedes.</summary>
     [MaxLength(32)]
     public string? SupersededQuality { get; set; }
@@ -379,4 +392,7 @@ public static class RetentionProvenances
 
     /// <summary>The superseded version of a completed upgrade.</summary>
     public const string UpgradeReplaced = "upgrade_replaced";
+
+    /// <summary>An administrator removed exactly this version (V1 decision 3).</summary>
+    public const string VersionRemoved = "version_removed";
 }

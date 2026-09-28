@@ -106,7 +106,10 @@ public sealed class LibraryEventListener(
         item.Path, item.IsVirtualItem, item.ProviderIds.GetValueOrDefault("Tmdb"), item.ParentIndexNumber,
         item.IndexNumber, (item as Episode)?.IndexNumberEnd, (item as Episode)?.SeriesId,
         item is MediaBrowser.Controller.Entities.Video video
-            ? string.Join(',', video.LocalAlternateVersions ?? []) : null);
+            ? string.Join(',', video.LocalAlternateVersions ?? []) + ";" +
+              string.Join(',', (video.LinkedAlternateVersions ?? []).Select(link => link.ItemId?.ToString("N"))) + ";" +
+              video.PrimaryVersionId?.ToString("N")
+            : null);
 
     private async Task ProcessAsync(CancellationToken cancellationToken)
     {

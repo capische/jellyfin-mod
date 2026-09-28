@@ -75,6 +75,13 @@ public static class ImportReasons
     /// <summary>A different file already has the destination name.</summary>
     public const string DestinationCollision = "destination_collision";
 
+    /// <summary>
+    /// The new file would not be grouped with the title's existing file as a version: Jellyfin 12 groups a folder's videos
+    /// only when every one of them is named after the folder, and an episode's only when they parse to the same season and
+    /// episode (V1, analysis C14). Nothing was linked.
+    /// </summary>
+    public const string VersionsNotGrouped = "versions_not_grouped";
+
     /// <summary>The target library has no usable root on the source's mount.</summary>
     public const string LibraryRootMissing = "library_root_missing";
 

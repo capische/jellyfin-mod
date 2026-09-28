@@ -179,6 +179,24 @@ public sealed class RetentionLiveCheck(
         return coversSeveral && !Satisfied(fileCompletedBy) ? RetentionLiveReasons.NotCompleted : null;
     }
 
+    /// <summary>
+    /// Whether a session plays exactly this file, or null when sessions cannot be read (V1, Remove this version). Jellyfin
+    /// names the version through the media source; without one, the item itself is what plays.
+    /// </summary>
+    internal bool? IsFilePlaying(Guid itemId)
+    {
+        try
+        {
+            return sessions.Sessions.Any(session => Guid.TryParse(session.PlayState?.MediaSourceId, out var source)
+                ? source == itemId
+                : session.NowPlayingItem?.Id == itemId || session.FullNowPlayingItem?.Id == itemId);
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Returns whether any session plays one of the items, or null when sessions cannot be read.</summary>
     private bool? IsPlaying(IReadOnlyCollection<Guid> itemIds)
     {

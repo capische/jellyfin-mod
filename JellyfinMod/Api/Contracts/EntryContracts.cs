@@ -228,6 +228,18 @@ public sealed record RetentionWarningDto([property: JsonPropertyName("deadline")
 public sealed record VersionKeepResult([property: JsonPropertyName("bindingId")] Guid BindingId,
     [property: JsonPropertyName("kept")] bool Kept);
 
+/// <summary>What Remove this version did (V1 decision 3).</summary>
+/// <param name="BindingId">The removed version's binding.</param>
+/// <param name="LogicalBytesUnlinked">The bytes of the file unlinked.</param>
+/// <param name="PhysicalBytesReleased">Bytes freed; 0 while another link (a seeding copy) holds the file, null when unknown.</param>
+/// <param name="State">The title's file state afterwards: <c>onDisk</c>, or <c>none</c> when the last copy went.</param>
+/// <param name="Monitored">Whether the title is still monitored; removing the last copy stops monitoring.</param>
+public sealed record VersionRemoveResult([property: JsonPropertyName("bindingId")] Guid BindingId,
+    [property: JsonPropertyName("logicalBytesUnlinked")] long LogicalBytesUnlinked,
+    [property: JsonPropertyName("physicalBytesReleased"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? PhysicalBytesReleased,
+    [property: JsonPropertyName("state")] string State,
+    [property: JsonPropertyName("monitored")] bool Monitored);
+
 /// <summary>Explicit stable file-state names; integer serialization is never exposed.</summary>
 public static class FileStates
 {

@@ -147,13 +147,20 @@ public sealed class RetentionEventListener(
         // Events for one user and item are coalesced into one read of the stored state. The reason recorded with it is
         // the newest, except that playback progress never replaces another reason: an import (Trakt, NFO) or a mark
         // played queued behind progress reports is still recorded as that, and its warning names that cause (review P3-3).
-        var added = false;
-        pending.AddOrUpdate(work.Key, _ =>
+        // TryAdd decides who queues the read, so two events arriving together queue it once (P3-A); the others only merge
+        // their reason into the pending one.
+        while (true)
         {
-            added = true;
-            return work.SourceReason;
-        }, (_, queued) => work.SourceReason is null || work.SourceReason == ProgressReason ? queued : work.SourceReason);
-        if (added) queue.Writer.TryWrite(work);
+            if (pending.TryAdd(work.Key, work.SourceReason))
+            {
+                queue.Writer.TryWrite(work);
+                return;
+            }
+
+            if (!pending.TryGetValue(work.Key, out var queued)) continue;
+            var merged = work.SourceReason is null || work.SourceReason == ProgressReason ? queued : work.SourceReason;
+            if (merged == queued || pending.TryUpdate(work.Key, merged, queued)) return;
+        }
     }
 
     private async Task ProcessAsync(CancellationToken cancellationToken)
@@ -201,6 +208,7 @@ public sealed class RetentionEventListener(
                 catch (Exception error)
                 {
                     logger.LogWarning(error, "JellyfinMod retention evidence refresh failed for {WorkKey}", work.Key);
+
                 }
             }
         }

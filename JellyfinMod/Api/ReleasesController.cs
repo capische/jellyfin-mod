@@ -24,7 +24,8 @@ public sealed class ReleasesController(
     ReleaseSearchService search,
     GrabService grabs,
     GrabDispatcher dispatcher,
-    GrabHoldOptions hold) : ControllerBase
+    GrabHoldOptions hold,
+    MediaBrowser.Controller.Library.ILibraryManager? library = null) : ControllerBase
 {
     /// <summary>Searches enabled indexers for one movie entry or one episode. Never submits anything.</summary>
     [HttpGet("Releases")]
@@ -58,7 +59,7 @@ public sealed class ReleasesController(
             if (!playable) return Error(409, "no_playable_version", "Another quality can only be added to a title that has a file.");
             if (episode is not null && !state.Settings.EpisodeUpgradesEnabled)
                 return Error(409, "episode_versions_unsupported", "Episodes do not take a second version until episode upgrades are enabled.");
-            held = (await JellyfinMod.Services.Automation.VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken))
+            held = (await JellyfinMod.Services.Automation.VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken, library))
                 .Select(version => version.Quality).OfType<string>().ToHashSet(StringComparer.Ordinal);
         }
 

@@ -2191,7 +2191,9 @@ static async Task VerifyLiveStateRevalidationAsync(
     ((Movie)nativeItems[mergedIntoUnbound.ItemId]).PrimaryVersionId = unboundMain.Id;
     var unboundBytes = await File.ReadAllBytesAsync(mergedIntoUnbound.Fixture.MediaPath);
     var unboundResult = await RecoverAsync(mergedIntoUnbound.Fixture);
-    Assert(unboundResult.State == "blocked" && unboundResult.Reason == "versions_untracked" &&
+    // This fixture's main item does not list the copy among its versions, so V1 reports the copy as no longer one of its
+    // main item's versions (versions_unverified); a main that lists it, as Jellyfin's does, reports versions_untracked.
+    Assert(unboundResult.State == "blocked" && unboundResult.Reason is "versions_untracked" or "versions_unverified" &&
         (await File.ReadAllBytesAsync(mergedIntoUnbound.Fixture.MediaPath)).SequenceEqual(unboundBytes),
         $"A copy merged into a title the plugin does not track is blocked through its own primary and byte-identical " +
         $"(RET4-R2): {unboundResult.State}/{unboundResult.Reason}");

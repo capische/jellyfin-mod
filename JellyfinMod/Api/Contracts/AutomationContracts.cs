@@ -164,6 +164,29 @@ public sealed record VersionDto(
     /// <summary>Gets a value indicating whether an administrator kept this file while other versions may go (P10).</summary>
     [JsonPropertyName("kept")]
     public bool Kept { get; init; }
+
+    /// <summary>
+    /// Gets a value indicating whether the plugin binds this file. False for a file Jellyfin plays for the title that
+    /// reconciliation has not bound yet; such a row has an empty binding id and no retention (V1).
+    /// </summary>
+    [JsonPropertyName("tracked")]
+    public bool Tracked { get; init; } = true;
+
+    /// <summary>Gets a value indicating whether an administrator may remove exactly this file (V1 decision 3).</summary>
+    [JsonPropertyName("removable")]
+    public bool Removable { get; init; }
+
+    /// <summary>Gets a value indicating whether this is the title's last bound file: removing it stops monitoring (V1).</summary>
+    [JsonPropertyName("isLast")]
+    public bool IsLast { get; init; }
+
+    /// <summary>Gets a value indicating whether the viewer is part-way through this version (V1 decision 4).</summary>
+    [JsonPropertyName("inProgress")]
+    public bool InProgress { get; init; }
+
+    /// <summary>Gets the episodes a multi-episode file holds, such as <c>S01E01-E02</c>, or null (V1 decision 2).</summary>
+    [JsonPropertyName("episodeRange"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public string? EpisodeRange { get; init; }
 }
 
 /// <summary>A version's own retention state (P6.M7): seeding can hold one version while another is scheduled.</summary>

@@ -840,6 +840,22 @@ public sealed class ImportService(
             string? episodeLabel = null;
             if (addEpisodeVersion)
             {
+                // Jellyfin 12 groups an episode's files only within one folder and only when they parse to the same season
+                // and episode (V1, analysis C14): the new version goes beside the held file, which must parse as this
+                // episode alone.
+                var held = await database.EpisodeBindings.AsNoTracking()
+                    .Where(binding => binding.EpisodeId == episode.Id && binding.MediaPath != null)
+                    .OrderBy(binding => binding.OwnerItemId == null ? 0 : 1).Select(binding => binding.MediaPath!)
+                    .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+                if (held is not null)
+                {
+                    if (!ImportNaming.IsSingleEpisodeFile(held, episode.SeasonNumber, episode.EpisodeNumber))
+                        return DestinationPlan.Blocked(ImportReasons.VersionsNotGrouped,
+                            $"{Path.GetFileName(held)} does not read as S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00} alone, so Jellyfin would not group a new version with it.");
+                    if (Path.GetDirectoryName(held) is { } heldFolder && MediaStorageIdentity.Contains(root, heldFolder))
+                        seasonFolder = heldFolder;
+                }
+
                 var episodeGrab = await database.GrabOperations.AsNoTracking()
                     .SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken).ConfigureAwait(false);
                 episodeLabel = ImportNaming.VersionLabel(episodeGrab is null ? null : JsonSerializer.Deserialize<ParsedRelease>(episodeGrab.ParsedJson));
@@ -869,11 +885,16 @@ public sealed class ImportService(
             movieRoot = roots.First(candidate => MediaStorageIdentity.Contains(candidate, bound));
         }
 
+        var folderName = Path.GetFileName(movieFolder);
+        // A second version lands beside the title's file only where Jellyfin 12 will group them; otherwise the new file would
+        // become a movie of its own and change what stock Delete removes (V1, analysis C14). Existing files are never renamed.
+        if (ImportNaming.NonGroupingVideo(movieFolder, folderName) is { } loose)
+            return DestinationPlan.Blocked(ImportReasons.VersionsNotGrouped,
+                $"{loose} is not named after its folder, so Jellyfin would not group a new version with it.");
         var grab = await database.GrabOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken)
             .ConfigureAwait(false);
         var parsed = grab is null ? null : JsonSerializer.Deserialize<ParsedRelease>(grab.ParsedJson);
         var baseLabel = ImportNaming.VersionLabel(parsed);
-        var folderName = Path.GetFileName(movieFolder);
         // The label must not collide with a sibling; a later version gets a numbered label rather than an overwrite.
         for (var attempt = 1; attempt <= 9; attempt++)
         {
@@ -1078,6 +1099,7 @@ public static class ImportMessages
         ImportReasons.CrossFilesystem => "the download and the library are on different mounts; nothing was copied.",
         ImportReasons.DestinationNotWritable => "the library folder cannot be written.",
         ImportReasons.DestinationCollision => "another file already has the destination name.",
+        ImportReasons.VersionsNotGrouped => "Jellyfin would not group the new file with the title's existing file, so it would become a separate title; nothing was linked.",
         ImportReasons.LibraryRootMissing => "the library has no usable folder.",
         ImportReasons.ScanTimeout => "Jellyfin did not scan the new file in time.",
         ImportReasons.BindingNotObserved => "Jellyfin did not add the new file to the library.",

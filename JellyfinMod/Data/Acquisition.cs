@@ -397,10 +397,10 @@ public sealed class AcquisitionSettings
     public DateTime? SetupDismissedAt { get; set; }
 
     /// <summary>
-    /// Gets or sets a value indicating whether episodes may be upgraded or gain versions. Off until the host is shown to
-    /// group episode versions (PHASE6 M1 / open question 5).
+    /// Gets or sets a value indicating whether episodes may be upgraded or gain versions. On by default since V1 tracks an
+    /// episode's versions (user, 2026-09-28); the V1 migration also turned it on in existing databases.
     /// </summary>
-    public bool EpisodeUpgradesEnabled { get; set; }
+    public bool EpisodeUpgradesEnabled { get; set; } = true;
 
     /// <summary>
     /// Gets or sets a value indicating whether automation searches again for a monitored title after retention reclaimed

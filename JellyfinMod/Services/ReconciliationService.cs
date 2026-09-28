@@ -401,7 +401,11 @@ public sealed class ReconciliationService(
         // has no mount to compare; prove the file itself is gone instead.
         if (string.IsNullOrWhiteSpace(identity) || !MediaStorageIdentity.IsWithin(path, locations))
             return MediaStorageIdentity.IsProvablyAbsent(path, out detail);
-        return _mediaStorage.IsCurrent(path, identity, locations, out detail);
+        // The mount must be the one the file was seen on, and the file itself must be gone: Jellyfin can stop reporting a
+        // file that is still there (an extra version it re-identified, a hidden merged copy), and absence decided by the
+        // observation alone deleted such bindings and reset their clocks (V1, analysis C5).
+        return _mediaStorage.IsCurrent(path, identity, locations, out detail) &&
+            MediaStorageIdentity.IsProvablyAbsent(path, out detail);
     }
 
     private async Task<ReconciliationResult> ReconcileAsync(
@@ -595,8 +599,10 @@ public sealed class ReconciliationService(
         // A further media source has no existence of its own: when the title that owned it is gone from a
         // complete observation of this entry, the row is stale rather than absent media. Its file, if it is
         // still there, is named by one of the observed representations above (P6.M6).
+        // A file still on disk keeps its row until absence confirmation proves it gone (V1, C5).
         foreach (var stale in entryBindings.Where(binding => binding.OwnerItemId is { } ownerId &&
-                     !representationIds.Contains(ownerId) && !representationIds.Contains(binding.JellyfinItemId)))
+                     !representationIds.Contains(ownerId) && !representationIds.Contains(binding.JellyfinItemId) &&
+                     MediaStorageIdentity.IsProvablyAbsent(binding.MediaPath, out _)))
         {
             database.EntryBindings.Remove(stale);
             entryBindingChanges++;
@@ -1028,13 +1034,15 @@ public sealed class ReconciliationService(
                         ReplacedInPlace(existingBinding.MediaPath, existingBinding.FileFingerprint, candidate.MediaPath, fingerprint))
                         arrivals.Add((episode.Id, candidate.MediaPath, true));
                     if (fingerprint is not null) existingBinding.FileFingerprint = fingerprint;
+                    // A version that became the main episode, or the reverse, keeps its binding and clock (V1, C6).
                     var structuralChange = existingBinding.SeriesItemId != candidate.SeriesItemId ||
-                        existingBinding.TargetLibraryId != targetLibraryId;
+                        existingBinding.TargetLibraryId != targetLibraryId || existingBinding.OwnerItemId != candidate.OwnerItemId;
                     if (structuralChange ||
                         existingBinding.MediaPath != candidate.MediaPath ||
                         existingBinding.StorageIdentity != candidate.StorageIdentity)
                     {
                         existingBinding.SeriesItemId = candidate.SeriesItemId;
+                        existingBinding.OwnerItemId = candidate.OwnerItemId;
                         existingBinding.TargetLibraryId = targetLibraryId;
                         existingBinding.MediaPath = candidate.MediaPath;
                         existingBinding.StorageIdentity = candidate.StorageIdentity;
@@ -1049,6 +1057,7 @@ public sealed class ReconciliationService(
                     EpisodeId = episode.Id,
                     JellyfinItemId = candidate.JellyfinItemId,
                     SeriesItemId = candidate.SeriesItemId,
+                    OwnerItemId = candidate.OwnerItemId,
                     TargetLibraryId = targetLibraryId,
                     MediaPath = candidate.MediaPath,
                     StorageIdentity = candidate.StorageIdentity,
@@ -1064,7 +1073,10 @@ public sealed class ReconciliationService(
                     arrivals.Add((episode.Id, candidate.MediaPath, false));
             }
 
+            // The episode points at the item a user opens: a main episode, never one of its further versions (V1).
             var candidates = allCandidates.Where(observation => observation.IsPlayable).ToArray();
+            if (candidates.Any(candidate => candidate.OwnerItemId is null))
+                candidates = candidates.Where(candidate => candidate.OwnerItemId is null).ToArray();
             if (candidates.Length > 0)
             {
                 var selected = candidates.FirstOrDefault(candidate => candidate.JellyfinItemId == episode.JellyfinItemId) ??
@@ -1137,7 +1149,8 @@ public sealed class ReconciliationService(
                     episode.EpisodeNumber == representative.EpisodeNumber))
                 continue;
             var playable = providerGroup.Where(observation => observation.IsPlayable)
-                .OrderBy(observation => observation.JellyfinItemId).FirstOrDefault();
+                .OrderBy(observation => observation.OwnerItemId is null ? 0 : 1).ThenBy(observation => observation.JellyfinItemId)
+                .FirstOrDefault();
             var newEpisode = new Episode
             {
                 EntryId = entryId,
@@ -1161,6 +1174,7 @@ public sealed class ReconciliationService(
                     EpisodeId = newEpisode.Id,
                     JellyfinItemId = observation.JellyfinItemId,
                     SeriesItemId = observation.SeriesItemId,
+                    OwnerItemId = observation.OwnerItemId,
                     TargetLibraryId = targetLibraryId,
                     MediaPath = observation.MediaPath,
                     StorageIdentity = observation.StorageIdentity,
@@ -1188,7 +1202,8 @@ public sealed class ReconciliationService(
         {
             var representative = positionGroup.OrderBy(observation => observation.JellyfinItemId).First();
             var playable = positionGroup.Where(observation => observation.IsPlayable)
-                .OrderBy(observation => observation.JellyfinItemId).FirstOrDefault();
+                .OrderBy(observation => observation.OwnerItemId is null ? 0 : 1).ThenBy(observation => observation.JellyfinItemId)
+                .FirstOrDefault();
             var positionEpisode = new Episode
             {
                 EntryId = entryId,
@@ -1211,6 +1226,7 @@ public sealed class ReconciliationService(
                     EpisodeId = positionEpisode.Id,
                     JellyfinItemId = observation.JellyfinItemId,
                     SeriesItemId = observation.SeriesItemId,
+                    OwnerItemId = observation.OwnerItemId,
                     TargetLibraryId = targetLibraryId,
                     MediaPath = observation.MediaPath,
                     StorageIdentity = observation.StorageIdentity,
@@ -1354,10 +1370,14 @@ public sealed record NativeRepresentation(Guid JellyfinItemId, Guid TargetLibrar
 }
 
 /// <summary>One playable or unavailable native episode observation.</summary>
+/// <remarks>
+/// <see cref="OwnerItemId"/> names the main episode when this is one of its further versions (V1): Jellyfin 12 groups the
+/// files of one episode in one folder, plays them from the main episode and hides the others from queries.
+/// </remarks>
 public sealed record NativeEpisodeSnapshot(Guid JellyfinItemId, Guid SeriesItemId, int? TmdbId,
     int SeasonNumber, int EpisodeNumber, bool IsPlayable, string? Title = null, string? Overview = null,
     string? StillPath = null, DateTime? AirDate = null, int? RuntimeMinutes = null,
-    string? MediaPath = null, string? StorageIdentity = null, int? EpisodeNumberEnd = null);
+    string? MediaPath = null, string? StorageIdentity = null, int? EpisodeNumberEnd = null, Guid? OwnerItemId = null);
 
 /// <summary>A complete successful observation used to remove stale native bindings for one available library.</summary>
 /// <remarks>Protected identities belong to titles that failed, conflicted or lost their provider identity.</remarks>

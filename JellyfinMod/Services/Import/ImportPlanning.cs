@@ -186,6 +186,45 @@ public static partial class ImportNaming
         string.Create(CultureInfo.InvariantCulture, $"S{season:00}E{episode:00}") +
         (label is null ? string.Empty : " - " + Sanitize(label)) + "." + extension;
 
+    /// <summary>
+    /// The first video directly in <paramref name="folder"/> that stops Jellyfin 12 from grouping the folder's videos as
+    /// versions of one movie, or null when a new <c>Folder - Label</c> file would be grouped with them (v12.0
+    /// <c>VideoListResolver.IsEligibleForMultiVersion</c>): every name must start with the folder name, followed by nothing,
+    /// a <c>-</c>, <c>_</c> or <c>.</c>, or a bracketed label. Extras (<c>-trailer</c> and the like) do not take part. This is
+    /// stricter than Jellyfin, which also strips release words first, so it can only refuse a case Jellyfin would group.
+    /// </summary>
+    public static string? NonGroupingVideo(string folder, string folderName)
+    {
+        try
+        {
+            if (!Directory.Exists(folder)) return null;
+            foreach (var file in Directory.EnumerateFiles(folder))
+            {
+                var name = Path.GetFileNameWithoutExtension(file);
+                if (!VideoExtensionPattern().IsMatch(Path.GetExtension(file)) || ExtraSuffixPattern().IsMatch(name)) continue;
+                if (!name.StartsWith(folderName, StringComparison.OrdinalIgnoreCase)) return Path.GetFileName(file);
+                var rest = name[folderName.Length..].Trim();
+                if (rest.Length == 0 || rest[0] is '-' or '_' or '.' || rest[0] == '[' && rest.Contains(']', StringComparison.Ordinal))
+                    continue;
+                return Path.GetFileName(file);
+            }
+
+            return null;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            // An unreadable folder cannot be shown to group; nothing is linked into it.
+            return Path.GetFileName(folder);
+        }
+    }
+
+    /// <summary>Whether a held episode file's own name reads as exactly this season and episode (one episode, not a range).</summary>
+    public static bool IsSingleEpisodeFile(string path, int season, int episode)
+    {
+        var parsed = ReleaseParser.Parse(Path.GetFileNameWithoutExtension(path));
+        return parsed.SeasonNumber == season && parsed.EpisodeNumbers.Count == 1 && parsed.EpisodeNumbers[0] == episode;
+    }
+
     /// <summary>The season folder name.</summary>
     public static string SeasonFolder(int season) =>
         season == 0 ? "Specials" : string.Create(CultureInfo.InvariantCulture, $"Season {season:00}");
@@ -231,6 +270,12 @@ public static partial class ImportNaming
     }
 
     private static string Trim(string value) => value.Length <= MaxNameLength ? value : value[..MaxNameLength].TrimEnd('.', ' ');
+
+    [GeneratedRegex(@"^\.(mkv|mp4|m4v|avi|mov|wmv|ts|m2ts|webm|mpg|mpeg|flv|iso|vob|ogv|3gp|divx|xvid|rmvb|strm)$", RegexOptions.IgnoreCase)]
+    private static partial Regex VideoExtensionPattern();
+
+    [GeneratedRegex(@"(^|[-_. ])(trailer|sample|featurette|behindthescenes|deleted|deletedscene|interview|scene|short|clip|other|extra|teaser)$", RegexOptions.IgnoreCase)]
+    private static partial Regex ExtraSuffixPattern();
 
     private static string StripProviderTag(string folderName) => ProviderTagPattern().Replace(folderName, string.Empty).Trim();
 

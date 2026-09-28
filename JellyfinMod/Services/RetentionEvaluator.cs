@@ -16,7 +16,8 @@ public sealed class RetentionEvaluator(
     TimeProvider clock,
     RetentionCompletionService? completion = null,
     ILibraryManager? library = null,
-    IUserDataManager? userData = null)
+    IUserDataManager? userData = null,
+    Microsoft.Extensions.Logging.ILogger<RetentionEvaluator>? logger = null)
 {
     /// <summary>Re-evaluates every episode target that belongs to one native series (P3.T11).</summary>
     public async Task EvaluateSeriesAsync(Guid seriesItemId, CancellationToken cancellationToken)
@@ -418,7 +419,11 @@ public sealed class RetentionEvaluator(
                                           !SqliteBusy.IsBusy(error))
             {
                 // Jellyfin's item could not be read just now (review P3-1): this evaluation stays as it was, deadline
-                // included, and the next evaluation reads the user again.
+                // included, and the next evaluation reads the user again. Said once per target, not silently (P3-C).
+                Microsoft.Extensions.Logging.LoggerExtensions.LogWarning(
+                    logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<RetentionEvaluator>.Instance, error,
+                    "JellyfinMod could not read a user's state for retention target {TargetId}; its evaluation is kept as it was",
+                    targetId);
                 database.ChangeTracker.Clear();
                 return;
             }

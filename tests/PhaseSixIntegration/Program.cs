@@ -83,7 +83,8 @@ internal static class Phase6
             Assert(!upgraded.AutomationEnabled && upgraded.AutomationIntervalHours == 6 && upgraded.AutomationBatchSize == 40 &&
                 upgraded.NewEpisodeDelayMinutes == 120 && upgraded.DailyAutoGrabBudget == 6 && upgraded.MaxConcurrentImports == 3 &&
                 upgraded.FreeSpaceFloorPercent == 10 && upgraded.FreeSpaceFloorBytes == 25_000_000_000 && upgraded.DecisionLogCap == 2000 &&
-                !upgraded.EpisodeUpgradesEnabled && !upgraded.ReacquireReclaimed,
+                // V1 turns episode upgrades on in existing databases too (user, 2026-09-28).
+                upgraded.EpisodeUpgradesEnabled && !upgraded.ReacquireReclaimed,
                 "The migration leaves automation off and applies the documented defaults to an existing settings row");
             Assert(await Scalar(database, "PRAGMA integrity_check") == "ok" && await Scalar(database, "PRAGMA foreign_key_check") is null,
                 "The upgraded database passes integrity and foreign-key checks");
@@ -242,8 +243,10 @@ internal static class Phase6
         Assert((await ordinary.PostAsync("/JellyfinMod/Automation/Run", null)).StatusCode == HttpStatusCode.Forbidden,
             "Ordinary users cannot start a run");
         var automation = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/Automation"));
-        Assert(!automation.GetProperty("automationEnabled").GetBoolean() && automation.GetProperty("revision").GetInt32() == 1,
-            "Automation settings read back off");
+        // V1's migration turns episode upgrades on and moves the revision past any form opened before it.
+        var initialRevision = automation.GetProperty("revision").GetInt32();
+        Assert(!automation.GetProperty("automationEnabled").GetBoolean() && initialRevision >= 1 &&
+            automation.GetProperty("episodeUpgradesEnabled").GetBoolean(), "Automation settings read back off");
         await ExpectAsync(admin.PatchAsJsonAsync("/JellyfinMod/Settings/Automation", AutomationSettings(9, enabled: true)), 409,
             "revision_conflict", "A stale automation revision is refused");
         Assert((await ordinary.PatchAsJsonAsync("/JellyfinMod/Settings/Automation", AutomationSettings(1, enabled: true))).StatusCode ==
@@ -314,7 +317,7 @@ internal static class Phase6
             "The queue carries an automation-paused banner while the master switch is off");
 
         // ---- M3: batches, budgets and backoff, counted against the boundary's own query log.
-        var saved = await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Automation", AutomationSettings(1, enabled: true,
+        var saved = await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Automation", AutomationSettings(initialRevision, enabled: true,
             batch: 3, grabs: 1)), 200, "Administrator turns automation on with a batch of 3 and one grab a day");
         var automationRevision = saved.GetProperty("revision").GetInt32();
         // The five monitored movies are due in a known order.

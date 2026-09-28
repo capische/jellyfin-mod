@@ -1,6 +1,7 @@
 using System.Text.Json;
 using JellyfinMod.Api.Contracts;
 using JellyfinMod.Data;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -187,6 +188,153 @@ public sealed class RetentionExecutor(
         database.RetentionOperations.Add(operation);
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return await ExecutePreparedUnderLeaseAsync([operation], bindingId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Removes exactly one version's file at an administrator's request (V1 decision 3): the file is unlinked by path and
+    /// physical identity, the native item is removed with file deletion off, and nothing else is touched. The folder, its
+    /// sidecars and every other version stay. It is an explicit act, so neither retention being off, the title's Keep, the
+    /// schedule nor seeding stops it (the seeding copy keeps its own link); a per-file Keep does, and so does the file
+    /// playing, a multi-part file, unwritable media, changed storage or a file another binding shares. Removing a title's
+    /// last file leaves it Not downloaded and unmonitored (user, 2026-09-28).
+    /// </summary>
+    public async Task<RetentionExecutionResult> RemoveVersionAsync(Guid entryId, Guid bindingId, CancellationToken cancellationToken)
+    {
+        await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        var target = await LoadVersionAsync(entryId, bindingId, cancellationToken).ConfigureAwait(false);
+        if (target is null) return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
+        if (await database.RetentionOperations.AsNoTracking().AnyAsync(operation => operation.BindingId == bindingId &&
+                (operation.State == RetentionOperationStates.Prepared || operation.State == RetentionOperationStates.Unlinked),
+                cancellationToken).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.OperationOpen);
+        var libraries = LibrariesContaining(target.Path).Append(target.LibraryId).ToHashSet();
+        await using var libraryLease = await AcquireLibrariesAsync(libraries, cancellationToken).ConfigureAwait(false);
+        // Read again under the locks: nothing below may act on a binding another writer changed meanwhile.
+        target = await LoadVersionAsync(entryId, bindingId, cancellationToken).ConfigureAwait(false);
+        if (target is null) return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
+        var (reason, observed) = await CheckRemovableAsync(target, cancellationToken).ConfigureAwait(false);
+        if (reason is not null) return RetentionExecutionResult.NotStarted(bindingId, reason);
+        var policy = await database.RetentionPolicySnapshots.AsNoTracking()
+            .SingleOrDefaultAsync(snapshot => snapshot.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
+        var operation = new RetentionOperation
+        {
+            ActionId = Guid.NewGuid(), BindingId = bindingId, EntryId = target.EntryId, EpisodeId = target.EpisodeId,
+            JellyfinItemId = target.ItemId, TargetLibraryId = target.LibraryId, PolicyVersion = policy?.Version ?? 0,
+            MediaPath = observed.CanonicalPath, StorageIdentity = target.StorageIdentity!, PhysicalIdentity = observed.PhysicalIdentity,
+            LogicalBytes = checked((long)observed.LogicalBytes), HardlinkCountBefore = observed.HardlinkCount,
+            Reason = RetentionProvenances.VersionRemoved, PreparedAt = clock.GetUtcNow().UtcDateTime,
+            Provenance = RetentionProvenances.VersionRemoved
+        };
+        database.RetentionOperations.Add(operation);
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+        // The last point at which cancellation is honoured; everything after the unlink must finish.
+        cancellationToken.ThrowIfCancellationRequested();
+        var unlink = files.UnlinkPinned(operation.MediaPath, operation.PhysicalIdentity);
+        if (!unlink.Removed)
+            return await FinishAsync([operation], bindingId,
+                unlink.IsReplacement ? RetentionOperationStates.Blocked : RetentionOperationStates.Failed,
+                unlink.IsReplacement ? RetentionPreviewReasons.MediaIdentityChanged : RetentionExecutionReasons.UnlinkFailed,
+                new IOException(unlink.Detail), cancellationToken).ConfigureAwait(false);
+        operation.State = RetentionOperationStates.Unlinked;
+        operation.Reason = RetentionExecutionReasons.Unlinked;
+        operation.UnlinkedAt = clock.GetUtcNow().UtcDateTime;
+        operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
+        await SaveAfterUnlinkAsync([operation]).ConfigureAwait(false);
+        TryRemoveNative(operation);
+        return await CompleteUnderLeaseAsync([operation], bindingId, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private sealed record RemovableVersion(Guid EntryId, Guid? EpisodeId, Guid ItemId, Guid LibraryId, string? Path, string? StorageIdentity);
+
+    private async Task<RemovableVersion?> LoadVersionAsync(Guid entryId, Guid bindingId, CancellationToken cancellationToken)
+    {
+        database.ChangeTracker.Clear();
+        var movie = await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == bindingId && binding.EntryId == entryId)
+            .Select(binding => new RemovableVersion(binding.EntryId, null, binding.JellyfinItemId, binding.TargetLibraryId,
+                binding.MediaPath, binding.StorageIdentity))
+            .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (movie is not null) return movie;
+        return await database.EpisodeBindings.AsNoTracking().Where(binding => binding.Id == bindingId)
+            .Join(database.Episodes.AsNoTracking().Where(episode => episode.EntryId == entryId), binding => binding.EpisodeId,
+                episode => episode.Id, (binding, episode) => new RemovableVersion(episode.EntryId, episode.Id, binding.JellyfinItemId,
+                    binding.TargetLibraryId, binding.MediaPath, binding.StorageIdentity))
+            .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Why this one file cannot be removed now, or null with the file as it is on disk.</summary>
+    private async Task<(string? Reason, UnixFileSnapshot File)> CheckRemovableAsync(RemovableVersion target,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(target.Path)) return (RetentionPreviewReasons.MediaPathUnavailable, default);
+        IReadOnlyList<string> roots;
+        try
+        {
+            roots = library.GetVirtualFolders()
+                .FirstOrDefault(folder => Guid.TryParse(folder.ItemId, out var id) && id == target.LibraryId)?.Locations ?? [];
+        }
+        catch
+        {
+            roots = [];
+        }
+
+        if (roots.Count == 0) return (RetentionPreviewReasons.LibraryRootMissing, default);
+        try
+        {
+            if (!storage.IsCurrent(target.Path, target.StorageIdentity, roots, out _))
+                return (RetentionPreviewReasons.StorageUnavailable, default);
+        }
+        catch
+        {
+            return (RetentionPreviewReasons.StorageUnavailable, default);
+        }
+
+        BaseItem? native;
+        try
+        {
+            native = library.GetItemById(target.ItemId);
+        }
+        catch
+        {
+            return (RetentionPreviewReasons.NativeBindingUnavailable, default);
+        }
+
+        if (native is null || string.IsNullOrWhiteSpace(native.Path) ||
+            !string.Equals(native.Path, target.Path, StringComparison.Ordinal))
+            return (RetentionPreviewReasons.NativeBindingMissing, default);
+        if (native is Video { AdditionalParts.Length: > 0 }) return (RetentionPreviewReasons.MultiPartUnsupported, default);
+        try
+        {
+            if (new FileInfo(native.Path).LinkTarget is not null) return (RetentionPreviewReasons.SymlinkRepresentation, default);
+        }
+        catch
+        {
+            return (RetentionPreviewReasons.MediaPathUnavailable, default);
+        }
+
+        if (!files.TryInspect(native.Path, out var observed)) return (RetentionPreviewReasons.MediaPathUnavailable, default);
+        if (!roots.Select(root => files.TryCanonicalize(root, out var canonical) ? canonical : null).OfType<string>()
+                .Any(root => string.Equals(Path.TrimEndingDirectorySeparator(root), observed.CanonicalPath, StringComparison.Ordinal) ||
+                    observed.CanonicalPath.StartsWith(Path.TrimEndingDirectorySeparator(root) + Path.DirectorySeparatorChar,
+                        StringComparison.Ordinal)))
+            return (RetentionPreviewReasons.SymlinkEscape, observed);
+        if (string.IsNullOrWhiteSpace(target.StorageIdentity)) return (RetentionPreviewReasons.StorageUnavailable, observed);
+        // Kept by path or by physical identity, exactly as the preview reads a per-file Keep (PHASE10 Q3).
+        if (await database.VersionKeeps.AsNoTracking().AnyAsync(keep => keep.EntryId == target.EntryId &&
+                (keep.MediaPath == target.Path || keep.MediaPath == observed.CanonicalPath || keep.PhysicalIdentity == observed.PhysicalIdentity),
+                cancellationToken).ConfigureAwait(false))
+            return (RetentionPreviewReasons.VersionKept, observed);
+        if (!files.CanUnlink(observed.CanonicalPath)) return (RetentionExecutionReasons.MediaNotWritable, observed);
+        // A file another binding shares (an overlapping library, a hardlinked copy bound elsewhere) is not this version alone.
+        var sharing = await CurrentBindingSetAsync(observed.CanonicalPath, cancellationToken).ConfigureAwait(false);
+        if (sharing.Count != 1) return (RetentionPreviewReasons.SharedPathNotAllEligible, observed);
+        switch (liveCheck.IsFilePlaying(target.ItemId))
+        {
+            case null: return (RetentionPreviewReasons.ActiveSessionUnknown, observed);
+            case true: return (RetentionPreviewReasons.ActiveSession, observed);
+        }
+
+        return (null, observed);
     }
 
     /// <summary>Inspects and resolves operations left prepared or unlinked by an interrupted process.</summary>
@@ -398,7 +546,11 @@ public sealed class RetentionExecutor(
             episode.JellyfinItemId = remaining
                 .FirstOrDefault(candidate => candidate.JellyfinItemId == episode.JellyfinItemId)?.JellyfinItemId ??
                 remaining.FirstOrDefault()?.JellyfinItemId;
-            episode.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
+            var removed = operation.Provenance == RetentionProvenances.VersionRemoved;
+            // An administrator's removal of the last copy leaves the episode Not downloaded and unmonitored, so automation does
+            // not fetch it again (V1, user, 2026-09-28); retention's leaves it reclaimed.
+            episode.State = remaining.Length > 0 ? FileState.OnDisk : removed ? FileState.None : FileState.Reclaimed;
+            if (removed && remaining.Length == 0) episode.Monitored = false;
             // Episodes a multi-episode file covered without files of their own went with it (PHASE10 Q5).
             foreach (var covered in await database.Episodes.Where(candidate => candidate.EntryId == entryId &&
                          candidate.Id != episode.Id && candidate.JellyfinItemId == operation.JellyfinItemId &&
@@ -406,7 +558,7 @@ public sealed class RetentionExecutor(
                          .ToListAsync(cancellationToken).ConfigureAwait(false))
             {
                 covered.JellyfinItemId = null;
-                covered.State = FileState.Reclaimed;
+                covered.State = removed ? FileState.None : FileState.Reclaimed;
             }
 
             // A file re-added at this path gets this item id again; its old evidence must not come back with it (RET2-R1).
@@ -423,7 +575,7 @@ public sealed class RetentionExecutor(
                 if (!await database.EpisodeBindings.AnyAsync(candidate => seriesEpisodeIds.Contains(candidate.EpisodeId) &&
                         candidate.Id != operation.BindingId, cancellationToken).ConfigureAwait(false))
                     (await database.Entries.SingleAsync(candidate => candidate.Id == entryId, cancellationToken)
-                        .ConfigureAwait(false)).State = FileState.Reclaimed;
+                        .ConfigureAwait(false)).State = removed ? FileState.None : FileState.Reclaimed;
             }
         }
         else
@@ -444,7 +596,9 @@ public sealed class RetentionExecutor(
                 remaining.Any(candidate => (candidate.OwnerItemId ?? candidate.JellyfinItemId) == current)
                     ? current
                     : remaining.FirstOrDefault() is { } next ? next.OwnerItemId ?? next.JellyfinItemId : null;
-            entry.State = remaining.Length == 0 ? FileState.Reclaimed : FileState.OnDisk;
+            var removedMovie = operation.Provenance == RetentionProvenances.VersionRemoved;
+            entry.State = remaining.Length > 0 ? FileState.OnDisk : removedMovie ? FileState.None : FileState.Reclaimed;
+            if (removedMovie && remaining.Length == 0) entry.Monitored = false;
             if (remaining.Length > 0)
                 await ReconciliationService.ForgetRepresentationEvidenceAsync(database, entry.Id, operation.JellyfinItemId,
                     cancellationToken).ConfigureAwait(false);
@@ -462,12 +616,21 @@ public sealed class RetentionExecutor(
                 .ConfigureAwait(false))
         {
             var replaced = operation.Provenance == RetentionProvenances.UpgradeReplaced;
+            var versionRemoved = operation.Provenance == RetentionProvenances.VersionRemoved;
+            var lastRemoved = versionRemoved && !(operation.EpisodeId.HasValue
+                ? await database.EpisodeBindings.AnyAsync(candidate => candidate.EpisodeId == operation.EpisodeId &&
+                    candidate.Id != operation.BindingId, cancellationToken).ConfigureAwait(false)
+                : await database.EntryBindings.AnyAsync(candidate => candidate.EntryId == operation.EntryId &&
+                    candidate.Id != operation.BindingId, cancellationToken).ConfigureAwait(false));
             database.History.Add(new HistoryRecord
             {
                 Id = operation.Id,
                 EntryId = entryId,
-                EventType = replaced ? "upgrade_replaced" : "reclaimed",
-                Summary = replaced
+                EventType = replaced ? "upgrade_replaced" : versionRemoved ? "version_removed" : "reclaimed",
+                Summary = versionRemoved
+                    ? $"Removed the version {Path.GetFileName(operation.MediaPath)}; the folder and its other files stay" +
+                        (lastRemoved ? ". It was the last copy, so this is no longer monitored" : string.Empty)
+                    : replaced
                     ? operation.EpisodeId.HasValue ? "Replaced the episode's older version after an upgrade"
                         : "Replaced the older version after an upgrade"
                     : operation.EpisodeId.HasValue
@@ -807,4 +970,5 @@ internal static class RetentionExecutionReasons
     public const string Unlinked = "unlinked";
     public const string Reclaimed = "reclaimed";
     public const string ReclaimedNativeCleanupFailed = "reclaimed_native_cleanup_failed";
+    public const string OperationOpen = "operation_open";
 }

@@ -166,6 +166,7 @@ public sealed class RetentionCompletionService(
         logger.LogInformation("Refreshing retention evidence for {ItemCount} bound items and {UserCount} users",
             itemIds.Length, userIds.Length);
         var completed = 0;
+        var skipped = 0;
         foreach (var itemId in itemIds)
         {
             // Each item, with the other versions of its target, is loaded once for every user.
@@ -179,8 +180,10 @@ public sealed class RetentionCompletionService(
                 }
                 catch (Exception error) when (error is not OperationCanceledException)
                 {
-                    logger.LogDebug(error, "Retention evidence repair skipped item {ItemId} for now", itemId);
-                    // Unreadable now: the recorded evidence stays, and the next repair or event reads it again.
+                    // Unreadable now, or not written: the recorded evidence stays, and the next repair or event reads it
+                    // again. A write failure is not a passing read error, so neither is left at Debug (P3-B).
+                    skipped++;
+                    logger.LogWarning(error, "Retention evidence repair skipped item {ItemId} for user {UserId}", itemId, userId);
                     database.ChangeTracker.Clear();
                 }
 
@@ -188,6 +191,9 @@ public sealed class RetentionCompletionService(
             }
         }
 
+        if (skipped > 0)
+            logger.LogWarning("Retention evidence repair skipped {Skipped} of {Total} item and user pairs; they are read again next time",
+                skipped, total);
         if (total == 0) progress.Report(100);
     }
 

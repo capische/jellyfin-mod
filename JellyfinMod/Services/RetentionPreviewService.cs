@@ -91,10 +91,10 @@ public sealed class RetentionPreviewService(
         var trackedItems = targets.GroupBy(target => target.EpisodeId ?? target.EntryId)
             .ToDictionary(group => group.Key, group => (IReadOnlySet<string>)group.Where(target => target.Path is not null)
                 .Select(target => target.Path!).ToHashSet(StringComparer.Ordinal));
-        var mergedElsewhere = FilesMergedIntoOtherTitles(targets);
+        var linkedOwners = LinkedVersionOwners(targets);
         var inspected = targets.Select(target => Inspect(target, libraryRoots, now,
             replacementBindingIds?.Contains(target.BindingId) == true, keptPaths, keptIdentities,
-            trackedItems[target.EpisodeId ?? target.EntryId], mergedElsewhere)).ToArray();
+            trackedItems[target.EpisodeId ?? target.EntryId], linkedOwners)).ToArray();
         await ApplyMultiEpisodeRuleAsync(inspected, policy, evaluations, now, cancellationToken).ConfigureAwait(false);
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
@@ -257,7 +257,7 @@ public sealed class RetentionPreviewService(
         IReadOnlySet<string> keptPaths,
         IReadOnlySet<string> keptIdentities,
         IReadOnlySet<string> trackedItems,
-        IReadOnlyDictionary<string, HashSet<Guid>> mergedElsewhere)
+        IReadOnlyDictionary<string, HashSet<Guid>>? linkedOwners)
     {
         var evaluation = target.Evaluation;
         // A kept file is never reclaimed or replaced, whatever its title's schedule says (PHASE10 Q3).
@@ -317,23 +317,14 @@ public sealed class RetentionPreviewService(
                 return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MultiEpisodeUnsupported, evaluation?.Deadline);
             covered = (season, firstEpisode, lastEpisode);
         }
-        // Jellyfin 12.0.0 (the runtime host) groups several files of one movie, and now of one episode, as versions of
-        // one main item, and it groups S01E01-E02 with S01E01 because its episode key ignores the ending number. Only
-        // what the plugin binds is checked, watched and kept, so while Jellyfin plays a version the plugin does not
-        // track, or the bound item has itself become an extra version, nothing of that title is reclaimed (PHASE10 S17,
-        // Jellyfin 12 analysis C1, C7, C10), until versions are enumerated (task V1) and tracked (E7).
-        // Jellyfin 12 records a merge ("Group versions") only on the main item: the file merged into it still looks like a
-        // title of its own. A file that another tracked title plays as one of its versions is part of a title whose other
-        // files this target does not track, so it is blocked like any other untracked version (C2, found live).
-        if (target.Path is { } mergedPath && mergedElsewhere.TryGetValue(mergedPath, out var mergers) &&
-            mergers.Any(owner => owner != (target.EpisodeId ?? target.EntryId)))
-            return PreviewCandidate.Blocked(target, target.EpisodeId.HasValue
-                ? RetentionPreviewReasons.EpisodeVersionsUntracked
-                : RetentionPreviewReasons.VersionsUntracked, evaluation?.Deadline);
-        if (native is Video video && VersionsUntracked(video, trackedItems, target.EpisodeId.HasValue))
-            return PreviewCandidate.Blocked(target, target.EpisodeId.HasValue
-                ? RetentionPreviewReasons.EpisodeVersionsUntracked
-                : RetentionPreviewReasons.VersionsUntracked, evaluation?.Deadline);
+        // Jellyfin 12.0.0 groups several files of one movie, and now of one episode, as versions of one main item, groups
+        // S01E01-E02 with S01E01 (its episode key ignores the ending number) and marks every version played when one is
+        // finished. Only what the plugin binds is checked, watched and kept, so a title is reclaimed file by file only while
+        // every file Jellyfin plays for it is bound, its versions are one title, and the bound file is still one of them
+        // (V1; PHASE10 S17, S18; analysis C1, C2, C5, C7, C10; RET4-R2).
+        if (native is Video video && VersionGuard(video, trackedItems, target.EpisodeId.HasValue, target.TargetLibraryId,
+                linkedOwners) is { } versionReason)
+            return PreviewCandidate.Blocked(target, versionReason, evaluation?.Deadline);
         try
         {
             if (new FileInfo(native.Path).LinkTarget is not null)
@@ -464,79 +455,102 @@ public sealed class RetentionPreviewService(
     private static DateTime Latest(DateTime left, DateTime right) => left > right ? left : right;
 
     /// <summary>
-    /// Whether Jellyfin plays a version of this title that the plugin does not track: the bound item is an extra
-    /// version whose main item cannot be read, or a file of the main item or of any of its versions is not bound.
-    /// An episode with any other version is untracked until E7. Anything that cannot be read counts as untracked.
+    /// Why the files of this movie or episode cannot be reclaimed one by one, or null when they can (V1). Blocked when the
+    /// versions Jellyfin groups with the bound item are not one title (<c>version_identity_conflict</c>), when the bound
+    /// item is no longer one of its main item's versions (<c>versions_unverified</c>), when any file Jellyfin plays for it
+    /// is not bound (<c>versions_untracked</c>, <c>episode_versions_untracked</c>), or when another title plays the bound
+    /// file as a version merged into it (RET4-R2). Anything that cannot be read blocks.
     /// </summary>
     /// <remarks>
-    /// The versions are the union of every list Jellyfin 12 keeps: the paths in the item (<c>LocalAlternateVersions</c>),
-    /// the linked children (<c>LinkedAlternateVersions</c>, each resolved by its item id; one that cannot be resolved
-    /// counts as untracked), and the ids its library manager uses to build media sources
-    /// (<c>GetLocalAlternateVersionIds</c>, <c>GetLinkedAlternateVersions</c>). A movie whose every file is bound passes;
-    /// one untracked file blocks the whole title (RET3-R2).
+    /// The versions are the ones <c>GetMediaSources(false)</c> lists for the main item (<see cref="NativeVersions"/>), plus
+    /// the paths the main item still names in <c>LocalAlternateVersions</c>, whose items Jellyfin may not have written yet.
     /// </remarks>
-    private bool VersionsUntracked(Video video, IReadOnlySet<string> trackedPaths, bool episode)
+    private string? VersionGuard(Video video, IReadOnlySet<string> trackedPaths, bool episode, Guid libraryId,
+        IReadOnlyDictionary<string, HashSet<Guid>>? linkedOwners)
     {
+        var untracked = episode ? RetentionPreviewReasons.EpisodeVersionsUntracked : RetentionPreviewReasons.VersionsUntracked;
         try
         {
-            if (episode && (video.LocalAlternateVersions is { Length: > 0 } || video.LinkedAlternateVersions is { Length: > 0 } ||
-                    JellyfinNativeTitleSource.PrimaryVersionId(video).HasValue ||
-                    library.GetLocalAlternateVersionIds(video).Any() || library.GetLinkedAlternateVersions(video).Any()))
-                return true;
-            var primaryId = JellyfinNativeTitleSource.PrimaryVersionId(video);
-            var primary = primaryId is { } id ? library.GetItemById(id) as Video : video;
-            if (primary is null || string.IsNullOrEmpty(primary.Path)) return true;
-            var played = new List<string?> { primary.Path };
-            played.AddRange(primary.LocalAlternateVersions ?? []);
-            played.AddRange((primary.LinkedAlternateVersions ?? [])
-                .Select(link => link.ItemId is { } linked ? library.GetItemById(linked)?.Path : null));
-            played.AddRange(library.GetLocalAlternateVersionIds(primary).Select(version => library.GetItemById(version)?.Path));
-            played.AddRange(library.GetLinkedAlternateVersions(primary).Select(version => version?.Path));
-            return played.Any(path => string.IsNullOrEmpty(path) || !trackedPaths.Contains(path));
+            if (linkedOwners is null) return untracked;
+            var main = NativeVersions.MainOf(library, video);
+            // A version whose main item cannot be read is part of a title the plugin cannot see whole.
+            if (JellyfinNativeTitleSource.PrimaryVersionId(video).HasValue && ReferenceEquals(main, video)) return untracked;
+            var set = NativeVersions.Read(library, main, libraryId);
+            if (set.Conflict is not null) return RetentionPreviewReasons.VersionIdentityConflict;
+            if (!set.Versions.Any(version => version.Item.Id.Equals(video.Id))) return RetentionPreviewReasons.VersionsUnverified;
+            if (set.Versions.Any(version => !trackedPaths.Contains(version.Path)) ||
+                (main.LocalAlternateVersions ?? []).Any(path => string.IsNullOrEmpty(path) || !trackedPaths.Contains(path)))
+                return untracked;
+            // Merged into another title: that title plays this file among its own versions (RET4-R2).
+            if (set.Versions.Select(version => version.Path).Concat(main.LocalAlternateVersions ?? []).Any(path =>
+                    !string.IsNullOrEmpty(path) && linkedOwners.TryGetValue(path, out var owners) &&
+                    owners.Any(owner => !owner.Equals(main.Id))))
+                return untracked;
+            return null;
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
-            return true;
+            return untracked;
         }
     }
 
     /// <summary>
-    /// The files each tracked title plays as merged (linked) versions of its own, with each linked version's local
-    /// alternates, keyed by path, with the targets (movie or episode) whose bound item lists them. Anything that cannot be
-    /// read is left out here; the per-target check then still reads the item itself. A merge whose main item the plugin
-    /// does not bind is seen only through the merged item's own <c>PrimaryVersionId</c> (<see cref="VersionsUntracked"/>);
-    /// once a later scan clears that, only the version enumeration of task V1 can find it (RET4-R2).
+    /// For every file Jellyfin plays as part of a merged (linked) version of another movie or episode, with that version's
+    /// own file versions, the main items that list it, by path (RET4-R2). Found from the whole library, not only from tracked titles: a merge
+    /// into a title the plugin does not bind would otherwise go unseen once a scan clears the merged item's
+    /// <c>PrimaryVersionId</c>. Null when the library cannot be read, which blocks every title with versions.
     /// </summary>
-    private Dictionary<string, HashSet<Guid>> FilesMergedIntoOtherTitles(IEnumerable<PreviewTarget> targets)
+    private Dictionary<string, HashSet<Guid>>? LinkedVersionOwners(IEnumerable<PreviewTarget> targets)
     {
-        var result = new Dictionary<string, HashSet<Guid>>(StringComparer.Ordinal);
-        foreach (var target in targets)
+        try
         {
-            try
+            var result = new Dictionary<string, HashSet<Guid>>(StringComparer.Ordinal);
+            // Jellyfin plays a linked version with its own file versions: its path, the paths its item names and the files
+            // of the items its library manager links to it (RET4-R2).
+            void Add(Video owner, Video linked)
             {
-                if (library.GetItemById(target.JellyfinItemId) is not Video video) continue;
-                // Jellyfin plays each linked version together with that version's own local alternates (Video
-                // GetAllItemsForMediaSources): a copy merged in from a folder that holds two files brings both (RET4-R2).
-                var linkedVersions = (video.LinkedAlternateVersions ?? [])
-                    .Select(link => link.ItemId is { } linked ? library.GetItemById(linked) as Video : null)
-                    .Concat(library.GetLinkedAlternateVersions(video))
-                    .OfType<Video>()
-                    .ToArray();
-                var paths = linkedVersions.SelectMany(linked => new[] { linked.Path }
-                    .Concat(linked.LocalAlternateVersions ?? [])
-                    .Concat(library.GetLocalAlternateVersionIds(linked).Select(version => library.GetItemById(version)?.Path)));
+                var paths = new[] { linked.Path }.Concat(linked.LocalAlternateVersions ?? [])
+                    .Concat((library.GetLocalAlternateVersionIds(linked) ?? []).Select(id => library.GetItemById(id)?.Path));
                 foreach (var path in paths.Where(path => !string.IsNullOrEmpty(path)))
                 {
                     if (!result.TryGetValue(path!, out var owners)) result[path!] = owners = [];
-                    owners.Add(target.EpisodeId ?? target.EntryId);
+                    owners.Add(owner.Id);
                 }
             }
-            catch (Exception error) when (error is not OutOfMemoryException)
-            {
-            }
-        }
 
-        return result;
+            // Every tracked title's own merges, from the list on its item and from its linked children (RET3-R2 C2).
+            foreach (var target in targets)
+            {
+                if (library.GetItemById(target.JellyfinItemId) is not Video tracked) continue;
+                var owner = NativeVersions.MainOf(library, tracked);
+                foreach (var linked in (owner.LinkedAlternateVersions ?? [])
+                             .Select(link => link.ItemId is { } linkedId ? library.GetItemById(linkedId) as Video : null)
+                             .Concat(library.GetLinkedAlternateVersions(owner) ?? []).OfType<Video>())
+                    Add(owner, linked);
+            }
+
+            var ids = library.GetItemIds(new InternalItemsQuery
+            {
+                IncludeItemTypes = [Jellyfin.Data.Enums.BaseItemKind.Movie, Jellyfin.Data.Enums.BaseItemKind.Episode],
+                IsVirtualItem = false,
+                Recursive = true
+            }) ?? [];
+            foreach (var chunk in ids.Chunk(500))
+            {
+                foreach (var ownerId in library.GetItemIdsWithAlternateVersions(chunk) ?? new HashSet<Guid>())
+                {
+                    if (library.GetItemById(ownerId) is not Video owner) continue;
+                    foreach (var linked in (library.GetLinkedAlternateVersions(owner) ?? []).OfType<Video>())
+                        Add(owner, linked);
+                }
+            }
+
+            return result;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
     }
 
     private bool IsSeriesFavorite(PreviewTarget target)
@@ -668,6 +682,8 @@ internal static class RetentionPreviewReasons
     public const string VersionKept = "version_kept";
     public const string EpisodeVersionsUntracked = "episode_versions_untracked";
     public const string VersionsUntracked = "versions_untracked";
+    public const string VersionIdentityConflict = NativeVersions.IdentityConflict;
+    public const string VersionsUnverified = "versions_unverified";
     public const string SeedingIncomplete = "seeding_incomplete";
     public const string SeedGoalUnbounded = "seed_goal_unbounded";
     public const string SeedGoalUnmet = "seed_goal_unmet";

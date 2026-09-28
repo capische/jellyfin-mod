@@ -10,7 +10,9 @@ namespace JellyfinMod.Services.Automation;
 /// <param name="MediaPath">The native media path.</param>
 /// <param name="Quality">The quality identifier parsed from the file name, or null.</param>
 /// <param name="Resolution">The parsed resolution, or null.</param>
-public sealed record HeldVersion(Guid BindingId, Guid JellyfinItemId, string? MediaPath, string? Quality, string? Resolution);
+/// <param name="MultiEpisode">Whether the file's own name holds more than one episode (<c>S01E01-E02</c>).</param>
+public sealed record HeldVersion(Guid BindingId, Guid JellyfinItemId, string? MediaPath, string? Quality, string? Resolution,
+    bool MultiEpisode = false);
 
 /// <summary>
 /// Reads the quality of held versions from their file names, with the same independent parser Phase 4 uses for release
@@ -54,23 +56,50 @@ public static class VersionQuality
         return index < 0 ? int.MaxValue : index;
     }
 
-    /// <summary>Loads the held versions of a movie entry or an episode.</summary>
+    /// <summary>
+    /// Loads the held versions of a movie entry or an episode: every bound file, and with <paramref name="library"/> every
+    /// further file Jellyfin plays for it that is not bound yet, with an empty binding id (V1, analysis C12), so a copy the
+    /// plugin has not tracked is still a held quality and is never grabbed again.
+    /// </summary>
     public static async Task<IReadOnlyList<HeldVersion>> HeldAsync(ModDbContext database, Guid entryId, Guid? episodeId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, MediaBrowser.Controller.Library.ILibraryManager? library = null)
     {
-        if (episodeId is { } id)
-            return (await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == id)
+        var bound = episodeId is { } id
+            ? (await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == id)
                     .ToListAsync(cancellationToken).ConfigureAwait(false))
-                .Select(binding => Held(binding.Id, binding.JellyfinItemId, binding.MediaPath)).ToArray();
-        return (await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entryId)
-                .ToListAsync(cancellationToken).ConfigureAwait(false))
-            .Select(binding => Held(binding.Id, binding.JellyfinItemId, binding.MediaPath)).ToArray();
+                .Select(binding => (binding.Id, binding.JellyfinItemId, Owner: binding.OwnerItemId ?? binding.JellyfinItemId, binding.MediaPath))
+                .ToArray()
+            : (await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entryId)
+                    .ToListAsync(cancellationToken).ConfigureAwait(false))
+                .Select(binding => (binding.Id, binding.JellyfinItemId, Owner: binding.OwnerItemId ?? binding.JellyfinItemId, binding.MediaPath))
+                .ToArray();
+        var held = bound.Select(binding => Held(binding.Id, binding.JellyfinItemId, binding.MediaPath)).ToList();
+        if (library is null) return held;
+        foreach (var owner in bound.Select(binding => binding.Owner).Distinct())
+        {
+            try
+            {
+                if (library.GetItemById(owner) is not MediaBrowser.Controller.Entities.Video video) continue;
+                var versions = NativeVersions.Read(library, NativeVersions.MainOf(library, video), null);
+                foreach (var version in versions.Versions.Where(version => held.All(known =>
+                             known.JellyfinItemId != version.Item.Id && !string.Equals(known.MediaPath, version.Path, StringComparison.Ordinal))))
+                    held.Add(Held(Guid.Empty, version.Item.Id, version.Path));
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                // What cannot be read now is read again on the next run; the bound versions stand.
+            }
+        }
+
+        return held;
     }
 
     private static HeldVersion Held(Guid bindingId, Guid itemId, string? path)
     {
         var (quality, resolution) = Parse(path);
-        return new HeldVersion(bindingId, itemId, path, quality, resolution);
+        var multiEpisode = !string.IsNullOrWhiteSpace(path) &&
+            ReleaseParser.Parse(Path.GetFileNameWithoutExtension(path)).EpisodeNumbers.Count > 1;
+        return new HeldVersion(bindingId, itemId, path, quality, resolution, multiEpisode);
     }
 }
 
@@ -96,11 +125,18 @@ public sealed record UpgradeAssessment(bool Eligible, string? Cutoff, string? He
             return new(false, profile?.Cutoff, best.Quality, mode, AutomationReasons.UpgradeNotAllowed, null);
         if (episode && !episodeUpgradesEnabled)
             return new(false, profile.Cutoff, best.Quality, mode, AutomationReasons.EpisodeVersionsUnsupported, null);
+        // A single-episode upgrade would group under the first episode while the later ones still need the multi-episode
+        // file, which is never replaced: the grab could never finish its job (V1, answer 4).
+        if (episode && held.Any(version => version.MultiEpisode))
+            return new(false, profile.Cutoff, best.Quality, mode, AutomationReasons.MultiEpisodeHeld, null);
         // A file whose quality cannot be read from its name might already be excellent; it is never replaced blindly.
         if (best.Quality is null)
             return new(false, profile.Cutoff, null, mode, AutomationReasons.HeldQualityUnknown, null);
         if (VersionQuality.ProfileIndex(qualities, best.Quality) <= VersionQuality.ProfileIndex(qualities, profile.Cutoff))
             return new(false, profile.Cutoff, best.Quality, mode, AutomationReasons.AlreadyHeldAtCutoff, null);
+        // A copy Jellyfin plays that is not bound yet cannot be replaced; reconciliation binds it first (V1).
+        if (best.BindingId == Guid.Empty)
+            return new(false, profile.Cutoff, best.Quality, mode, AutomationReasons.VersionsUntracked, null);
         return new(true, profile.Cutoff, best.Quality, mode, null, best);
     }
 }

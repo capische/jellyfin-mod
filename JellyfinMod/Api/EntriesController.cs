@@ -27,8 +27,25 @@ public sealed class EntriesController(
     JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null,
     MediaBrowser.Controller.Library.IMediaSourceManager? mediaSources = null,
     UnixFileInspector? files = null,
-    TimeProvider? clock = null) : ControllerBase
+    TimeProvider? clock = null,
+    MediaBrowser.Controller.Library.ILibraryManager? library = null,
+    MediaBrowser.Controller.Library.IUserDataManager? userData = null) : ControllerBase
 {
+    /// <summary>The main item of a native version, or null when the item is its own main item or cannot be read (V1).</summary>
+    private Guid? MainVersionOf(Guid itemId)
+    {
+        try
+        {
+            return library?.GetItemById(itemId) is MediaBrowser.Controller.Entities.Video video
+                ? JellyfinNativeTitleSource.PrimaryVersionId(video)
+                : null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
     public async Task<ActionResult<EntriesResult>> List([FromQuery] string? mediaType, [FromQuery] Guid? targetLibraryId, [FromQuery] Guid? jellyfinItemId,
@@ -49,13 +66,18 @@ public sealed class EntriesController(
         if (targetLibraryId.HasValue) candidates = candidates.Where(entry => entry.TargetLibraryId == targetLibraryId);
         // Any bound native copy finds its entry, not only the selected one (P1.P11); a native episode finds its
         // series, and a reclaimed native item finds the entry it belonged to through the reclaim audit (P3.T14).
-        if (jellyfinItemId.HasValue)
-            candidates = candidates.Where(entry => entry.JellyfinItemId == jellyfinItemId ||
-                database.EntryBindings.Any(binding => binding.EntryId == entry.Id && binding.JellyfinItemId == jellyfinItemId) ||
-                database.Episodes.Any(episode => episode.EntryId == entry.Id && (episode.JellyfinItemId == jellyfinItemId ||
-                    database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id && binding.JellyfinItemId == jellyfinItemId))) ||
+        // An extra version of a movie or episode (Continue Watching lists the version being resumed) also finds the title
+        // of its main item, whether or not the version itself is bound yet (V1, analysis C13).
+        if (jellyfinItemId is { } itemId)
+        {
+            var ids = new[] { itemId, MainVersionOf(itemId) ?? itemId }.Distinct().ToArray();
+            candidates = candidates.Where(entry => entry.JellyfinItemId != null && ids.Contains(entry.JellyfinItemId.Value) ||
+                database.EntryBindings.Any(binding => binding.EntryId == entry.Id && ids.Contains(binding.JellyfinItemId)) ||
+                database.Episodes.Any(episode => episode.EntryId == entry.Id && (episode.JellyfinItemId != null && ids.Contains(episode.JellyfinItemId.Value) ||
+                    database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id && ids.Contains(binding.JellyfinItemId)))) ||
                 database.RetentionOperations.Any(operation => operation.EntryId == entry.Id &&
-                    operation.JellyfinItemId == jellyfinItemId && operation.State == RetentionOperationStates.Completed));
+                    operation.JellyfinItemId == itemId && operation.State == RetentionOperationStates.Completed));
+        }
         var candidateRows = await candidates.ToListAsync(cancellationToken);
         var nativeIds = candidateRows.Where(entry => entry.JellyfinItemId.HasValue).Select(entry => entry.MediaType).Distinct()
             .ToDictionary(type => type, type => (IReadOnlySet<Guid>)access.GetNativeItems(user, type, targetLibraryId).Select(item => item.Id).ToHashSet());
@@ -389,6 +411,38 @@ public sealed class EntriesController(
     [HttpPost("{id:guid}/Versions/{bindingId:guid}/Keep"), Authorize(Policy = Policies.RequiresElevation)]
     public Task<ActionResult<VersionKeepResult>> KeepVersion(Guid id, Guid bindingId, CancellationToken cancellationToken) =>
         ChangeVersionKeepAsync(id, bindingId, true, cancellationToken);
+
+    /// <summary>
+    /// Removes exactly one version's file (V1 decision 3, answered 2026-09-28). Administrators only. The folder, its sidecars
+    /// and every other version stay; removing the last copy leaves the title (or episode) Not downloaded and unmonitored.
+    /// A refusal is a 409 whose <c>reason</c> names why: <c>version_kept</c>, <c>active_session</c>,
+    /// <c>multi_part_unsupported</c>, <c>media_not_writable</c>, <c>shared_path_not_all_eligible</c>, and the storage and
+    /// identity reasons of the retention preview.
+    /// </summary>
+    [HttpPost("{id:guid}/Versions/{bindingId:guid}/Remove"), Authorize(Policy = Policies.RequiresElevation)]
+    public async Task<ActionResult<VersionRemoveResult>> RemoveVersion(Guid id, Guid bindingId,
+        [FromServices] RetentionExecutor executor, CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
+        var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(candidate => candidate.Id == id, cancellationToken)
+            .ConfigureAwait(false);
+        if (entry is null || !access.CanManage(user, entry) || !access.CanRead(user, entry)) return NotFound();
+        var result = await executor.RemoveVersionAsync(id, bindingId, cancellationToken).ConfigureAwait(false);
+        if (result.Reason == RetentionExecutionReasons.BindingUnavailable && result.OperationId is null) return NotFound();
+        if (result.State != RetentionOperationStates.Completed)
+            return Conflict(new ProblemDetails
+            {
+                Status = 409,
+                Title = "This version was not removed.",
+                Extensions = { ["reason"] = result.Reason }
+            });
+        var removed = await database.Entries.AsNoTracking().SingleAsync(candidate => candidate.Id == id, cancellationToken)
+            .ConfigureAwait(false);
+        return new VersionRemoveResult(bindingId, result.LogicalBytesUnlinked, result.PhysicalBytesReleased,
+            FileStates.ToWire(removed.State), removed.Monitored);
+    }
 
     /// <summary>Stops keeping one file; it follows its title's retention again (PHASE10 Q3, Q4).</summary>
     [HttpDelete("{id:guid}/Versions/{bindingId:guid}/Keep"), Authorize(Policy = Policies.RequiresElevation)]
@@ -724,7 +778,8 @@ public sealed class EntriesController(
             ? AcquisitionSummaryDto.From(operation, isAdmin) : null;
         var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots, [entry.Id], cancellationToken)
             .ConfigureAwait(false);
-        var versions = new JellyfinMod.Services.Automation.VersionReader(database, mediaSources, files ?? new UnixFileInspector());
+        var versions = new JellyfinMod.Services.Automation.VersionReader(database, mediaSources, files ?? new UnixFileInspector(),
+            library, userData);
         var warnings = await RetentionWarningsAsync(entry, episodes, policy, evaluations, history, isAdmin, cancellationToken).ConfigureAwait(false);
         var episodeDtos = new List<EpisodeDto>();
         foreach (var e in readableEpisodes)
@@ -733,7 +788,7 @@ public sealed class EntriesController(
             {
                 RetentionWarning = warnings.GetValueOrDefault(e.Id),
                 Versions = e.State == FileState.OnDisk
-                    ? await versions.ForAsync(entry.Id, e.Id, evaluations.GetValueOrDefault(e.Id), isAdmin, cancellationToken)
+                    ? await versions.ForAsync(entry.Id, e.Id, evaluations.GetValueOrDefault(e.Id), isAdmin, cancellationToken, user)
                     : []
             });
         // A series aggregate is built only from episodes this requester may read (P3.T15).
@@ -745,7 +800,7 @@ public sealed class EntriesController(
             entry.MediaType == "movie" ? Summary(null) : null)
         {
             Versions = entry.MediaType == "movie" && entry.State == FileState.OnDisk
-                ? await versions.ForAsync(entry.Id, null, evaluations.GetValueOrDefault(entry.Id), isAdmin, cancellationToken)
+                ? await versions.ForAsync(entry.Id, null, evaluations.GetValueOrDefault(entry.Id), isAdmin, cancellationToken, user)
                 : [],
             Upgrade = isAdmin && entry.MediaType == "movie" ? await versions.UpgradeAsync(entry, cancellationToken) : null,
             RetentionWarning = entry.MediaType == "movie" ? warnings.GetValueOrDefault(entry.Id) : null
