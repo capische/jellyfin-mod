@@ -266,7 +266,43 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
         // S01E01): Jellyfin's queries list only the main episode, so the version is readable through it (V1, review P2-6).
         var main = MainVersionOf(id);
         return GetNativeItems(user, "series").SelectMany(series => GetEpisodes(user, series))
-            .Any(native => native.Id == id || main is { } owner && native.Id == owner);
+            .Any(native => native.Id == id || main is { } owner && native.Id == owner) && CanSeeVersion(user, id);
+    }
+
+    /// <summary>
+    /// Whether the user may see this version itself (V1, review P2-12). Jellyfin's queries list only a title's main item, so
+    /// reading the main one says nothing about a further version with its own tags or parental rating: that version is
+    /// checked with Jellyfin's own per-user rule (<see cref="BaseItem.IsVisible(User, bool)"/>). A main item, or an item
+    /// Jellyfin no longer has, is left to the caller's own checks; a version that cannot be read is not visible.
+    /// </summary>
+    public bool CanSeeVersion(User user, Guid itemId)
+    {
+        BaseItem? item;
+        try
+        {
+            item = library.GetItemById(itemId);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return false;
+        }
+
+        return CanSeeVersion(user, item);
+    }
+
+    /// <summary>The same rule for a version already read.</summary>
+    public static bool CanSeeVersion(User user, BaseItem? item)
+    {
+        if (item is not MediaBrowser.Controller.Entities.Video video || JellyfinNativeTitleSource.PrimaryVersionId(video) is null)
+            return true;
+        try
+        {
+            return video.IsVisible(user);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return false;
+        }
     }
 
     /// <summary>The main item of a native version, or null when the item is its own main item or cannot be read (V1).</summary>

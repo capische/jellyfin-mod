@@ -2,7 +2,9 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Jellyfin.Data;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Enums;
 using JellyfinMod;
 using JellyfinMod.Data;
 using JellyfinMod.Services;
@@ -683,6 +685,30 @@ internal static class Phase6
         var viewerDetail = Json.Parse(await ordinary.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}"));
         Assert(viewerDetail.GetProperty("versions").GetArrayLength() == 2 && viewerDetail.GetProperty("upgrade").ValueKind == JsonValueKind.Null,
             "Ordinary users see the versions but not the upgrade state");
+
+        // V1 review P2-12: the 2160p is a further version of the readable 1080p main item. With its own tag blocked for a user,
+        // Jellyfin's rule hides that version from them: the entry's rows leave it out for the ordinary user and the
+        // administrator, and Remove answers the administrator as for a version that does not exist. Nothing is removed.
+        var uhdRow = versions.Single(item => item.GetProperty("resolution").GetString() == "2160p");
+        var hiddenVersion = world.Native.Items.Single(item => item.Id == Guid.Parse(uhdRow.GetProperty("mediaSourceId").GetString()!));
+        Assert(hiddenVersion is Video { PrimaryVersionId: not null }, "The 2160p is a further version of the title's main item");
+        hiddenVersion.Tags = ["jfmod-v1-hidden"];
+        foreach (var restricted in new[] { world.Admin, world.Ordinary })
+            restricted.SetPreference(PreferenceKind.BlockedTags, ["jfmod-v1-hidden"]);
+        var hiddenForViewer = Json.Parse(await ordinary.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}")).GetProperty("versions");
+        var hiddenForAdmin = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}")).GetProperty("versions");
+        var hiddenRemove = await admin.PostAsync($"/JellyfinMod/Entries/{ids["up"]}/Versions/{uhdRow.GetProperty("bindingId").AsGuid()}/Remove", null);
+        var hiddenRemoveStatus = hiddenRemove.StatusCode;
+        foreach (var restricted in new[] { world.Admin, world.Ordinary })
+            restricted.SetPreference(PreferenceKind.BlockedTags, []);
+        hiddenVersion.Tags = [];
+        Assert(hiddenForViewer.GetArrayLength() == 1 && hiddenForViewer[0].GetProperty("resolution").GetString() == "1080p" &&
+            hiddenForAdmin.GetArrayLength() == 1 && hiddenRemoveStatus == HttpStatusCode.NotFound && File.Exists(hiddenVersion.Path),
+            $"A further version hidden by its own tag is not listed ({hiddenForViewer.GetArrayLength()} rows for the viewer, " +
+            $"{hiddenForAdmin.GetArrayLength()} for the administrator) and Remove conceals it ({(int)hiddenRemoveStatus}, file present " +
+            $"{File.Exists(hiddenVersion.Path)})");
+        Assert(Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}")).GetProperty("versions").GetArrayLength() == 2,
+            "Without the blocked tag both versions are listed again");
 
         // ---- M7: within a due title the lowest quality goes first; a seeding higher version does not stop it.
         await host.Service<RetentionPolicyService>().SyncAsync(configuration, CancellationToken.None);

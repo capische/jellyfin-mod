@@ -439,6 +439,15 @@ public sealed class EntriesController(
             if (episode is null || !access.CanReadEpisode(user, episode)) return NotFound();
         }
 
+        // The version itself must be one this user may see: reading its main item does not show a further version hidden by
+        // its own tags or parental rating (review P2-12). It answers like a version that does not exist.
+        var versionItemId = entry.MediaType == "series"
+            ? await database.EpisodeBindings.AsNoTracking().Where(binding => binding.Id == bindingId)
+                .Select(binding => (Guid?)binding.JellyfinItemId).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
+            : await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == bindingId && binding.EntryId == id)
+                .Select(binding => (Guid?)binding.JellyfinItemId).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (versionItemId is { } versionItem && !access.CanSeeVersion(user, versionItem)) return NotFound();
+
         var result = await executor.RemoveVersionAsync(id, bindingId, cancellationToken).ConfigureAwait(false);
         if (result.Reason == RetentionExecutionReasons.BindingUnavailable && result.OperationId is null) return NotFound();
         if (result.State != RetentionOperationStates.Completed)
@@ -481,8 +490,10 @@ public sealed class EntriesController(
         Episode? episode = null;
         if (entry.MediaType == "movie")
         {
-            path = await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == bindingId && binding.EntryId == id)
-                .Select(binding => binding.MediaPath).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            var binding = await database.EntryBindings.AsNoTracking().SingleOrDefaultAsync(
+                candidate => candidate.Id == bindingId && candidate.EntryId == id, cancellationToken).ConfigureAwait(false);
+            // A version hidden from this user by its own tags or rating is not theirs to keep (review P2-12).
+            path = binding is not null && access.CanSeeVersion(user, binding.JellyfinItemId) ? binding.MediaPath : null;
         }
         else
         {
@@ -490,7 +501,8 @@ public sealed class EntriesController(
                 candidate => candidate.Id == bindingId, cancellationToken).ConfigureAwait(false);
             episode = binding is null ? null : await database.Episodes.AsNoTracking().SingleOrDefaultAsync(
                 candidate => candidate.Id == binding.EpisodeId && candidate.EntryId == id, cancellationToken).ConfigureAwait(false);
-            if (episode is not null && !access.CanReadEpisode(user, episode)) episode = null;
+            if (episode is not null && (!access.CanReadEpisode(user, episode) || !access.CanSeeVersion(user, binding!.JellyfinItemId)))
+                episode = null;
             path = episode is null ? null : binding!.MediaPath;
         }
 
@@ -780,10 +792,12 @@ public sealed class EntriesController(
         // Further versions of readable episodes are readable too: an episode covered by S01E01-E02 grouped under S01E01
         // points at that version, which Jellyfin's queries leave out (V1, review P2-6).
         {
+            // Only a version this user may see itself: its own tags or parental rating can hide it (review P2-12).
             var mains = visibleEpisodeIds.ToArray();
-            visibleEpisodeIds.UnionWith(await database.EpisodeBindings.AsNoTracking()
-                .Where(binding => binding.OwnerItemId != null && mains.Contains(binding.OwnerItemId.Value))
-                .Select(binding => binding.JellyfinItemId).ToListAsync(cancellationToken).ConfigureAwait(false));
+            visibleEpisodeIds.UnionWith((await database.EpisodeBindings.AsNoTracking()
+                    .Where(binding => binding.OwnerItemId != null && mains.Contains(binding.OwnerItemId.Value))
+                    .Select(binding => binding.JellyfinItemId).ToListAsync(cancellationToken).ConfigureAwait(false))
+                .Where(itemId => access.CanSeeVersion(user, itemId)));
         }
         var isAdmin = await IsAdministratorAsync();
         var readableEpisodes = episodes.Where(e => LibraryAccess.CanReadEpisode(e, visibleEpisodeIds)).ToArray();

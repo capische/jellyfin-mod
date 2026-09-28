@@ -91,6 +91,9 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
                 : evaluation is null ? null
                 : new VersionRetentionDto(evaluation.State, administrator ? evaluation.Reason : null);
             var native = Native(binding.ItemId);
+            // A further version hidden from the viewer by its own tags or parental rating is not listed, although its main item
+            // is readable (review P2-12); it still counts above, so no row claims to be the last copy.
+            if (viewer is not null && !LibraryAccess.CanSeeVersion(viewer, native)) continue;
             result.Add(new VersionDto(binding.OwnerId, binding.ItemId.ToString("N", CultureInfo.InvariantCulture), binding.BindingId,
                 (binding.Path is null ? null : labels.GetValueOrDefault(binding.Path)) ?? Label(binding.Path),
                 quality, resolution ?? ResolutionOf(video),
