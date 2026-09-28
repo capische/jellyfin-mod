@@ -395,11 +395,13 @@ public sealed class ReconciliationService(
     internal static async Task RepointRepresentationEvidenceAsync(ModDbContext database, Guid targetId, Guid removedItemId,
         Guid remainingItemId, CancellationToken cancellationToken)
     {
+        // Every completion the target held while the removed version existed is carried, whichever version the last event
+        // named: Jellyfin 12 fires events for the copies it marks played too (seen live on 28096, 2026-09-28).
         foreach (var observation in await database.CompletionObservations
-                     .Where(observation => observation.TargetId == targetId && observation.JellyfinItemId == removedItemId)
+                     .Where(observation => observation.TargetId == targetId)
                      .ToListAsync(cancellationToken).ConfigureAwait(false))
         {
-            observation.JellyfinItemId = remainingItemId;
+            if (observation.JellyfinItemId == removedItemId) observation.JellyfinItemId = remainingItemId;
             if (observation.CompletedAt.HasValue) observation.SourceReason = RetentionCompletionService.CarriedReason;
         }
     }

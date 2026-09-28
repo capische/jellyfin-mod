@@ -1638,8 +1638,11 @@ static async Task VerifyVersionRemovalAsync(
     {
         database.CompletionObservations.Add(new CompletionObservation
         {
-            EntryId = together.EntryId, TargetId = together.EntryId, UserId = userId, JellyfinItemId = together.Items[1].Id,
-            EvidenceAvailable = true, Played = true, CompletedAt = completedAt, LastPlayedAt = completedAt, ObservedAt = completedAt
+            // As seen live: Jellyfin 12's event for the copy it marked played is the last one read, so the observation names
+            // the 1080p, not the 720p that was actually finished.
+            EntryId = together.EntryId, TargetId = together.EntryId, UserId = userId, JellyfinItemId = together.Items[0].Id,
+            EvidenceAvailable = true, Played = true, CompletedAt = completedAt, LastPlayedAt = completedAt, ObservedAt = completedAt,
+            SourceReason = "TogglePlayed"
         });
         var seededAt = clock.GetUtcNow().UtcDateTime;
         database.RetentionEvaluations.Add(new RetentionEvaluation
