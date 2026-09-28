@@ -138,6 +138,23 @@ public sealed class RetentionLiveCheck(
 
         bool Counts(UserItemData? state) => state is { Played: true, PlaybackPositionTicks: 0, LastPlayedDate: { } played } &&
             floor is { } since && DateTime.SpecifyKind(played, DateTimeKind.Utc) >= since;
+        // A dated completion recorded through a version that has since been removed on purpose (a lower copy reclaimed
+        // first, an upgrade, Remove this version) still stands while the remaining copies read played with no resume:
+        // Jellyfin 12 copies the played flag to them without a date, and the copies expire together (decision 1, review
+        // P2-4). Only while no remaining copy carries a date of its own: a dated live state is Jellyfin's word and is judged
+        // against the floor as before (RET3-R4). Marking the title unwatched clears the flag and so the completion.
+        var recorded = requireCompletion && (operation.EpisodeId ?? operation.EntryId) is { } recordedTarget
+            ? (await database.CompletionObservations.AsNoTracking()
+                    .Where(observation => observation.TargetId == recordedTarget && observation.CompletedAt != null &&
+                        observation.SourceReason == RetentionCompletionService.CarriedReason)
+                    .Select(observation => new { observation.UserId, observation.CompletedAt })
+                    .ToListAsync(cancellationToken).ConfigureAwait(false))
+                .ToDictionary(observation => observation.UserId, observation => observation.CompletedAt!.Value)
+            : [];
+        bool Recorded(Guid userId, UserItemData[] states) => floor is { } since &&
+            recorded.TryGetValue(userId, out var at) && DateTime.SpecifyKind(at, DateTimeKind.Utc) >= since &&
+            states.Length > 0 && states.All(state => state.PlaybackPositionTicks == 0 && state.LastPlayedDate is null) &&
+            states.Any(state => state.Played);
 
         var completedBy = new HashSet<Guid>();
         var fileCompletedBy = new HashSet<Guid>();
@@ -162,7 +179,7 @@ public sealed class RetentionLiveCheck(
             if (policy.ExemptFavourites && current.Any(state => state.IsFavorite)) return RetentionLiveReasons.Favorite;
             if (policy.ExemptFavourites && seriesState?.IsFavorite == true)
                 return RetentionLiveReasons.FavoriteSeries;
-            if (current.Any(Counts)) completedBy.Add(user.Id);
+            if (current.Any(Counts) || Recorded(user.Id, current)) completedBy.Add(user.Id);
             if (coversSeveral && Counts(fileState)) fileCompletedBy.Add(user.Id);
         }
 

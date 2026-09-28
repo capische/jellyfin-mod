@@ -101,9 +101,6 @@ internal static class NativeVersions
             var name = System.IO.Path.GetFileName(version.Path);
             if (version.Item.GetType() != main.Item.GetType())
                 return $"{IdentityConflict}: {name} is a {version.Item.GetType().Name}, grouped with a {main.Item.GetType().Name}";
-            if (version.IsLinked && libraryId is { } required &&
-                !library.GetCollectionFolders(version.Item).Any(folder => folder.Id.Equals(required)))
-                return $"{IdentityConflict}: {name} is in another library";
             foreach (var provider in new[] { "Tmdb", "Imdb", "Tvdb" })
             {
                 var mine = ProviderId(main.Item, provider);
@@ -120,6 +117,13 @@ internal static class NativeVersions
             if (version.SeasonNumber != main.SeasonNumber || version.FirstEpisode != main.FirstEpisode)
                 return string.Create(CultureInfo.InvariantCulture,
                     $"{IdentityConflict}: {name} is S{version.SeasonNumber:00}E{version.FirstEpisode:00}, grouped with S{main.SeasonNumber:00}E{main.FirstEpisode:00}");
+        }
+
+        // A merged version must be in the title's library; checked last, as it is the one check that asks the library.
+        foreach (var version in versions.Where(version => !version.IsMain && version.IsLinked))
+        {
+            if (libraryId is { } required && !library.GetCollectionFolders(version.Item).Any(folder => folder.Id.Equals(required)))
+                return $"{IdentityConflict}: {System.IO.Path.GetFileName(version.Path)} is in another library";
         }
 
         return null;

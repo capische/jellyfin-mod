@@ -386,6 +386,24 @@ public sealed class ReconciliationService(
     /// Forgets completion evidence read through a file that is no longer bound while its siblings stay (RET2-R1): a file
     /// re-added later at the same path gets the same item id, which must not revive that evidence.
     /// </summary>
+    /// <summary>
+    /// Moves completion evidence read through a file that the plugin itself just removed on purpose (a reclaim, an upgrade's
+    /// replacement, Remove this version) onto a version that stays, so the remaining copies keep the completion that
+    /// scheduled them and expire together (decision 1, review P2-4). The removed file's item id is no longer referenced,
+    /// so a file re-added later at that path, which gets the same id, does not revive it (RET2-R1).
+    /// </summary>
+    internal static async Task RepointRepresentationEvidenceAsync(ModDbContext database, Guid targetId, Guid removedItemId,
+        Guid remainingItemId, CancellationToken cancellationToken)
+    {
+        foreach (var observation in await database.CompletionObservations
+                     .Where(observation => observation.TargetId == targetId && observation.JellyfinItemId == removedItemId)
+                     .ToListAsync(cancellationToken).ConfigureAwait(false))
+        {
+            observation.JellyfinItemId = remainingItemId;
+            if (observation.CompletedAt.HasValue) observation.SourceReason = RetentionCompletionService.CarriedReason;
+        }
+    }
+
     internal static async Task ForgetRepresentationEvidenceAsync(ModDbContext database, Guid targetId, Guid jellyfinItemId,
         CancellationToken cancellationToken)
     {

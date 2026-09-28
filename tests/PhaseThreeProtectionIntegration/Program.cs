@@ -316,10 +316,14 @@ static async Task VerifyPreviewHttpAsync(
         return storedCopies.GetValueOrDefault(id) ?? items.GetValueOrDefault(id);
     }
 
+    // Versions of a main item, as Jellyfin 12's library manager lists them (V1): file versions by id, merged versions.
+    var localVersionIds = new Dictionary<Guid, Guid[]>();
+    var linkedVersions = new Dictionary<Guid, MediaBrowser.Controller.Entities.Video[]>();
     var library = Stub<ILibraryManager>.Create((method, arguments) => method.Name switch
     {
-        "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
-        "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
+        "GetLocalAlternateVersionIds" when arguments?[0] is BaseItem owner => localVersionIds.GetValueOrDefault(owner.Id) ?? Array.Empty<Guid>(),
+        "GetLinkedAlternateVersions" when arguments?[0] is BaseItem owner =>
+            linkedVersions.GetValueOrDefault(owner.Id) ?? Array.Empty<MediaBrowser.Controller.Entities.Video>(),
         "GetUserRootFolder" => root,
         "GetVirtualFolders" => virtualFolders,
         "GetItemById" when arguments?[0] is Guid id => items.GetValueOrDefault(id),
@@ -927,6 +931,8 @@ static async Task VerifyPreviewHttpAsync(
         await VerifyFileIdentityAsync(api.Services, http, databasePath, libraryPath, storage, tvLibraryFolder, items);
         await VerifyUnlinkSurvivesBusyDatabaseAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
             user.Id, libraryFolder.Id, hook => userDataRead = hook);
+        await VerifyVersionRemovalAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items, user.Id,
+            libraryFolder.Id, localVersionIds, linkedVersions, liveStates);
     }
     finally
     {
@@ -1500,6 +1506,160 @@ static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
     database.RetentionOperations.Add(operation);
     await database.SaveChangesAsync();
     return new(operation.Id, mediaPath, sidecarPath);
+}
+
+// V1 (review of 9c10b63): Remove this version deletes exactly the file the administrator chose, never a replacement at its
+// path, a member of a group that is not one title, or a copy while Jellyfin plays another the plugin has not bound; and a
+// copy reclaimed first leaves its sibling the completion that scheduled them both (decision 1).
+static async Task VerifyVersionRemovalAsync(
+    IServiceProvider services,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    PluginConfiguration settings,
+    IDictionary<Guid, BaseItem> nativeItems,
+    Guid userId,
+    Guid libraryId,
+    Dictionary<Guid, Guid[]> localVersionIds,
+    Dictionary<Guid, MediaBrowser.Controller.Entities.Video[]> linkedVersions,
+    Dictionary<Guid, UserItemData> liveStates)
+{
+    settings.RetentionEnabled = true;
+    var policy = await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
+    clock.Advance(TimeSpan.FromDays(2));
+    var inspector = new UnixFileInspector();
+
+    // A movie folder of files; the first is the main item, the rest are its file versions. `bound` says which are bound.
+    async Task<(Guid EntryId, Movie[] Items, Guid?[] Bindings)> TitleAsync(string name, int tmdbId, params bool[] bound)
+    {
+        var entryId = Guid.NewGuid();
+        var movies = new Movie[bound.Length];
+        for (var index = 0; index < bound.Length; index++)
+        {
+            var path = Path.Combine(libraryPath, $"{name} - {index + 1}.mkv");
+            await File.WriteAllBytesAsync(path, new byte[2048 + index]);
+            movies[index] = new Movie { Id = Guid.NewGuid(), Name = name, Path = path };
+            movies[index].ProviderIds["Tmdb"] = tmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            nativeItems[movies[index].Id] = movies[index];
+        }
+
+        movies[0].LocalAlternateVersions = movies.Skip(1).Select(movie => movie.Path).ToArray();
+        localVersionIds[movies[0].Id] = movies.Skip(1).Select(movie => movie.Id).ToArray();
+        foreach (var extra in movies.Skip(1)) extra.PrimaryVersionId = movies[0].Id;
+        var bindings = new Guid?[bound.Length];
+        await using var database = new ModDbContext(databasePath);
+        database.Entries.Add(new Entry
+        {
+            Id = entryId, MediaType = "movie", TmdbId = tmdbId, Title = name, State = FileState.OnDisk, TargetLibraryId = libraryId,
+            JellyfinItemId = movies[0].Id, Monitored = true
+        });
+        for (var index = 0; index < bound.Length; index++)
+        {
+            if (!bound[index]) continue;
+            Assert(inspector.TryInspect(movies[index].Path, out var observed), "Version fixture has Linux inode evidence");
+            var binding = new EntryBinding
+            {
+                EntryId = entryId, JellyfinItemId = movies[index].Id, TargetLibraryId = libraryId, VersionGroupId = movies[0].Id,
+                OwnerItemId = index == 0 ? null : movies[0].Id, MediaPath = movies[index].Path,
+                StorageIdentity = storage.Capture(movies[index].Path), FileFingerprint = observed.FileFingerprint
+            };
+            database.EntryBindings.Add(binding);
+            bindings[index] = binding.Id;
+        }
+
+        await database.SaveChangesAsync();
+        return (entryId, movies, bindings);
+    }
+
+    var executor = services.GetRequiredService<RetentionExecutor>();
+
+    // P1-2: another file was put at the bound path since reconciliation: it is not the version that was chosen.
+    var replaced = await TitleAsync("v1-replaced", 900301, true, true);
+    File.Delete(replaced.Items[1].Path);
+    await File.WriteAllBytesAsync(replaced.Items[1].Path, new byte[4096]);
+    var replacedBytes = await File.ReadAllBytesAsync(replaced.Items[1].Path);
+    var replacedResult = await executor.RemoveVersionAsync(replaced.EntryId, replaced.Bindings[1]!.Value, default);
+    Assert(replacedResult.State != "completed" && replacedResult.Reason == "media_identity_changed" &&
+        (await File.ReadAllBytesAsync(replaced.Items[1].Path)).SequenceEqual(replacedBytes),
+        $"Remove refuses a file that replaced the bound version at its path: {replacedResult.State}/{replacedResult.Reason}");
+
+    // P1-1: a merged version with another TMDB id is not this title; the group is refused as a whole.
+    var conflict = await TitleAsync("v1-conflict", 900302, true);
+    var foreign = new Movie { Id = Guid.NewGuid(), Name = "v1-foreign", Path = Path.Combine(libraryPath, "v1-foreign.mkv"),
+        PrimaryVersionId = conflict.Items[0].Id };
+    foreign.ProviderIds["Tmdb"] = "900399";
+    await File.WriteAllBytesAsync(foreign.Path, new byte[3000]);
+    nativeItems[foreign.Id] = foreign;
+    linkedVersions[conflict.Items[0].Id] = [foreign];
+    Guid foreignBinding;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        Assert(inspector.TryInspect(foreign.Path, out var observed), "Merged fixture has Linux inode evidence");
+        var binding = new EntryBinding
+        {
+            EntryId = conflict.EntryId, JellyfinItemId = foreign.Id, TargetLibraryId = libraryId, VersionGroupId = conflict.Items[0].Id,
+            OwnerItemId = conflict.Items[0].Id, MediaPath = foreign.Path, StorageIdentity = storage.Capture(foreign.Path),
+            FileFingerprint = observed.FileFingerprint
+        };
+        database.EntryBindings.Add(binding);
+        await database.SaveChangesAsync();
+        foreignBinding = binding.Id;
+    }
+
+    var conflictResult = await executor.RemoveVersionAsync(conflict.EntryId, foreignBinding, default);
+    Assert(conflictResult.State != "completed" && conflictResult.Reason == "version_identity_conflict" && File.Exists(foreign.Path),
+        $"Remove refuses a member of a group that is not one title: {conflictResult.State}/{conflictResult.Reason}");
+
+    // P2-8: Jellyfin plays a copy the plugin has not bound, so this bound copy is not known to be the last one.
+    var untracked = await TitleAsync("v1-untracked", 900303, true, false);
+    var untrackedResult = await executor.RemoveVersionAsync(untracked.EntryId, untracked.Bindings[0]!.Value, default);
+    Assert(untrackedResult.State != "completed" && untrackedResult.Reason == "versions_untracked" &&
+        File.Exists(untracked.Items[0].Path) && File.Exists(untracked.Items[1].Path),
+        $"Remove waits while a copy Jellyfin plays is not bound: {untrackedResult.State}/{untrackedResult.Reason}");
+
+    // Decision 3: exactly one file goes; the other version stays and the title stays on disk and monitored.
+    var removable = await TitleAsync("v1-removable", 900304, true, true);
+    var removed = await executor.RemoveVersionAsync(removable.EntryId, removable.Bindings[1]!.Value, default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var entry = await database.Entries.AsNoTracking().SingleAsync(value => value.Id == removable.EntryId);
+        Assert(removed.State == "completed" && !File.Exists(removable.Items[1].Path) && File.Exists(removable.Items[0].Path) &&
+            entry.State == FileState.OnDisk && entry.Monitored &&
+            await database.History.AnyAsync(value => value.EntryId == removable.EntryId && value.EventType == "version_removed"),
+            $"Remove this version deletes exactly one file and keeps the title: {removed.State}/{removed.Reason}");
+    }
+
+    // P2-4: the watched 720p is reclaimed first; the 1080p, whose played flag Jellyfin copied without a date, keeps the
+    // completion that scheduled both and goes with it.
+    var together = await TitleAsync("v1-together", 900305, true, true);
+    var completedAt = clock.GetUtcNow().UtcDateTime.AddHours(-25);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.CompletionObservations.Add(new CompletionObservation
+        {
+            EntryId = together.EntryId, TargetId = together.EntryId, UserId = userId, JellyfinItemId = together.Items[1].Id,
+            EvidenceAvailable = true, Played = true, CompletedAt = completedAt, LastPlayedAt = completedAt, ObservedAt = completedAt
+        });
+        var seededAt = clock.GetUtcNow().UtcDateTime;
+        database.RetentionEvaluations.Add(new RetentionEvaluation
+        {
+            EntryId = together.EntryId, TargetId = together.EntryId, State = "scheduled", Reason = "completion_policy_satisfied",
+            PolicyVersion = policy.Version, EvaluatedAt = seededAt.AddDays(-3), BaselineAt = seededAt.AddDays(-3),
+            CompletionBasisAt = completedAt, EligibleAt = completedAt, Deadline = completedAt, AnnouncedDeadline = completedAt
+        });
+        await database.SaveChangesAsync();
+    }
+
+    liveStates[together.Items[1].Id] = new UserItemData { Key = "v1-720", Played = true, LastPlayedDate = completedAt };
+    liveStates[together.Items[0].Id] = new UserItemData { Key = "v1-1080", Played = true };
+    var first = await executor.ReclaimAsync(together.Bindings[1]!.Value, default);
+    Assert(first.State == "completed" && !File.Exists(together.Items[1].Path), $"The watched 720p is reclaimed: {first.State}/{first.Reason}");
+    var second = await executor.ReclaimAsync(together.Bindings[0]!.Value, default);
+    Assert(second.State == "completed" && !File.Exists(together.Items[0].Path),
+        $"The 1080p keeps the completion that scheduled both and goes with it: {second.State}/{second.Reason}");
+    settings.RetentionEnabled = false;
+    await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
 }
 
 static void Assert(bool condition, string message)

@@ -429,6 +429,16 @@ public sealed class EntriesController(
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(candidate => candidate.Id == id, cancellationToken)
             .ConfigureAwait(false);
         if (entry is null || !access.CanManage(user, entry) || !access.CanRead(user, entry)) return NotFound();
+        // A series' version belongs to one episode, which this user must be able to read as well (review P2-5).
+        if (entry.MediaType == "series")
+        {
+            var episode = await database.EpisodeBindings.AsNoTracking().Where(binding => binding.Id == bindingId)
+                .Join(database.Episodes.AsNoTracking().Where(candidate => candidate.EntryId == id), binding => binding.EpisodeId,
+                    candidate => candidate.Id, (_, candidate) => candidate)
+                .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            if (episode is null || !access.CanReadEpisode(user, episode)) return NotFound();
+        }
+
         var result = await executor.RemoveVersionAsync(id, bindingId, cancellationToken).ConfigureAwait(false);
         if (result.Reason == RetentionExecutionReasons.BindingUnavailable && result.OperationId is null) return NotFound();
         if (result.State != RetentionOperationStates.Completed)
@@ -766,6 +776,14 @@ public sealed class EntriesController(
         {
             var series = access.GetNativeItems(user, "series", entry.TargetLibraryId).SingleOrDefault(item => item.Id == nativeId);
             if (series is not null) visibleEpisodeIds.UnionWith(access.GetEpisodes(user, series).Select(item => item.Id));
+        }
+        // Further versions of readable episodes are readable too: an episode covered by S01E01-E02 grouped under S01E01
+        // points at that version, which Jellyfin's queries leave out (V1, review P2-6).
+        {
+            var mains = visibleEpisodeIds.ToArray();
+            visibleEpisodeIds.UnionWith(await database.EpisodeBindings.AsNoTracking()
+                .Where(binding => binding.OwnerItemId != null && mains.Contains(binding.OwnerItemId.Value))
+                .Select(binding => binding.JellyfinItemId).ToListAsync(cancellationToken).ConfigureAwait(false));
         }
         var isAdmin = await IsAdministratorAsync();
         var readableEpisodes = episodes.Where(e => LibraryAccess.CanReadEpisode(e, visibleEpisodeIds)).ToArray();

@@ -91,7 +91,7 @@ public sealed class RetentionPreviewService(
         var trackedItems = targets.GroupBy(target => target.EpisodeId ?? target.EntryId)
             .ToDictionary(group => group.Key, group => (IReadOnlySet<string>)group.Where(target => target.Path is not null)
                 .Select(target => target.Path!).ToHashSet(StringComparer.Ordinal));
-        var linkedOwners = LinkedVersionOwners(targets);
+        var linkedOwners = LinkedVersionOwners(targets.Select(target => target.JellyfinItemId));
         var inspected = targets.Select(target => Inspect(target, libraryRoots, now,
             replacementBindingIds?.Contains(target.BindingId) == true, keptPaths, keptIdentities,
             trackedItems[target.EpisodeId ?? target.EntryId], linkedOwners)).ToArray();
@@ -479,10 +479,10 @@ public sealed class RetentionPreviewService(
             if (set.Conflict is not null) return RetentionPreviewReasons.VersionIdentityConflict;
             if (!set.Versions.Any(version => version.Item.Id.Equals(video.Id))) return RetentionPreviewReasons.VersionsUnverified;
             if (set.Versions.Any(version => !trackedPaths.Contains(version.Path)) ||
-                (main.LocalAlternateVersions ?? []).Any(path => string.IsNullOrEmpty(path) || !trackedPaths.Contains(path)))
+                LivePaths(main).Any(path => !trackedPaths.Contains(path)))
                 return untracked;
             // Merged into another title: that title plays this file among its own versions (RET4-R2).
-            if (set.Versions.Select(version => version.Path).Concat(main.LocalAlternateVersions ?? []).Any(path =>
+            if (set.Versions.Select(version => version.Path).Concat(LivePaths(main)).Any(path =>
                     !string.IsNullOrEmpty(path) && linkedOwners.TryGetValue(path, out var owners) &&
                     owners.Any(owner => !owner.Equals(main.Id))))
                 return untracked;
@@ -495,12 +495,48 @@ public sealed class RetentionPreviewService(
     }
 
     /// <summary>
+    /// The paths a main item names in <c>LocalAlternateVersions</c> whose files are still there. Jellyfin keeps a removed
+    /// version's path in that list until its next scan, and a file that is gone is not a copy anyone plays.
+    /// </summary>
+    private static IEnumerable<string> LivePaths(Video main) =>
+        (main.LocalAlternateVersions ?? []).Where(path => !string.IsNullOrEmpty(path) && File.Exists(path));
+
+    /// <summary>
+    /// Why exactly this file cannot be removed on its own (V1 decision 3; review P1-1, P2-8), or null: the versions Jellyfin
+    /// groups with it are not one title, it is no longer one of its main item's versions, another title plays it as a
+    /// merged version, or Jellyfin plays a copy of the title that the plugin has not bound, so whether this is the last
+    /// copy cannot be told until reconciliation binds it. Anything that cannot be read refuses.
+    /// </summary>
+    internal string? RemovalGuard(Video video, Guid libraryId, IReadOnlySet<string> boundPaths, IEnumerable<Guid> trackedItemIds)
+    {
+        try
+        {
+            var main = NativeVersions.MainOf(library, video);
+            if (JellyfinNativeTitleSource.PrimaryVersionId(video).HasValue && ReferenceEquals(main, video))
+                return RetentionPreviewReasons.VersionsUntracked;
+            var set = NativeVersions.Read(library, main, libraryId);
+            if (set.Conflict is not null) return RetentionPreviewReasons.VersionIdentityConflict;
+            if (!set.Versions.Any(version => version.Item.Id.Equals(video.Id))) return RetentionPreviewReasons.VersionsUnverified;
+            if (set.Versions.Select(version => version.Path).Concat(LivePaths(main)).Any(path => !boundPaths.Contains(path)))
+                return RetentionPreviewReasons.VersionsUntracked;
+            if (LinkedVersionOwners(trackedItemIds) is not { } owners) return RetentionPreviewReasons.VersionsUntracked;
+            return set.Versions.Any(version => owners.TryGetValue(version.Path, out var by) && by.Any(owner => !owner.Equals(main.Id)))
+                ? RetentionPreviewReasons.VersionsUntracked
+                : null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return RetentionPreviewReasons.VersionsUntracked;
+        }
+    }
+
+    /// <summary>
     /// For every file Jellyfin plays as part of a merged (linked) version of another movie or episode, with that version's
     /// own file versions, the main items that list it, by path (RET4-R2). Found from the whole library, not only from tracked titles: a merge
     /// into a title the plugin does not bind would otherwise go unseen once a scan clears the merged item's
     /// <c>PrimaryVersionId</c>. Null when the library cannot be read, which blocks every title with versions.
     /// </summary>
-    private Dictionary<string, HashSet<Guid>>? LinkedVersionOwners(IEnumerable<PreviewTarget> targets)
+    private Dictionary<string, HashSet<Guid>>? LinkedVersionOwners(IEnumerable<Guid> trackedItemIds)
     {
         try
         {
@@ -519,9 +555,9 @@ public sealed class RetentionPreviewService(
             }
 
             // Every tracked title's own merges, from the list on its item and from its linked children (RET3-R2 C2).
-            foreach (var target in targets)
+            foreach (var trackedId in trackedItemIds.Distinct())
             {
-                if (library.GetItemById(target.JellyfinItemId) is not Video tracked) continue;
+                if (library.GetItemById(trackedId) is not Video tracked) continue;
                 var owner = NativeVersions.MainOf(library, tracked);
                 foreach (var linked in (owner.LinkedAlternateVersions ?? [])
                              .Select(link => link.ItemId is { } linkedId ? library.GetItemById(linkedId) as Video : null)

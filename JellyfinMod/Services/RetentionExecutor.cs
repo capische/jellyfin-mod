@@ -245,20 +245,46 @@ public sealed class RetentionExecutor(
         return await CompleteUnderLeaseAsync([operation], bindingId, CancellationToken.None).ConfigureAwait(false);
     }
 
-    private sealed record RemovableVersion(Guid EntryId, Guid? EpisodeId, Guid ItemId, Guid LibraryId, string? Path, string? StorageIdentity);
+    /// <summary>Whether an upgrade's new version is still bound, on disk and playable (review P1-3).</summary>
+    private async Task<bool> SuccessorPresentAsync(Guid upgradeOperationId, CancellationToken cancellationToken)
+    {
+        var upgrade = await database.UpgradeOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == upgradeOperationId,
+            cancellationToken).ConfigureAwait(false);
+        if (upgrade?.NewImportOperationId is not { } importId) return false;
+        var import = await database.ImportOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == importId, cancellationToken)
+            .ConfigureAwait(false);
+        if (import?.BindingId is not { } bindingId || import.NativeItemId is not { } nativeId) return false;
+        var path = upgrade.EpisodeId is null
+            ? await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == bindingId).Select(binding => binding.MediaPath)
+                .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
+            : await database.EpisodeBindings.AsNoTracking().Where(binding => binding.Id == bindingId).Select(binding => binding.MediaPath)
+                .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrEmpty(path) || !files.TryInspect(path, out _)) return false;
+        try
+        {
+            return library.GetItemById(nativeId) is { Path.Length: > 0 };
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return false;
+        }
+    }
+
+    private sealed record RemovableVersion(Guid EntryId, Guid? EpisodeId, Guid ItemId, Guid LibraryId, string? Path, string? StorageIdentity,
+        string? Fingerprint);
 
     private async Task<RemovableVersion?> LoadVersionAsync(Guid entryId, Guid bindingId, CancellationToken cancellationToken)
     {
         database.ChangeTracker.Clear();
         var movie = await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == bindingId && binding.EntryId == entryId)
             .Select(binding => new RemovableVersion(binding.EntryId, null, binding.JellyfinItemId, binding.TargetLibraryId,
-                binding.MediaPath, binding.StorageIdentity))
+                binding.MediaPath, binding.StorageIdentity, binding.FileFingerprint))
             .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         if (movie is not null) return movie;
         return await database.EpisodeBindings.AsNoTracking().Where(binding => binding.Id == bindingId)
             .Join(database.Episodes.AsNoTracking().Where(episode => episode.EntryId == entryId), binding => binding.EpisodeId,
                 episode => episode.Id, (binding, episode) => new RemovableVersion(episode.EntryId, episode.Id, binding.JellyfinItemId,
-                    binding.TargetLibraryId, binding.MediaPath, binding.StorageIdentity))
+                    binding.TargetLibraryId, binding.MediaPath, binding.StorageIdentity, binding.FileFingerprint))
             .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -319,6 +345,26 @@ public sealed class RetentionExecutor(
                         StringComparison.Ordinal)))
             return (RetentionPreviewReasons.SymlinkEscape, observed);
         if (string.IsNullOrWhiteSpace(target.StorageIdentity)) return (RetentionPreviewReasons.StorageUnavailable, observed);
+        // Exactly the file reconciliation bound: another file put at its path since then is not the version the
+        // administrator chose, and a binding without a recorded identity cannot show it is (review P1-2).
+        if (string.IsNullOrEmpty(target.Fingerprint)) return (RetentionExecutionReasons.MediaIdentityUnverified, observed);
+        if (!string.Equals(target.Fingerprint, observed.FileFingerprint, StringComparison.Ordinal))
+            return (RetentionPreviewReasons.MediaIdentityChanged, observed);
+        // The versions Jellyfin groups with it must be one title, the file must not be played as part of another title,
+        // and every other copy Jellyfin plays must be bound, or "last copy" could not be told (review P1-1, P2-8).
+        if (native is Video video)
+        {
+            var boundPaths = await database.EntryBindings.AsNoTracking().Where(binding => binding.MediaPath != null)
+                .Select(binding => binding.MediaPath!)
+                .Concat(database.EpisodeBindings.AsNoTracking().Where(binding => binding.MediaPath != null).Select(binding => binding.MediaPath!))
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var trackedItems = await database.EntryBindings.AsNoTracking().Select(binding => binding.JellyfinItemId)
+                .Concat(database.EpisodeBindings.AsNoTracking().Select(binding => binding.JellyfinItemId))
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            if (preview.RemovalGuard(video, target.LibraryId, boundPaths.ToHashSet(StringComparer.Ordinal), trackedItems) is { } guard)
+                return (guard, observed);
+        }
+
         // Kept by path or by physical identity, exactly as the preview reads a per-file Keep (PHASE10 Q3).
         if (await database.VersionKeeps.AsNoTracking().AnyAsync(keep => keep.EntryId == target.EntryId &&
                 (keep.MediaPath == target.Path || keep.MediaPath == observed.CanonicalPath || keep.PhysicalIdentity == observed.PhysicalIdentity),
@@ -470,6 +516,13 @@ public sealed class RetentionExecutor(
                     liveReason, null, cancellationToken).ConfigureAwait(false);
         }
 
+        // An upgrade replaces the old version only while its successor is still there: bound, on disk and playable.
+        // Remove this version or anything else may have taken it since the upgrade checked (review P1-3).
+        foreach (var operation in operations.Where(operation => operation.UpgradeOperationId.HasValue))
+            if (!await SuccessorPresentAsync(operation.UpgradeOperationId!.Value, cancellationToken).ConfigureAwait(false))
+                return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                    RetentionExecutionReasons.SuccessorUnavailable, null, cancellationToken).ConfigureAwait(false);
+
         // A binding added since prepare (for example from an overlapping library) shares the file but was
         // never checked; the whole action stops rather than unlinking media it protects (P3.T12).
         if (!(await CurrentBindingSetAsync(operations[0].MediaPath, cancellationToken).ConfigureAwait(false))
@@ -559,12 +612,14 @@ public sealed class RetentionExecutor(
             {
                 covered.JellyfinItemId = null;
                 covered.State = removed ? FileState.None : FileState.Reclaimed;
+                // Every episode that loses its last copy with an administrator's removal stops being monitored (review P2-7).
+                if (removed) covered.Monitored = false;
             }
 
             // A file re-added at this path gets this item id again; its old evidence must not come back with it (RET2-R1).
             if (remaining.Length > 0)
-                await ReconciliationService.ForgetRepresentationEvidenceAsync(database, episode.Id, operation.JellyfinItemId,
-                    cancellationToken).ConfigureAwait(false);
+                await ReconciliationService.RepointRepresentationEvidenceAsync(database, episode.Id, operation.JellyfinItemId,
+                    remaining[0].JellyfinItemId, cancellationToken).ConfigureAwait(false);
             if (remaining.Length == 0)
             {
                 await RetentionTargetReset.ResetAsync(database, entryId, episode.Id,
@@ -600,8 +655,8 @@ public sealed class RetentionExecutor(
             entry.State = remaining.Length > 0 ? FileState.OnDisk : removedMovie ? FileState.None : FileState.Reclaimed;
             if (removedMovie && remaining.Length == 0) entry.Monitored = false;
             if (remaining.Length > 0)
-                await ReconciliationService.ForgetRepresentationEvidenceAsync(database, entry.Id, operation.JellyfinItemId,
-                    cancellationToken).ConfigureAwait(false);
+                await ReconciliationService.RepointRepresentationEvidenceAsync(database, entry.Id, operation.JellyfinItemId,
+                    remaining[0].JellyfinItemId, cancellationToken).ConfigureAwait(false);
             if (remaining.Length == 0)
                 await RetentionTargetReset.ResetAsync(database, entry.Id, null,
                     clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
@@ -971,4 +1026,6 @@ internal static class RetentionExecutionReasons
     public const string Reclaimed = "reclaimed";
     public const string ReclaimedNativeCleanupFailed = "reclaimed_native_cleanup_failed";
     public const string OperationOpen = "operation_open";
+    public const string MediaIdentityUnverified = "media_identity_unverified";
+    public const string SuccessorUnavailable = "successor_unavailable";
 }

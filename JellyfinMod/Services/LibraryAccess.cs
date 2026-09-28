@@ -259,8 +259,30 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     }
 
     /// <summary>Checks a bound episode's own restrictions before returning its metadata.</summary>
-    public bool CanReadEpisode(User user, Episode episode) => episode.JellyfinItemId is not { } id ||
-        GetNativeItems(user, "series").SelectMany(series => GetEpisodes(user, series)).Any(native => native.Id == id);
+    public bool CanReadEpisode(User user, Episode episode)
+    {
+        if (episode.JellyfinItemId is not { } id) return true;
+        // An episode can point at a further version of another episode (S01E02 covered by S01E01-E02, grouped under
+        // S01E01): Jellyfin's queries list only the main episode, so the version is readable through it (V1, review P2-6).
+        var main = MainVersionOf(id);
+        return GetNativeItems(user, "series").SelectMany(series => GetEpisodes(user, series))
+            .Any(native => native.Id == id || main is { } owner && native.Id == owner);
+    }
+
+    /// <summary>The main item of a native version, or null when the item is its own main item or cannot be read (V1).</summary>
+    public Guid? MainVersionOf(Guid itemId)
+    {
+        try
+        {
+            return library.GetItemById(itemId) is MediaBrowser.Controller.Entities.Video video
+                ? JellyfinNativeTitleSource.PrimaryVersionId(video)
+                : null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>Checks a bound episode using native episode IDs already enumerated for this request.</summary>
     public static bool CanReadEpisode(Episode episode, IReadOnlySet<Guid> nativeEpisodeIds) =>

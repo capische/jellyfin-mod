@@ -595,6 +595,27 @@ internal static class Phase6
                 $"A per-file Keep on the older version stops the replacement while the new version is added ({fileKept.State}/{fileKept.Reason})");
         }
 
+        // V1 review P1-3: the upgrade service found the file-kept title's new 1080p playable; then, before its replacement step
+        // ran, that 1080p went (as Remove this version takes it: the file, its binding and its native item). The replacement
+        // must not remove the 720p, now the title's only copy.
+        await ReadAsync(await admin.DeleteAsync($"/JellyfinMod/Entries/{ids["filekept"]}/Versions/{fileKeptBinding}/Keep"), 200,
+            "Stop keeping the third title's 720p");
+        UpgradeOperation waitingUpgrade;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            waitingUpgrade = await database.UpgradeOperations.AsNoTracking().SingleAsync(value => value.EntryId == ids["filekept"]);
+            var import = await database.ImportOperations.AsNoTracking().SingleAsync(value => value.Id == waitingUpgrade.NewImportOperationId);
+            var successor = await database.EntryBindings.SingleAsync(value => value.Id == import.BindingId);
+            File.Delete(successor.MediaPath!);
+            database.EntryBindings.Remove(successor);
+            await database.SaveChangesAsync();
+            world.Native.Remove(host.Service<MediaBrowser.Controller.Library.ILibraryManager>().GetItemById(import.NativeItemId!.Value)!);
+        }
+
+        var raced = await host.Service<RetentionExecutor>().ReplaceAsync(waitingUpgrade.SupersededBindingId, waitingUpgrade.Id, default);
+        Assert(raced.State != "completed" && File.Exists(fileKeptOld),
+            $"The replacement refuses once its successor is gone, and the 720p stays ({raced.State}/{raced.Reason})");
+
         // ---- M6 get another quality on purpose; M8 versions API.
         await ExpectAsync(ordinary.GetAsync($"/JellyfinMod/Releases?entryId={ids["up"]}&intent=addVersion"), 403, "", "Ordinary users cannot add a version");
         await ExpectAsync(admin.GetAsync($"/JellyfinMod/Releases?entryId={ids["m5"]}&intent=addVersion"), 409, "no_playable_version",

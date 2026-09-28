@@ -107,6 +107,7 @@ public sealed class RetentionCompletionService(
             database.CompletionObservations.Add(observation);
         }
 
+        var previousReason = observation.SourceReason;
         observation.JellyfinItemId = jellyfinItemId;
         observation.ObservedAt = now;
         observation.SourceReason = sourceReason;
@@ -137,13 +138,25 @@ public sealed class RetentionCompletionService(
         observation.Played = finished;
         observation.IsFavorite = current.Any(state => state.IsFavorite);
         observation.PlaybackPositionTicks = resume;
-        observation.LastPlayedAt = Utc(current.Max(state => state.LastPlayedDate));
+        // The dated completion of a version removed on purpose stands while the remaining copies still read played with no
+        // resume and no date of their own (their played flag was copied without one, review P2-4); unwatched, resumed or a
+        // dated state replaces it as before.
+        var carried = previousReason == CarriedReason && isCompleted && wasCompleted &&
+            current.All(state => state.LastPlayedDate is null);
+        if (carried) observation.SourceReason = CarriedReason;
+        observation.LastPlayedAt = Utc(current.Max(state => state.LastPlayedDate)) ?? (carried ? observation.LastPlayedAt : null);
         observation.CompletedAt = isCompleted
             ? wasCompleted ? observation.CompletedAt : CompletionTime(observation.LastPlayedAt, now)
             : null;
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return true;
     }
+
+    /// <summary>
+    /// The source of a completion carried over from a version the plugin removed on purpose to a version that stays
+    /// (review P2-4); it counts only while the remaining copies read played with no resume and no date of their own.
+    /// </summary>
+    internal const string CarriedReason = "CarriedFromRemovedVersion";
 
     private async Task<Guid[]> BoundItemIdsAsync(RetentionTarget target, CancellationToken cancellationToken) =>
         target.EpisodeId is { } episodeId

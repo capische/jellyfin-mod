@@ -46,6 +46,9 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
         foreach (var untracked in UntrackedVersions(bindings.Select(binding => binding.OwnerId).Distinct(),
                      bindings.Select(binding => binding.ItemId).ToHashSet(), bindings.Select(binding => binding.Path)))
             bindings.Add((Guid.Empty, untracked.Item.Id, bindings[0].OwnerId, untracked.Path, false));
+        // With a copy the plugin has not bound yet, no bound copy is the last one and none is removed until
+        // reconciliation binds it (review P2-8).
+        var untrackedCount = bindings.Count - trackedCount;
         // Keyed by the file the import landed, because a version's binding can be re-identified when a sibling goes.
         var labels = (await database.ImportOperations.AsNoTracking()
                 .Where(operation => operation.DestinationPath != null && operation.VersionLabel != null && operation.EntryId == entryId)
@@ -97,8 +100,9 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
                 Kept = kept,
                 Tracked = tracked,
                 // Remove this version (decision 3): administrators, a bound single file that no per-file Keep holds.
-                Removable = administrator && tracked && !kept && native is not Video { AdditionalParts.Length: > 0 },
-                IsLast = tracked && trackedCount == 1,
+                Removable = administrator && tracked && !kept && untrackedCount == 0 &&
+                    native is not Video { AdditionalParts.Length: > 0 },
+                IsLast = tracked && trackedCount == 1 && untrackedCount == 0,
                 InProgress = InProgress(viewer, native),
                 EpisodeRange = EpisodeRange(native)
             });
