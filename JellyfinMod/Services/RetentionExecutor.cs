@@ -245,7 +245,11 @@ public sealed class RetentionExecutor(
         return await CompleteUnderLeaseAsync([operation], bindingId, CancellationToken.None).ConfigureAwait(false);
     }
 
-    /// <summary>Whether an upgrade's new version is still bound, on disk and playable (review P1-3).</summary>
+    /// <summary>
+    /// Whether an upgrade's new version is still there: bound to the same target, on disk, playable (review P1-3), and still
+    /// the very file the import linked (review P1-9). A file put at its path since then, or the same file rewritten in place,
+    /// is not the successor, and the old version may be the last valid copy.
+    /// </summary>
     private async Task<bool> SuccessorPresentAsync(Guid upgradeOperationId, CancellationToken cancellationToken)
     {
         var upgrade = await database.UpgradeOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == upgradeOperationId,
@@ -253,16 +257,34 @@ public sealed class RetentionExecutor(
         if (upgrade?.NewImportOperationId is not { } importId) return false;
         var import = await database.ImportOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == importId, cancellationToken)
             .ConfigureAwait(false);
-        if (import?.BindingId is not { } bindingId || import.NativeItemId is not { } nativeId) return false;
-        var path = upgrade.EpisodeId is null
-            ? await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == bindingId).Select(binding => binding.MediaPath)
+        if (import?.BindingId is not { } bindingId || import.NativeItemId is not { } nativeId ||
+            string.IsNullOrEmpty(import.DestinationPath) || string.IsNullOrEmpty(import.DestinationPhysicalIdentity))
+            return false;
+        var binding = upgrade.EpisodeId is { } episodeId
+            ? await database.EpisodeBindings.AsNoTracking().Where(value => value.Id == bindingId && value.EpisodeId == episodeId)
+                .Select(value => new { value.JellyfinItemId, value.MediaPath, value.FileFingerprint })
                 .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
-            : await database.EpisodeBindings.AsNoTracking().Where(binding => binding.Id == bindingId).Select(binding => binding.MediaPath)
+            : await database.EntryBindings.AsNoTracking().Where(value => value.Id == bindingId && value.EntryId == upgrade.EntryId)
+                .Select(value => new { value.JellyfinItemId, value.MediaPath, value.FileFingerprint })
                 .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
-        if (string.IsNullOrEmpty(path) || !files.TryInspect(path, out _)) return false;
+        // The binding the import completed with, still on the upgrade's own movie or episode and still the item it bound.
+        if (binding is null || binding.JellyfinItemId != nativeId || string.IsNullOrEmpty(binding.MediaPath) ||
+            string.IsNullOrEmpty(binding.FileFingerprint))
+            return false;
+        // Existence is not identity: the file at the binding's path must be the inode the import linked, with the size it
+        // linked, and the content reconciliation last recorded for the binding.
+        if (!files.TryInspect(binding.MediaPath, out var observed) ||
+            !files.TryCanonicalize(import.DestinationPath, out var destination) ||
+            !string.Equals(observed.CanonicalPath, destination, StringComparison.Ordinal) ||
+            !string.Equals(observed.PhysicalIdentity, import.DestinationPhysicalIdentity, StringComparison.Ordinal) ||
+            import.SourceLogicalBytes is { } linkedBytes && (ulong)linkedBytes != observed.LogicalBytes ||
+            !string.Equals(observed.FileFingerprint, binding.FileFingerprint, StringComparison.Ordinal))
+            return false;
         try
         {
-            return library.GetItemById(nativeId) is { Path.Length: > 0 };
+            // What Jellyfin plays for that item is the same file.
+            return library.GetItemById(nativeId) is { Path.Length: > 0 } native &&
+                string.Equals(native.Path, binding.MediaPath, StringComparison.Ordinal);
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {

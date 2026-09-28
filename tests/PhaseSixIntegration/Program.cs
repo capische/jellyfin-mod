@@ -600,6 +600,26 @@ internal static class Phase6
         // must not remove the 720p, now the title's only copy.
         await ReadAsync(await admin.DeleteAsync($"/JellyfinMod/Entries/{ids["filekept"]}/Versions/{fileKeptBinding}/Keep"), 200,
             "Stop keeping the third title's 720p");
+
+        // V1 review P1-9: a file at the new version's path is not the new version. Its bytes rewritten in place (the inode the
+        // import linked, other content), then another file put at its path: the replacement keeps the 720p both times.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var pending = await database.UpgradeOperations.AsNoTracking().SingleAsync(value => value.EntryId == ids["filekept"]);
+            var import = await database.ImportOperations.AsNoTracking().SingleAsync(value => value.Id == pending.NewImportOperationId);
+            var successorPath = (await database.EntryBindings.AsNoTracking().SingleAsync(value => value.Id == import.BindingId)).MediaPath!;
+            await using (var rewrite = new FileStream(successorPath, FileMode.Append, FileAccess.Write))
+                await rewrite.WriteAsync(new byte[] { 1 });
+            var rewritten = await host.Service<RetentionExecutor>().ReplaceAsync(pending.SupersededBindingId, pending.Id, default);
+            Assert(rewritten.State != "completed" && rewritten.Reason == "successor_unavailable" && File.Exists(fileKeptOld),
+                $"The replacement refuses a new version rewritten in place, and the 720p stays ({rewritten.State}/{rewritten.Reason})");
+            File.Delete(successorPath);
+            await File.WriteAllBytesAsync(successorPath, Enumerable.Repeat((byte)7, (int)Size).ToArray());
+            var swapped = await host.Service<RetentionExecutor>().ReplaceAsync(pending.SupersededBindingId, pending.Id, default);
+            Assert(swapped.State != "completed" && swapped.Reason == "successor_unavailable" && File.Exists(fileKeptOld),
+                $"The replacement refuses another file at the new version's path, and the 720p stays ({swapped.State}/{swapped.Reason})");
+        }
+
         UpgradeOperation waitingUpgrade;
         await using (var database = new ModDbContext(dbPath))
         {
