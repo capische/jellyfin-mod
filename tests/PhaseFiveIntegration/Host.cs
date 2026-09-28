@@ -185,6 +185,25 @@ internal sealed partial class NativeWorld
         _updated?.Invoke(this, new ItemChangeEventArgs { Item = owner });
     }
 
+    /// <summary>
+    /// Attaches a further file of the same season folder as a version of an existing episode, as Jellyfin 12 groups an
+    /// episode's files that parse to the same season and first episode: typed like the main episode, its id derived from
+    /// that type and its path, its owner and primary version the main episode (V1).
+    /// </summary>
+    public MediaBrowser.Controller.Entities.TV.Episode AddEpisodeVersion(MediaBrowser.Controller.Entities.TV.Episode main, string file)
+    {
+        var version = new MediaBrowser.Controller.Entities.TV.Episode
+        {
+            Id = NewItemId(file, main.GetType()), Name = Path.GetFileNameWithoutExtension(file), Path = file, SeriesId = main.SeriesId,
+            ParentIndexNumber = main.ParentIndexNumber, IndexNumber = main.IndexNumber, DateCreated = DateTime.UtcNow,
+            OwnerId = main.Id, PrimaryVersionId = main.Id
+        };
+        main.LocalAlternateVersions = [.. main.LocalAlternateVersions, file];
+        _items[version.Id] = version;
+        _updated?.Invoke(this, new ItemChangeEventArgs { Item = main });
+        return version;
+    }
+
     private void AddEpisode(TestLibrary library, string file)
     {
         var parent = Path.GetDirectoryName(file)!;

@@ -610,6 +610,15 @@ internal static class Phase6
             var pending = await database.UpgradeOperations.AsNoTracking().SingleAsync(value => value.EntryId == ids["filekept"]);
             var import = await database.ImportOperations.AsNoTracking().SingleAsync(value => value.Id == pending.NewImportOperationId);
             var successorPath = (await database.EntryBindings.AsNoTracking().SingleAsync(value => value.Id == import.BindingId)).MediaPath!;
+            // Re-review coverage: the same size, other bytes, written in place (the inode and size the import linked; only the
+            // content and its modification time differ).
+            var linkedSize = new FileInfo(successorPath).Length;
+            await using (var sameSize = new FileStream(successorPath, FileMode.Open, FileAccess.Write))
+                await sameSize.WriteAsync(Enumerable.Repeat((byte)9, 4096).ToArray());
+            var sameSized = await host.Service<RetentionExecutor>().ReplaceAsync(pending.SupersededBindingId, pending.Id, default);
+            Assert(new FileInfo(successorPath).Length == linkedSize && sameSized.State != "completed" &&
+                sameSized.Reason == "successor_unavailable" && File.Exists(fileKeptOld),
+                $"The replacement refuses a new version rewritten in place at its own size, and the 720p stays ({sameSized.State}/{sameSized.Reason})");
             await using (var rewrite = new FileStream(successorPath, FileMode.Append, FileAccess.Write))
                 await rewrite.WriteAsync(new byte[] { 1 });
             var rewritten = await host.Service<RetentionExecutor>().ReplaceAsync(pending.SupersededBindingId, pending.Id, default);
@@ -941,6 +950,42 @@ internal static class Phase6
             episodeTarget.GetProperty("blockedReason").GetString() != AutomationReasons.HeldQualityUnknown,
             $"An unlabelled episode file holds the quality of the release it was imported from ({Path.GetFileName(episodeImport.DestinationPath)}: " +
             episodeTarget.GetRawText() + ")");
+
+        // V1 re-review coverage of P2-12 for an episode: S01E02 gains a further version, which its own tag hides from a user
+        // who can read the episode. The episode's rows leave it out, and Remove and Keep answer as for a version that does not
+        // exist; without the blocked tag it is listed again.
+        var mainEpisode = world.Native.Items.OfType<MediaBrowser.Controller.Entities.TV.Episode>()
+            .Single(item => item.Path == episodeImport.DestinationPath);
+        var episodeVersionPath = Path.Combine(Path.GetDirectoryName(episodeImport.DestinationPath)!, "Auto Show (2024) S01E02 - 720p WEB-DL.mkv");
+        await File.WriteAllBytesAsync(episodeVersionPath, new byte[4096]);
+        var episodeVersion = world.Native.AddEpisodeVersion(mainEpisode, episodeVersionPath);
+        var episodeVersionBinding = await WaitAsync(async () =>
+        {
+            await using var database = new ModDbContext(dbPath);
+            return await database.EpisodeBindings.AsNoTracking().SingleOrDefaultAsync(value => value.EpisodeId == ids["s1e2"] &&
+                value.JellyfinItemId == episodeVersion.Id);
+        }, "The episode's further version is bound");
+        async Task<int> EpisodeRowsAsync(HttpClient client) => Json.Parse(await client.GetStringAsync($"/JellyfinMod/Entries/{ids["series"]}"))
+            .GetProperty("episodes").EnumerateArray().Single(item => item.GetProperty("id").AsGuid() == ids["s1e2"])
+            .GetProperty("versions").GetArrayLength();
+        var visibleRows = await EpisodeRowsAsync(admin);
+        episodeVersion.Tags = ["jfmod-v1-hidden"];
+        foreach (var restricted in new[] { world.Admin, world.Ordinary })
+            restricted.SetPreference(PreferenceKind.BlockedTags, ["jfmod-v1-hidden"]);
+        var hiddenEpisodeViewer = await EpisodeRowsAsync(ordinary);
+        var hiddenEpisodeAdmin = await EpisodeRowsAsync(admin);
+        var hiddenEpisodeRemove = (await admin.PostAsync(
+            $"/JellyfinMod/Entries/{ids["series"]}/Versions/{episodeVersionBinding.Id}/Remove", null)).StatusCode;
+        var hiddenEpisodeKeep = (await admin.PostAsync(
+            $"/JellyfinMod/Entries/{ids["series"]}/Versions/{episodeVersionBinding.Id}/Keep", null)).StatusCode;
+        foreach (var restricted in new[] { world.Admin, world.Ordinary })
+            restricted.SetPreference(PreferenceKind.BlockedTags, []);
+        episodeVersion.Tags = [];
+        Assert(visibleRows == 2 && hiddenEpisodeViewer == 1 && hiddenEpisodeAdmin == 1 && hiddenEpisodeRemove == HttpStatusCode.NotFound &&
+            hiddenEpisodeKeep == HttpStatusCode.NotFound && File.Exists(episodeVersionPath) && await EpisodeRowsAsync(admin) == 2,
+            $"An episode's further version hidden by its own tag is not listed ({visibleRows} rows visible, then {hiddenEpisodeViewer} " +
+            $"for the viewer and {hiddenEpisodeAdmin} for the administrator) and Remove ({(int)hiddenEpisodeRemove}) and Keep " +
+            $"({(int)hiddenEpisodeKeep}) conceal it");
 
         // ---- Settings survive a restart; the whole run wrote no media_missing.
         await host.DisposeAsync();
