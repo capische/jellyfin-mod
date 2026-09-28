@@ -74,24 +74,57 @@ public static class VersionQuality
                 .Select(binding => (binding.Id, binding.JellyfinItemId, Owner: binding.OwnerItemId ?? binding.JellyfinItemId, binding.MediaPath))
                 .ToArray();
         var held = bound.Select(binding => Held(binding.Id, binding.JellyfinItemId, binding.MediaPath)).ToList();
-        if (library is null) return held;
-        foreach (var owner in bound.Select(binding => binding.Owner).Distinct())
-        {
-            try
+        if (library is not null)
+            foreach (var owner in bound.Select(binding => binding.Owner).Distinct())
             {
-                if (library.GetItemById(owner) is not MediaBrowser.Controller.Entities.Video video) continue;
-                var versions = NativeVersions.Read(library, NativeVersions.MainOf(library, video), null);
-                foreach (var version in versions.Versions.Where(version => held.All(known =>
-                             known.JellyfinItemId != version.Item.Id && !string.Equals(known.MediaPath, version.Path, StringComparison.Ordinal))))
-                    held.Add(Held(Guid.Empty, version.Item.Id, version.Path));
+                try
+                {
+                    if (library.GetItemById(owner) is not MediaBrowser.Controller.Entities.Video video) continue;
+                    var versions = NativeVersions.Read(library, NativeVersions.MainOf(library, video), null);
+                    foreach (var version in versions.Versions.Where(version => held.All(known =>
+                                 known.JellyfinItemId != version.Item.Id && !string.Equals(known.MediaPath, version.Path, StringComparison.Ordinal))))
+                        held.Add(Held(Guid.Empty, version.Item.Id, version.Path));
+                }
+                catch (Exception error) when (error is not OutOfMemoryException)
+                {
+                    // What cannot be read now is read again on the next run; the bound versions stand.
+                }
             }
-            catch (Exception error) when (error is not OutOfMemoryException)
-            {
-                // What cannot be read now is read again on the next run; the bound versions stand.
-            }
-        }
 
-        return held;
+        return await WithImportedQualityAsync(database, entryId, held, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gives a held file whose name carries no quality the quality of the release the plugin imported it from (V1, D1). An
+    /// episode's first file is named <c>Series (Year) SNNENN</c> with no label, so without this its quality was unknown and
+    /// automation never upgraded it (<c>held_quality_unknown</c>); files already imported that way are covered too, because
+    /// the release is read from the import record. Only while the file at that path is still the inode the import linked:
+    /// a file put there since is not that release, and its quality stays unknown.
+    /// </summary>
+    private static async Task<List<HeldVersion>> WithImportedQualityAsync(ModDbContext database, Guid entryId, List<HeldVersion> held,
+        CancellationToken cancellationToken)
+    {
+        if (!held.Any(version => version.Quality is null && !string.IsNullOrWhiteSpace(version.MediaPath))) return held;
+        var imports = await database.ImportOperations.AsNoTracking()
+            .Where(operation => operation.EntryId == entryId && operation.State == ImportStates.Completed &&
+                operation.DestinationPath != null && operation.DestinationPhysicalIdentity != null)
+            .Select(operation => new { operation.DestinationPath, operation.DestinationPhysicalIdentity, operation.ReleaseTitle,
+                operation.UpdatedAt })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (imports.Count == 0) return held;
+        var files = new UnixFileInspector();
+        return held.Select(version =>
+        {
+            if (version.Quality is not null || string.IsNullOrWhiteSpace(version.MediaPath) ||
+                !files.TryInspect(version.MediaPath, out var file))
+                return version;
+            var import = imports.Where(candidate => string.Equals(candidate.DestinationPath, file.CanonicalPath, StringComparison.Ordinal) &&
+                    string.Equals(candidate.DestinationPhysicalIdentity, file.PhysicalIdentity, StringComparison.Ordinal))
+                .OrderByDescending(candidate => candidate.UpdatedAt).FirstOrDefault();
+            if (import is null) return version;
+            var release = ReleaseParser.Parse(import.ReleaseTitle);
+            return release.Quality is null ? version : version with { Quality = release.Quality, Resolution = release.Resolution ?? version.Resolution };
+        }).ToList();
     }
 
     private static HeldVersion Held(Guid bindingId, Guid itemId, string? path)

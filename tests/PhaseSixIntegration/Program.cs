@@ -907,6 +907,25 @@ internal static class Phase6
 
         await WaitForTorrentAsync(transmission, fixtures["textauto"].InfoHash);
 
+        // V1 D1: an episode's first file is named `Series (Year) SNNENN` with no quality label, so its name tells nothing; its
+        // held quality is the quality of the release the plugin imported it from, and it is not held_quality_unknown.
+        await WaitForTorrentAsync(transmission, fixtures["s1e2"].InfoHash);
+        transmission.Progress(fixtures["s1e2"].InfoHash, 1.0);
+        var episodeImport = await WaitAsync(async () =>
+        {
+            await Tick();
+            await using var database = new ModDbContext(dbPath);
+            return await database.ImportOperations.AsNoTracking().SingleOrDefaultAsync(value => value.EpisodeId == ids["s1e2"] &&
+                value.State == ImportStates.Completed);
+        }, "The new episode is imported", 60);
+        var episodeTarget = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Automation/Targets?entryId={ids["series"]}"))
+            .EnumerateArray().Single(item => item.GetProperty("targetId").AsGuid() == ids["s1e2"]);
+        Assert(Path.GetFileName(episodeImport.DestinationPath) == "Auto Show (2024) S01E02.mkv" &&
+            episodeTarget.GetProperty("heldBestQuality").GetString() == "webdl-1080p" &&
+            episodeTarget.GetProperty("blockedReason").GetString() != AutomationReasons.HeldQualityUnknown,
+            $"An unlabelled episode file holds the quality of the release it was imported from ({Path.GetFileName(episodeImport.DestinationPath)}: " +
+            episodeTarget.GetRawText() + ")");
+
         // ---- Settings survive a restart; the whole run wrote no media_missing.
         await host.DisposeAsync();
         host = await PluginHost.StartAsync(world, dbPath, time, logs, configuration, taskManager);
