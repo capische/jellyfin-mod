@@ -402,7 +402,11 @@ public sealed class ReconciliationService(
                      .ToListAsync(cancellationToken).ConfigureAwait(false))
         {
             if (observation.JellyfinItemId == removedItemId) observation.JellyfinItemId = remainingItemId;
-            if (observation.CompletedAt.HasValue) observation.SourceReason = RetentionCompletionService.CarriedReason;
+            // Only a completion that stands: one revoked because the target was seen unwatched (possibly while this removal was
+            // in flight) has no date left to carry and stays revoked (re-review P-1b).
+            if (observation.CompletedAt.HasValue && observation.Played &&
+                observation.SourceReason != RetentionCompletionService.UnwatchedReason)
+                observation.SourceReason = RetentionCompletionService.CarriedReason;
         }
     }
 

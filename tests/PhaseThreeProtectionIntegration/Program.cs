@@ -932,7 +932,7 @@ static async Task VerifyPreviewHttpAsync(
         await VerifyUnlinkSurvivesBusyDatabaseAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
             user.Id, libraryFolder.Id, hook => userDataRead = hook);
         await VerifyVersionRemovalAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items, user.Id,
-            libraryFolder.Id, localVersionIds, linkedVersions, liveStates);
+            libraryFolder.Id, localVersionIds, linkedVersions, liveStates, retrieveFailures);
     }
     finally
     {
@@ -1523,7 +1523,8 @@ static async Task VerifyVersionRemovalAsync(
     Guid libraryId,
     Dictionary<Guid, Guid[]> localVersionIds,
     Dictionary<Guid, MediaBrowser.Controller.Entities.Video[]> linkedVersions,
-    Dictionary<Guid, UserItemData> liveStates)
+    Dictionary<Guid, UserItemData> liveStates,
+    Dictionary<Guid, int> retrieveFailures)
 {
     settings.RetentionEnabled = true;
     var policy = await services.GetRequiredService<RetentionPolicyService>().SyncAsync(settings, default);
@@ -1722,6 +1723,43 @@ static async Task VerifyVersionRemovalAsync(
             $"An undated played flag after an observed unwatched state does not restore the carried completion: " +
             $"{afterImport.State}/{afterImport.Reason}; observation {observation.SourceReason} completed {observation.CompletedAt:o}; " +
             $"evaluation {evaluation.State}/{evaluation.Reason} deadline {evaluation.Deadline:o}");
+    }
+
+    // Re-review P-1b: the title is marked unwatched while Remove this version is about to carry its ordinary completion to the
+    // remaining copy, and the read behind that unwatched event fails. The carry must not bring the old date back: after an
+    // import marks the remaining copy played without a date, it is not reclaimed on the old completion.
+    var interleaved = await TitleAsync("v1-interleaved", 900308, true, true);
+    await ScheduleAsync(interleaved, now.AddHours(-25), now.AddHours(-25), now.AddDays(-3));
+    liveStates[interleaved.Items[0].Id] = new UserItemData { Key = "v1-interleaved-unwatched-1080", Played = false };
+    liveStates[interleaved.Items[1].Id] = new UserItemData { Key = "v1-interleaved-unwatched-720", Played = false };
+    retrieveFailures[interleaved.Items[0].Id] = 1;
+    retrieveFailures[interleaved.Items[1].Id] = 1;
+    try
+    {
+        await services.GetRequiredService<RetentionCompletionService>().RefreshAsync(userId, interleaved.Items[0].Id, "TogglePlayed", true,
+            default);
+    }
+    catch (InvalidOperationException)
+    {
+        // The read failed, as injected; the listener logs this and moves on.
+    }
+
+    retrieveFailures.Remove(interleaved.Items[0].Id);
+    retrieveFailures.Remove(interleaved.Items[1].Id);
+    var interleavedRemove = await executor.RemoveVersionAsync(interleaved.EntryId, interleaved.Bindings[1]!.Value, default);
+    liveStates[interleaved.Items[0].Id] = new UserItemData { Key = "v1-interleaved-imported", Played = true };
+    await services.GetRequiredService<RetentionCompletionService>().RefreshAsync(userId, interleaved.Items[0].Id, "Import", default);
+    await services.GetRequiredService<RetentionEvaluator>().EvaluateNativeItemAsync(interleaved.Items[0].Id, default);
+    var interleavedReclaim = await executor.ReclaimAsync(interleaved.Bindings[0]!.Value, default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var observation = await database.CompletionObservations.AsNoTracking().SingleAsync(value => value.TargetId == interleaved.EntryId);
+        var evaluation = await database.RetentionEvaluations.AsNoTracking().SingleAsync(value => value.TargetId == interleaved.EntryId);
+        Assert(interleavedRemove.State == "completed" && interleavedReclaim.State != "completed" && File.Exists(interleaved.Items[0].Path) &&
+            observation.SourceReason != "CarriedFromRemovedVersion" && evaluation.State != "scheduled",
+            $"An unwatched event seen before a removal carries the completion keeps it revoked: remove {interleavedRemove.State}/" +
+            $"{interleavedRemove.Reason}, reclaim {interleavedReclaim.State}/{interleavedReclaim.Reason}; observation " +
+            $"{observation.SourceReason} completed {observation.CompletedAt:o}; evaluation {evaluation.State}/{evaluation.Reason}");
     }
 
     settings.RetentionEnabled = false;

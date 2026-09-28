@@ -97,11 +97,12 @@ public sealed class RetentionCompletionService(
         // user and item, so the stored state is the newest one, at least as new as any event.
         var boundItemIds = await BoundItemIdsAsync(target, cancellationToken).ConfigureAwait(false);
         if (!boundItemIds.Contains(jellyfinItemId)) boundItemIds = [.. boundItemIds, jellyfinItemId];
-        // An unwatched event ends a completion carried from a removed copy whatever the read below finds, so that revocation
-        // is written first: the listener has already taken this work off its queue, and a read that fails now must not drop
-        // the unwatched state and leave the old date and deadline to a later undated played flag (re-review P-1).
+        // An unwatched event ends the recorded completion, carried or not, whatever the read below finds, so that revocation is
+        // written first: the listener has already taken this work off its queue, and a read that fails now must not drop the
+        // unwatched state and leave the old date and deadline to a later undated played flag (re-review P-1). An ordinary
+        // completion is revoked too, because a removal still in flight may carry it to a remaining copy next (re-review P-1b).
         if (unwatchedSeen)
-            await RetentionLiveCheck.RevokeCarriedAsync(database, target.TargetId, [userId], clock.GetUtcNow().UtcDateTime,
+            await RetentionLiveCheck.RevokeCompletionAsync(database, target.TargetId, [userId], clock.GetUtcNow().UtcDateTime,
                 cancellationToken).ConfigureAwait(false);
         // Read everything before changing the tracked observation, so an item that cannot be read leaves it as it was.
         var states = boundItemIds.Select(id => StoredItem(id, loaded) is { } item ? userData.GetUserData(user, item) : null)
@@ -177,8 +178,9 @@ public sealed class RetentionCompletionService(
     internal const string CarriedReason = "CarriedFromRemovedVersion";
 
     /// <summary>
-    /// The source of an observation whose carried completion was revoked because the last check before an unlink saw the
-    /// user with no copy played (review P1-10); the next read of Jellyfin's state replaces it.
+    /// The source of an observation whose completion was revoked because an unwatched state was seen, by the last check
+    /// before an unlink or by an unwatched event (review P1-10, re-review P-1, P-1b); the next read of Jellyfin's state
+    /// replaces it, and a revoked completion is never carried to a remaining copy.
     /// </summary>
     internal const string UnwatchedReason = "UnwatchedSeenLive";
 

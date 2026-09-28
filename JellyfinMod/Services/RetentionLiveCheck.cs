@@ -36,23 +36,25 @@ public sealed class RetentionLiveCheck(
     {
         var unwatched = new HashSet<Guid>();
         var reason = await BlockReasonAsync(operation, policy, unwatched, requireCompletion, cancellationToken).ConfigureAwait(false);
-        // A user seen here with no copy played has not finished the target, whatever was carried over from a removed copy:
-        // the carried completion is revoked durably, so a later played flag without a date (an NFO or Trakt import) cannot
+        // A user seen here with no copy played has not finished the target, whatever completion was recorded or carried over
+        // from a removed copy: it is revoked durably, so a later played flag without a date (an NFO or Trakt import) cannot
         // bring the old date and deadline back when the unwatched event itself is late or coalesced away (review P1-10).
         if (unwatched.Count > 0 && (operation.EpisodeId ?? operation.EntryId) is { } targetId)
-            await RevokeCarriedAsync(database, targetId, unwatched, clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
+            await RevokeCompletionAsync(database, targetId, unwatched, clock.GetUtcNow().UtcDateTime, cancellationToken).ConfigureAwait(false);
         return reason;
     }
 
     /// <summary>
-    /// Revokes the completions carried from a removed copy for these users of one target (review P1-10): the observation reads
-    /// as not finished until the next read of Jellyfin's state records what is there now, dated or not.
+    /// Revokes the recorded completion of these users for one target, carried or not (review P1-10, re-review P-1b): the
+    /// observation reads as not finished, and marked unwatched-seen, until the next read of Jellyfin's state records what is
+    /// there now, dated or not. Nothing carries a revoked completion to a remaining copy
+    /// (<see cref="ReconciliationService.RepointRepresentationEvidenceAsync"/>), so the revocation also holds when it is
+    /// written before a removal that is still carrying the evidence.
     /// </summary>
-    internal static Task<int> RevokeCarriedAsync(ModDbContext database, Guid targetId, IReadOnlyCollection<Guid> userIds, DateTime now,
+    internal static Task<int> RevokeCompletionAsync(ModDbContext database, Guid targetId, IReadOnlyCollection<Guid> userIds, DateTime now,
         CancellationToken cancellationToken) =>
         database.CompletionObservations
-            .Where(observation => observation.TargetId == targetId && userIds.Contains(observation.UserId) &&
-                observation.SourceReason == RetentionCompletionService.CarriedReason)
+            .Where(observation => observation.TargetId == targetId && userIds.Contains(observation.UserId))
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(observation => observation.SourceReason, RetentionCompletionService.UnwatchedReason)
                 .SetProperty(observation => observation.Played, false)
