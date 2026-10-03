@@ -54,9 +54,52 @@ version_newer() {
     [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
 }
 
+# Finishes a replacement a stopped container left half done, before anything reads the plugin folders
+# (whole-review chunk 3c, P2 5). A replacement moves the installed folder aside as <folder>.previous,
+# moves the prepared <folder>.installing into place, then deletes the previous one. With the folder in
+# place the previous copy is stale; without it the previous copy, status and all, goes back. A
+# preparing copy is never trusted to be complete and is removed, but a status it carries (written by an
+# image that deleted the installed folder first) is kept in recovered_status for the install below.
+# Only JellyfinMod's own folders are touched (Codex round 2 P2): a JellyfinMod_* name, and where a copy says
+# whose it is, this plugin's guid. Another plugin's backup or staging folder is left exactly as it is.
+owned() { # owned <folder> <guid>: the folder's meta.json, if it has one, names this plugin
+    [ -f "$1/meta.json" ] || return 0
+    [ "$(meta_value "$1/meta.json" guid)" = "$2" ]
+}
+
+recover_interrupted() {
+    recovered_status=""
+    for previous in "$plugins_dir"/JellyfinMod_*.previous; do
+        [ -d "$previous" ] || continue
+        [ -f "$previous/meta.json" ] && owned "$previous" "$1" || continue
+        folder="${previous%.previous}"
+        if [ -f "$folder/meta.json" ]; then
+            rm -rf "$previous"
+        else
+            rm -rf "$folder"
+            if mv "$previous" "$folder"; then
+                log "restored $(basename "$folder") after an interrupted replacement"
+            fi
+        fi
+    done
+    for staging in "$plugins_dir"/JellyfinMod_*.installing; do
+        [ -d "$staging" ] || continue
+        owned "$staging" "$1" || continue
+        folder="${staging%.installing}"
+        if [ ! -e "$folder" ] && [ -f "$staging/meta.json" ]; then
+            status="$(meta_value "$staging/meta.json" status)"
+            [ -n "$status" ] && recovered_status="$status"
+        fi
+        rm -rf "$staging"
+        log "removed $(basename "$staging") left by an interrupted install"
+    done
+}
+
 install_plugin() {
     guid="$(meta_value "$bundled/meta.json" guid)"
     version="$(meta_value "$bundled/meta.json" version)"
+    recovered_status=""
+    [ -d "$plugins_dir" ] && [ -n "$guid" ] && recover_interrupted "$guid"
     if [ -z "$guid" ] || [ -z "$version" ]; then
         log "the bundled plugin has no readable meta.json; nothing installed"
         return 0
@@ -128,15 +171,31 @@ install_plugin() {
     fi
 
     # An administrator who disabled the plugin keeps it disabled across an image upgrade.
+    status=""
     if [ -n "$status_dir" ]; then
         status="$(meta_value "$status_dir/meta.json" status)"
-        if [ -n "$status" ] && [ "$status" != "Active" ]; then
-            sed -i "1a\\    \"status\": \"$status\"," "$staging/meta.json"
-        fi
+    elif [ -n "${recovered_status:-}" ]; then
+        status="$recovered_status"
+    fi
+    if [ -n "$status" ] && [ "$status" != "Active" ]; then
+        sed -i "1a\\    \"status\": \"$status\"," "$staging/meta.json"
     fi
 
-    rm -rf "$target"
-    mv "$staging" "$target"
+    # The installed folder is moved aside, never deleted, until the new one is in place.
+    previous="$target.previous"
+    rm -rf "$previous"
+    if [ -e "$target" ] && ! mv "$target" "$previous"; then
+        log "could not move the installed plugin aside; Jellyfin starts with it unchanged"
+        rm -rf "$staging"
+        return 0
+    fi
+    if ! mv "$staging" "$target"; then
+        log "could not move the new plugin into place; the installed one is kept"
+        [ -e "$previous" ] && mv "$previous" "$target"
+        rm -rf "$staging"
+        return 0
+    fi
+    rm -rf "$previous"
     if [ "$rebuild" = 1 ]; then
         log "replaced JellyfinMod $version build $(utc "$installed_seconds") with build $(utc "$bundled_seconds")"
     elif [ -n "$newest" ]; then

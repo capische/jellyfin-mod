@@ -1,7 +1,6 @@
 using System.Net;
 using System.Text.Json;
 using JellyfinMod.Data;
-using MediaBrowser.Common.Net;
 using MediaBrowser.Model.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -184,7 +183,22 @@ public sealed class ProwlarrSync(
             }
         }
 
-        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        // A sync that read the source before an administrator moved it or changed its key must not write the old feed
+        // addresses back over the move (whole-review P1 c3bf1): the check and the save hold SQLite's write lock together.
+        await using (var transaction = await database.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (!await SourceUnchangedAsync(source, cancellationToken).ConfigureAwait(false))
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                database.ChangeTracker.Clear();
+                logger.LogInformation("JellyfinMod Prowlarr sync of {Source} was discarded: the source changed meanwhile", source.Name);
+                return new ProwlarrSyncOutcome("source_changed", 0, 0, 0, 0, 0, 0, []);
+            }
+
+            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         await ApplyStatusAsync(source, rows, cancellationToken).ConfigureAwait(false);
 
         // Every new or changed synced indexer proves itself through Prowlarr with t=caps; a failure leaves it off.
@@ -302,6 +316,21 @@ public sealed class ProwlarrSync(
         return result;
     }
 
+    /// <summary>Whether the stored source still has the address, key and revision this sync read.</summary>
+    private async Task<bool> SourceUnchangedAsync(ProwlarrSource source, CancellationToken cancellationToken)
+    {
+        var entry = database.Entry(source);
+        var read = (Revision: entry.Property(value => value.Revision).OriginalValue,
+            BaseUrl: entry.Property(value => value.BaseUrl).OriginalValue,
+            Key: entry.Property(value => value.ApiKeySecretRef).OriginalValue);
+        var stored = await database.ProwlarrSources.AsNoTracking().Where(value => value.Id == source.Id)
+            .Select(value => new { value.Revision, value.BaseUrl, value.ApiKeySecretRef })
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        return stored is not null && stored.Revision == read.Revision &&
+            string.Equals(stored.BaseUrl, read.BaseUrl, StringComparison.Ordinal) &&
+            string.Equals(stored.ApiKeySecretRef, read.Key, StringComparison.Ordinal);
+    }
+
     /// <summary>The movie and TV trees the indexer advertises; both trees when it advertises none.</summary>
     private static int[] Categories(JsonElement item)
     {
@@ -331,7 +360,12 @@ public sealed class ProwlarrSync(
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(new Uri(source.BaseUrl.TrimEnd('/') + "/"), path));
             request.Headers.Add("X-Api-Key", key);
-            using var response = await http.CreateClient(NamedClient.Default).SendAsync(request, timeout.Token).ConfigureAwait(false);
+            // The acquisition client follows no redirect: .NET drops Authorization on a redirect but keeps X-Api-Key, so a
+            // proxy redirecting elsewhere would receive the key (whole-review P1 4, PHASE7 source-host restriction).
+            using var response = await http.CreateClient(TorznabClient.HttpClientName).SendAsync(request, timeout.Token).ConfigureAwait(false);
+            if ((int)response.StatusCode is >= 300 and < 400)
+                throw new ProwlarrException("unreachable",
+                    $"Prowlarr answered with a redirect (HTTP {(int)response.StatusCode}); enter Prowlarr's own address.");
             if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
                 throw new ProwlarrException("unauthorized", "Prowlarr refused the API key.");
             if (response.StatusCode == HttpStatusCode.TooManyRequests)

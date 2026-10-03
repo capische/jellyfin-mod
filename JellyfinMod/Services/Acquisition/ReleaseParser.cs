@@ -105,6 +105,20 @@ public static partial class ReleaseParser
         {
             season = Int(cross.Groups["season"].Value);
             episodes.Add(Int(cross.Groups["episode"].Value));
+            // 1x01-02 and 1x01x02 name more than one episode; reading only the first would let a double episode pass as
+            // a single one (whole-review chunk 2a, P2 7).
+            foreach (Capture extra in cross.Groups["more"].Captures)
+            {
+                var number = Int(DigitsPattern().Match(extra.Value).Value);
+                if (!episodes.Contains(number)) episodes.Add(number);
+            }
+
+            if (episodes.Count == 2 && cross.Groups["range"].Success)
+            {
+                var (first, last) = (episodes[0], episodes[1]);
+                episodes = Enumerable.Range(first, Math.Max(1, last - first + 1)).ToList();
+            }
+
             markerIndex = cross.Index;
         }
         else if (SeasonPattern().Match(title) is { Success: true } seasonOnly)
@@ -135,7 +149,10 @@ public static partial class ReleaseParser
         {
             var last = years[^1];
             year = Int(last.Value);
-            if (markerIndex < 0) titleEnd = last.Index;
+            // A series year right before the episode marker (Ghosts.2021.S01E01) qualifies the title; it is not part of it
+            // (whole-review chunk 2a, P2 6). A year followed by more words before the marker stays in the name.
+            if (markerIndex < 0 || title[(last.Index + last.Length)..markerIndex].Trim(' ', '.', '_', '-', '(', ')', '[', ']').Length == 0)
+                titleEnd = last.Index;
         }
 
         titleEnd = Math.Clamp(titleEnd, 0, title.Length);
@@ -262,7 +279,7 @@ public static partial class ReleaseParser
     private static partial Regex ExtensionPattern();
     [GeneratedRegex(B + @"S(?<season>\d{1,3})[ ._-]?E(?<episode>\d{1,4})(?:(?<more>[ ._-]?E\d{1,4})|(?<range>(?<more>-E?\d{1,4})))*" + E, RegexOptions.IgnoreCase)]
     private static partial Regex EpisodePattern();
-    [GeneratedRegex(B + @"(?<season>\d{1,2})x(?<episode>\d{2,3})" + E, RegexOptions.IgnoreCase)]
+    [GeneratedRegex(B + @"(?<season>\d{1,2})x(?<episode>\d{2,3})(?:(?<more>x\d{2,3})|(?<range>(?<more>-\d{2,3})))*" + E, RegexOptions.IgnoreCase)]
     private static partial Regex CrossPattern();
     [GeneratedRegex(B + @"(?:S(?<season>\d{1,3})|Season[ ._-]?(?<season>\d{1,3}))" + E, RegexOptions.IgnoreCase)]
     private static partial Regex SeasonPattern();

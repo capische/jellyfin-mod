@@ -83,6 +83,12 @@ public static class ReleaseEvaluator
     /// <summary>The scoring rules version recorded on every grab.</summary>
     public const string Version = "p4.a4.v1";
 
+    /// <summary>
+    /// The identity of an episodic text match that carries no year: grabbable by hand, never by automation, because nothing
+    /// tells same-named series apart (whole-review chunk 2a, P2 6).
+    /// </summary>
+    public const string TitleWithoutYear = "title_without_year";
+
     /// <summary>Evaluates one row.</summary>
     public static ReleaseEvaluation Evaluate(ReleaseTarget target, EvaluationProfile profile, ReleaseFacts facts)
     {
@@ -203,6 +209,20 @@ public static class ReleaseEvaluator
                 rejections.Add(new("year_mismatch", $"The release is from {parsed.Year}, not {year}."));
                 return "unverified";
             }
+        }
+        else
+        {
+            // Two series can share a name (Ghosts, 2019 and 2021). A year the release carries must be the series' own
+            // (whole-review chunk 2a, P2 6).
+            if (parsed.Year is { } released && target.Year is { } premiered && released != premiered)
+            {
+                rejections.Add(new("year_mismatch", $"The release is from {released}, not {premiered}."));
+                return "unverified";
+            }
+
+            // Episodic releases rarely carry a year, so a text match without one stays grabbable by hand, but nothing
+            // confirms which same-named series it is: automation never takes it, even from a trusted indexer.
+            if (titleOnly && parsed.Year is null) return TitleWithoutYear;
         }
 
         return titleOnly ? "title" : "verified";

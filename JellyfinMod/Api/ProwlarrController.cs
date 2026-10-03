@@ -62,6 +62,8 @@ public sealed class ProwlarrController(
     public async Task<ActionResult<ProwlarrSourceDto>> Patch(Guid id, ProwlarrSourceRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         if (Validate(request, creating: false) is { } error) return Invalid(error);
         var source = await database.ProwlarrSources.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (source is null) return NotFound();

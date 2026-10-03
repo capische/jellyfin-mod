@@ -57,8 +57,23 @@ public static class SqliteWriteDiagnostics
 
     private static string OperationName => CurrentOperation.Value ?? "unnamed";
 
+    /// <summary>
+    /// Forgets holders and waiters that can no longer hold or wait for the lock (whole-review chunk 3c, P3 6): a transaction
+    /// disposed without a commit or rollback (a cancelled save) is rolled back by its disposal, which no interceptor sees,
+    /// and a transaction that never started leaves its connection's wait behind.
+    /// </summary>
+    private static void Prune()
+    {
+        foreach (var holder in Holders.Keys)
+            if (holder is DbTransaction { Connection: null } || holder is DbConnection { State: System.Data.ConnectionState.Closed })
+                Holders.TryRemove(holder, out _);
+        foreach (var connection in Waiting.Keys)
+            if (connection.State == System.Data.ConnectionState.Closed) Waiting.TryRemove(connection, out _);
+    }
+
     private static void Acquired(object holder, long waitStarted)
     {
+        Prune();
         var now = Stopwatch.GetTimestamp();
         Holders[holder] = new Hold(OperationName, now, waitStarted);
         var waited = Stopwatch.GetElapsedTime(waitStarted, now);
@@ -80,6 +95,7 @@ public static class SqliteWriteDiagnostics
     private static void Failed(object? self, Exception exception, long waitStarted)
     {
         if (exception is not SqliteException { SqliteErrorCode: 5 or 6 } sqlite) return;
+        Prune();
         var waited = Stopwatch.GetElapsedTime(waitStarted);
         var now = Stopwatch.GetTimestamp();
         var holders = Holders.Where(pair => !ReferenceEquals(pair.Key, self))

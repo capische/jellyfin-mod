@@ -2,11 +2,17 @@
 
 ![JellyfinMod](JellyfinMod/Assets/logo.png)
 
-Plugin loading, authenticated health, configuration, persistent SQLite and the Phase 1 catalog
-APIs are implemented. Phase 2 reconciliation has passed its integration, native-host and browser
-acceptance checkpoints. Phase 3 T1 policy, completion evidence and access-aware deadline evaluation
-are implemented and accepted on the isolated test instance. Retention preview, protection checks and
-reclamation remain planned work; no automatic file deletion exists yet.
+The plugin keeps a library-scoped catalog, reconciles it with Jellyfin's libraries, searches indexers,
+grabs and imports releases through Transmission, and applies retention. Library files are deleted
+automatically in two cases only, both after the same protection checks (a per-file Keep, the title's
+Keep, shared hardlinks, active sessions, resume points, favourites and seeding):
+- retention, when its rules make a watched title's library file due (see the retention settings and
+  `../jellyfin-web/docs/jellyfinmod/PHASE10.md`), removes that library file and its Jellyfin item;
+- an automatic upgrade, once the better release is imported, replaces the version it supersedes, whether
+  or not that version was watched and without waiting for the retention window.
+
+Downloaded files are never deleted automatically (see "Downloaded files: detach and keep" below). The sections further down that name a phase checkpoint record that phase's
+validation at the time; they are history, not the current state.
 
 The server half of **JellyfinMod**. The other half is the
 [`jellyfin-web`](https://github.com/capische/jellyfin-web) fork.
@@ -210,6 +216,28 @@ plugin-update task has a startup trigger that fires after 3 s, core startup take
 completes the server answers every request, its own repository included, with 503 "loading". The catalog and the
 daily update check read the repository with 200 afterwards. A 503 **after** `Core startup complete`, or any other
 status, is a real error.
+
+## Downloaded files: detach and keep
+
+JellyfinMod 0.1.0.0 never deletes a downloaded file automatically. When a torrent's seed goal is met (seed release) or an
+administrator removes it from the queue together with its client, the client is only told to forget the torrent, with its
+data kept (`delete-local-data: false`). The files that were verified as that torrent's are recorded on the release or the
+queue operation, and the release is marked detached: `cleanup_pending` when its file list was recorded, `manual_cleanup`
+when there is no trustworthy list. This build creates `manual_cleanup` releases itself: a torrent that disappears from the
+client while its download is still on disk (or cannot be checked) is detached that way, never treated as gone; a release an
+earlier build detached without a file list is `manual_cleanup` too. A torrent that disappears after its release was
+detached does not change it.
+
+Automatic retention removes only library files. It refuses one that is a recorded download, or the recorded seeding file of
+any release, whatever the release's state (seeding, detached or long completed), reached under another name: a bind mount,
+or the same name in the same folder reached by another path. Anything it cannot read (a folder it may not open, for
+example) is refused too. A separate imported hardlink in the library stays removable; the download it shares data with is
+kept.
+
+The plugin's history says when a release stopped seeding or a queue entry was removed and that nothing was deleted; the
+recorded file lists stay in the plugin database. 0.1.0.0 has no page that lists them and no action that deletes them:
+remove downloads you no longer want in the download client's folders yourself. A cleanup tool that lists the unused files
+and removes them on an administrator's confirmation is planned for a later version.
 
 ## Database and local validation
 

@@ -72,6 +72,10 @@ internal sealed class TorznabBoundary : IAsyncDisposable
     public Uri Address { get; private set; } = null!;
     /// <summary>Answers every search (not caps) with this HTTP status when set, as an overloaded indexer would.</summary>
     public int? FailSearchesWith { get; set; }
+    /// <summary>Runs with each search's query string before it is answered, for a change that lands mid-search.</summary>
+    public Func<string, Task>? OnSearch { get; set; }
+    /// <summary>Runs with each torrent download's id before it is answered, for a change that lands while a grab fetches it.</summary>
+    public Func<string, Task>? OnDownload { get; set; }
     public int SearchQueries;
 
     public string Download(string id) => new Uri(Address, $"/dl/{id}").ToString();
@@ -96,6 +100,7 @@ internal sealed class TorznabBoundary : IAsyncDisposable
             var mode = context.Request.Query["t"].ToString();
             if (mode == "caps") { await context.Response.WriteAsync(Caps); return; }
             Interlocked.Increment(ref SearchQueries);
+            if (OnSearch is { } hook) await hook(context.Request.QueryString.Value ?? string.Empty);
             if (FailSearchesWith is { } status)
             {
                 context.Response.StatusCode = status;
@@ -112,6 +117,7 @@ internal sealed class TorznabBoundary : IAsyncDisposable
         {
             var id = (string)context.Request.RouteValues["id"]!;
             if (!Torrents.TryGetValue(id, out var bytes)) { context.Response.StatusCode = 404; return; }
+            if (OnDownload is { } downloadHook) await downloadHook(id);
             context.Response.ContentType = "application/x-bittorrent";
             await context.Response.Body.WriteAsync(bytes);
         });
@@ -210,6 +216,17 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
     public ConcurrentDictionary<string, string> Roots { get; } = new(StringComparer.Ordinal);
     public int GetCalls;
     public int RemoveCalls;
+    /// <summary>Runs after a torrent-get answer is built and before it is sent, with the hashes it asked for (null for all).</summary>
+    public Func<IReadOnlySet<string>?, Task>? AfterGet { get; set; }
+    /// <summary>While above zero, each torrent-remove is refused and this is decremented.</summary>
+    public int FailRemoves;
+    /// <summary>Runs with the hashes of each accepted torrent-remove before it is carried out, as the client relocating data.</summary>
+    public Func<IReadOnlyList<string>, Task>? OnRemove { get; set; }
+    /// <summary>While above zero, a torrent-remove is carried out and then left unanswered, as a client that acts and then
+    /// drops the connection; this is decremented.</summary>
+    public int DropRemoveAnswers;
+    /// <summary>Whether each torrent-remove asked the client to delete the torrent's data.</summary>
+    public ConcurrentQueue<bool> RemoveDeletedData { get; } = new();
     public bool Offline { get; set; }
     public Uri Endpoint { get; private set; } = null!;
 
@@ -312,6 +329,7 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
                 foreach (var torrent in Torrents.Values.Where(value => ids is null || ids.Contains(value.Hash)).ToArray())
                     list.Add(Describe(torrent, ++index));
                 result = new JsonObject { ["torrents"] = list };
+                if (AfterGet is { } afterGet) await afterGet(ids);
                 break;
             case "torrent-add":
                 var metainfo = arguments["metainfo"]!.GetValue<string>();
@@ -342,10 +360,27 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
                 break;
             case "torrent-remove":
                 Interlocked.Increment(ref RemoveCalls);
+                if (Interlocked.Decrement(ref FailRemoves) >= 0)
+                {
+                    await context.Response.WriteAsJsonAsync(new { result = "removal refused by the test", arguments = new { } });
+                    return;
+                }
+
+                Interlocked.Exchange(ref FailRemoves, 0);
+                if (OnRemove is { } onRemove)
+                    await onRemove(arguments["ids"]!.AsArray().Select(value => value!.GetValue<string>()).ToList());
                 var deleteData = arguments["delete-local-data"]?.GetValue<bool>() == true;
+                RemoveDeletedData.Enqueue(deleteData);
                 foreach (var id in arguments["ids"]!.AsArray().Select(value => value!.GetValue<string>()))
                     if (Torrents.TryRemove(id.ToLowerInvariant(), out var removed) && deleteData)
                         DeleteData(removed);
+                if (Interlocked.Decrement(ref DropRemoveAnswers) >= 0)
+                {
+                    context.Abort();
+                    return;
+                }
+
+                Interlocked.Exchange(ref DropRemoveAnswers, 0);
                 result = [];
                 break;
             default:

@@ -21,6 +21,8 @@ public sealed class DatabaseInitializer(
         {
             using var scope = scopeFactory.CreateScope();
             var database = scope.ServiceProvider.GetRequiredService<ModDbContext>();
+            // Earlier 0.1.0.0 builds left schema variants today's migration files cannot reconstruct (whole-review P1 10).
+            await HistoricalSchemaRepair.RepairAsync(database, cancellationToken).ConfigureAwait(false);
             await database.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
             // Only this process runs reconciliation, so a row still "running" belongs to a process that
             // stopped before finishing it (P2.R10).

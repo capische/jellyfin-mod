@@ -187,6 +187,13 @@ public sealed class PathMappingsRequest
 
     /// <summary>Gets or sets the client revision being replaced.</summary>
     [JsonPropertyName("revision")] public int? Revision { get; set; }
+
+    /// <summary>
+    /// Gets or sets the version of the mappings being replaced, as the client read them (<c>mappingsVersion</c>). A save of
+    /// the mappings does not advance the client's revision, so this is what refuses a stale copy; it is required (Codex delta
+    /// review 6, P2; final review, finding 4).
+    /// </summary>
+    [MaxLength(64), JsonPropertyName("mappingsVersion")] public string? MappingsVersion { get; set; }
 }
 
 /// <summary>The body of <c>POST /Settings/DownloadClients/{id}/TestImportPath</c>.</summary>

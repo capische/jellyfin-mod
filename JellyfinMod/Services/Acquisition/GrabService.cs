@@ -107,12 +107,16 @@ public sealed class GrabService(
     /// <summary>Creates, or idempotently returns, a held grab. Access to the target is checked by the caller.</summary>
     /// <returns>The operation and whether this call created it.</returns>
     public async Task<(GrabOperation Operation, bool Created)> CreateAsync(Guid userId, GrabRequest request,
-        Func<Entry, Episode?, bool> canAccess, CancellationToken cancellationToken)
+        Func<Entry, Episode?, bool> canAccess, CancellationToken cancellationToken,
+        Func<CancellationToken, Task<string?>>? admit = null)
     {
         var fingerprint = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(
             request.SearchId.ToString("N") + "\n" + request.ReleaseId)));
         if (await FindByKeyAsync(userId, request.IdempotencyKey, cancellationToken).ConfigureAwait(false) is { } replay)
+        {
+            await AuthorizeReplayAsync(replay, canAccess, cancellationToken).ConfigureAwait(false);
             return (Replay(replay, fingerprint), false);
+        }
 
         var (snapshot, expired) = searches.Find(request.SearchId, userId);
         if (snapshot is null) throw new GrabException(404, "search_not_found", "This search is not available. Search again.");
@@ -172,6 +176,10 @@ public sealed class GrabService(
 
         if (candidate.InfoHash is { } advertised && advertised != locator.InfoHash)
             throw new GrabException(409, "hash_mismatch", "The torrent does not match the infohash the indexer advertised.");
+        // The search could not see a hash the indexer did not advertise, and a blocklist action can postdate the search:
+        // the current blocklist is read again with the resolved hash (whole-review chunk 2a, P2 5).
+        if (await BlocklistedAsync(locator.InfoHash, candidate.IndexerId, candidate.SourceGuid, cancellationToken).ConfigureAwait(false))
+            throw new GrabException(409, "release_blocklisted", "An administrator blocked this release; it is not grabbed again.");
 
         var now = Now;
         var operation = new GrabOperation
@@ -191,27 +199,48 @@ public sealed class GrabService(
             CreatedAt = now, UpdatedAt = now, HoldUntil = now + hold.Hold
         };
         // The library lease makes the insert atomic with entry removal, which checks for active grabs under it.
+        // Admission is one step with the insert (Codex round 2 P2): the target is read and checked again here, after the
+        // torrent was fetched, under the library lease that changes to its monitoring take too, and every grab is inserted
+        // under one process-wide gate, so a limit checked by the caller's admission still holds when the row is saved.
         await using (await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false))
         {
-            if (!await database.Entries.AnyAsync(value => value.Id == entry.Id, cancellationToken).ConfigureAwait(false))
-                throw new GrabException(404, "target_not_found", "The title is not available.");
-            database.GrabOperations.Add(operation);
+            await AdmissionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                var current = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entry.Id, cancellationToken)
+                    .ConfigureAwait(false);
+                var currentEpisode = episode is null ? null
+                    : await database.Episodes.AsNoTracking().SingleOrDefaultAsync(value => value.Id == episode.Id, cancellationToken)
+                        .ConfigureAwait(false);
+                if (current is null || episode is not null && currentEpisode is null || !canAccess(current, currentEpisode))
+                    throw new GrabException(404, "target_not_found", "The title is not available.");
+                if (admit is not null && await admit(cancellationToken).ConfigureAwait(false) is { } refusal)
+                    throw new GrabException(409, refusal, "The grab was not admitted: " + refusal + ".");
+                database.GrabOperations.Add(operation);
+                try
+                {
+                    await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (DbUpdateException error) when (error.InnerException is SqliteException { SqliteErrorCode: 19 })
+                {
+                    database.ChangeTracker.Clear();
+                    if (await FindByKeyAsync(userId, request.IdempotencyKey, cancellationToken).ConfigureAwait(false) is { } concurrent)
+                    {
+                        await AuthorizeReplayAsync(concurrent, canAccess, cancellationToken).ConfigureAwait(false);
+                        return (Replay(concurrent, fingerprint), false);
+                    }
+                    var owner = await database.GrabOperations.AsNoTracking()
+                        .FirstOrDefaultAsync(value => value.ActiveTarget == operation.ActiveTarget, cancellationToken).ConfigureAwait(false);
+                    if (owner is not null)
+                        throw new GrabException(409, "grab_active", "Another grab for this title is still active.", owner.Id);
+                    owner = await database.GrabOperations.AsNoTracking()
+                        .FirstOrDefaultAsync(value => value.ActiveHash == operation.ActiveHash, cancellationToken).ConfigureAwait(false);
+                    throw new GrabException(409, "duplicate_hash", "This torrent is already owned by another grab.", owner?.Id);
+                }
             }
-            catch (DbUpdateException error) when (error.InnerException is SqliteException { SqliteErrorCode: 19 })
+            finally
             {
-                database.ChangeTracker.Clear();
-                if (await FindByKeyAsync(userId, request.IdempotencyKey, cancellationToken).ConfigureAwait(false) is { } concurrent)
-                    return (Replay(concurrent, fingerprint), false);
-                var owner = await database.GrabOperations.AsNoTracking()
-                    .FirstOrDefaultAsync(value => value.ActiveTarget == operation.ActiveTarget, cancellationToken).ConfigureAwait(false);
-                if (owner is not null)
-                    throw new GrabException(409, "grab_active", "Another grab for this title is still active.", owner.Id);
-                owner = await database.GrabOperations.AsNoTracking()
-                    .FirstOrDefaultAsync(value => value.ActiveHash == operation.ActiveHash, cancellationToken).ConfigureAwait(false);
-                throw new GrabException(409, "duplicate_hash", "This torrent is already owned by another grab.", owner?.Id);
+                AdmissionGate.Release();
             }
         }
 
@@ -219,6 +248,32 @@ public sealed class GrabService(
         logger.LogInformation("Held grab {Operation} for {Entry} until {HoldUntil}", operation.Id, entry.Id, operation.HoldUntil);
         return (operation, true);
     }
+
+    /// <summary>
+    /// Why automation would no longer make this automatic grab, or null while it still would: automation on, the target
+    /// monitored and still without a file (or still holding the one an upgrade replaces), and the switch for its kind of grab
+    /// still on: episode upgrades for an episode upgrade or extra version, reacquisition for a reclaimed title (final review 2,
+    /// finding 1).
+    /// </summary>
+    private async Task<string?> AutomaticBlockAsync(GrabOperation operation, Entry entry, AcquisitionSettings settings,
+        CancellationToken cancellationToken)
+    {
+        if (!settings.AutomationEnabled) return "automation_disabled";
+        if (!entry.Monitored) return "no_longer_wanted";
+        var episode = operation.EpisodeId is { } episodeId
+            ? await database.Episodes.AsNoTracking().SingleOrDefaultAsync(value => value.Id == episodeId, cancellationToken).ConfigureAwait(false)
+            : null;
+        if (operation.EpisodeId.HasValue && episode is not { Monitored: true }) return "no_longer_wanted";
+        var state = episode?.State ?? entry.State;
+        var upgrade = operation.UpgradeOperationId.HasValue;
+        if (upgrade ? state != FileState.OnDisk : state == FileState.OnDisk) return "no_longer_wanted";
+        if (episode is not null && (upgrade || operation.Intent == GrabIntents.AddVersion) && !settings.EpisodeUpgradesEnabled)
+            return "episode_upgrades_disabled";
+        return state == FileState.Reclaimed && !settings.ReacquireReclaimed ? "reacquire_disabled" : null;
+    }
+
+    /// <summary>Serializes every grab's final admission and insert in this process (Codex round 2 P2).</summary>
+    private static readonly SemaphoreSlim AdmissionGate = new(1, 1);
 
     /// <summary>Cancels a held grab; repeating it returns the same cancelled operation without another event.</summary>
     public async Task<GrabOperation> CancelAsync(Guid operationId, Guid userId, CancellationToken cancellationToken)
@@ -260,11 +315,20 @@ public sealed class GrabService(
             ? await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken).ConfigureAwait(false)
             : null;
         var failure = !state.Settings.Enabled ? "acquisition_disabled"
+            // Turning automation off stops its held grabs too; the hold is for a person to cancel, not an exemption
+            // (whole-review chunk 2a, P2 2).
             : !state.Ready ? "acquisition_not_ready"
             : state.Client!.Id != operation.DownloadClientId || state.Client.Revision != operation.DownloadClientRevision ? "configuration_changed"
             : entry?.TargetLibraryId is not { } libraryId ? "target_not_found"
             : !destinations.Supports(state.Client.LocalDirectory, libraryId) ? "destination_not_same_filesystem"
             : null;
+        // An automatic grab is sent only while its target is still one automation would grab: monitored, and still without
+        // a file (or still holding the one an upgrade replaces). The hold is the window to change that (Codex round 2 P2).
+        if (failure is null && operation.Automatic)
+            failure = await AutomaticBlockAsync(operation, entry!, state.Settings, cancellationToken).ConfigureAwait(false);
+        if (failure is null && operation.InfoHash is { } hash &&
+            await BlocklistedAsync(hash, operation.IndexerId, operation.SourceGuid, cancellationToken).ConfigureAwait(false))
+            failure = "release_blocklisted";
         if (failure is not null)
         {
             await FailAsync(operation, failure, false).ConfigureAwait(false);
@@ -295,9 +359,38 @@ public sealed class GrabService(
             return;
         }
 
-        operation.State = GrabStates.Submitting;
-        operation.SubmittedAt = operation.UpdatedAt = Now;
-        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        // The target is checked once more, and the grab committed to submitting, under the library lease a change to its
+        // monitoring saves under: a title unmonitored while the client was asked is not sent (Codex delta review 2).
+        // The switches and the client are read once more under the settings gate every settings change saves under: grabbing or
+        // automation turned off, or the client changed, while the client was asked, stops the grab (final review, finding 3).
+        await using (await libraryLock.AcquireAsync(entry!.TargetLibraryId!.Value, cancellationToken).ConfigureAwait(false))
+        await using (await JellyfinMod.Api.SettingsMutationGate.AcquireAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var current = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entry.Id, cancellationToken)
+                .ConfigureAwait(false);
+            var settings = await database.AcquisitionSettings.AsNoTracking()
+                .SingleOrDefaultAsync(value => value.Id == AcquisitionSettings.SingletonId, cancellationToken).ConfigureAwait(false);
+            var client = await database.AcquisitionDownloadClients.AsNoTracking()
+                .SingleOrDefaultAsync(value => value.Id == operation.DownloadClientId, cancellationToken).ConfigureAwait(false);
+            var changed = settings is null || !settings.Enabled ? "acquisition_disabled"
+                : current is null ? "target_not_found"
+                : settings.DownloadClientId != operation.DownloadClientId || client is null || !client.Enabled ||
+                  client.Revision != operation.DownloadClientRevision ? "configuration_changed"
+                : null;
+            // Every switch that applies to an automatic grab is read here too, under the gate its change saves under.
+            if (changed is null && operation.Automatic)
+                changed = await AutomaticBlockAsync(operation, current!, settings!, cancellationToken).ConfigureAwait(false);
+            if (changed is not null)
+            {
+                await FailAsync(operation, changed, false).ConfigureAwait(false);
+                return;
+            }
+
+            operation.State = GrabStates.Submitting;
+            operation.SubmittedAt = operation.UpdatedAt = Now;
+            await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+
         vault.Remove(operationId);
 
         var submission = new DownloadSubmission(operation.Id, operation.InfoHash!, locator.Metainfo, locator.MagnetUri,
@@ -492,6 +585,27 @@ public sealed class GrabService(
     private async Task<GrabOperation?> FindByKeyAsync(Guid userId, string key, CancellationToken cancellationToken) =>
         await database.GrabOperations.AsNoTracking().SingleOrDefaultAsync(
             value => value.RequestedBy == userId && value.IdempotencyKey == key, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// A replayed request answers only for a target the requester may still read: a stored operation is no exemption from
+    /// the access the original request needed (whole-review chunk 2a, P2 3). Otherwise the same concealed 404 as a GET.
+    /// </summary>
+    private async Task AuthorizeReplayAsync(GrabOperation existing, Func<Entry, Episode?, bool> canAccess, CancellationToken cancellationToken)
+    {
+        var entry = existing.EntryId is { } entryId
+            ? await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken).ConfigureAwait(false)
+            : null;
+        var episode = existing.EpisodeId is { } episodeId
+            ? await database.Episodes.AsNoTracking().SingleOrDefaultAsync(value => value.Id == episodeId, cancellationToken).ConfigureAwait(false)
+            : null;
+        if (entry is null || existing.EpisodeId.HasValue && episode is null || !canAccess(entry, episode))
+            throw new GrabException(404, "target_not_found", "The title is not available.");
+    }
+
+    /// <summary>Whether an administrator blocked this torrent or this indexer's release.</summary>
+    private async Task<bool> BlocklistedAsync(string infoHash, Guid indexerId, string? sourceGuid, CancellationToken cancellationToken) =>
+        await database.ReleaseBlocklist.AsNoTracking().AnyAsync(blocked => blocked.InfoHash == infoHash ||
+            sourceGuid != null && blocked.IndexerId == indexerId && blocked.SourceGuid == sourceGuid, cancellationToken).ConfigureAwait(false);
 
     private static GrabOperation Replay(GrabOperation existing, string fingerprint) => existing.RequestFingerprint == fingerprint
         ? existing

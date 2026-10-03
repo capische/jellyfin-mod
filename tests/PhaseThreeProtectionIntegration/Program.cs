@@ -53,6 +53,19 @@ var sawSessionToken = false;
 // P3.T17: an optional second, still-downloading multi-file torrent using the incomplete dir.
 var multiFile = false;
 var incomplete = Path.Combine(folder, "incomplete");
+// Codex delta review 1: a TMDB stand-in for the series refresh, answering what TmdbFixtures holds.
+app.MapGet("/3/{**path}", async context =>
+{
+    var path = (string)context.Request.RouteValues["path"]!;
+    if (!TmdbFixtures.Responses.TryGetValue(path, out var json))
+    {
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return;
+    }
+
+    context.Response.ContentType = "application/json";
+    await context.Response.WriteAsync(json);
+});
 app.MapPost("/transmission/rpc", async context =>
 {
     if (context.Request.Headers["X-Transmission-Session-Id"] != "fixture-session")
@@ -438,7 +451,8 @@ static async Task VerifyPreviewHttpAsync(
     apiBuilder.Services.AddTransient<RetentionRunner>();
     apiBuilder.Services.AddTransient(provider => new TmdbClient(
         provider.GetRequiredService<IHttpClientFactory>(), () => settings,
-        NullLogger<TmdbClient>.Instance));
+        NullLogger<TmdbClient>.Instance,
+        endpoint: new TmdbEndpoint(new Uri(new Uri(transmissionUrl).GetLeftPart(UriPartial.Authority) + "/"))));
     await using var api = apiBuilder.Build();
     hostServices = api.Services;
     api.UseAuthentication();
@@ -470,22 +484,26 @@ static async Task VerifyPreviewHttpAsync(
             new EntryBinding
             {
                 EntryId = entry.Id, JellyfinItemId = movie.Id, TargetLibraryId = libraryFolder.Id,
-                VersionGroupId = movie.Id, MediaPath = mediaPath, StorageIdentity = storage.Capture(mediaPath)
+                VersionGroupId = movie.Id, MediaPath = mediaPath, StorageIdentity = storage.Capture(mediaPath),
+                FileFingerprint = StoredFingerprint(mediaPath)
             },
             new EntryBinding
             {
                 EntryId = entry.Id, JellyfinItemId = secondVersion.Id, TargetLibraryId = libraryFolder.Id,
-                VersionGroupId = movie.Id, MediaPath = secondMedia, StorageIdentity = storage.Capture(secondMedia)
+                VersionGroupId = movie.Id, MediaPath = secondMedia, StorageIdentity = storage.Capture(secondMedia),
+                FileFingerprint = StoredFingerprint(secondMedia)
             },
             new EntryBinding
             {
                 EntryId = entry.Id, JellyfinItemId = escapedVersion.Id, TargetLibraryId = libraryFolder.Id,
-                VersionGroupId = movie.Id, MediaPath = escapeMedia, StorageIdentity = storage.Capture(escapeMedia)
+                VersionGroupId = movie.Id, MediaPath = escapeMedia, StorageIdentity = storage.Capture(escapeMedia),
+                FileFingerprint = StoredFingerprint(escapeMedia)
             });
         database.EpisodeBindings.Add(new EpisodeBinding
         {
             EpisodeId = episode.Id, JellyfinItemId = nativeEpisode.Id, SeriesItemId = series.Id,
-            TargetLibraryId = tvLibraryFolder.Id, MediaPath = episodeMedia, StorageIdentity = storage.Capture(episodeMedia)
+            TargetLibraryId = tvLibraryFolder.Id, MediaPath = episodeMedia, StorageIdentity = storage.Capture(episodeMedia),
+            FileFingerprint = StoredFingerprint(episodeMedia)
         });
         database.RetentionPolicySnapshots.Add(new RetentionPolicySnapshot
         {
@@ -891,7 +909,7 @@ static async Task VerifyPreviewHttpAsync(
             {
                 EntryId = sharedEntry.Id, JellyfinItemId = sharedMovie.Id,
                 TargetLibraryId = sharedLibraryFolder.Id, VersionGroupId = sharedMovie.Id,
-                MediaPath = mediaPath, StorageIdentity = storage.Capture(mediaPath)
+                MediaPath = mediaPath, StorageIdentity = storage.Capture(mediaPath), FileFingerprint = StoredFingerprint(mediaPath)
             });
             database.CompletionObservations.Add(new CompletionObservation
             {
@@ -929,14 +947,508 @@ static async Task VerifyPreviewHttpAsync(
         await VerifyPinnedExecutionAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
             user.Id, libraryFolder.Id);
         await VerifyFileIdentityAsync(api.Services, http, databasePath, libraryPath, storage, tvLibraryFolder, items);
+        await VerifyMultiEpisodeUnkeepAsync(api.Services, http, databasePath, libraryPath, storage, clock, tvLibraryFolder, items,
+            liveStates);
+        await VerifyMovieBaselineAsync(api.Services, databasePath, libraryPath, storage, clock, libraryFolder, items, liveStates, user.Id);
         await VerifyUnlinkSurvivesBusyDatabaseAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items,
             user.Id, libraryFolder.Id, hook => userDataRead = hook);
         await VerifyVersionRemovalAsync(api.Services, databasePath, libraryPath, storage, clock, settings, items, user.Id,
             libraryFolder.Id, localVersionIds, linkedVersions, liveStates, retrieveFailures);
+        await VerifyDuplicateGraceAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings, tvLibraryFolder, items,
+            liveStates);
     }
     finally
     {
         await api.StopAsync();
+    }
+}
+
+// Codex round 2 P1 and delta review 1 (P1 2, P2 4): a duplicate row's retention protection survives the row, through the
+// real refresh and reconciliation and real reclamation. A file-less TMDB episode un-kept an hour ago folds into the position
+// row holding a file watched forty days ago; a wanted series with a longer window merges into a re-homed one whose
+// multi-episode file covers an episode without a file of its own. Each file survives retention while its fresh grace runs
+// and is reclaimed once it has.
+static async Task VerifyDuplicateGraceAsync(
+    IServiceProvider services,
+    HttpClient http,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    PluginConfiguration settings,
+    FixtureLibrary tvLibrary,
+    IDictionary<Guid, BaseItem> nativeItems,
+    IDictionary<Guid, UserItemData> liveStates)
+{
+    RetentionPolicySnapshot original;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        original = new RetentionPolicySnapshot { Enabled = snapshot.Enabled, FirstEnabledAt = snapshot.FirstEnabledAt,
+            EnabledAt = snapshot.EnabledAt, ReclaimAfterDays = snapshot.ReclaimAfterDays, TestWindowMinutes = snapshot.TestWindowMinutes,
+            WatchedUserMode = snapshot.WatchedUserMode };
+        var start = clock.GetUtcNow().UtcDateTime;
+        snapshot.Enabled = true;
+        (snapshot.FirstEnabledAt, snapshot.EnabledAt) = (start.AddDays(-90), start.AddDays(-90));
+        snapshot.ReclaimAfterDays = 14;
+        snapshot.TestWindowMinutes = 0;
+        snapshot.WatchedUserMode = WatchedUserMode.AllUsers;
+        await database.SaveChangesAsync();
+    }
+
+    // The policy follows the plugin configuration whenever it is evaluated: retention is switched on there too.
+    var originalSettings = (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites);
+    (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites) =
+        (true, 14, WatchedUserMode.AllUsers, false);
+    var cleanup = new List<(Guid Entry, string Path, Guid[] Natives, FixtureSeries Series)>();
+    async Task<JellyfinMod.Api.Contracts.RetentionRepresentationDto> RowAsync(Guid bindingId) =>
+        (await services.GetRequiredService<RetentionPreviewService>().PreviewAsync(default, null, Array.Empty<Guid>())).Items
+            .Single(item => item.BindingId == bindingId);
+    async Task EvaluateAsync(Guid entryId) =>
+        await services.GetRequiredService<RetentionEvaluator>().EvaluateEntriesAsync([entryId], default);
+    try
+    {
+        // ---- The refresh fold.
+        var now = clock.GetUtcNow().UtcDateTime;
+        var foldFolder = Path.Combine(libraryPath, "fold-series");
+        Directory.CreateDirectory(foldFolder);
+        var foldPath = Path.Combine(foldFolder, "Fold S01E04.mkv");
+        await File.WriteAllBytesAsync(foldPath, Enumerable.Repeat((byte)7, 2048).ToArray());
+        var foldSeries = new FixtureSeries { Id = Guid.NewGuid(), Name = "Fold series" };
+        var foldNative = new MediaBrowser.Controller.Entities.TV.Episode
+        {
+            Id = Guid.NewGuid(), Name = "Fourth", Path = foldPath, SeriesId = foldSeries.Id, ParentIndexNumber = 1, IndexNumber = 4
+        };
+        foldSeries.Items.Add(foldNative);
+        tvLibrary.Items.Add(foldSeries);
+        nativeItems[foldSeries.Id] = foldSeries;
+        nativeItems[foldNative.Id] = foldNative;
+        liveStates[foldNative.Id] = new UserItemData { Key = foldNative.Id.ToString("N"), Played = true, LastPlayedDate = now.AddDays(-40) };
+        var foldEntry = new Entry
+        {
+            Id = Guid.NewGuid(), MediaType = "series", TmdbId = 900601, Title = "Fold series", State = FileState.OnDisk,
+            TargetLibraryId = tvLibrary.Id, JellyfinItemId = foldSeries.Id
+        };
+        cleanup.Add((foldEntry.Id, foldPath, [foldNative.Id], foldSeries));
+        var airDate = new DateTime(2020, 1, 23, 0, 0, 0, DateTimeKind.Utc);
+        var positionRow = new JellyfinMod.Data.Episode
+        {
+            Id = Guid.NewGuid(), EntryId = foldEntry.Id, TmdbId = 0, SeasonNumber = 1, EpisodeNumber = 4, Title = "Fourth",
+            AirDate = airDate, State = FileState.OnDisk, JellyfinItemId = foldNative.Id
+        };
+        var tmdbRow = new JellyfinMod.Data.Episode
+        {
+            Id = Guid.NewGuid(), EntryId = foldEntry.Id, TmdbId = 900613, SeasonNumber = 1, EpisodeNumber = 3, Title = "Fourth",
+            AirDate = airDate
+        };
+        var foldBinding = new EpisodeBinding
+        {
+            EpisodeId = positionRow.Id, JellyfinItemId = foldNative.Id, SeriesItemId = foldSeries.Id, TargetLibraryId = tvLibrary.Id,
+            MediaPath = foldPath, StorageIdentity = storage.Capture(foldPath), FileFingerprint = StoredFingerprint(foldPath)
+        };
+        await using (var database = new ModDbContext(databasePath))
+        {
+            database.Entries.Add(foldEntry);
+            database.Episodes.AddRange(positionRow, tmdbRow);
+            database.EpisodeBindings.Add(foldBinding);
+            database.RetentionEvaluations.AddRange(
+                new RetentionEvaluation
+                {
+                    EntryId = foldEntry.Id, EpisodeId = positionRow.Id, TargetId = positionRow.Id, State = "scheduled",
+                    Reason = "completion_policy_satisfied", BaselineAt = now.AddDays(-60), CompletionBasisAt = now.AddDays(-40),
+                    EligibleAt = now.AddDays(-40), Deadline = now.AddDays(-26), EvaluatedAt = now, RequiresFreshCompletion = true
+                },
+                new RetentionEvaluation
+                {
+                    EntryId = foldEntry.Id, EpisodeId = tmdbRow.Id, TargetId = tmdbRow.Id, State = "waiting",
+                    Reason = "waiting_for_completion", BaselineAt = now.AddDays(-60), GraceNotBefore = now.AddHours(-1), EvaluatedAt = now
+                });
+            await database.SaveChangesAsync();
+        }
+
+        var beforeFold = await RowAsync(foldBinding.Id);
+        Assert(beforeFold.State == "due", $"Without the folded row's grace the watched file would be due: {beforeFold.State}/{beforeFold.Reason}");
+        TmdbFixtures.Responses["tv/900601"] =
+            """{"id":900601,"name":"Fold series","seasons":[{"season_number":1,"name":"Season 1","episode_count":1}]}""";
+        TmdbFixtures.Responses["tv/900601/season/1"] =
+            """{"season_number":1,"episodes":[{"id":900613,"season_number":1,"episode_number":4,"name":"Fourth","air_date":"2020-01-23"}]}""";
+        settings.TmdbReadAccessToken = "p3-fold-fixture";
+        using (var refreshed = await http.PostAsync($"/JellyfinMod/Entries/{foldEntry.Id}/Refresh", null))
+            Assert(refreshed.IsSuccessStatusCode, "The series refresh answers: " + refreshed.StatusCode);
+        await using (var database = new ModDbContext(databasePath))
+            Assert(await database.Episodes.CountAsync(row => row.EntryId == foldEntry.Id) == 1 &&
+                await database.Episodes.AnyAsync(row => row.Id == positionRow.Id && row.TmdbId == 900613),
+                "The refresh folds the TMDB row into the position row that holds the file");
+        await EvaluateAsync(foldEntry.Id);
+        var foldResult = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(foldBinding.Id, default);
+        Assert(foldResult.State != "completed" && File.Exists(foldPath),
+            $"Retention leaves the file while the folded row's grace runs (Codex round 2 P1): {foldResult.State}/{foldResult.Reason}");
+        clock.Advance(TimeSpan.FromDays(15));
+        await EvaluateAsync(foldEntry.Id);
+        var foldLater = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(foldBinding.Id, default);
+        Assert(foldLater.State == "completed" && !File.Exists(foldPath),
+            $"Once that grace has run, retention reclaims the file: {foldLater.State}/{foldLater.Reason}");
+
+        // ---- The re-homing merge with a longer series window.
+        now = clock.GetUtcNow().UtcDateTime;
+        var deadLibrary = Guid.NewGuid();
+        var rehomeFolder = Path.Combine(libraryPath, "rehome-series");
+        Directory.CreateDirectory(rehomeFolder);
+        var rehomePath = Path.Combine(rehomeFolder, "Rehome S01E01-E02.mkv");
+        await File.WriteAllBytesAsync(rehomePath, Enumerable.Repeat((byte)8, 2048).ToArray());
+        var rehomeSeries = new FixtureSeries { Id = Guid.NewGuid(), Name = "Rehome series" };
+        var rehomeNative = new MediaBrowser.Controller.Entities.TV.Episode
+        {
+            Id = Guid.NewGuid(), Name = "Rehome", Path = rehomePath, SeriesId = rehomeSeries.Id, ParentIndexNumber = 1, IndexNumber = 1,
+            IndexNumberEnd = 2
+        };
+        rehomeSeries.Items.Add(rehomeNative);
+        tvLibrary.Items.Add(rehomeSeries);
+        nativeItems[rehomeSeries.Id] = rehomeSeries;
+        nativeItems[rehomeNative.Id] = rehomeNative;
+        liveStates[rehomeNative.Id] = new UserItemData { Key = rehomeNative.Id.ToString("N"), Played = true, LastPlayedDate = now.AddDays(-40) };
+        var orphan = new Entry
+        {
+            Id = Guid.NewGuid(), MediaType = "series", TmdbId = 900701, Title = "Rehome series", State = FileState.OnDisk,
+            TargetLibraryId = deadLibrary, JellyfinItemId = rehomeSeries.Id
+        };
+        var wanted = new Entry
+        {
+            Id = Guid.NewGuid(), MediaType = "series", TmdbId = 900701, Title = "Rehome series", TargetLibraryId = tvLibrary.Id,
+            RetentionPolicy = RetentionPolicy.Days, ReclaimAfterDays = 30
+        };
+        cleanup.Add((orphan.Id, rehomePath, [rehomeNative.Id], rehomeSeries));
+        cleanup.Add((wanted.Id, string.Empty, [], rehomeSeries));
+        // E01 has a day of its own; E02, held only in E01's file, follows its series.
+        var first = new JellyfinMod.Data.Episode
+        {
+            Id = Guid.NewGuid(), EntryId = orphan.Id, TmdbId = 900702, SeasonNumber = 1, EpisodeNumber = 1, Title = "Rehome",
+            State = FileState.OnDisk, JellyfinItemId = rehomeNative.Id, RetentionPolicy = RetentionPolicy.Days, ReclaimAfterDays = 1
+        };
+        var covered = new JellyfinMod.Data.Episode
+        {
+            Id = Guid.NewGuid(), EntryId = orphan.Id, TmdbId = 900703, SeasonNumber = 1, EpisodeNumber = 2, Title = "Covered",
+            State = FileState.OnDisk
+        };
+        var rehomeBinding = new EpisodeBinding
+        {
+            EpisodeId = first.Id, JellyfinItemId = rehomeNative.Id, SeriesItemId = rehomeSeries.Id, TargetLibraryId = deadLibrary,
+            MediaPath = rehomePath, StorageIdentity = storage.Capture(rehomePath), FileFingerprint = StoredFingerprint(rehomePath)
+        };
+        await using (var database = new ModDbContext(databasePath))
+        {
+            database.Entries.AddRange(orphan, wanted);
+            database.Episodes.AddRange(first, covered);
+            database.EpisodeBindings.Add(rehomeBinding);
+            database.RetentionEvaluations.Add(new RetentionEvaluation
+            {
+                EntryId = orphan.Id, EpisodeId = first.Id, TargetId = first.Id, State = "scheduled",
+                Reason = "completion_policy_satisfied", BaselineAt = now.AddDays(-60), CompletionBasisAt = now.AddDays(-40),
+                EligibleAt = now.AddDays(-40), Deadline = now.AddDays(-39), EvaluatedAt = now, RequiresFreshCompletion = true
+            });
+            await database.SaveChangesAsync();
+        }
+
+        var rehomeSnapshot = new NativeTitleSnapshot(
+            "series", 900701, tvLibrary.Id, "Rehome series", 2020, null, null, null, null,
+            [new(rehomeSeries.Id, tvLibrary.Id, true, rehomeSeries.Id)],
+            [new(rehomeNative.Id, rehomeSeries.Id, 900702, 1, 1, true, "Rehome", MediaPath: rehomePath,
+                StorageIdentity: storage.Capture(rehomePath), EpisodeNumberEnd: 2)]);
+        // Final review, finding 2: another writer holds the orphan's old library and waits for the destination (as retention
+        // recovery takes libraries in order) while reconciliation holds the destination and wants the old one. Neither waits
+        // forever: reconciliation gives the old library up after its bounded wait and leaves the move for later, and the other
+        // writer then gets the destination.
+        var locks = services.GetRequiredService<ReconciliationLibraryLock>();
+        var holdingOld = await locks.AcquireAsync(deadLibrary, default);
+        var otherWriterDone = false;
+        var otherWriter = Task.Run(async () =>
+        {
+            await Task.Delay(500);
+            await using (await locks.AcquireAsync(tvLibrary.Id, default)) otherWriterDone = true;
+            await holdingOld.DisposeAsync();
+        });
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        using (var scope = services.CreateScope())
+            await scope.ServiceProvider.GetRequiredService<ReconciliationService>().ReconcileAsync(rehomeSnapshot, default);
+        var finished = await Task.WhenAny(otherWriter, Task.Delay(TimeSpan.FromSeconds(60))) == otherWriter;
+        await using (var database = new ModDbContext(databasePath))
+            Assert(finished && otherWriterDone && started.Elapsed < TimeSpan.FromSeconds(60) &&
+                (await database.Entries.AsNoTracking().SingleAsync(row => row.Id == orphan.Id)).TargetLibraryId == deadLibrary,
+                $"Rehoming and a writer holding the old library never deadlock; the move waits for a later pass (final review, finding 2): " +
+                $"finished {finished}, {started.Elapsed.TotalSeconds:F1} s");
+
+        // Codex delta review 3, P1: the first move is interrupted after the merged window is written and before the fresh
+        // grace is: the database refuses the grace row, as a crash would leave it unwritten. Done again in a new scope, the
+        // move must still give the covered episode its grace.
+        await using (var database = new ModDbContext(databasePath))
+            await database.Database.ExecuteSqlRawAsync(
+                "CREATE TRIGGER jfmod_interrupt_grace BEFORE INSERT ON RetentionEvaluations WHEN NEW.Reason = 'representation_reset' " +
+                "BEGIN SELECT RAISE(ABORT, 'interrupted'); END;");
+        var interrupted = false;
+        try
+        {
+            using var scope = services.CreateScope();
+            await scope.ServiceProvider.GetRequiredService<ReconciliationService>().ReconcileAsync(rehomeSnapshot, default);
+        }
+        catch (DbUpdateException)
+        {
+            interrupted = true;
+        }
+        finally
+        {
+            await using var database = new ModDbContext(databasePath);
+            await database.Database.ExecuteSqlRawAsync("DROP TRIGGER IF EXISTS jfmod_interrupt_grace;");
+        }
+
+        Assert(interrupted, "The first move is interrupted before its grace is written");
+        using (var scope = services.CreateScope())
+            await scope.ServiceProvider.GetRequiredService<ReconciliationService>().ReconcileAsync(rehomeSnapshot, default);
+        await using (var database = new ModDbContext(databasePath))
+        {
+            var merged = await database.Entries.AsNoTracking().SingleOrDefaultAsync(row => row.Id == orphan.Id);
+            Assert(merged is { RetentionPolicy: RetentionPolicy.Days, ReclaimAfterDays: 30 } && merged.TargetLibraryId == tvLibrary.Id &&
+                !await database.Entries.AnyAsync(row => row.Id == wanted.Id),
+                $"Re-homing merges the wanted series and takes its longer window: {merged?.RetentionPolicy}/{merged?.ReclaimAfterDays}");
+        }
+
+        await EvaluateAsync(orphan.Id);
+        var rehomeResult = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(rehomeBinding.Id, default);
+        Assert(rehomeResult.State != "completed" && File.Exists(rehomePath),
+            $"A longer series window taken in a merge gives the episodes that follow it a fresh grace, the one held only in another " +
+            $"episode's file included (Codex delta review 1, P1): {rehomeResult.State}/{rehomeResult.Reason}");
+        clock.Advance(TimeSpan.FromDays(31));
+        await EvaluateAsync(orphan.Id);
+        var rehomeLater = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(rehomeBinding.Id, default);
+        Assert(rehomeLater.State == "completed" && !File.Exists(rehomePath),
+            $"Once the longer window has run, retention reclaims the file: {rehomeLater.State}/{rehomeLater.Reason}");
+    }
+    finally
+    {
+        settings.TmdbReadAccessToken = string.Empty;
+        (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites) = originalSettings;
+        TmdbFixtures.Responses.Clear();
+        await using var database = new ModDbContext(databasePath);
+        foreach (var (entryId, path, natives, series) in cleanup)
+        {
+            foreach (var native in natives)
+            {
+                liveStates.Remove(native);
+                nativeItems.Remove(native);
+            }
+
+            tvLibrary.Items.Remove(series);
+            nativeItems.Remove(series.Id);
+            await database.CompletionObservations.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+            await database.RetentionOperations.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+            await database.RetentionEvaluations.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+            await database.EpisodeBindings.Where(item => database.Episodes.Any(row => row.Id == item.EpisodeId && row.EntryId == entryId))
+                .ExecuteDeleteAsync();
+            await database.Episodes.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+            await database.History.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+            await database.Entries.Where(item => item.Id == entryId).ExecuteDeleteAsync();
+            if (path.Length > 0 && File.Exists(path)) File.Delete(path);
+        }
+
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        (snapshot.Enabled, snapshot.FirstEnabledAt, snapshot.EnabledAt, snapshot.ReclaimAfterDays, snapshot.TestWindowMinutes,
+                snapshot.WatchedUserMode) = (original.Enabled, original.FirstEnabledAt, original.EnabledAt, original.ReclaimAfterDays,
+            original.TestWindowMinutes, original.WatchedUserMode);
+        await database.SaveChangesAsync();
+    }
+}
+
+// Whole-review chunk 1, P2 7: a movie reconciliation discovers is tracked from that moment (decision 12). Its first watch,
+// a little later, triggers its first evaluation; that watch must count, not be dated before a baseline set by the event.
+static async Task VerifyMovieBaselineAsync(
+    IServiceProvider services,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    FixtureLibrary movieLibrary,
+    IDictionary<Guid, BaseItem> nativeItems,
+    IDictionary<Guid, UserItemData> liveStates,
+    Guid userId)
+{
+    var path = Path.Combine(libraryPath, "Baseline movie.mkv");
+    await File.WriteAllBytesAsync(path, Enumerable.Repeat((byte)6, 2048).ToArray());
+    var movie = new Movie { Id = Guid.NewGuid(), Name = "Baseline movie", Path = path };
+    movieLibrary.Items.Add(movie);
+    nativeItems[movie.Id] = movie;
+    liveStates[movie.Id] = new UserItemData { Key = movie.Id.ToString("N"), Played = false };
+    RetentionPolicySnapshot original;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        original = new RetentionPolicySnapshot { Enabled = snapshot.Enabled, FirstEnabledAt = snapshot.FirstEnabledAt, EnabledAt = snapshot.EnabledAt };
+        snapshot.Enabled = true;
+        (snapshot.FirstEnabledAt, snapshot.EnabledAt) = (clock.GetUtcNow().UtcDateTime.AddDays(-20), clock.GetUtcNow().UtcDateTime.AddDays(-20));
+        await database.SaveChangesAsync();
+    }
+
+    Guid entryId = Guid.Empty;
+    try
+    {
+        var trackedAt = clock.GetUtcNow().UtcDateTime;
+        using (var scope = services.CreateScope())
+        {
+            var result = await scope.ServiceProvider.GetRequiredService<ReconciliationService>().ReconcileAsync(new NativeTitleSnapshot(
+                "movie", 900501, movieLibrary.Id, "Baseline movie", 2020, null, null, null, null,
+                [new(movie.Id, movieLibrary.Id, true, movie.Id, path, storage.Capture(path))], []), default);
+            Assert(result.Outcome == ReconciliationOutcome.Created, "Reconciliation tracks the new movie");
+            entryId = result.EntryId!.Value;
+        }
+
+        // Watched an hour later; the playback event a minute after that is the first thing to evaluate the movie.
+        clock.Advance(TimeSpan.FromHours(1));
+        liveStates[movie.Id] = new UserItemData
+        {
+            Key = movie.Id.ToString("N"), Played = true, LastPlayedDate = clock.GetUtcNow().UtcDateTime
+        };
+        clock.Advance(TimeSpan.FromMinutes(1));
+        using (var scope = services.CreateScope())
+        {
+            await scope.ServiceProvider.GetRequiredService<RetentionCompletionService>().RefreshAsync(userId, movie.Id, "PlaybackFinished", default);
+            await scope.ServiceProvider.GetRequiredService<RetentionEvaluator>().EvaluateNativeItemAsync(movie.Id, default);
+        }
+
+        await using var check = new ModDbContext(databasePath);
+        var evaluation = await check.RetentionEvaluations.AsNoTracking().SingleAsync(item => item.TargetId == entryId);
+        Assert(evaluation.BaselineAt == trackedAt && evaluation.State == "scheduled",
+            $"A new movie's first watch after it was tracked starts its retention (whole-review c1f7): baseline {evaluation.BaselineAt:O} " +
+            $"(tracked {trackedAt:O}), {evaluation.State}/{evaluation.Reason}");
+    }
+    finally
+    {
+        liveStates.Remove(movie.Id);
+        movieLibrary.Items.Remove(movie);
+        nativeItems.Remove(movie.Id);
+        await using var database = new ModDbContext(databasePath);
+        await database.CompletionObservations.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+        await database.RetentionEvaluations.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+        await database.EntryBindings.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+        await database.History.Where(item => item.EntryId == entryId).ExecuteDeleteAsync();
+        await database.Entries.Where(item => item.Id == entryId).ExecuteDeleteAsync();
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        (snapshot.Enabled, snapshot.FirstEnabledAt, snapshot.EnabledAt) = (original.Enabled, original.FirstEnabledAt, original.EnabledAt);
+        await database.SaveChangesAsync();
+        File.Delete(path);
+    }
+}
+
+// Whole-review P1 2: a file holding S01E01-E02 is bound to E01 only. Un-keeping E02, which has no file of its own, must
+// give the file a fresh window (PHASE10 Q4), even though E02 has no evaluation of its own and the watch is long past.
+static async Task VerifyMultiEpisodeUnkeepAsync(
+    IServiceProvider services,
+    HttpClient http,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    FixtureLibrary tvLibrary,
+    IDictionary<Guid, BaseItem> nativeItems,
+    IDictionary<Guid, UserItemData> liveStates)
+{
+    var folder = Path.Combine(libraryPath, "multi-series");
+    Directory.CreateDirectory(folder);
+    var path = Path.Combine(folder, "Multi S01E01-E02.mkv");
+    await File.WriteAllBytesAsync(path, Enumerable.Repeat((byte)5, 2048).ToArray());
+    var series = new FixtureSeries { Id = Guid.NewGuid(), Name = "Multi series" };
+    var native = new MediaBrowser.Controller.Entities.TV.Episode
+    {
+        Id = Guid.NewGuid(), Name = "Multi episode", Path = path, SeriesId = series.Id, ParentIndexNumber = 1, IndexNumber = 1,
+        IndexNumberEnd = 2
+    };
+    series.Items.Add(native);
+    tvLibrary.Items.Add(series);
+    nativeItems[series.Id] = series;
+    nativeItems[native.Id] = native;
+    var now = clock.GetUtcNow().UtcDateTime;
+    // Every user finished the file five days ago: long past a one-day window.
+    liveStates[native.Id] = new UserItemData { Key = native.Id.ToString("N"), Played = true, LastPlayedDate = now.AddDays(-5) };
+    var entry = new Entry
+    {
+        Id = Guid.NewGuid(), MediaType = "series", TmdbId = 900401, Title = "Multi series", State = FileState.OnDisk,
+        TargetLibraryId = tvLibrary.Id, JellyfinItemId = series.Id
+    };
+    var first = new JellyfinMod.Data.Episode
+    {
+        Id = Guid.NewGuid(), EntryId = entry.Id, TmdbId = 900402, SeasonNumber = 1, EpisodeNumber = 1, Title = "First",
+        State = FileState.OnDisk, JellyfinItemId = native.Id
+    };
+    var second = new JellyfinMod.Data.Episode
+    {
+        Id = Guid.NewGuid(), EntryId = entry.Id, TmdbId = 900403, SeasonNumber = 1, EpisodeNumber = 2, Title = "Second",
+        State = FileState.OnDisk, RetentionPolicy = RetentionPolicy.Never
+    };
+    Guid bindingId;
+    RetentionPolicySnapshot original;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.Entries.Add(entry);
+        database.Episodes.AddRange(first, second);
+        var binding = new EpisodeBinding
+        {
+            EpisodeId = first.Id, JellyfinItemId = native.Id, SeriesItemId = series.Id, TargetLibraryId = tvLibrary.Id,
+            MediaPath = path, StorageIdentity = storage.Capture(path), FileFingerprint = StoredFingerprint(path)
+        };
+        bindingId = binding.Id;
+        database.EpisodeBindings.Add(binding);
+        database.RetentionEvaluations.Add(new RetentionEvaluation
+        {
+            EntryId = entry.Id, EpisodeId = first.Id, TargetId = first.Id, State = "scheduled",
+            Reason = "completion_policy_satisfied", BaselineAt = now.AddDays(-10), CompletionBasisAt = now.AddDays(-5),
+            EligibleAt = now.AddDays(-5), Deadline = now.AddDays(-4), EvaluatedAt = now
+        });
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        original = new RetentionPolicySnapshot { Enabled = snapshot.Enabled, FirstEnabledAt = snapshot.FirstEnabledAt,
+            EnabledAt = snapshot.EnabledAt, ReclaimAfterDays = snapshot.ReclaimAfterDays, TestWindowMinutes = snapshot.TestWindowMinutes,
+            WatchedUserMode = snapshot.WatchedUserMode };
+        snapshot.Enabled = true;
+        (snapshot.FirstEnabledAt, snapshot.EnabledAt) = (now.AddDays(-20), now.AddDays(-20));
+        snapshot.ReclaimAfterDays = 1;
+        snapshot.TestWindowMinutes = 0;
+        snapshot.WatchedUserMode = WatchedUserMode.AllUsers;
+        await database.SaveChangesAsync();
+    }
+
+    var preview = services.GetRequiredService<RetentionPreviewService>();
+    async Task<JellyfinMod.Api.Contracts.RetentionRepresentationDto> RowAsync() =>
+        (await preview.PreviewAsync(default, null, Array.Empty<Guid>())).Items.Single(item => item.BindingId == bindingId);
+    try
+    {
+        var whileKept = await RowAsync();
+        Assert(whileKept is { State: "blocked", Reason: "multi_episode_not_all_due" },
+            $"A kept episode the file also holds keeps the whole file: {whileKept.State}/{whileKept.Reason}");
+        using (var unkeep = await http.DeleteAsync($"/JellyfinMod/Entries/{entry.Id}/Episodes/{second.Id}/Keep"))
+            Assert(unkeep.IsSuccessStatusCode, "An administrator stops keeping the covered episode: " + unkeep.StatusCode);
+        var afterUnkeep = await RowAsync();
+        Assert(afterUnkeep is { State: "blocked", Reason: "multi_episode_not_all_due" },
+            $"Un-keeping an episode held only in another episode's file starts the file's window again rather than letting " +
+            $"the old watch delete it at once (whole-review P1 2): {afterUnkeep.State}/{afterUnkeep.Reason}");
+        clock.Advance(TimeSpan.FromDays(2));
+        var afterWindow = await RowAsync();
+        Assert(afterWindow is { State: "due" },
+            $"Once the fresh window has run, the file is due: {afterWindow.State}/{afterWindow.Reason}");
+    }
+    finally
+    {
+        liveStates.Remove(native.Id);
+        tvLibrary.Items.Remove(series);
+        nativeItems.Remove(native.Id);
+        nativeItems.Remove(series.Id);
+        await using var database = new ModDbContext(databasePath);
+        await database.RetentionEvaluations.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.EpisodeBindings.Where(item => item.Id == bindingId).ExecuteDeleteAsync();
+        await database.Episodes.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.History.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.Entries.Where(item => item.Id == entry.Id).ExecuteDeleteAsync();
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        (snapshot.Enabled, snapshot.FirstEnabledAt, snapshot.EnabledAt, snapshot.ReclaimAfterDays, snapshot.TestWindowMinutes,
+                snapshot.WatchedUserMode) = (original.Enabled, original.FirstEnabledAt, original.EnabledAt, original.ReclaimAfterDays,
+            original.TestWindowMinutes, original.WatchedUserMode);
+        await database.SaveChangesAsync();
+        File.Delete(path);
     }
 }
 
@@ -1041,6 +1553,37 @@ static async Task VerifyFileIdentityAsync(
             history.EventType == "retention_reset").OrderByDescending(history => history.CreatedAt).FirstAsync()).Summary;
         Assert(summary.Contains("replaced in place", StringComparison.Ordinal), "History says the file was replaced: " + summary);
     }
+
+    // Whole-review P1 1: an overdue file replaced at the same path before reconciliation sees it. Jellyfin keeps the item and
+    // its watched state, and the preview's two inspections both read the replacement; only the binding's stored
+    // fingerprint tells it apart. The stored evaluation is read as it is (no re-evaluation), exactly as a run that started
+    // before the replacement would read it.
+    await ScheduleAsync();
+    await using (var database = new ModDbContext(databasePath))
+    {
+        // Overdue on the plugin's own (fixed) clock, whatever the real date.
+        var evaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == episodeId);
+        evaluation.Deadline = new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        await database.SaveChangesAsync();
+    }
+
+    var identityPreview = services.GetRequiredService<RetentionPreviewService>();
+    async Task<JellyfinMod.Api.Contracts.RetentionRepresentationDto> PreviewRowAsync() =>
+        (await identityPreview.PreviewAsync(default, null, Array.Empty<Guid>())).Items.Single(item => item.BindingId == bindingId);
+    var overdue = await PreviewRowAsync();
+    Assert(overdue is { State: "due" }, $"The overdue identity fixture is due while it is the bound file: {overdue.State}/{overdue.Reason}");
+    var swapped = path + ".swap";
+    await File.WriteAllBytesAsync(swapped, Enumerable.Repeat((byte)4, 3072).ToArray());
+    File.Move(swapped, path, overwrite: true);
+    var afterSwap = await PreviewRowAsync();
+    Assert(afterSwap is { State: "blocked", Reason: "media_identity_changed" },
+        $"A file put at an overdue binding's path before reconciliation is not due (whole-review P1 1): {afterSwap.State}/{afterSwap.Reason}");
+    var swapResult = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(bindingId, default);
+    Assert(swapResult.State != "completed" && File.Exists(path),
+        $"Retention does not reclaim the replacement under the old deadline: {swapResult.State}/{swapResult.Reason}");
+    await ReconcileAsync(native.Id, path);
+    Assert((await ReadAsync()) is { State: "waiting", Reason: "representation_reset" },
+        "Reconciliation then resets the replaced file's retention");
 
     // RET3-R7: keep the file by itself, then move it by copy and delete (a new inode at a new path). The Keep matches no
     // file of the title any more: it is removed with one History event, and a new file at the old path is not kept.
@@ -1349,9 +1892,50 @@ static async Task VerifyReclamationAsync(
     var after = await SeedRecoveryFixtureAsync(databasePath, libraryPath, storage, clock, nativeItems,
         userId, libraryId, 900102, "after-unlink", RetentionOperationStatesForTest.Unlinked, keep: false);
     File.Delete(after.MediaPath);
+    Guid afterItemId;
+    await using (var database = new ModDbContext(databasePath))
+        afterItemId = (await database.RetentionOperations.AsNoTracking().SingleAsync(operation => operation.Id == after.OperationId)).JellyfinItemId;
+    var afterItem = nativeItems[afterItemId];
     var afterResult = (await executor.RecoverAsync(default)).Single(result => result.OperationId == after.OperationId);
     Assert(afterResult.State == "completed" && File.Exists(after.SidecarPath),
         "Restart recovery completes catalog state when the exact file was already unlinked");
+    Assert(!nativeItems.ContainsKey(afterItemId) && afterResult.Reason == "reclaimed",
+        $"Recovery after the unlink also removes the stale native item (whole-review c1f5): present={nativeItems.ContainsKey(afterItemId)}, " +
+        $"reason={afterResult.Reason}");
+
+    // Whole-review c1f6: a native cleanup left to retry, then the title is reacquired at its old path and Jellyfin gives it
+    // the same item id. The retry must not remove the new item; the obsolete cleanup is retired.
+    await File.WriteAllBytesAsync(after.MediaPath, new byte[1536]);
+    nativeItems[afterItemId] = afterItem;
+    Guid reacquiredBinding;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var operation = await database.RetentionOperations.SingleAsync(candidate => candidate.Id == after.OperationId);
+        operation.Reason = "reclaimed_native_cleanup_failed";
+        operation.Error = "fixture: Jellyfin was busy";
+        var binding = new EntryBinding
+        {
+            EntryId = operation.EntryId!.Value, JellyfinItemId = afterItemId, TargetLibraryId = operation.TargetLibraryId,
+            VersionGroupId = afterItemId, MediaPath = after.MediaPath, StorageIdentity = storage.Capture(after.MediaPath),
+            FileFingerprint = StoredFingerprint(after.MediaPath)
+        };
+        reacquiredBinding = binding.Id;
+        database.EntryBindings.Add(binding);
+        await database.SaveChangesAsync();
+    }
+
+    await executor.RetryNativeCleanupAsync(default);
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var operation = await database.RetentionOperations.AsNoTracking().SingleAsync(candidate => candidate.Id == after.OperationId);
+        Assert(nativeItems.ContainsKey(afterItemId) && operation.Reason == "reclaimed",
+            $"A delayed native cleanup never removes a reacquired item and is retired (whole-review c1f6): present={nativeItems.ContainsKey(afterItemId)}, " +
+            $"reason={operation.Reason}");
+        await database.EntryBindings.Where(binding => binding.Id == reacquiredBinding).ExecuteDeleteAsync();
+    }
+
+    nativeItems.Remove(afterItemId);
+    File.Delete(after.MediaPath);
 
     Assert((await executor.RecoverAsync(default)).Count == 0,
         "Completed recovery is idempotent and leaves no interrupted operation");
@@ -1467,7 +2051,7 @@ static async Task<RecoveryFixture> SeedRecoveryFixtureAsync(
     {
         Id = Guid.NewGuid(), EntryId = entry.Id, JellyfinItemId = movie.Id,
         TargetLibraryId = entry.TargetLibraryId!.Value, VersionGroupId = movie.Id, MediaPath = mediaPath,
-        StorageIdentity = storage.Capture(mediaPath)
+        StorageIdentity = storage.Capture(mediaPath), FileFingerprint = StoredFingerprint(mediaPath)
     };
     var operationId = Guid.NewGuid();
     var operation = new RetentionOperation
@@ -1771,6 +2355,10 @@ static void Assert(bool condition, string message)
     if (!condition) throw new InvalidOperationException(message);
 }
 
+// The fingerprint reconciliation records for a bound file (RET3-R3), for fixtures that seed bindings directly.
+static string? StoredFingerprint(string path) =>
+    new UnixFileInspector().TryInspect(path, out var observed) ? observed.FileFingerprint : null;
+
 // P3.T10: removing an entry can never race an unlink, erase the reclaim audit, or drop Keep.
 static async Task VerifyRemoveGuardsAsync(
     IServiceProvider services,
@@ -1940,7 +2528,8 @@ static async Task VerifyPinnedExecutionAsync(
         database.EntryBindings.Add(new EntryBinding
         {
             EntryId = overlapEntry.Id, JellyfinItemId = overlap.Id, TargetLibraryId = libraryId,
-            VersionGroupId = overlap.Id, MediaPath = prepared.MediaPath, StorageIdentity = storage.Capture(prepared.MediaPath)
+            VersionGroupId = overlap.Id, MediaPath = prepared.MediaPath, StorageIdentity = storage.Capture(prepared.MediaPath),
+            FileFingerprint = StoredFingerprint(prepared.MediaPath)
         });
         database.CompletionObservations.Add(new CompletionObservation
         {
@@ -2727,4 +3316,10 @@ internal static partial class NativeTestMethods
 {
     [LibraryImport("libc", EntryPoint = "link", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
     internal static partial int Link(string existingPath, string newPath);
+}
+
+/// <summary>What the TMDB stand-in answers, by request path below <c>/3/</c>.</summary>
+internal static class TmdbFixtures
+{
+    public static System.Collections.Concurrent.ConcurrentDictionary<string, string> Responses { get; } = new(StringComparer.Ordinal);
 }

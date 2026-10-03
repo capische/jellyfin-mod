@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Security.Claims;
 using System.Text.Encodings.Web;
 using System.Text.RegularExpressions;
+using Jellyfin.Data;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
 using JellyfinMod;
@@ -79,6 +80,8 @@ internal sealed partial class NativeWorld
     private EventHandler<ItemChangeEventArgs>? _removed;
 
     public required IReadOnlyList<TestLibrary> Libraries { get; init; }
+    /// <summary>Rewrites what Jellyfin reports as its libraries, for a root that changes while it is read.</summary>
+    public Func<List<VirtualFolderInfo>, List<VirtualFolderInfo>>? VirtualFoldersHook { get; set; }
     public required Func<Guid, BaseItem[]> UserLibraries { get; init; }
     public ConcurrentQueue<string> ScanRequests { get; } = new();
     public bool AutoScan { get; set; } = true;
@@ -322,11 +325,12 @@ internal sealed partial class NativeWorld
         {
             case "GetUserRootFolder": return new TestRoot(UserLibraries);
             case "GetVirtualFolders":
-                return Libraries.Select(folder => new VirtualFolderInfo
+                var folders = Libraries.Select(folder => new VirtualFolderInfo
                 {
                     ItemId = folder.Id.ToString(), Name = folder.Name, Locations = [folder.Location],
                     CollectionType = folder.CollectionType == CollectionType.tvshows ? CollectionTypeOptions.tvshows : CollectionTypeOptions.movies
                 }).ToList();
+                return VirtualFoldersHook is { } hook ? hook(folders) : folders;
             case "GetNewItemId": return NewItemId((string)arguments![0]!, (Type)arguments[1]!);
             case "GetLocalAlternateVersionIds":
                 // The file versions Jellyfin has linked to a video: an item exists for each of its extra paths.
@@ -463,9 +467,10 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Services.AddTransient<RetentionPolicyService>();
         builder.Services.AddTransient<RetentionCompletionService>();
         builder.Services.AddTransient<RetentionEvaluator>();
+        // As production registers it: with the secret store, so a client chosen in the settings is read with its saved password.
         builder.Services.AddTransient(provider => new TransmissionSeedClient(provider.GetRequiredService<IHttpClientFactory>(),
             () => configuration, provider.GetRequiredService<UnixFileInspector>(),
-            provider.GetRequiredService<ILogger<TransmissionSeedClient>>()));
+            provider.GetRequiredService<ILogger<TransmissionSeedClient>>(), provider.GetRequiredService<AcquisitionSecretStore>()));
         builder.Services.AddTransient<RetentionPreviewService>();
         builder.Services.AddTransient<RetentionLiveCheck>();
         builder.Services.AddTransient<RetentionExecutor>();
@@ -564,10 +569,14 @@ namespace PhaseFiveFixtures
     {
         public List<BaseItem> Items { get; } = [];
 
+        // Like Jellyfin, a user's blocked tags hide an episode from that user's queries.
         protected override MediaBrowser.Model.Querying.QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query)
         {
             BaseItem[] items;
             lock (Items) items = Items.ToArray();
+            var blocked = query.User?.GetPreference(Jellyfin.Database.Implementations.Enums.PreferenceKind.BlockedTags) ?? [];
+            if (blocked.Length > 0)
+                items = items.Where(item => !(item.Tags ?? []).Intersect(blocked, StringComparer.OrdinalIgnoreCase).Any()).ToArray();
             return new() { Items = items, TotalRecordCount = items.Length };
         }
     }

@@ -153,8 +153,6 @@ public sealed class AutomationRunner(
             var today = now.Date;
             var grabsToday = await database.GrabOperations.CountAsync(grab => grab.Automatic && grab.CreatedAt >= today, cancellationToken)
                 .ConfigureAwait(false);
-            var openImports = await database.ImportOperations.CountAsync(operation => ImportStates.Open.Contains(operation.State),
-                cancellationToken).ConfigureAwait(false);
             foreach (var target in due)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -172,16 +170,29 @@ public sealed class AutomationRunner(
                 run = await database.AutomationRuns.SingleAsync(value => value.Id == run.Id, cancellationToken).ConfigureAwait(false);
                 var row = await database.AutomationTargets.SingleAsync(value => value.TargetId == target.TargetId, cancellationToken)
                     .ConfigureAwait(false);
-                var outcome = await ProcessAsync(run, target, row, current, grabsToday, openImports, queries, cancellationToken)
+                var (outcome, created) = await ProcessAsync(run, target, row, current, grabsToday, queries, cancellationToken)
                     .ConfigureAwait(false);
-                if (outcome == AutomationReasons.Grabbed || outcome == AutomationReasons.UpgradePlanned)
-                {
-                    grabsToday++;
-                    openImports++;
-                }
+                if (outcome == AutomationReasons.Grabbed || outcome == AutomationReasons.UpgradePlanned) grabsToday++;
 
                 run.QueriesByIndexerJson = JsonSerializer.Serialize(queries);
-                await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+                catch when (created is not null)
+                {
+                    // The grab, its upgrade and the target's schedule are kept together: a grab whose upgrade or schedule
+                    // could not be saved is cancelled during its hold, never submitted (whole-review chunk 2c, P2 3).
+                    await CancelUnrecordedAsync(created).ConfigureAwait(false);
+                    throw;
+                }
+
+                // Dispatch is scheduled only once everything the grab belongs to is saved.
+                if (created is not null)
+                {
+                    using var scope = scopes.CreateScope();
+                    scope.ServiceProvider.GetRequiredService<GrabDispatcher>().Schedule(created.Id, created.HoldUntil);
+                }
             }
 
             run = await database.AutomationRuns.SingleAsync(value => value.Id == run.Id, cancellationToken).ConfigureAwait(false);
@@ -206,9 +217,65 @@ public sealed class AutomationRunner(
         }
     }
 
+    /// <summary>Cancels an automatic grab whose run step could not be saved; it is still within its hold.</summary>
+    private async Task CancelUnrecordedAsync(GrabOperation created)
+    {
+        try
+        {
+            using var scope = scopes.CreateScope();
+            await scope.ServiceProvider.GetRequiredService<GrabService>()
+                .CancelAsync(created.Id, GrabService.AutomationUserId, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogError(error, "JellyfinMod could not cancel automatic grab {Grab} after its run step failed", created.Id);
+        }
+    }
+
+    /// <summary>
+    /// Open imports and the automatic or manual grabs that will become imports: held, submitting or unconfirmed grabs, and
+    /// accepted ones whose import row is not created yet, counted once each and read again before every target
+    /// (whole-review chunk 2c, P2 2).
+    /// </summary>
+    /// <summary>
+    /// Open imports and the grabs that will become one, counted in one statement over one snapshot: a grab whose import is
+    /// created meanwhile is counted once, as either, never neither (Codex delta review 2).
+    /// </summary>
+    private async Task<int> OpenImportsAsync(CancellationToken cancellationToken) =>
+        await database.ImportOperations.Where(operation => ImportStates.Open.Contains(operation.State)).Select(operation => operation.Id)
+            .Concat(database.GrabOperations.Where(grab => grab.State == GrabStates.Pending || grab.State == GrabStates.Submitting ||
+                grab.State == GrabStates.Unknown ||
+                grab.State == GrabStates.Accepted && grab.ActiveTarget != null &&
+                !database.ImportOperations.Any(operation => operation.GrabId == grab.Id)).Select(grab => grab.Id))
+            .CountAsync(cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// Whether the target, read again now, is still one automation may grab: monitored (the series and the episode), and
+    /// still without a file, or still holding one for an upgrade (whole-review chunk 2c, P2 1).
+    /// </summary>
+    private static bool StillWanted(AutomationTarget target, Entry entry, Episode? episode)
+    {
+        if (!entry.Monitored) return false;
+        if (target.Episode is not null && episode is not { Monitored: true }) return false;
+        var state = episode?.State ?? entry.State;
+        return target.IsUpgrade ? state == FileState.OnDisk : state != FileState.OnDisk;
+    }
+
     /// <summary>Checks budgets, searches, picks and grabs for one target, recording exactly one decision.</summary>
-    private async Task<string> ProcessAsync(AutomationRun run, AutomationTarget target, AutomationTargetState row,
-        AcquisitionSettings settings, int grabsToday, int openImports, Dictionary<Guid, int> queries, CancellationToken cancellationToken)
+    private async Task<(string Outcome, GrabOperation? Created)> ProcessAsync(AutomationRun run, AutomationTarget target,
+        AutomationTargetState row, AcquisitionSettings settings, int grabsToday, Dictionary<Guid, int> queries,
+        CancellationToken cancellationToken)
+    {
+        createdGrab = null;
+        var outcome = await ProcessCoreAsync(run, target, row, settings, grabsToday, queries, cancellationToken).ConfigureAwait(false);
+        return (outcome, createdGrab);
+    }
+
+    /// <summary>The grab the current target's step created, scheduled by the run once the step is saved.</summary>
+    private GrabOperation? createdGrab;
+
+    private async Task<string> ProcessCoreAsync(AutomationRun run, AutomationTarget target, AutomationTargetState row,
+        AcquisitionSettings settings, int grabsToday, Dictionary<Guid, int> queries, CancellationToken cancellationToken)
     {
         var now = Now;
         var targetKey = GrabService.TargetKey(target.Entry.Id, target.Episode?.Id);
@@ -223,7 +290,7 @@ public sealed class AutomationRunner(
         if (row.LastAutoGrabAt is { } lastGrab && now - lastGrab < PerEntryGrabWindow)
             return Skip(run, target, row, AutomationReasons.BudgetGrabs, "This title was grabbed automatically in the last 24 hours.",
                 retryIn: PerEntryGrabWindow - (now - lastGrab));
-        if (openImports >= Math.Max(0, settings.MaxConcurrentImports))
+        if (await OpenImportsAsync(cancellationToken).ConfigureAwait(false) >= Math.Max(0, settings.MaxConcurrentImports))
             return Skip(run, target, row, AutomationReasons.TooManyOpenImports, null, retryIn: TimeSpan.FromHours(1));
         if (FreeSpaceBelowFloor(target.Entry.TargetLibraryId, settings, out var freeDetail))
             return Skip(run, target, row, AutomationReasons.FreeSpaceFloor, freeDetail, retryIn: TimeSpan.FromHours(6));
@@ -281,8 +348,10 @@ public sealed class AutomationRunner(
         var titleMatchIndexers = await database.AcquisitionIndexers.AsNoTracking()
             .Where(indexer => indexer.AutomateTitleMatches).Select(indexer => indexer.Id)
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        // Only an id-verified release, or a title-and-year match from a trusted indexer; never a match without a year.
         var eligible = snapshot.Candidates.Where(candidate => candidate.Evaluation.Eligible &&
-                (candidate.Evaluation.Identity != "title" || titleMatchIndexers.Contains(candidate.IndexerId)) &&
+                (candidate.Evaluation.Identity == "verified" ||
+                 candidate.Evaluation.Identity == "title" && titleMatchIndexers.Contains(candidate.IndexerId)) &&
                 (!target.IsUpgrade || VersionQuality.ProfileIndex(qualities, candidate.Parsed.Quality) < heldIndex))
             .ToArray();
         if (eligible.Length == 0)
@@ -292,11 +361,23 @@ public sealed class AutomationRunner(
                 $"{snapshot.Candidates.Count} candidates, none eligible.", empty: true);
         }
 
-        var best = eligible[0];
-        if (target.Profile.MinimumAutoScore is { } minimumScore && best.Evaluation.Score < minimumScore)
-            return Skip(run, target, row, AutomationReasons.BelowMinimumScore, $"Best score {best.Evaluation.Score} < {minimumScore}.", empty: true);
-        if (target.Profile.MinimumSeeders is { } minimumSeeders && (best.Seeders ?? 0) < minimumSeeders)
-            return Skip(run, target, row, AutomationReasons.BelowMinimumSeeders, $"Best release has {best.Seeders ?? 0} seeders.", empty: true);
+        // The thresholds apply to every candidate before the best is chosen: a better-scored release with too few seeders
+        // must not hide a lower-ranked one that meets both (whole-review chunk 2c, P2 6). The skip names the first
+        // threshold the best candidate missed.
+        var qualifying = eligible.Where(candidate =>
+                (target.Profile.MinimumAutoScore is not { } score || candidate.Evaluation.Score >= score) &&
+                (target.Profile.MinimumSeeders is not { } seeders || (candidate.Seeders ?? 0) >= seeders))
+            .ToArray();
+        if (qualifying.Length == 0)
+        {
+            var top = eligible[0];
+            if (target.Profile.MinimumAutoScore is { } minimumScore && top.Evaluation.Score < minimumScore)
+                return Skip(run, target, row, AutomationReasons.BelowMinimumScore, $"Best score {top.Evaluation.Score} < {minimumScore}.", empty: true);
+            return Skip(run, target, row, AutomationReasons.BelowMinimumSeeders,
+                $"No release meeting the score has {target.Profile.MinimumSeeders} seeders; the best has {top.Seeders ?? 0}.", empty: true);
+        }
+
+        var best = qualifying[0];
 
         var upgradeId = target.IsUpgrade ? Guid.NewGuid() : (Guid?)null;
         GrabOperation grab;
@@ -306,11 +387,17 @@ public sealed class AutomationRunner(
             try
             {
                 // The key is derived from run and target, so a replayed run step cannot create a second grab.
+                // The target is read again when the grab is committed: unmonitored meanwhile, or no longer without a file
+                // (or no longer with one, for an upgrade), it is not grabbed (whole-review chunk 2c, P2 1).
                 var (operation, created) = await grabs.CreateAsync(GrabService.AutomationUserId,
                     new GrabRequest(snapshot.SearchId, best.ReleaseId, $"auto-{run.Id:N}-{target.TargetId:N}", true, upgradeId),
-                    (_, _) => true, cancellationToken).ConfigureAwait(false);
+                    (entry, episode) => StillWanted(target, entry, episode), cancellationToken,
+                    // The open-import limit is checked again at the insert, under the gate every grab is admitted through,
+                    // so a manual grab admitted during this search counts (Codex round 2 P2).
+                    async token => await OpenImportsAsync(token).ConfigureAwait(false) >= Math.Max(0, settings.MaxConcurrentImports)
+                        ? "too_many_open_imports" : null).ConfigureAwait(false);
                 grab = operation;
-                if (created) scope.ServiceProvider.GetRequiredService<GrabDispatcher>().Schedule(operation.Id, operation.HoldUntil);
+                if (created) createdGrab = operation;
             }
             catch (GrabException error)
             {
@@ -318,6 +405,8 @@ public sealed class AutomationRunner(
                 {
                     "grab_active" => AutomationReasons.ActiveGrabExists,
                     "held_quality" => AutomationReasons.AlreadyHeldAtCutoff,
+                    "target_not_found" => AutomationReasons.NoLongerWanted,
+                    "too_many_open_imports" => AutomationReasons.TooManyOpenImports,
                     _ => AutomationReasons.GrabRefused
                 };
                 return Skip(run, target, row, reason, error.Code, retryIn: TimeSpan.FromHours(1));
@@ -543,15 +632,21 @@ public sealed class AutomationRunner(
     public bool FreeSpaceBelowFloor(Guid? libraryId, AcquisitionSettings settings, out string? detail)
     {
         detail = null;
-        var roots = FreeSpace(libraryId);
-        foreach (var (root, free, total) in roots)
+        // One measurement decides: a root whose free space cannot be read is not room to spare, so acquisition waits for a
+        // real measurement of every root (whole-review chunk 2c, P2 4; Codex round 2 P2).
+        if (MeasureFreeSpace(libraryId) is not { } roots)
+        {
+            detail = "The library mount's free space could not be read.";
+            return true;
+        }
+
+        foreach (var (_, free, total) in roots)
         {
             var floor = Math.Max((ulong)Math.Max(0, settings.FreeSpaceFloorBytes),
                 (ulong)(total * (Math.Clamp(settings.FreeSpaceFloorPercent, 0, 100) / 100.0)));
             if (free < floor)
             {
                 detail = $"{free} bytes free on the library mount, floor {floor}.";
-                _ = root;
                 return true;
             }
         }
@@ -559,19 +654,26 @@ public sealed class AutomationRunner(
         return false;
     }
 
-    /// <summary>Free and total bytes of each root of a library.</summary>
-    public IReadOnlyList<(string Root, ulong Free, ulong Total)> FreeSpace(Guid? libraryId)
+    /// <summary>Free and total bytes of every root of a library, or null when it has none or any one cannot be read.</summary>
+    private IReadOnlyList<(string Root, ulong Free, ulong Total)>? MeasureFreeSpace(Guid? libraryId)
     {
         try
         {
             var folder = library.GetVirtualFolders()?.FirstOrDefault(value => Guid.TryParse(value.ItemId, out var id) && id == libraryId);
-            return (folder?.Locations ?? []).Select(location => files.TryGetFreeSpace(location, out var free, out var total)
-                    ? (location, free, total) : (location, 0UL, 0UL))
-                .Where(value => value.Item3 > 0).ToArray();
+            var locations = folder?.Locations ?? [];
+            if (locations.Length == 0) return null;
+            var roots = new List<(string Root, ulong Free, ulong Total)>(locations.Length);
+            foreach (var location in locations)
+            {
+                if (!files.TryGetFreeSpace(location, out var free, out var total) || total == 0) return null;
+                roots.Add((location, free, total));
+            }
+
+            return roots;
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
-            return [];
+            return null;
         }
     }
 

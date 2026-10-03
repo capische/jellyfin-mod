@@ -27,6 +27,8 @@ public sealed class WebBundleStore
     private const string ZipName = "jellyfinmod-web.zip";
     private const string ManifestName = "jellyfinmod-web.json";
     private const string RetainedName = "retained.json";
+    /// <summary>The bundle that was current when this store last started, kept apart from the retention record.</summary>
+    private const string CurrentName = "current-bundle";
 
     /// <summary>The most bundles kept on disk, the current one included.</summary>
     public const int MaxRetained = 3;
@@ -260,9 +262,26 @@ public sealed class WebBundleStore
     private void Retain(string currentId, int graceDays)
     {
         var record = ReadRetained();
-        record[currentId] = DateTime.UtcNow;
+        var now = DateTime.UtcNow;
+        // A bundle's grace runs from when it stopped being current, not from when it was installed or last started: after
+        // weeks without a restart the bundle being replaced is still what running clients hold (whole-review chunk 3c,
+        // P2 4). Which bundle that is comes from the stored identity of the current bundle, never from the record's times,
+        // which two bundles can share (Codex round 2 P2).
+        if (ReadCurrent() is { } previous)
+        {
+            if (previous != currentId && record.ContainsKey(previous)) record[previous] = now;
+        }
+        else if (record.Where(pair => pair.Key != currentId).Select(pair => (DateTime?)pair.Value).Max() is { } latest &&
+                 (!record.TryGetValue(currentId, out var currentSince) || latest > currentSince))
+        {
+            // A record written before the identity was stored: every bundle that could have been current keeps its grace.
+            foreach (var id in record.Where(pair => pair.Key != currentId && pair.Value == latest).Select(pair => pair.Key).ToList())
+                record[id] = now;
+        }
 
-        var cutoff = DateTime.UtcNow.AddDays(-Math.Max(0, graceDays));
+        record[currentId] = now;
+
+        var cutoff = now.AddDays(-Math.Max(0, graceDays));
         // At most three bundles (§4.5, PHASE7 default 6): the current one and the two most recent before it, so a
         // run of deployments cannot fill the disk while each one waits out its grace period.
         var newest = record.Where(pair => pair.Key != currentId).OrderByDescending(pair => pair.Value)
@@ -284,8 +303,36 @@ public sealed class WebBundleStore
         }
 
         // Directories nobody recorded (a manual copy, an interrupted upgrade) are left alone but not advertised.
-        RetainedBundleIds = record.OrderByDescending(pair => pair.Value).Select(pair => pair.Key).ToList();
+        RetainedBundleIds = record.OrderByDescending(pair => pair.Key == currentId).ThenByDescending(pair => pair.Value)
+            .Select(pair => pair.Key).ToList();
         WriteRetained(record);
+        WriteCurrent(currentId);
+    }
+
+    private string? ReadCurrent()
+    {
+        try
+        {
+            var path = Path.Combine(_root, CurrentName);
+            var value = File.Exists(path) ? File.ReadAllText(path).Trim() : null;
+            return value is not null && IsSafeBundleId(value) ? value : null;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private void WriteCurrent(string currentId)
+    {
+        try
+        {
+            File.WriteAllText(Path.Combine(_root, CurrentName), currentId);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(error, "JellyfinMod could not record its current web bundle");
+        }
     }
 
     private Dictionary<string, DateTime> ReadRetained()

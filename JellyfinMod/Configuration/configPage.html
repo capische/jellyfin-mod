@@ -2833,7 +2833,8 @@
           pathMappings: state.mappings.map(function (mapping) {
             return { clientPathPrefix: mapping.clientPathPrefix, localPathPrefix: mapping.localPathPrefix };
           }),
-          revision: state.client.revision
+          revision: state.client.revision,
+          mappingsVersion: state.client.mappingsVersion
         }).then(function (saved) {
           busy(control, false);
           text($('[data-savemeta="mappings"]'), 'Saved and probed ' + when(new Date().toISOString()));

@@ -418,7 +418,45 @@ internal static class AbsenceIntegration
             Monitored = false
         };
         database.Entries.Add(wanted);
-        database.Episodes.Add(new JellyfinMod.Data.Episode { EntryId = wanted.Id, TmdbId = 9799, SeasonNumber = 2, EpisodeNumber = 1 });
+        var movedEpisode = new JellyfinMod.Data.Episode { EntryId = wanted.Id, TmdbId = 9799, SeasonNumber = 2, EpisodeNumber = 1 };
+        database.Episodes.Add(movedEpisode);
+        // A moved episode keeps its evaluation; left on the wanted entry it would go with that entry (Codex round 2 P1).
+        database.RetentionEvaluations.Add(new RetentionEvaluation { EntryId = wanted.Id, EpisodeId = movedEpisode.Id,
+            TargetId = movedEpisode.Id, State = "waiting", Reason = "waiting_for_completion", EvaluatedAt = DateTime.UtcNow,
+            BaselineAt = DateTime.UtcNow, GraceNotBefore = DateTime.UtcNow });
+        // Whole-review P1 3: the wanted entry kept the episode the re-homed entry already tracks, and holds position-identity
+        // rows (TMDB id 0) at other positions than the re-homed entry's own position row.
+        database.Episodes.Add(new JellyfinMod.Data.Episode
+        {
+            EntryId = wanted.Id, TmdbId = 9701, SeasonNumber = 1, EpisodeNumber = 1, RetentionPolicy = RetentionPolicy.Never
+        });
+        database.Episodes.Add(new JellyfinMod.Data.Episode { EntryId = dailyEntry.Id, TmdbId = 0, SeasonNumber = 4, EpisodeNumber = 1 });
+        database.Episodes.Add(new JellyfinMod.Data.Episode
+        {
+            EntryId = wanted.Id, TmdbId = 0, SeasonNumber = 4, EpisodeNumber = 1, RetentionPolicy = RetentionPolicy.Days,
+            ReclaimAfterDays = 90
+        });
+        database.Episodes.Add(new JellyfinMod.Data.Episode { EntryId = wanted.Id, TmdbId = 0, SeasonNumber = 4, EpisodeNumber = 2 });
+        // Codex re-review P2-d: the surviving episode inherits the global window (14 days); the duplicate's explicit day is
+        // shorter and must not replace it. P1-b: a surviving episode without an evaluation takes the duplicate's longer window
+        // with a grace of its own, and a duplicate un-kept an hour ago hands its grace to the survivor.
+        var inheritingSurvivor = new JellyfinMod.Data.Episode { EntryId = dailyEntry.Id, TmdbId = 9702, SeasonNumber = 5, EpisodeNumber = 2 };
+        var unevaluatedSurvivor = new JellyfinMod.Data.Episode { EntryId = dailyEntry.Id, TmdbId = 9703, SeasonNumber = 5, EpisodeNumber = 3 };
+        var graceSurvivor = new JellyfinMod.Data.Episode { EntryId = dailyEntry.Id, TmdbId = 9704, SeasonNumber = 5, EpisodeNumber = 4 };
+        var unkeptDuplicate = new JellyfinMod.Data.Episode { EntryId = wanted.Id, TmdbId = 9704, SeasonNumber = 5, EpisodeNumber = 4 };
+        database.Episodes.AddRange(inheritingSurvivor, unevaluatedSurvivor, graceSurvivor, unkeptDuplicate,
+            new JellyfinMod.Data.Episode { EntryId = wanted.Id, TmdbId = 9702, SeasonNumber = 5, EpisodeNumber = 2,
+                RetentionPolicy = RetentionPolicy.Days, ReclaimAfterDays = 1 },
+            new JellyfinMod.Data.Episode { EntryId = wanted.Id, TmdbId = 9703, SeasonNumber = 5, EpisodeNumber = 3,
+                RetentionPolicy = RetentionPolicy.Days, ReclaimAfterDays = 30 });
+        var unkeptAt = DateTime.UtcNow.AddHours(-1);
+        database.RetentionEvaluations.AddRange(
+            new RetentionEvaluation { EntryId = dailyEntry.Id, EpisodeId = graceSurvivor.Id, TargetId = graceSurvivor.Id,
+                State = "waiting", Reason = "waiting_for_completion",
+                EvaluatedAt = unkeptAt.AddDays(-5), BaselineAt = unkeptAt.AddDays(-5) },
+            new RetentionEvaluation { EntryId = wanted.Id, EpisodeId = unkeptDuplicate.Id, TargetId = unkeptDuplicate.Id,
+                State = "waiting", Reason = "waiting_for_completion",
+                EvaluatedAt = unkeptAt, BaselineAt = unkeptAt, GraceNotBefore = unkeptAt });
         database.History.Add(new HistoryRecord { EntryId = wanted.Id, EventType = "added", Summary = "Added" });
         await database.SaveChangesAsync();
         // A second library shares the TV path and lists one series as well.
@@ -447,6 +485,30 @@ internal static class AbsenceIntegration
             await database.Episodes.AnyAsync(episode => episode.EntryId == dailyEntry.Id && episode.TmdbId == 9799) &&
             await database.History.AnyAsync(history => history.EntryId == dailyEntry.Id && history.EventType == "added"),
             "A file-less entry for the same title in the new library is merged into the re-homed entry");
+        var mergedEpisodes = await database.Episodes.AsNoTracking().Where(episode => episode.EntryId == dailyEntry.Id).ToListAsync();
+        Assert(mergedEpisodes.Count(episode => episode.TmdbId == 9701) == 1 &&
+            mergedEpisodes.Single(episode => episode.TmdbId == 9701).RetentionPolicy == RetentionPolicy.Never,
+            "A Keep on the merged entry's copy of a tracked episode carries over to the surviving episode (whole-review P1 3)");
+        Assert(mergedEpisodes.Count(episode => episode.TmdbId == 0 && episode.SeasonNumber == 4 && episode.EpisodeNumber == 1) == 1 &&
+            mergedEpisodes.Single(episode => episode is { TmdbId: 0, SeasonNumber: 4, EpisodeNumber: 1 }) is
+                { RetentionPolicy: RetentionPolicy.Days, ReclaimAfterDays: 90 } &&
+            mergedEpisodes.Any(episode => episode is { TmdbId: 0, SeasonNumber: 4, EpisodeNumber: 2 }),
+            "Position-identity episodes merge by season and number: a matching row's longer window carries over and another " +
+            "position is moved, not dropped (whole-review P1 3): " + string.Join(", ", mergedEpisodes.Select(episode =>
+                $"{episode.TmdbId}/S{episode.SeasonNumber}E{episode.EpisodeNumber}/{episode.RetentionPolicy}")));
+        var inheriting = mergedEpisodes.Single(episode => episode.Id == inheritingSurvivor.Id);
+        Assert(inheriting.RetentionPolicy == RetentionPolicy.Inherit,
+            $"A duplicate's shorter explicit window never replaces the survivor's longer inherited one (Codex re-review P2-d): " +
+            $"{inheriting.RetentionPolicy}/{inheriting.ReclaimAfterDays}");
+        var unevaluated = mergedEpisodes.Single(episode => episode.Id == unevaluatedSurvivor.Id);
+        var createdEvaluation = await database.RetentionEvaluations.AsNoTracking().SingleOrDefaultAsync(value => value.TargetId == unevaluatedSurvivor.Id);
+        var carried = await database.RetentionEvaluations.AsNoTracking().SingleOrDefaultAsync(value => value.TargetId == graceSurvivor.Id);
+        Assert(unevaluated is { RetentionPolicy: RetentionPolicy.Days, ReclaimAfterDays: 30 } && createdEvaluation?.GraceNotBefore is not null &&
+            carried?.GraceNotBefore is { } carriedGrace && Math.Abs((carriedGrace - unkeptAt).TotalSeconds) < 1,
+            $"A survivor without an evaluation gets one with a grace, and a duplicate's recent grace is carried over (Codex re-review P1-b): " +
+            $"{unevaluated.RetentionPolicy}/{unevaluated.ReclaimAfterDays}, created {createdEvaluation?.GraceNotBefore:O}, carried {carried?.GraceNotBefore:O}");
+        Assert(await database.RetentionEvaluations.AnyAsync(value => value.TargetId == movedEpisode.Id && value.EntryId == dailyEntry.Id),
+            "A wanted episode moved by a merge keeps its evaluation and its grace (Codex round 2 P1)");
         Assert(await database.Entries.CountAsync(entry => entry.TmdbId == 9730) == 1 &&
             await database.Entries.AnyAsync(entry => entry.TmdbId == 9730 && entry.TargetLibraryId == tvLibrary.Id) &&
             r7Run.DiagnosticsJson?.Contains("owned by another library", StringComparison.Ordinal) == true,

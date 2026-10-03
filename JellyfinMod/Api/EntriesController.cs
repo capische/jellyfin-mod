@@ -225,6 +225,11 @@ public sealed class EntriesController(
         if (request.QualityProfileId is { } profileId &&
             !await database.AcquisitionQualityProfiles.AnyAsync(profile => profile.Id == profileId, cancellationToken))
             return BadRequest(new ProblemDetails { Status = 400, Type = "invalid_quality_profile", Title = "The quality profile does not exist." });
+        // Monitoring again, or searching with another profile, starts the automatic searches afresh (whole-review chunk
+        // 2c, P2 7): two profiles can share a revision number, so the switch itself is the change.
+        if (request.Monitored is true && !entry.Monitored ||
+            request.QualityProfileIdSpecified && request.QualityProfileId != entry.QualityProfileId)
+            await ResetBackoffAsync(entry.Id, null, cancellationToken);
         if (request.Monitored.HasValue) entry.Monitored = request.Monitored.Value;
         // Saving a profile is a separate administrator action; searches never change it (P4.A1).
         if (request.QualityProfileIdSpecified) entry.QualityProfileId = request.QualityProfileId;
@@ -239,8 +244,24 @@ public sealed class EntriesController(
                 await RequestSearchAsync(entry.Id, targetId, episodeId, cancellationToken);
         }
 
-        await database.SaveChangesAsync(cancellationToken);
+        await SaveMonitoringAsync(request.Monitored, entry.TargetLibraryId, cancellationToken);
         return new EntryDto(entry);
+    }
+
+    /// <summary>
+    /// Saves a monitoring change. Stopping monitoring saves under the library lease a grab's admission takes, so a grab is
+    /// either admitted before it (and its dispatch checks again) or sees it (Codex round 2 P2).
+    /// </summary>
+    private async Task SaveMonitoringAsync(bool? monitored, Guid? libraryId, CancellationToken cancellationToken)
+    {
+        if (monitored != false || libraryId is not { } library)
+        {
+            await database.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        await using var lease = await libraryLock.AcquireAsync(library, cancellationToken);
+        await database.SaveChangesAsync(cancellationToken);
     }
 
     /// <summary>Resets a target's backoff and asks the next automation run to search it (P6.M3).</summary>
@@ -391,7 +412,7 @@ public sealed class EntriesController(
             // evaluation gate, so no evaluation in flight saves over the restart (RET3-R4).
             using (await RetentionEvaluator.HoldTargetAsync(episode.Id, cancellationToken).ConfigureAwait(false))
             {
-                if (!keeping) await RestartGraceAsync(episode.Id, cancellationToken).ConfigureAwait(false);
+                if (!keeping) await RestartGraceAsync(episode.Id, cancellationToken, entry.Id).ConfigureAwait(false);
                 await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
             }
         }
@@ -543,18 +564,51 @@ public sealed class EntriesController(
     /// Restarts a target's grace now (PHASE10 Q4, RET2-R2): a running schedule goes back to waiting and the next evaluation
     /// counts the window from this moment, so a change never makes the target due at once. The caller saves.
     /// </summary>
-    private async Task RestartGraceAsync(Guid targetId, CancellationToken cancellationToken)
+    /// <remarks>
+    /// An episode with no file of its own can still be held in another episode's multi-episode file (S01E01-E02), whose
+    /// schedule reads every episode it covers. Its restart is persisted on a row of its own (with
+    /// <paramref name="seriesEntryId"/>), which no evaluation of a bound target overwrites and which no series aggregate
+    /// reads, so un-keeping it gives the file a fresh window too (whole-review P1 2, PHASE10 Q4).
+    /// </remarks>
+    private async Task RestartGraceAsync(Guid targetId, CancellationToken cancellationToken, Guid? seriesEntryId = null)
     {
+        var now = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
         var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(
             item => item.TargetId == targetId, cancellationToken).ConfigureAwait(false);
-        if (evaluation is null) return;
-        evaluation.GraceNotBefore = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
+        if (evaluation is null)
+        {
+            if (seriesEntryId is not { } entryId) return;
+            database.RetentionEvaluations.Add(new RetentionEvaluation
+            {
+                EntryId = entryId, EpisodeId = targetId, TargetId = targetId, State = RetentionEvaluationStates.Waiting,
+                Reason = RetentionEvaluationReasons.RepresentationReset, EvaluatedAt = now, BaselineAt = now,
+                GraceNotBefore = now, RequiresFreshCompletion = true
+            });
+            return;
+        }
+
+        evaluation.GraceNotBefore = now;
         if (evaluation.State != RetentionEvaluationStates.Scheduled) return;
         evaluation.State = RetentionEvaluationStates.Waiting;
         evaluation.Reason = RetentionEvaluationReasons.WaitingForCompletion;
         evaluation.Deadline = null;
         evaluation.EligibleAt = null;
         evaluation.CompletionBasisAt = null;
+    }
+
+    /// <summary>
+    /// Monitoring a target again starts its automatic searches afresh, as PHASE6 documents: an old empty-search backoff of up
+    /// to a week does not carry over (whole-review chunk 2c, P2 7). A series resets every one of its episodes. The caller saves.
+    /// </summary>
+    private async Task ResetBackoffAsync(Guid entryId, Guid? episodeId, CancellationToken cancellationToken)
+    {
+        var now = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
+        foreach (var row in await database.AutomationTargets.Where(row => episodeId == null ? row.EntryId == entryId : row.TargetId == episodeId)
+                     .ToListAsync(cancellationToken))
+        {
+            row.ConsecutiveEmpty = 0;
+            row.NextSearchAt = now;
+        }
     }
 
     /// <summary>Updates an individual episode's future monitoring, restricted to administrators.</summary>
@@ -570,9 +624,10 @@ public sealed class EntriesController(
         if (episode is null || !access.CanReadEpisode(user, episode)) return NotFound();
         // Episodes inherit their series profile; monitoring and a search request are the episode settings.
         if (!request.Monitored.HasValue && request.SearchNow != true || request.QualityProfileIdSpecified) return BadRequest();
+        if (request.Monitored is true && !episode.Monitored) await ResetBackoffAsync(id, episode.Id, cancellationToken);
         if (request.Monitored.HasValue) episode.Monitored = request.Monitored.Value;
         if (request.SearchNow == true) await RequestSearchAsync(id, episode.Id, episode.Id, cancellationToken);
-        await database.SaveChangesAsync(cancellationToken);
+        await SaveMonitoringAsync(request.Monitored, entry.TargetLibraryId, cancellationToken);
         return new EpisodeDto(episode);
     }
 
@@ -772,6 +827,112 @@ public sealed class EntriesController(
         }
     }
 
+    /// <summary>
+    /// The title's history as this requester may read it (whole-review chunk 3a, P2 2): an event about an episode the
+    /// requester cannot read is left out, and so is an event about a version Jellyfin hides from them (its own tags or
+    /// parental rating). When a restricted requester's event names an episode or version that no longer exists, so its
+    /// visibility cannot be established, the event stays with a summary that names nothing.
+    /// </summary>
+    private async Task<HistoryDto[]> ReadableHistoryAsync(Jellyfin.Database.Implementations.Entities.User user, IReadOnlyList<HistoryRecord> history,
+        IReadOnlyList<Episode> episodes, IReadOnlyList<Episode> readableEpisodes, bool series, CancellationToken cancellationToken)
+    {
+        var known = episodes.Select(episode => episode.Id).ToHashSet();
+        var readable = readableEpisodes.Select(episode => episode.Id).ToHashSet();
+        var restricted = LibraryAccess.HasContentRestrictions(user);
+        var bindingIds = history.Select(record => HistoryDto.GuidOf(record.Data, "bindingId")).OfType<Guid>().Distinct().ToArray();
+        var bindingItems = new Dictionary<Guid, Guid>();
+        if (restricted && bindingIds.Length > 0)
+        {
+            foreach (var row in await database.EntryBindings.AsNoTracking().Where(binding => bindingIds.Contains(binding.Id))
+                         .Select(binding => new { binding.Id, binding.JellyfinItemId }).ToListAsync(cancellationToken).ConfigureAwait(false))
+                bindingItems[row.Id] = row.JellyfinItemId;
+            foreach (var row in await database.EpisodeBindings.AsNoTracking().Where(binding => bindingIds.Contains(binding.Id))
+                         .Select(binding => new { binding.Id, binding.JellyfinItemId }).ToListAsync(cancellationToken).ConfigureAwait(false))
+                bindingItems[row.Id] = row.JellyfinItemId;
+        }
+
+        // An event that names only its grab or import operation (a queue blocklisting, Codex round 2 P2) is about that
+        // operation's episode. Where some episodes are hidden from the requester and the operation is gone, the event cannot
+        // be placed, so it names nothing.
+        var partial = restricted || readable.Count < known.Count;
+        var operationEpisodes = new Dictionary<Guid, Guid?>();
+        var operationIds = partial
+            ? history.Where(record => HistoryDto.EpisodeOf(record.Data) is null)
+                .Select(record => HistoryDto.GuidOf(record.Data, "operationId")).OfType<Guid>().Distinct().ToArray()
+            : [];
+        if (operationIds.Length > 0)
+        {
+            foreach (var row in await database.ImportOperations.AsNoTracking().Where(operation => operationIds.Contains(operation.Id))
+                         .Select(operation => new { operation.Id, operation.EpisodeId }).ToListAsync(cancellationToken).ConfigureAwait(false))
+                operationEpisodes[row.Id] = row.EpisodeId;
+            foreach (var row in await database.GrabOperations.AsNoTracking().Where(operation => operationIds.Contains(operation.Id))
+                         .Select(operation => new { operation.Id, operation.EpisodeId }).ToListAsync(cancellationToken).ConfigureAwait(false))
+                operationEpisodes[row.Id] = row.EpisodeId;
+            foreach (var row in await database.RetentionOperations.AsNoTracking().Where(operation => operationIds.Contains(operation.Id))
+                         .Select(operation => new { operation.Id, operation.EpisodeId }).ToListAsync(cancellationToken).ConfigureAwait(false))
+                operationEpisodes[row.Id] = row.EpisodeId;
+        }
+
+        var result = new List<HistoryDto>();
+        foreach (var record in history)
+        {
+            var episodeId = HistoryDto.EpisodeOf(record.Data);
+            var summary = record.Summary;
+            if (episodeId is null && partial && HistoryDto.GuidOf(record.Data, "operationId") is { } operationId)
+            {
+                // A series' grabs and imports are per episode: one that names no episode was detached from a row since
+                // deleted, so which episode it was about is unknown (Codex delta review 2).
+                if (!operationEpisodes.TryGetValue(operationId, out var operationEpisode) || operationEpisode is null && series)
+                    summary = Unattributed(record.EventType);
+                else if (operationEpisode is { } owned && known.Contains(owned) && !readable.Contains(owned)) continue;
+            }
+
+            if (episodeId is { } episode)
+            {
+                if (known.Contains(episode) && !readable.Contains(episode)) continue;
+                if (!known.Contains(episode) && restricted) summary = Unattributed(record.EventType);
+            }
+
+            if (restricted)
+            {
+                var bindingId = HistoryDto.GuidOf(record.Data, "bindingId");
+                var itemId = HistoryDto.GuidOf(record.Data, "jellyfinItemId") ??
+                    (bindingId is { } binding && bindingItems.TryGetValue(binding, out var bound) ? bound : null);
+                if (itemId is { } item)
+                {
+                    MediaBrowser.Controller.Entities.BaseItem? native;
+                    try
+                    {
+                        native = library?.GetItemById(item);
+                    }
+                    catch (Exception error) when (error is not OutOfMemoryException)
+                    {
+                        native = null;
+                    }
+
+                    if (native is null) summary = Unattributed(record.EventType);
+                    else if (!LibraryAccess.CanSeeVersion(user, native)) continue;
+                }
+                else if (bindingId is not null) summary = Unattributed(record.EventType);
+            }
+
+            result.Add(new HistoryDto(record.Id, record.EntryId, record.EventType, summary,
+                DateTime.SpecifyKind(record.CreatedAt, DateTimeKind.Utc)) { EpisodeId = episodeId });
+        }
+
+        return result.ToArray();
+    }
+
+    private static string Unattributed(string eventType) => eventType switch
+    {
+        "version_kept" => "Kept a version indefinitely",
+        "version_unkept" => "Stopped keeping a version",
+        "version_removed" => "Removed a version",
+        "imported" => "Imported a download",
+        "blocklisted" => "Blocklisted a release",
+        _ => "Updated this title"
+    };
+
     private async Task<EntryDetail> BuildDetail(Entry entry, CancellationToken cancellationToken)
     {
         var user = access.GetUser(User)!;
@@ -827,8 +988,9 @@ public sealed class EntriesController(
         var readableTargets = readableEpisodes.Select(e => e.Id).Append(entry.Id).ToHashSet();
         var entryRetention = RetentionSummaries.ForViewer(RetentionSummaries.ForEntry(entry, policy,
             evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
-        return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id)), history.Select(h => new HistoryDto(h.Id, h.EntryId, h.EventType, h.Summary,
-            DateTime.SpecifyKind(h.CreatedAt, DateTimeKind.Utc)) { EpisodeId = HistoryDto.EpisodeOf(h.Data) }).ToArray(), episodeDtos, entryRetention,
+        var readableHistory = await ReadableHistoryAsync(user, history, episodes, readableEpisodes, entry.MediaType == "series",
+            cancellationToken).ConfigureAwait(false);
+        return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id)), readableHistory, episodeDtos, entryRetention,
             entry.MediaType == "movie" ? Summary(null) : null)
         {
             Versions = entry.MediaType == "movie" && entry.State == FileState.OnDisk

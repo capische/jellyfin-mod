@@ -39,6 +39,14 @@ public sealed class SeriesMetadataRefresher(
     private static bool SameEpisode(Episode positional, Episode remote, IReadOnlyCollection<DateTime?> listedAirDates) =>
         EpisodeIdentityEvidence.Agrees(positional.Title, positional.AirDate, remote.Title, remote.AirDate, listedAirDates);
 
+    /// <summary>Whether grabs, imports or upgrades still name this episode, which therefore must not be folded away.</summary>
+    private async Task<bool> HasAcquisitionWorkAsync(Guid episodeId, CancellationToken cancellationToken) =>
+        await database.GrabOperations.AnyAsync(grab => grab.EpisodeId == episodeId && grab.ActiveTarget != null, cancellationToken) ||
+        await database.ImportOperations.AnyAsync(operation => operation.EpisodeId == episodeId &&
+            ImportStates.Open.Contains(operation.State), cancellationToken) ||
+        await database.UpgradeOperations.AnyAsync(upgrade => upgrade.EpisodeId == episodeId && upgrade.OpenTargetKey != null,
+            cancellationToken);
+
     /// <summary>Refreshes one series entry. TMDB failures surface as <see cref="TmdbException"/>.</summary>
     public async Task<SeriesRefreshOutcome> RefreshAsync(Guid id, CancellationToken cancellationToken)
     {
@@ -94,9 +102,54 @@ public sealed class SeriesMetadataRefresher(
             {
                 if (byTmdbId.Remove(remote.TmdbId, out var local))
                 {
+                    // A file-less TMDB row never moves onto a position a position-identity row holds (PHASE10, whole-review
+                    // chunk 2c, P2 5). With evidence that they are the same episode, the row with the file takes the TMDB
+                    // identity and the file-less row's settings, unless that row still has acquisition work of its own;
+                    // otherwise the TMDB row keeps its numbers.
+                    var destination = (remote.SeasonNumber, remote.EpisodeNumber);
+                    if (!local.JellyfinItemId.HasValue && destination != originalPositions[local.Id] &&
+                        byPosition.TryGetValue(destination, out var occupant))
+                    {
+                        if (SameEpisode(occupant, remote, listedAirDates) &&
+                            !await HasAcquisitionWorkAsync(local.Id, cancellationToken))
+                        {
+                            byPosition.Remove(destination);
+                            // Its settings and retention protections carry over before its evaluation goes with the row
+                            // (Codex round 2 P1): the grace of an un-Keep can never be lost to a fold.
+                            await RetentionProtectionTransfer.CarryEpisodeAsync(database, entry, occupant, local,
+                                DateTime.UtcNow, cancellationToken);
+                            // Its finished grabs, imports and other records name the surviving row from now on.
+                            await DuplicateRecordTransfer.MoveEpisodeAsync(database, local.Id, occupant.Id, cancellationToken);
+                            database.Episodes.Remove(local);
+                            // Its automation schedule goes with it; the surviving row is scheduled on its own.
+                            database.AutomationTargets.RemoveRange(await database.AutomationTargets
+                                .Where(row => row.TargetId == local.Id).ToListAsync(cancellationToken));
+                            // The TMDB id is released before the position row takes it (one row per identity).
+                            await database.SaveChangesAsync(cancellationToken);
+                            occupant.TmdbId = remote.TmdbId;
+                            (occupant.SeasonNumber, occupant.EpisodeNumber) = originalPositions[occupant.Id];
+                            occupant.Title = remote.Title;
+                            occupant.Overview = remote.Overview;
+                            occupant.StillPath = remote.StillPath;
+                            occupant.AirDate = remote.AirDate;
+                            occupant.RuntimeMinutes = remote.RuntimeMinutes;
+                            database.History.Add(new HistoryRecord
+                            {
+                                EntryId = entry.Id,
+                                EventType = "episode_adopted",
+                                Summary = $"S{occupant.SeasonNumber:00}E{occupant.EpisodeNumber:00} matched TMDB episode {remote.TmdbId}",
+                                Data = JsonSerializer.Serialize(new { episodeId = occupant.Id, tmdbId = remote.TmdbId,
+                                    occupant.SeasonNumber, occupant.EpisodeNumber, mergedEpisodeId = local.Id })
+                            });
+                            continue;
+                        }
+
+                        destination = originalPositions[local.Id];
+                    }
+
                     (local.SeasonNumber, local.EpisodeNumber) = local.JellyfinItemId.HasValue
                         ? originalPositions[local.Id]
-                        : (remote.SeasonNumber, remote.EpisodeNumber);
+                        : destination;
                     local.Title = remote.Title;
                     local.Overview = remote.Overview;
                     local.StillPath = remote.StillPath;

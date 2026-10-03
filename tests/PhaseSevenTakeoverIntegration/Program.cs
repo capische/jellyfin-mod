@@ -44,6 +44,43 @@ try
     Check(!Directory.Exists(Path.Combine(bundlesRoot, "000000000003")) && !Directory.Exists(Path.Combine(bundlesRoot, "000000000004")) &&
         Directory.Exists(Path.Combine(bundlesRoot, "000000000002")), "older bundles are pruned from disk at once, inside their grace period");
 
+    // ---- Whole-review chunk 3c, P2 4: bundle 9 was current for 20 days without a restart (its record is its last start),
+    // then the packaged bundle replaces it. Bundle 9's grace starts now, so it stays; bundle 1, superseded 30 days ago, goes.
+    Directory.CreateDirectory(Path.Combine(bundlesRoot, "000000000009"));
+    File.WriteAllText(Path.Combine(bundlesRoot, "000000000009", "jellyfinmod.html"), "long-running bundle");
+    File.WriteAllText(Path.Combine(bundlesRoot, "retained.json"), JsonSerializer.Serialize(new Dictionary<string, DateTime>
+    {
+        ["000000000009"] = DateTime.UtcNow.AddDays(-20), ["000000000001"] = DateTime.UtcNow.AddDays(-30)
+    }));
+    File.WriteAllText(Path.Combine(bundlesRoot, "current-bundle"), "000000000009");
+    var upgradedStore = new WebBundleStore(Path.Combine(root, "bundles"), Path.GetDirectoryName(package)!, NullLogger<WebBundleStore>.Instance);
+    await upgradedStore.InstallAsync(14, CancellationToken.None);
+    Check(Directory.Exists(Path.Combine(bundlesRoot, "000000000009")) && upgradedStore.RetainedBundleIds.Contains("000000000009") &&
+        !Directory.Exists(Path.Combine(bundlesRoot, "000000000001")),
+        "a bundle replaced after a long run keeps its grace from the replacement (whole-review c3cf4): " +
+        string.Join(",", upgradedStore.RetainedBundleIds));
+
+    // ---- Codex round 2 P2: the upgrade from bundle 8 to bundle 6 twenty days ago gave both the same time. Bundle 6 has been
+    // current since; the packaged bundle now replaces it. Bundle 6 keeps its grace from now and bundle 8 goes, whatever
+    // order the record lists them in.
+    foreach (var id in new[] { "000000000006", "000000000008" })
+    {
+        Directory.CreateDirectory(Path.Combine(bundlesRoot, id));
+        File.WriteAllText(Path.Combine(bundlesRoot, id, "jellyfinmod.html"), "bundle " + id);
+    }
+
+    var tied = DateTime.UtcNow.AddDays(-20);
+    File.WriteAllText(Path.Combine(bundlesRoot, "retained.json"), JsonSerializer.Serialize(new Dictionary<string, DateTime>
+    {
+        ["000000000008"] = tied, ["000000000006"] = tied
+    }));
+    File.WriteAllText(Path.Combine(bundlesRoot, "current-bundle"), "000000000006");
+    var secondUpgrade = new WebBundleStore(Path.Combine(root, "bundles"), Path.GetDirectoryName(package)!, NullLogger<WebBundleStore>.Instance);
+    await secondUpgrade.InstallAsync(14, CancellationToken.None);
+    Check(Directory.Exists(Path.Combine(bundlesRoot, "000000000006")) && !Directory.Exists(Path.Combine(bundlesRoot, "000000000008")),
+        "a second upgrade keeps the bundle that was current, not one that shared its time (Codex round 2 P2): " +
+        string.Join(",", secondUpgrade.RetainedBundleIds));
+
     (WebRootTakeover Engine, string Index, string Stock) Scenario(string name, string prefix = "")
     {
         var web = Path.Combine(root, name, "web");

@@ -150,7 +150,9 @@ internal sealed class PluginHost : IAsyncDisposable
         AcquisitionServices.Add(builder.Services, () => world.Folder);
         AcquisitionServices.AddHostedServices(builder.Services);
         builder.Services.AddSingleton(new GrabHoldOptions(hold));
-        builder.Services.AddSingleton(new TorznabOptions(TimeSpan.FromSeconds(2), 5, 4));
+        // Long enough that a well-behaved indexer always answers in full on a loaded machine; the slow indexer never
+        // answers at all, so it times out whatever this is (Codex round 2 P4).
+        builder.Services.AddSingleton(new TorznabOptions(TimeSpan.FromSeconds(10), 5, 4));
         // A later suite may add or replace registrations; the last registration of a service wins.
         configure?.Invoke(builder.Services);
 

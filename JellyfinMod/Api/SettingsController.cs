@@ -50,6 +50,8 @@ public sealed class SettingsController(
     public async Task<ActionResult<DiscoverySettingsDto>> PatchDiscovery(DiscoverySettingsRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         if (request.Revision is null) return Invalid("revision_required");
         if (ValidateSecret(request.Token) is { } error) return Invalid(error);
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
@@ -108,6 +110,8 @@ public sealed class SettingsController(
         CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         using var operation = SqliteWriteDiagnostics.Operation("seed-protection settings");
         if (request.Revision is null) return Invalid("revision_required");
         if (request.Source is not (SeedProtectionSources.AcquisitionClient or SeedProtectionSources.Separate))
@@ -198,6 +202,8 @@ public sealed class SettingsController(
     public async Task<ActionResult<RetentionSettingsDto>> PatchRetention(RetentionSettingsRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         using var operation = SqliteWriteDiagnostics.Operation("retention settings");
         if (request.Revision is null) return Invalid("revision_required");
         if (request.ReclaimAfterDays is < 1 or > 3650) return Invalid("invalid_reclaim_days", "Days must be between 1 and 3650.");

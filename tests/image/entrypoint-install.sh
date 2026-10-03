@@ -18,7 +18,13 @@
 #  10. a later build in JellyfinMod_0.1.0.0 (Disabled) beside an earlier one in another folder: both kept as they are;
 #  11. an earlier build in JellyfinMod_0.1.0.0 (Disabled) beside an earlier one in another folder (Active): only
 #      JellyfinMod_0.1.0.0 is replaced, and it stays Disabled;
-#  12. the same version only in another folder: kept, nothing installed.
+#  12. the same version only in another folder: kept, nothing installed;
+#  13. a replacement stopped after the installed folder (Disabled, earlier build) was moved aside and before the new one
+#      was in place: the installed folder comes back, is then replaced, and stays Disabled; nothing is left beside it;
+#  14. an install stopped by an earlier image, which deleted the installed folder before moving its prepared copy
+#      (Disabled) into place: installed again, still Disabled, nothing left beside it;
+#  15. another plugin's backup and staging folders, and a JellyfinMod_-named staging copy of another plugin, beside an
+#      interrupted JellyfinMod replacement: JellyfinMod is restored and replaced; the others are left exactly as they are.
 # Leaves nothing behind: every container is --rm and the scratch directory is removed.
 set -euo pipefail
 
@@ -158,4 +164,35 @@ out="$(run "$v")"
 [[ ! -e $v/plugins/JellyfinMod_0.1.0.0 && $(dll "$v" JellyfinMod) == installed ]] && grep -q 'not installed in JellyfinMod_0.1.0.0' <<<"$out" ||
     fail "a version held elsewhere was installed again: $out"
 pass "same version only in another folder: kept, nothing installed"
-echo "PASS: entrypoint plugin install rule (12 cases)"
+
+# 13. Interrupted between moving the installed folder aside and moving the prepared one into place.
+v="$(case_dir interrupted-swap JellyfinMod_0.1.0.0.previous 0.1.0.0 2026-09-25T06:09:17.0000000Z Disabled)"
+add_folder "$v" JellyfinMod_0.1.0.0.installing 0.1.0.0 2026-09-27T05:11:47Z Disabled
+out="$(run "$v")"
+[[ $(dll "$v" JellyfinMod_0.1.0.0) == bundled ]] && grep -q '"status": "Disabled"' "$v/plugins/JellyfinMod_0.1.0.0/meta.json" &&
+    [[ $(find "$v/plugins" -mindepth 1 -maxdepth 1 | wc -l) -eq 1 ]] || fail "an interrupted replacement lost the plugin or its status: $out"
+pass "interrupted replacement: restored, replaced, still Disabled, nothing left beside it"
+
+# 14. Interrupted by an earlier image after it deleted the installed folder.
+v="$(case_dir interrupted-delete JellyfinMod_0.1.0.0.installing 0.1.0.0 2026-09-27T05:11:47Z Disabled)"
+out="$(run "$v")"
+[[ $(dll "$v" JellyfinMod_0.1.0.0) == bundled ]] && grep -q '"status": "Disabled"' "$v/plugins/JellyfinMod_0.1.0.0/meta.json" &&
+    [[ $(find "$v/plugins" -mindepth 1 -maxdepth 1 | wc -l) -eq 1 ]] || fail "an install interrupted by an earlier image lost its status: $out"
+pass "install interrupted by an earlier image: installed again, still Disabled"
+
+# 15. Other plugins' interrupted folders beside an interrupted JellyfinMod replacement.
+v="$(case_dir neighbours JellyfinMod_0.1.0.0.previous 0.1.0.0 2026-09-25T06:09:17.0000000Z Disabled)"
+for folder in Other_1.0.0.0.previous Other_1.0.0.0.installing JellyfinMod_9.9.9.9.installing; do
+    mkdir -p "$v/plugins/$folder"
+    printf '{\n  "guid": "11111111-2222-3333-4444-555555555555",\n  "name": "Other",\n  "version": "1.0.0.0",\n  "status": "Active"\n}\n' \
+        >"$v/plugins/$folder/meta.json"
+    echo other >"$v/plugins/$folder/Other.dll"
+done
+chmod -R 0777 "$v/plugins"
+out="$(run "$v")"
+[[ $(dll "$v" JellyfinMod_0.1.0.0) == bundled ]] && grep -q '"status": "Disabled"' "$v/plugins/JellyfinMod_0.1.0.0/meta.json" &&
+    [[ -f $v/plugins/Other_1.0.0.0.previous/Other.dll && -f $v/plugins/Other_1.0.0.0.installing/Other.dll &&
+       -f $v/plugins/JellyfinMod_9.9.9.9.installing/Other.dll && ! -e $v/plugins/Other_1.0.0.0 && ! -e $v/plugins/JellyfinMod_9.9.9.9 ]] ||
+    fail "recovery touched another plugin's folders: $out"
+pass "another plugin's interrupted folders: left alone; JellyfinMod restored and replaced"
+echo "PASS: entrypoint plugin install rule (15 cases)"

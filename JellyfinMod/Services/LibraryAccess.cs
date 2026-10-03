@@ -9,6 +9,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Globalization;
 using MediaBrowser.Model.Entities;
+using Microsoft.EntityFrameworkCore;
 
 namespace JellyfinMod.Services;
 
@@ -151,6 +152,60 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
                 return folder.GetItemList(query);
             }).DistinctBy(item => item.Id).ToArray();
     }
+
+    /// <summary>
+    /// The entries of a set this user may read, enumerating each library's native items once rather than once per entry,
+    /// for lists that must apply the same visibility as a single read (whole-review chunk 3a P2 5, 3b P2 5).
+    /// </summary>
+    public HashSet<Guid> ReadableEntryIds(User user, IEnumerable<Entry> entries)
+    {
+        var readable = new HashSet<Guid>();
+        foreach (var group in entries.GroupBy(entry => (entry.MediaType, entry.TargetLibraryId)))
+        {
+            if (group.Key.MediaType is not ("movie" or "series")) continue;
+            var nativeIds = group.Any(entry => entry.JellyfinItemId.HasValue)
+                ? GetNativeItems(user, group.Key.MediaType, group.Key.TargetLibraryId).Select(item => item.Id).ToHashSet()
+                : [];
+            readable.UnionWith(group.Where(entry => CanRead(user, entry, nativeIds)).Select(entry => entry.Id));
+        }
+
+        return readable;
+    }
+
+    /// <summary>
+    /// The episodes of a set this user may read, with the same rule as <see cref="CanReadEpisode(User, Episode)"/>: an
+    /// unbound episode follows its series, a bound one must be among the series' visible episodes or a further version of
+    /// one that the user may see. Each series is enumerated once.
+    /// </summary>
+    public async Task<HashSet<Guid>> ReadableEpisodeIdsAsync(ModDbContext database, User user, IReadOnlyCollection<Entry> entries,
+        IReadOnlyCollection<Episode> episodes, CancellationToken cancellationToken)
+    {
+        var readable = new HashSet<Guid>(episodes.Where(episode => !episode.JellyfinItemId.HasValue).Select(episode => episode.Id));
+        foreach (var group in episodes.Where(episode => episode.JellyfinItemId.HasValue).GroupBy(episode => episode.EntryId))
+        {
+            var entry = entries.FirstOrDefault(candidate => candidate.Id == group.Key);
+            var visible = new HashSet<Guid>();
+            if (entry?.JellyfinItemId is { } seriesId &&
+                GetNativeItems(user, "series", entry.TargetLibraryId).FirstOrDefault(item => item.Id == seriesId) is { } series)
+                visible.UnionWith(GetEpisodes(user, series).Select(item => item.Id));
+            var mains = visible.ToArray();
+            visible.UnionWith((await database.EpisodeBindings.AsNoTracking()
+                    .Where(binding => binding.OwnerItemId != null && mains.Contains(binding.OwnerItemId.Value))
+                    .Select(binding => binding.JellyfinItemId).ToListAsync(cancellationToken).ConfigureAwait(false))
+                .Where(itemId => CanSeeVersion(user, itemId)));
+            readable.UnionWith(group.Where(episode => CanReadEpisode(episode, visible)).Select(episode => episode.Id));
+        }
+
+        return readable;
+    }
+
+    /// <summary>
+    /// Whether Jellyfin may hide single items from this user inside a library they can use: a maximum parental rating,
+    /// blocked or allowed tags, or blocked unrated items. Without any of them every episode of a visible series is visible.
+    /// </summary>
+    public static bool HasContentRestrictions(User user) =>
+        user.MaxParentalRatingScore.HasValue || user.GetPreference(PreferenceKind.BlockedTags).Length > 0 ||
+        user.GetPreference(PreferenceKind.AllowedTags).Length > 0 || user.GetPreferenceValues<UnratedItem>(PreferenceKind.BlockUnratedItems).Length > 0;
 
     /// <summary>Gets the latest played descendant date for a native series, using the pinned presentation-key relationship.</summary>
     public DateTime? GetSeriesDatePlayed(User user, BaseItem series, IUserDataManager userData)

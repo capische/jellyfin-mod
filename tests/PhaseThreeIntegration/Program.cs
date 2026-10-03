@@ -16,7 +16,11 @@ using MediaBrowser.Model.Serialization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 var folder = Path.Combine(Path.GetTempPath(), "jfmod-phase-three-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(folder);
@@ -24,6 +28,7 @@ try
 {
     await VerifyLegacyMigrationAsync(folder);
     await VerifyEventAndPolicyPersistenceAsync(folder);
+    await VerifyConcurrentConfigurationSavesAsync(folder);
     Console.WriteLine("PASS: Phase 3 policy and completion evidence survive real events, SQLite migration and restart");
 }
 finally
@@ -117,6 +122,7 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         _ => null
     });
     var persistedConfiguration = new PluginConfiguration();
+    var failNextSave = false;
     var serializer = Stub<IXmlSerializer>.Create((method, arguments) => method.Name switch
     {
         "DeserializeFromFile" => persistedConfiguration,
@@ -142,6 +148,31 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         File.ReadAllText(secretsPath).Contains("tmdb-secret-value", StringComparison.Ordinal),
         "An empty field keeps its secret, submitted references are ignored and the clear marker removes one");
     plugin.UpdateConfiguration(new PluginConfiguration { TmdbReadAccessToken = Plugin.ClearSecret });
+    // Whole-review chunk 3c, P2 3: a replacement whose configuration cannot be saved leaves the saved secret in place.
+    plugin.UpdateConfiguration(new PluginConfiguration { TransmissionPassword = "rpc-original-value" });
+    var originalReference = persistedConfiguration.TransmissionPasswordRef;
+    failNextSave = true;
+    var saveFailed = false;
+    try
+    {
+        plugin.UpdateConfiguration(new PluginConfiguration { TransmissionPassword = "rpc-replacement-value" });
+    }
+    catch (IOException)
+    {
+        saveFailed = true;
+    }
+
+    var afterFailure = File.ReadAllText(secretsPath);
+    Assert(saveFailed && persistedConfiguration.TransmissionPasswordRef == originalReference &&
+        plugin.Configuration.TransmissionPasswordRef == originalReference &&
+        afterFailure.Contains("rpc-original-value", StringComparison.Ordinal) && !afterFailure.Contains("rpc-replacement-value", StringComparison.Ordinal),
+        "A failed save keeps the saved credential and the configuration that names it (whole-review c3cf3)");
+    plugin.UpdateConfiguration(new PluginConfiguration { TransmissionPassword = "rpc-replacement-value" });
+    var afterReplacement = File.ReadAllText(secretsPath);
+    Assert(persistedConfiguration.TransmissionPasswordRef != originalReference &&
+        afterReplacement.Contains("rpc-replacement-value", StringComparison.Ordinal) && !afterReplacement.Contains("rpc-original-value", StringComparison.Ordinal),
+        "A saved replacement retires the credential it replaced");
+    plugin.UpdateConfiguration(new PluginConfiguration { TransmissionPassword = Plugin.ClearSecret });
     var clock = new MutableTimeProvider(new DateTimeOffset(2026, 9, 16, 0, 0, 0, TimeSpan.Zero));
     var movieEntryId = Guid.NewGuid();
     var seriesEntryId = Guid.NewGuid();
@@ -659,6 +690,12 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
 
     object? SaveConfiguration(object?[]? arguments)
     {
+        if (failNextSave)
+        {
+            failNextSave = false;
+            throw new IOException("injected: the configuration could not be written");
+        }
+
         persistedConfiguration = (PluginConfiguration)arguments![0]!;
         return null;
     }
@@ -673,6 +710,73 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
     });
 
     void RaiseUserUpdated(User user) => userUpdated!(null, new GenericEventArgs<User>(user));
+}
+
+// Codex round 2 P2 and delta review 2: two administrators save the plugin's configuration page at the same moment, each
+// replacing one credential and leaving the other as it is. The saves arrive as authenticated HTTP requests, as Jellyfin's
+// plugin configuration endpoint receives them, and are written to a real XML file. Whichever order they land in, the file on
+// disk, and the configuration a restart reads from it, name credentials that are still stored.
+static async Task VerifyConcurrentConfigurationSavesAsync(string folder)
+{
+    var root = Path.Combine(folder, "concurrent-configuration");
+    Directory.CreateDirectory(root);
+    var paths = Stub<IApplicationPaths>.Create((method, _) => method.Name switch
+    {
+        "get_DataPath" or "get_PluginsPath" or "get_PluginConfigurationsPath" => root,
+        _ => null
+    });
+    var serializer = new FileXmlSerializer();
+    var plugin = new Plugin(paths, serializer);
+    var builder = Microsoft.AspNetCore.Builder.WebApplication.CreateSlimBuilder();
+    builder.WebHost.UseUrls("http://127.0.0.1:0");
+    builder.Logging.ClearProviders();
+    await using var app = builder.Build();
+    // The plugin configuration endpoint as Jellyfin serves it: an administrator's request, the posted configuration
+    // deserialized and handed to the plugin.
+    app.MapPost("/Plugins/{id}/Configuration", async (Microsoft.AspNetCore.Http.HttpContext context) =>
+    {
+        if (context.Request.Headers["X-Test-Role"] != "admin") return Microsoft.AspNetCore.Http.Results.Forbid();
+        var posted = await System.Text.Json.JsonSerializer.DeserializeAsync<PluginConfiguration>(context.Request.Body);
+        Plugin.Instance!.UpdateConfiguration(posted!);
+        return Microsoft.AspNetCore.Http.Results.NoContent();
+    });
+    await app.StartAsync();
+    var address = app.Urls.Single();
+    using var http = new HttpClient { BaseAddress = new Uri(address) };
+    http.DefaultRequestHeaders.Add("X-Test-Role", "admin");
+    string ConfigurationPath() => Directory.GetFiles(root, "*.xml").Single();
+    var secretsPath = Path.Combine(root, "jellyfinmod", "acquisition-secrets.json");
+    var lost = new List<string>();
+    for (var round = 0; round < 25; round++)
+    {
+        using var start = new Barrier(2);
+        async Task<System.Net.HttpStatusCode> SaveAsync(PluginConfiguration configuration)
+        {
+            await Task.Run(() => start.SignalAndWait());
+            using var response = await http.PostAsync($"/Plugins/{plugin.Id}/Configuration",
+                new StringContent(System.Text.Json.JsonSerializer.Serialize(configuration), System.Text.Encoding.UTF8, "application/json"));
+            return response.StatusCode;
+        }
+
+        var statuses = await Task.WhenAll(
+            SaveAsync(new PluginConfiguration { TransmissionPassword = $"rpc-round-{round}" }),
+            SaveAsync(new PluginConfiguration { TmdbReadAccessToken = $"tmdb-round-{round}" }));
+        var saved = (PluginConfiguration)serializer.DeserializeFromFile(typeof(PluginConfiguration), ConfigurationPath())!;
+        var stored = File.ReadAllText(secretsPath);
+        if (statuses.Any(status => status != System.Net.HttpStatusCode.NoContent) ||
+            saved.TransmissionPasswordRef is not { } password || !stored.Contains(password, StringComparison.Ordinal) ||
+            saved.TmdbReadAccessTokenRef is not { } token || !stored.Contains(token, StringComparison.Ordinal))
+            lost.Add($"round {round}: {string.Join("/", statuses)}");
+    }
+
+    var restarted = new Plugin(paths, serializer);
+    var store = new AcquisitionSecretStore(restarted.DataPath);
+    var survivesRestart = await store.GetAsync(restarted.Configuration.TransmissionPasswordRef, default) == "rpc-round-24" &&
+        await store.GetAsync(restarted.Configuration.TmdbReadAccessTokenRef, default) == "tmdb-round-24";
+    Assert(lost.Count == 0 && survivesRestart,
+        $"Concurrent configuration saves never leave the saved file naming a retired credential (Codex round 2 P2): " +
+        $"{lost.Count} of 25 rounds lost one ({string.Join("; ", lost.Take(3))}), restart reads both: {survivesRestart}");
+    await app.StopAsync();
 }
 
 static UserItemData State(bool played, long position, DateTime? lastPlayedAt, bool favorite = false) => new()
@@ -753,4 +857,40 @@ class Stub<T> : DispatchProxy where T : class
     }
 
     protected override object? Invoke(MethodInfo? targetMethod, object?[]? arguments) => callback(targetMethod!, arguments);
+}
+
+/// <summary>Writes and reads plugin configuration as real XML files, as Jellyfin's own serializer does.</summary>
+sealed class FileXmlSerializer : IXmlSerializer
+{
+    private static readonly object Gate = new();
+
+    public object? DeserializeFromStream(Type type, Stream stream) => new System.Xml.Serialization.XmlSerializer(type).Deserialize(stream);
+
+    public void SerializeToStream(object obj, Stream stream) =>
+        new System.Xml.Serialization.XmlSerializer(obj.GetType()).Serialize(stream, obj);
+
+    public void SerializeToFile(object obj, string file)
+    {
+        lock (Gate)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+            using var stream = File.Create(file);
+            SerializeToStream(obj, stream);
+        }
+    }
+
+    public object? DeserializeFromFile(Type type, string file)
+    {
+        lock (Gate)
+        {
+            using var stream = File.OpenRead(file);
+            return DeserializeFromStream(type, stream);
+        }
+    }
+
+    public object? DeserializeFromBytes(Type type, byte[] buffer)
+    {
+        using var stream = new MemoryStream(buffer);
+        return DeserializeFromStream(type, stream);
+    }
 }

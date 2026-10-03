@@ -50,6 +50,11 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         var evaluations = await database.RetentionEvaluations.AsNoTracking()
             .Where(evaluation => entryIds.Contains(evaluation.EntryId))
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        // A series summary and the due filter read only episodes this requester may see: an episode hidden by a tag or a
+        // rating must not make its series look due or narrow its deadline (whole-review chunk 3b, P2 4; P3.T15). Only a
+        // user with content restrictions can be denied a single episode of a series they can see.
+        if (request.MediaType == "series" && LibraryAccess.HasContentRestrictions(user) && evaluations.Any(evaluation => evaluation.EpisodeId.HasValue))
+            evaluations = await ReadableEpisodeEvaluationsAsync(user, native, entries, evaluations, cancellationToken).ConfigureAwait(false);
         var retentionPolicy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
             policy => policy.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
         // A series is played when all its episodes are; only the native query applies Jellyfin's episode-based
@@ -136,6 +141,34 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             row.Entry is null ? null : RetentionSummaries.ForViewer(
                 RetentionSummaries.ForEntry(row.Entry, retentionPolicy, evaluations), isAdmin))).ToArray();
         return new BrowseResult(rows, filtered.Length, entries.Length > 0);
+    }
+
+    /// <summary>The evaluations of movies, series and of the episodes this user may read, as the detail page reads them.</summary>
+    private async Task<RetentionEvaluation[]> ReadableEpisodeEvaluationsAsync(Jellyfin.Database.Implementations.Entities.User user,
+        IReadOnlyList<BaseItem> native, IReadOnlyList<Entry> entries, RetentionEvaluation[] evaluations, CancellationToken cancellationToken)
+    {
+        var episodeIds = evaluations.Where(evaluation => evaluation.EpisodeId.HasValue).Select(evaluation => evaluation.EpisodeId!.Value)
+            .Distinct().ToArray();
+        var episodes = await database.Episodes.AsNoTracking().Where(episode => episodeIds.Contains(episode.Id))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var nativeById = native.ToDictionary(item => item.Id);
+        var readable = new HashSet<Guid>();
+        foreach (var group in episodes.GroupBy(episode => episode.EntryId))
+        {
+            var entry = entries.FirstOrDefault(candidate => candidate.Id == group.Key);
+            var visible = new HashSet<Guid>();
+            if (entry?.JellyfinItemId is { } seriesId && nativeById.TryGetValue(seriesId, out var series))
+                visible.UnionWith(access.GetEpisodes(user, series).Select(item => item.Id));
+            // Further versions of readable episodes, which Jellyfin's queries leave out, when the user may see them (V1).
+            var mains = visible.ToArray();
+            visible.UnionWith((await database.EpisodeBindings.AsNoTracking()
+                    .Where(binding => binding.OwnerItemId != null && mains.Contains(binding.OwnerItemId.Value))
+                    .Select(binding => binding.JellyfinItemId).ToListAsync(cancellationToken).ConfigureAwait(false))
+                .Where(itemId => access.CanSeeVersion(user, itemId)));
+            readable.UnionWith(group.Where(episode => LibraryAccess.CanReadEpisode(episode, visible)).Select(episode => episode.Id));
+        }
+
+        return evaluations.Where(evaluation => evaluation.EpisodeId is not { } episodeId || readable.Contains(episodeId)).ToArray();
     }
 
     private static bool MatchesMetadata(Candidate row, BrowseFilters filters) =>

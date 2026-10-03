@@ -58,6 +58,38 @@ public static class ImportPaths
         return "/" + string.Join('/', segments);
     }
 
+    /// <summary>
+    /// The files a client's remove-with-data would delete, as this server sees them: each of the torrent's current files at
+    /// its current download directory, mapped and resolved through every symbolic link. Null when any of them cannot be
+    /// mapped or resolved, which must refuse the deletion (whole-review P1 5 and P1 9).
+    /// </summary>
+    public static IReadOnlyList<string>? ResolveTorrentData(ClientTorrentStatus torrent, IEnumerable<DownloadClientPathMapping> mappings,
+        AcquisitionDownloadClient client, UnixFileInspector files)
+    {
+        var mappingList = mappings as IReadOnlyCollection<DownloadClientPathMapping> ?? mappings.ToArray();
+        var result = new List<string>(torrent.Files.Count);
+        foreach (var file in torrent.Files)
+        {
+            if (Normalize((torrent.DownloadDirectory ?? string.Empty) + "/" + file.Name) is not { } clientPath ||
+                Map(clientPath, mappingList, client) is not { } localPath ||
+                !files.TryResolveForDeletion(localPath, out var resolved))
+                return null;
+            result.Add(resolved);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// The version of a client's mappings: every save replaces the rows with new identities, so any save that leaves a
+    /// mapping, even of the same prefixes, changes it. Two empty sets have the same version; an edit started from an empty
+    /// set and saved over another empty one overwrites nothing (Codex delta review 6, P2).
+    /// </summary>
+    public static string MappingsVersion(IEnumerable<JellyfinMod.Data.DownloadClientPathMapping> mappings) =>
+        Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n',
+            mappings.OrderBy(mapping => mapping.Order).Select(mapping =>
+                $"{mapping.Id:N}|{mapping.Order}|{mapping.ClientPathPrefix}|{mapping.LocalPathPrefix}")))))[..16];
+
     /// <summary>Returns true when <paramref name="path"/> equals or lies below <paramref name="prefix"/>.</summary>
     public static bool Within(string prefix, string path) =>
         prefix == "/" || path == prefix || path.StartsWith(prefix + "/", StringComparison.Ordinal);

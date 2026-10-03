@@ -3,6 +3,7 @@ using System;
 using JellyfinMod.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -10,9 +11,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace JellyfinMod.Data.Migrations
 {
     [DbContext(typeof(ModDbContext))]
-    partial class ModDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261001233419_WholeReviewSeedCleanupManifest")]
+    partial class WholeReviewSeedCleanupManifest
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "10.0.11");
@@ -1132,9 +1135,6 @@ namespace JellyfinMod.Data.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<Guid?>("CancelledBy")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CleanupManifest")
                         .HasColumnType("TEXT");
 
                     b.Property<string>("ClientStatus")

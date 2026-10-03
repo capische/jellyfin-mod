@@ -21,7 +21,8 @@ public sealed class RetentionPreviewService(
     MediaStorageIdentity storage,
     UnixFileInspector files,
     TransmissionSeedClient transmission,
-    TimeProvider clock)
+    TimeProvider clock,
+    Import.SeedReleaseService? seedRelease = null)
 {
     /// <summary>Builds an admin-only preview without deleting or changing media.</summary>
     /// <param name="cancellationToken">Cancels the preview.</param>
@@ -138,10 +139,36 @@ public sealed class RetentionPreviewService(
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
             var byIdentity = pluginSeeds.GroupBy(seed => seed.SeedingPhysicalIdentity, StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
+            // A goal met once is not enough: the goal as it stands now, under the current floor, must be met by what the
+            // torrent last showed (whole-review chunk 1, P2 4). A raised floor blocks again until it is met.
+            var floor = pluginSeeds.Count == 0 ? null : await database.AcquisitionSettings.AsNoTracking()
+                .SingleOrDefaultAsync(value => value.Id == AcquisitionSettings.SingletonId, cancellationToken).ConfigureAwait(false) ??
+                new AcquisitionSettings();
             foreach (var candidate in seedCandidates)
             {
                 if (!byIdentity.TryGetValue(candidate.File!.Value.PhysicalIdentity, out var owned)) continue;
-                if (owned.Any(seed => seed.GoalMetAt is null)) candidate.Block(RetentionPreviewReasons.SeedGoalUnmet, true);
+                if (owned.Any(seed => seed.GoalMetAt is null || !Import.SeedReleaseService.Evaluate(true, seed.ObservedRatio ?? 0,
+                        seed.ObservedSeedingSeconds ?? 0, seed.GoalRatioSource == "client" ? seed.GoalRatio : null, seed.IndexerRatio,
+                        seed.IndexerSeconds, floor!.SeedFloorRatio, floor.SeedFloorHours).Met))
+                {
+                    candidate.Block(RetentionPreviewReasons.SeedGoalUnmet, true);
+                    continue;
+                }
+
+                // What the torrent last showed only ever blocks. Before the file is due, the client is asked now: the torrent
+                // may have turned incomplete, or its client goal been raised, since the last observation (Codex round 2 P2).
+                string? blocked = null;
+                foreach (var seed in owned)
+                {
+                    var current = seedRelease is null ? null
+                        : await seedRelease.CurrentGoalAsync(seed, floor!, cancellationToken).ConfigureAwait(false);
+                    blocked = current is null ? RetentionPreviewReasons.SeedStateUnknown
+                        : current.WaitingFor.Contains("complete") ? RetentionPreviewReasons.SeedingIncomplete
+                        : !current.Met ? RetentionPreviewReasons.SeedGoalUnmet : null;
+                    if (blocked is not null) break;
+                }
+
+                if (blocked is not null) candidate.Block(blocked, true);
                 else candidate.MarkDue(torrentManaged: true, []);
             }
 
@@ -241,11 +268,13 @@ public sealed class RetentionPreviewService(
         return movies.Select(row => new PreviewTarget(row.Binding.Id, row.Entry.Id, null,
                 row.Binding.JellyfinItemId, row.Binding.VersionGroupId, row.Binding.TargetLibraryId, row.Binding.MediaPath,
                 row.Binding.StorageIdentity, null, row.Entry,
-                evaluations.GetValueOrDefault(row.Entry.Id), RetentionOverrides.IsKept(row.Entry, (Episode?)null)))
+                evaluations.GetValueOrDefault(row.Entry.Id), RetentionOverrides.IsKept(row.Entry, (Episode?)null),
+                row.Binding.FileFingerprint))
             .Concat(episodes.Select(row => new PreviewTarget(row.Binding.Id, row.Entry.Id, row.Episode.Id,
                 row.Binding.JellyfinItemId, row.Binding.JellyfinItemId, row.Binding.TargetLibraryId, row.Binding.MediaPath,
                 row.Binding.StorageIdentity, row.Binding.SeriesItemId, row.Entry,
-                evaluations.GetValueOrDefault(row.Episode.Id), RetentionOverrides.IsKept(row.Entry, row.Episode))))
+                evaluations.GetValueOrDefault(row.Episode.Id), RetentionOverrides.IsKept(row.Entry, row.Episode),
+                row.Binding.FileFingerprint)))
             .ToArray();
     }
 
@@ -341,6 +370,14 @@ public sealed class RetentionPreviewService(
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.SymlinkEscape, evaluation?.Deadline, observed);
         if (!files.TryInspect(target.Path!, out var bound) || bound.PhysicalIdentity != observed.PhysicalIdentity)
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaIdentityChanged, evaluation?.Deadline, observed);
+        // Exactly the file reconciliation bound and the schedule belongs to (whole-review P1 1): a file put at the bound path
+        // since then keeps the item id and its old watched state, so two fresh inspections agree on it. Only the stored
+        // fingerprint tells them apart; reconciliation resets the target when it sees the new file. A binding with no
+        // recorded fingerprint cannot show it is the watched file, as for a manual removal (review P1-2).
+        if (string.IsNullOrEmpty(target.Fingerprint))
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaIdentityUnverified, evaluation?.Deadline, observed);
+        if (!string.Equals(target.Fingerprint, bound.FileFingerprint, StringComparison.Ordinal))
+            return PreviewCandidate.Blocked(target, RetentionPreviewReasons.MediaIdentityChanged, evaluation?.Deadline, observed);
         if (keptIdentities.Contains(observed.PhysicalIdentity) || keptPaths.Contains(observed.CanonicalPath))
             return PreviewCandidate.Blocked(target, RetentionPreviewReasons.VersionKept, evaluation?.Deadline, observed);
         return new(target, RetentionPreviewStates.PendingProtection, RetentionPreviewReasons.ProtectionPending,
@@ -403,6 +440,12 @@ public sealed class RetentionPreviewService(
             }
 
             var eligibleAt = Latest(Latest(completedAt, policy.GraceStartAt ?? completedAt), evaluation.BaselineAt);
+            // An administrator's restart on any episode the file holds, bound or not (un-Keep or a changed window), starts
+            // the file's window again from that moment (whole-review P1 2, PHASE10 Q4).
+            foreach (var restarted in coveredRows.Append(ownRow)
+                         .Select(row => evaluations.TryGetValue(row.Id, out var own) ? own.GraceNotBefore : null)
+                         .Append(evaluation.GraceNotBefore).OfType<DateTime>())
+                eligibleAt = Latest(eligibleAt, restarted);
             var deadline = policy.TestWindowMinutes > 0
                 ? eligibleAt.AddMinutes(policy.TestWindowMinutes)
                 : eligibleAt.AddDays(coveredRows.Append(ownRow).Max(row =>
@@ -627,7 +670,8 @@ public sealed class RetentionPreviewService(
         Guid? SeriesItemId,
         Entry Entry,
         RetentionEvaluation? Evaluation,
-        bool Kept);
+        bool Kept,
+        string? Fingerprint);
 
     private sealed class PreviewCandidate(
         PreviewTarget target,
@@ -707,6 +751,7 @@ internal static class RetentionPreviewReasons
     public const string MediaPathUnavailable = "media_path_unavailable";
     public const string SymlinkEscape = "symlink_escape";
     public const string MediaIdentityChanged = "media_identity_changed";
+    public const string MediaIdentityUnverified = "media_identity_unverified";
     public const string ActiveSession = "active_session";
     public const string ActiveSessionUnknown = "active_session_unknown";
     public const string FavoriteSeries = "favorite_series";

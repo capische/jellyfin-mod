@@ -20,6 +20,9 @@ public sealed class ReconciliationService(
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
     private readonly UnixFileInspector _files = files ?? new();
 
+    /// <summary>How long rehoming waits for an orphan's previous library while it holds the destination's lease.</summary>
+    public static readonly TimeSpan OrphanLibraryWait = TimeSpan.FromSeconds(10);
+
     /// <summary>The file's fingerprint now, or null when it cannot be read (RET3-R3).</summary>
     private string? Fingerprint(string? path) =>
         !string.IsNullOrEmpty(path) && _files.TryInspect(path, out var observed) ? observed.FileFingerprint : null;
@@ -473,7 +476,16 @@ public sealed class ReconciliationService(
         foreach (var (observation, detail) in FindObservationConflicts(snapshot.Episodes))
             skipped.TryAdd(observation.JellyfinItemId, detail);
 
-        await RehomeOrphanedEntryAsync(snapshot, representationIds, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await RehomeOrphanedEntryAsync(snapshot, representationIds, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // The move rolled back; nothing it changed in memory may be saved by a later step.
+            database.ChangeTracker.Clear();
+            throw;
+        }
 
         var conflictingEntry = await (from binding in database.EntryBindings.AsNoTracking()
             join boundEntry in database.Entries.AsNoTracking() on binding.EntryId equals boundEntry.Id
@@ -578,6 +590,7 @@ public sealed class ReconciliationService(
         var arrivedMovieFiles = new List<string?>();
         var replacedMovieFiles = new List<string?>();
         var entryBindingChanges = 0;
+        var addedEntryBindings = 0;
         foreach (var representation in snapshot.Representations)
         {
             var fingerprint = Fingerprint(representation.MediaPath);
@@ -606,6 +619,7 @@ public sealed class ReconciliationService(
 
             // A file this movie did not have before (RET2-R1); the same file under a new native id is not one.
             if (!boundMoviePaths.Contains(representation.MediaPath)) arrivedMovieFiles.Add(representation.MediaPath);
+            addedEntryBindings++;
             database.EntryBindings.Add(new EntryBinding
             {
                 EntryId = entry.Id,
@@ -631,6 +645,21 @@ public sealed class ReconciliationService(
             database.EntryBindings.Remove(stale);
             entryBindingChanges++;
         }
+
+        // A movie's retention baseline is the moment it is first tracked, as an episode's is (PHASE10 decision 12): a first
+        // watch right after that counts even when it, not a run, triggers the first evaluation (whole-review chunk 1, P2 7).
+        if (snapshot.MediaType == "movie" && entryBindings.Count == 0 && addedEntryBindings > 0 &&
+            !await database.RetentionEvaluations.AnyAsync(evaluation => evaluation.TargetId == entry.Id, cancellationToken)
+                .ConfigureAwait(false))
+            database.RetentionEvaluations.Add(new RetentionEvaluation
+            {
+                EntryId = entry.Id,
+                TargetId = entry.Id,
+                State = RetentionEvaluationStates.Waiting,
+                Reason = RetentionEvaluationReasons.WaitingForCompletion,
+                BaselineAt = _clock.GetUtcNow().UtcDateTime,
+                RequiresFreshCompletion = true
+            });
 
         var playableRepresentations = snapshot.MediaType == "series"
             ? snapshot.Representations.Where(representation => snapshot.HasPlayableEpisode(representation.JellyfinItemId))
@@ -835,8 +864,23 @@ public sealed class ReconciliationService(
             candidate.TargetLibraryId is not { } libraryId || !IsLiveLibrary(libraryId));
         if (orphan is null) return;
 
-        await using var oldLease = orphan.TargetLibraryId is { } oldLibrary && oldLibrary != snapshot.TargetLibraryId
-            ? await libraryLock.AcquireAsync(oldLibrary, cancellationToken).ConfigureAwait(false)
+        // The destination library's lease is already held, so the orphan's library is taken out of order: only with a bounded
+        // wait. A writer holding that library and waiting for the destination (retention recovery takes libraries in order)
+        // would otherwise deadlock with this; when the wait runs out the move is left for the next reconciliation (final
+        // review, finding 2).
+        IAsyncDisposable? oldLease = null;
+        if (orphan.TargetLibraryId is { } oldLibrary && oldLibrary != snapshot.TargetLibraryId)
+        {
+            oldLease = await libraryLock.TryAcquireAsync(oldLibrary, OrphanLibraryWait, cancellationToken).ConfigureAwait(false);
+            if (oldLease is null) return;
+        }
+
+        await using var heldOldLease = oldLease;
+        // The whole move is one transaction: the merged policy, the moved and merged episodes, their records, the fresh grace
+        // and the wanted entry's removal commit together or not at all, so an interrupted move is simply done again from
+        // the start and a grace restart can never be lost between two saves (Codex delta review 3, P1).
+        await using var transaction = database.Database.CurrentTransaction is null
+            ? await database.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false)
             : null;
         var entry = await database.Entries.SingleOrDefaultAsync(candidate => candidate.Id == orphan.Id, cancellationToken)
             .ConfigureAwait(false);
@@ -855,24 +899,56 @@ public sealed class ReconciliationService(
                     database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id), cancellationToken)
                     .ConfigureAwait(false))
                 return;
-            if (existing.RetentionPolicy == RetentionPolicy.Never) entry.RetentionPolicy = RetentionPolicy.Never;
-            entry.Monitored |= existing.Monitored;
+            // The wanted entry's settings and retention protections carry over conservatively before it goes, its evaluations
+            // with it (P3.T13, PHASE10 Q4; Codex re-review P1-b, P2-d).
+            var mergedAt = _clock.GetUtcNow().UtcDateTime;
+            var seriesWindowGrew = await RetentionProtectionTransfer.CarryEntryAsync(database, entry, existing, mergedAt, cancellationToken)
+                .ConfigureAwait(false);
             var trackedEpisodes = await database.Episodes.Where(episode => episode.EntryId == entry.Id)
-                .Select(episode => episode.TmdbId).ToListAsync(cancellationToken).ConfigureAwait(false);
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var moved = new List<Guid>();
             foreach (var wanted in await database.Episodes.Where(episode => episode.EntryId == existing.Id)
                          .ToListAsync(cancellationToken).ConfigureAwait(false))
             {
-                if (trackedEpisodes.Contains(wanted.TmdbId))
-                    database.Episodes.Remove(wanted);
-                else
+                // A TMDB episode matches its TMDB id; a position-identity row (TMDB id 0) matches its season and number only,
+                // never every other position row (whole-review P1 3).
+                var survivor = trackedEpisodes.FirstOrDefault(tracked => wanted.TmdbId > 0
+                    ? tracked.TmdbId == wanted.TmdbId
+                    : tracked.TmdbId == 0 && tracked.SeasonNumber == wanted.SeasonNumber &&
+                      tracked.EpisodeNumber == wanted.EpisodeNumber);
+                if (survivor is null)
+                {
                     wanted.EntryId = entry.Id;
+                    moved.Add(wanted.Id);
+                    continue;
+                }
+
+                await RetentionProtectionTransfer.CarryEpisodeAsync(database, entry, survivor, wanted, mergedAt, cancellationToken)
+                    .ConfigureAwait(false);
+                await DuplicateRecordTransfer.MoveEpisodeAsync(database, wanted.Id, survivor.Id, cancellationToken).ConfigureAwait(false);
+                database.Episodes.Remove(wanted);
             }
 
+            // A moved episode's evaluation moves with it; left on the wanted entry it would go with that entry's removal.
+            foreach (var evaluation in await database.RetentionEvaluations.Where(evaluation => evaluation.EpisodeId != null &&
+                             moved.Contains(evaluation.EpisodeId.Value))
+                         .ToListAsync(cancellationToken).ConfigureAwait(false))
+                evaluation.EntryId = entry.Id;
+            await DuplicateRecordTransfer.MoveEntryAsync(database, existing.Id, entry.Id, cancellationToken).ConfigureAwait(false);
             foreach (var record in await database.History.Where(history => history.EntryId == existing.Id)
                          .ToListAsync(cancellationToken).ConfigureAwait(false))
                 record.EntryId = entry.Id;
             // The wanted entry's rows move first so its removal cannot cascade them away.
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            // A longer series window taken from the wanted entry gives every episode that follows it a fresh grace, moved
+            // episodes and episodes without a file of their own included (Codex delta review 1, P1).
+            if (seriesWindowGrew)
+            {
+                await RetentionProtectionTransfer.RestartFollowingEpisodesAsync(database, entry, mergedAt, cancellationToken)
+                    .ConfigureAwait(false);
+                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             database.Entries.Remove(existing);
         }
 
@@ -894,6 +970,7 @@ public sealed class ReconciliationService(
                 mergedEntryId = existing?.Id })
         });
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        if (transaction is not null) await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         database.ChangeTracker.Clear();
     }
 

@@ -92,6 +92,46 @@ public sealed partial class UnixFileInspector
         }
     }
 
+    /// <summary>
+    /// Resolves a path a deletion would act on: its deepest existing ancestor through every symbolic link, followed by the
+    /// components that do not exist yet (a file a torrent has not created). False when nothing can be resolved, when a
+    /// component cannot be read, or when a missing component is a dangling symbolic link, whose target a later write could
+    /// create anywhere (whole-review P1 9).
+    /// </summary>
+    public bool TryResolveForDeletion(string path, out string resolvedPath)
+    {
+        resolvedPath = string.Empty;
+        if (!OperatingSystem.IsLinux() || string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            var current = Path.GetFullPath(path);
+            var missing = new Stack<string>();
+            while (true)
+            {
+                switch (Probe(current))
+                {
+                    case PathPresence.Present:
+                        if (!TryCanonicalize(current, out var canonical)) return false;
+                        resolvedPath = missing.Aggregate(canonical, (prefix, name) => prefix.TrimEnd('/') + "/" + name);
+                        return true;
+                    case PathPresence.Unknown:
+                        return false;
+                }
+
+                if (new FileInfo(current).LinkTarget is not null) return false;
+                var parent = Path.GetDirectoryName(current);
+                if (string.IsNullOrEmpty(parent) || parent == current) return false;
+                missing.Push(Path.GetFileName(current));
+                current = parent;
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or
+            NotSupportedException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>Resolves an existing path through every symbolic-link segment.</summary>
     public bool TryCanonicalize(string path, out string canonicalPath)
     {
@@ -198,11 +238,16 @@ public sealed partial class UnixFileInspector
         : OpenPath | 0x4000 | 0x8000 | 0x80000;
 
     /// <summary>
-    /// Unlinks exactly the verified file (P3.T12). Every directory from <c>/</c> down is opened relative to its
-    /// parent without following symbolic links, so a directory swapped for a symlink after the check cannot
-    /// redirect the unlink; the final name must still be the same device and inode, so a same-name
-    /// replacement is detected instead of deleted.
+    /// Unlinks the verified file (P3.T12). Every directory from <c>/</c> down is opened relative to its parent without
+    /// following symbolic links, so a directory swapped for a symlink before the walk cannot redirect the unlink; the final
+    /// name is checked to be the same device and inode just before the unlink, so a same-name replacement made before that
+    /// check is detected and kept.
     /// </summary>
+    /// <remarks>
+    /// The check and the unlink are two system calls (<c>statx</c>, then <c>unlinkat</c> on the same folder descriptor), not
+    /// one: a replacement made in that instant is unlinked instead, and a folder moved after the walk is unlinked from in its
+    /// new place (Codex delta review 9, P3 8).
+    /// </remarks>
     public PinnedUnlinkResult UnlinkPinned(string canonicalPath, string expectedPhysicalIdentity)
     {
         if (!OperatingSystem.IsLinux() || !Path.IsPathFullyQualified(canonicalPath))
@@ -239,6 +284,109 @@ public sealed partial class UnixFileInspector
         {
             if (directory >= 0) NativeMethods.Close(directory);
         }
+    }
+
+    private const int AtEmptyPath = 0x1000;
+
+    /// <summary>
+    /// Reads one directory entry through descriptors: every directory from <c>/</c> down is opened relative to its parent
+    /// without following symbolic links, the final entry is read with <c>statx</c> without following it, and each directory
+    /// on the way is identified by device and inode, so a folder reached under another name is recognised (retention's guard
+    /// for kept downloads). Nothing is changed.
+    /// </summary>
+    public EntryInspection InspectEntry(string canonicalPath)
+    {
+        if (!OperatingSystem.IsLinux() || !Path.IsPathFullyQualified(canonicalPath))
+            return EntryInspection.Unreadable("Reading a download needs Linux and a canonical path.");
+        var segments = canonicalPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0 || segments.Any(segment => segment is "." or ".."))
+            return EntryInspection.Unreadable("The path is not a file path.");
+        var ancestors = new List<string>(segments.Length);
+        var directory = NativeMethods.Open("/", DirectoryFlags, 0);
+        if (directory < 0) return EntryInspection.Unreadable($"Opening / failed ({Marshal.GetLastPInvokeError()}).");
+        try
+        {
+            if (DirectoryId(directory) is { } rootId) ancestors.Add(rootId);
+            foreach (var segment in segments[..^1])
+            {
+                var next = NativeMethods.OpenAt(directory, segment, DirectoryFlags, 0);
+                var error = Marshal.GetLastPInvokeError();
+                NativeMethods.Close(directory);
+                directory = next;
+                if (directory < 0)
+                    return error == ErrorNoEntry ? EntryInspection.Gone
+                        : EntryInspection.Unreadable($"A folder on its path changed or is a link ({error}).");
+                if (DirectoryId(directory) is { } id) ancestors.Add(id);
+            }
+
+            var buffer = Marshal.AllocHGlobal(256);
+            try
+            {
+                for (var offset = 0; offset < 256; offset += sizeof(long)) Marshal.WriteInt64(buffer, offset, 0);
+                if (NativeMethods.Statx(directory, segments[^1], AtSymlinkNoFollow, StatxBasicStats | StatxBirthTime, buffer) != 0)
+                {
+                    var error = Marshal.GetLastPInvokeError();
+                    return error == ErrorNoEntry ? EntryInspection.Gone : EntryInspection.Unreadable($"statx failed ({error}).");
+                }
+
+                var mode = unchecked((ushort)Marshal.ReadInt16(buffer, 28));
+                return new EntryInspection(true, (mode & 0xF000) == 0x8000, Identity(buffer),
+                    unchecked((long)(ulong)Marshal.ReadInt64(buffer, 40)), unchecked((uint)Marshal.ReadInt32(buffer, 16)),
+                    DescriptorPath(directory), ancestors, null);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+        finally
+        {
+            if (directory >= 0) NativeMethods.Close(directory);
+        }
+    }
+
+    /// <summary>The device and inode of a directory, following links, for comparing folders reached under different names.</summary>
+    public bool TryGetDirectoryId(string path, out string id)
+    {
+        id = string.Empty;
+        if (!OperatingSystem.IsLinux() || !Path.IsPathFullyQualified(path)) return false;
+        var directory = NativeMethods.Open(path, OpenPath | 0x80000, 0);
+        if (directory < 0) return false;
+        try
+        {
+            id = DirectoryId(directory) ?? string.Empty;
+            return id.Length > 0;
+        }
+        finally
+        {
+            NativeMethods.Close(directory);
+        }
+    }
+
+    private static string? DirectoryId(int descriptor)
+    {
+        var buffer = Marshal.AllocHGlobal(256);
+        try
+        {
+            for (var offset = 0; offset < 256; offset += sizeof(long)) Marshal.WriteInt64(buffer, offset, 0);
+            if (NativeMethods.Statx(descriptor, string.Empty, AtEmptyPath | AtSymlinkNoFollow, StatxBasicStats, buffer) != 0) return null;
+            var inode = unchecked((ulong)Marshal.ReadInt64(buffer, 32));
+            var major = unchecked((uint)Marshal.ReadInt32(buffer, 136));
+            var minor = unchecked((uint)Marshal.ReadInt32(buffer, 140));
+            return $"{major:x8}:{minor:x8}:{inode:x16}";
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    /// <summary>Where an open directory is now, read from the kernel through its descriptor.</summary>
+    private static string? DescriptorPath(int descriptor)
+    {
+        var buffer = new byte[PathMax];
+        var length = NativeMethods.ReadLink($"/proc/self/fd/{descriptor}", buffer, buffer.Length);
+        return length > 0 ? System.Text.Encoding.UTF8.GetString(buffer, 0, (int)length) : null;
     }
 
     /// <summary>
@@ -317,6 +465,9 @@ public sealed partial class UnixFileInspector
         [LibraryImport("libc", EntryPoint = "unlinkat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
         internal static partial int UnlinkAt(int directoryFileDescriptor, string path, int flags);
 
+        [LibraryImport("libc", EntryPoint = "readlink", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
+        internal static partial nint ReadLink(string path, byte[] buffer, nint size);
+
         [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
         internal static partial int Close(int fileDescriptor);
 
@@ -343,8 +494,27 @@ public readonly record struct HardlinkResult(bool Linked, int Errno)
     public bool Exists => Errno == 17;
 }
 
+/// <summary>What retention's guard for kept downloads read about one directory entry.</summary>
+/// <param name="Found">Whether the entry exists.</param>
+/// <param name="IsRegular">Whether it is a regular file.</param>
+/// <param name="Identity">Its device, inode and birth time.</param>
+/// <param name="Size">Its size in bytes.</param>
+/// <param name="LinkCount">How many names share its data.</param>
+/// <param name="Folder">Its folder as the kernel reports the descriptor that reached it.</param>
+/// <param name="FolderIds">The device and inode of every folder from <c>/</c> down to its own.</param>
+/// <param name="Error">Why it could not be read, when it could not.</param>
+public sealed record EntryInspection(bool Found, bool IsRegular, string Identity, long Size, uint LinkCount, string? Folder,
+    IReadOnlyList<string> FolderIds, string? Error)
+{
+    /// <summary>Nothing is at the path any more.</summary>
+    public static EntryInspection Gone { get; } = new(false, false, string.Empty, 0, 0, null, [], null);
+
+    /// <summary>The path could not be read; retention refuses.</summary>
+    public static EntryInspection Unreadable(string error) => new(false, false, string.Empty, 0, 0, null, [], error);
+}
+
 /// <summary>The outcome of a pinned unlink.</summary>
-/// <param name="Removed">True when exactly the verified file was unlinked.</param>
+/// <param name="Removed">True when the name was unlinked after it last checked as the verified file (the check and the unlink are separate system calls).</param>
 /// <param name="IsReplacement">True when the path now leads to a different file or directory chain.</param>
 /// <param name="Detail">Why nothing was removed.</param>
 public readonly record struct PinnedUnlinkResult(bool Removed, bool IsReplacement, string? Detail)

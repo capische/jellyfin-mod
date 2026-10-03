@@ -143,6 +143,13 @@ public sealed class ImportOperation
     [MaxLength(40)]
     public string InfoHash { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Gets or sets the downloaded files an administrator's queue removal left on disk when the client forgot the torrent,
+    /// as JSON (Codex delta review 5; user decisions 2026-10-02: nothing is deleted automatically, and 0.1.0.0 never deletes a download; a cleanup tool is planned for a later version).
+    /// Null when there is nothing recorded.
+    /// </summary>
+    public string? CleanupManifest { get; set; }
+
     /// <summary>Gets or sets the raw release title copied from the grab.</summary>
     [MaxLength(1024)]
     public string ReleaseTitle { get; set; } = string.Empty;
@@ -283,14 +290,25 @@ public static class SeedReleaseStates
     /// <summary>Seeding towards the effective goal.</summary>
     public const string Waiting = "waiting";
 
-    /// <summary>The client was asked to remove the torrent and its data; the outcome is being inspected.</summary>
+    /// <summary>
+    /// The client is being asked to forget the torrent, never to delete its data; the checked files are recorded first.
+    /// </summary>
     public const string Removing = "removing";
 
-    /// <summary>Terminal: released, or the seeding copy was already gone.</summary>
+    /// <summary>
+    /// Terminal: every recorded file was accounted for, or the torrent was removed outside the plugin.
+    /// </summary>
     public const string Completed = "completed";
 
     /// <summary>A precondition failed; nothing was removed.</summary>
     public const string Blocked = "blocked";
+
+    /// <summary>
+    /// The client forgot the torrent after its goal and nothing was deleted: the downloaded files stay on disk, recorded, for
+    /// the administrator to remove (0.1.0.0 never deletes a download; a cleanup tool is planned for a later version; user decisions 2026-10-02). Not open: no tick changes it, and a missing torrent
+    /// never completes it.
+    /// </summary>
+    public const string Detached = "detached";
 
     /// <summary>Terminal: removed from the queue by an administrator.</summary>
     public const string Cancelled = "cancelled";
@@ -332,7 +350,7 @@ public static class SeedReleaseReasons
     /// <summary>The client removed the torrent but the seeding file is still on disk.</summary>
     public const string SeedingSurvived = "seeding_copy_survived";
 
-    /// <summary>Released by the plugin after the goal.</summary>
+    /// <summary>Released after the goal: detached, and its recorded files accounted for.</summary>
     public const string Released = "released";
 
     /// <summary>The client no longer held the torrent; the plugin deleted nothing.</summary>
@@ -340,6 +358,15 @@ public static class SeedReleaseReasons
 
     /// <summary>Removed from the queue.</summary>
     public const string Cancelled = "cancelled";
+
+    /// <summary>Detached; its checked files wait for the administrator's manual cleanup.</summary>
+    public const string CleanupPending = "cleanup_pending";
+
+    /// <summary>
+    /// Detached by an older build without a trustworthy list of its files: shown for manual cleanup with its seeding path and
+    /// never resolved automatically (Codex delta review 5, P2).
+    /// </summary>
+    public const string ManualCleanup = "manual_cleanup";
 }
 
 /// <summary>The plugin's ownership of one seeding copy after its import (P5.I6).</summary>
@@ -419,6 +446,14 @@ public sealed class SeedReleaseOperation
     /// <summary>Gets or sets the library hardlink created by the import. Administrator-only.</summary>
     [MaxLength(4096)]
     public string LibraryPath { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the torrent's checked files, as JSON, stored before the client is asked to forget the torrent and kept
+    /// on disk afterwards for the administrator to remove (Codex delta reviews 3 and 5; user decisions 2026-10-02: nothing is
+    /// deleted automatically, and 0.1.0.0 never deletes a download; a cleanup tool is planned for a later version). Null when there is nothing recorded, or for a release left by an older build without
+    /// a trustworthy list, which is marked for manual cleanup instead.
+    /// </summary>
+    public string? CleanupManifest { get; set; }
 
     /// <summary>Gets or sets the logical size of the file.</summary>
     public long SourceLogicalBytes { get; set; }

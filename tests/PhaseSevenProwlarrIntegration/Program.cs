@@ -235,6 +235,69 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
             }), 200, "Administrator moves the source back");
             Assert(Synced(await Indexers(), 1).GetProperty("baseUrl").GetString() == new Uri(prowlarr.Address, "/1/api").ToString() &&
                 Synced(await Indexers(), 1).GetProperty("verified").GetBoolean(), "Moving back re-points and re-verifies the feeds");
+
+            // Whole-review P1 c3bf1: a search read Alpha's feed address, then the source moved with a new key. Resolving
+            // that search's endpoint must not pair the old address with the new key.
+            AcquisitionIndexer staleAlpha;
+            await using (var database = new ModDbContext(dbPath))
+                staleAlpha = await database.AcquisitionIndexers.AsNoTracking().SingleAsync(row => row.Id == alphaId);
+            var movedKey = "prowlarr-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+            secrets.Add(movedKey);
+            moved.ApiKey = movedKey;
+            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
+            {
+                name = "Prowlarr", baseUrl = moved.Address.ToString(), apiKey = new { action = "replace", value = movedKey },
+                revision = source.GetProperty("revision").GetInt32()
+            }), 200, "Administrator moves the source with a new key");
+            string? refusal = null;
+            string? pairedHost = null;
+            using (var scope = host.Service<IServiceScopeFactory>().CreateScope())
+            {
+                try
+                {
+                    var endpoint = await scope.ServiceProvider.GetRequiredService<JellyfinMod.Services.Acquisition.AcquisitionConfiguration>()
+                        .EndpointAsync(staleAlpha, default);
+                    pairedHost = endpoint.BaseUrl.Host + (endpoint.ApiKey == movedKey ? " with the new key" : " with another key");
+                }
+                catch (JellyfinMod.Services.Acquisition.TorznabException failure)
+                {
+                    refusal = failure.Code;
+                }
+            }
+
+            Assert(refusal == "source_changed",
+                $"A feed address read before a move is never paired with the moved source's key (whole-review P1 c3bf1): {refusal ?? pairedHost}");
+            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
+            {
+                name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "replace", value = rotated },
+                revision = source.GetProperty("revision").GetInt32()
+            }), 200, "Administrator moves the source back with its key");
+            Assert(Synced(await Indexers(), 1).GetProperty("verified").GetBoolean(), "Back at the old host, the feeds verify again");
+
+            // A sync that read the source before a move must not write the old feed addresses back over it.
+            moved.ApiKey = rotated;
+            await using (var staleContext = new ModDbContext(dbPath))
+            {
+                using var syncScope = host.Service<IServiceScopeFactory>().CreateScope();
+                var staleSync = ActivatorUtilities.CreateInstance<JellyfinMod.Services.Acquisition.ProwlarrSync>(syncScope.ServiceProvider,
+                    staleContext);
+                var staleSource = await staleContext.ProwlarrSources.SingleAsync(row => row.Id == sourceId);
+                source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
+                {
+                    name = "Prowlarr", baseUrl = moved.Address.ToString(), apiKey = new { action = "unchanged" },
+                    revision = source.GetProperty("revision").GetInt32()
+                }), 200, "Administrator moves the source while a sync is in flight");
+                var staleOutcome = await staleSync.SyncAsync(staleSource, default);
+                var alphaAfter = Synced(await Indexers(), 1).GetProperty("baseUrl").GetString();
+                Assert(staleOutcome.Code == "source_changed" && alphaAfter == new Uri(moved.Address, "/1/api").ToString(),
+                    $"An in-flight sync never restores the old feed addresses after a move (whole-review P1 c3bf1): {staleOutcome.Code}, {alphaAfter}");
+            }
+
+            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
+            {
+                name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "unchanged" },
+                revision = source.GetProperty("revision").GetInt32()
+            }), 200, "Administrator moves the source back again");
         }
 
         // ---- S9-R1: the scheduled task honours the source's own interval.
@@ -350,6 +413,21 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         Assert(rows.Length == 1 && rows[0].GetProperty("managedBy").GetString() == "manual" &&
             !File.ReadAllText(Path.Combine(folder, "acquisition-secrets.json")).Contains(rotated, StringComparison.Ordinal),
             "Its synced indexers and its key go with it; the manual indexer stays");
+        // ---- Whole-review P1 4: a redirect never carries the key anywhere. Prowlarr behind a proxy that redirects (here to
+        // another path; to another host in the finding) is refused, and the redirected request is never sent.
+        var movedSource = await Read(admin.PostAsJsonAsync("/JellyfinMod/Settings/Prowlarr", new
+        {
+            name = "Moved Prowlarr", baseUrl = new Uri(prowlarr.Address, "/moved/").ToString(), apiKey = new { action = "replace", value = prowlarr.ApiKey }
+        }), 201, "Administrator adds a source whose address redirects");
+        var movedId = movedSource.GetProperty("id").AsGuid();
+        var movedTest = await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{movedId}/Test", null), 200, "Redirecting test");
+        var movedSync = await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{movedId}/Sync", null), 200, "Redirecting sync");
+        Assert(prowlarr.CapturedKeys == 0 && movedTest.GetProperty("code").GetString() == "unreachable" &&
+            movedSync.GetProperty("code").GetString() == "unreachable",
+            $"A redirect is refused and never followed with the API key (whole-review P1 4): captured {prowlarr.CapturedKeys}, " +
+            $"test {movedTest.GetProperty("code").GetString()}, sync {movedSync.GetProperty("code").GetString()}");
+        Assert((await admin.DeleteAsync($"/JellyfinMod/Settings/Prowlarr/{movedId}")).StatusCode == HttpStatusCode.NoContent,
+            "Administrator removes the redirecting source");
         var health = await Read(admin.GetAsync("/JellyfinMod/Health"), 200, "Health");
         Assert(health.GetProperty("Capabilities").EnumerateArray().Any(value => value.GetString() == "acquisition.prowlarr"), "Health advertises acquisition.prowlarr");
     }
@@ -378,6 +456,8 @@ internal sealed class ProwlarrBoundary(TorznabBoundary torznab, string host = "1
 {
     private int _requests;
     private int _feedRequests;
+    private int _capturedKeys;
+    public int CapturedKeys => _capturedKeys;
     public int Requests => _requests;
     public int FeedRequests => _feedRequests;
     private WebApplication _app = null!;
@@ -410,6 +490,18 @@ internal sealed class ProwlarrBoundary(TorznabBoundary torznab, string host = "1
         }));
         _app.MapGet("/api/v1/indexerstatus", context => Api(context, () => new JsonArray(DisabledTill.Select(pair =>
             (JsonNode)new JsonObject { ["indexerId"] = pair.Key, ["disabledTill"] = pair.Value.ToString("O") }).ToArray())));
+        // A reverse proxy that redirects (whole-review P1 4): whatever follows it to /capture would carry the key there.
+        _app.MapGet("/moved/{**rest}", context =>
+        {
+            context.Response.StatusCode = 302;
+            context.Response.Headers.Location = "/capture/" + context.Request.RouteValues["rest"] + context.Request.QueryString;
+            return Task.CompletedTask;
+        });
+        _app.MapGet("/capture/{**rest}", context =>
+        {
+            if (context.Request.Headers.ContainsKey("X-Api-Key")) Interlocked.Increment(ref _capturedKeys);
+            return Api(context, () => new JsonObject { ["version"] = "1.99.0-boundary" });
+        });
         _app.MapGet("/{id:int}/api", async context =>
         {
             Interlocked.Increment(ref _feedRequests);

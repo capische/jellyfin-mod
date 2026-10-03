@@ -201,6 +201,20 @@ public sealed class ImportService(
                 await IdentifyAsync(operation, snapshot, settings, entry, episode, cancellationToken).ConfigureAwait(false);
                 return;
             case ImportStates.Linking:
+                // Found in `linking` by a later tick: the process stopped before the hardlink was made or recorded. Unless the
+                // recorded destination already is the identified file, identify again against this client snapshot, so a
+                // download the client now reports incomplete (a recheck after the restart) is never linked (whole-review
+                // chunk 2b, P2 4). Identification links straight away when completion and size still hold.
+                if (!(operation.DestinationPath is { } recorded && operation.SourcePhysicalIdentity is { } identified &&
+                      files.TryInspect(recorded, out var existing) && existing.PhysicalIdentity == identified))
+                {
+                    operation.State = ImportStates.Identifying;
+                    operation.UpdatedAt = Now;
+                    await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+                    await IdentifyAsync(operation, snapshot, settings, entry, episode, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
                 await LinkAsync(operation.Id, operation.TargetLibraryId, entry, episode, cancellationToken).ConfigureAwait(false);
                 return;
             case ImportStates.Linked:
@@ -868,7 +882,12 @@ public sealed class ImportService(
             return new(path, root, episodeLabel, Missing(seriesFolder, seasonFolder), null, null);
         }
 
-        var movieFolder = await BoundMovieFolderAsync(entry, roots, cancellationToken).ConfigureAwait(false);
+        var (movieFolder, heldUngrouped) = await BoundMovieFolderAsync(entry, roots, cancellationToken).ConfigureAwait(false);
+        // Another version of a title whose only files lie directly in a library root: a new file in a folder of its own would
+        // be a separate movie to Jellyfin, never a version of it (V1 S2). An upgrade replaces the held file instead.
+        if (movieFolder is null && heldUngrouped && operation.Intent == GrabIntents.AddVersion)
+            return DestinationPlan.Blocked(ImportReasons.VersionsNotGrouped,
+                "The title's file lies directly in the library folder, so Jellyfin would not group a new version with it.");
         if (movieFolder is not null && !SameMount(sourceMount, sourceIdentity, movieFolder, source))
             return DestinationPlan.Blocked(ImportReasons.CrossFilesystem,
                 "The movie's folder is on a different mount from the download; nothing was copied.");
@@ -950,10 +969,17 @@ public sealed class ImportService(
         }
     }
 
-    private async Task<string?> BoundMovieFolderAsync(Entry entry, IReadOnlyList<string> roots, CancellationToken cancellationToken)
+    /// <summary>
+    /// The folder of a file the movie already holds, where a new version is grouped with it; null with
+    /// <c>HeldUngrouped</c> false when the movie holds no file, or true when it holds files but none in a folder of its own
+    /// (directly in a library root), where no new version can join them (whole-review chunk 2b, P2 5).
+    /// </summary>
+    private async Task<(string? Folder, bool HeldUngrouped)> BoundMovieFolderAsync(Entry entry, IReadOnlyList<string> roots,
+        CancellationToken cancellationToken)
     {
         var bindings = await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entry.Id && binding.MediaPath != null)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var heldUngrouped = false;
         foreach (var binding in bindings.OrderBy(binding => binding.JellyfinItemId == binding.VersionGroupId ? 0 : 1)
                      .ThenBy(binding => binding.JellyfinItemId))
         {
@@ -961,11 +987,15 @@ public sealed class ImportService(
             var folder = Path.GetDirectoryName(media);
             // A movie file directly in a library root has no folder of its own to group versions in.
             if (folder is null || roots.Any(root => string.Equals(Path.TrimEndingDirectorySeparator(root), folder, StringComparison.Ordinal)))
+            {
+                heldUngrouped = true;
                 continue;
-            if (roots.Any(root => MediaStorageIdentity.Contains(root, folder))) return folder;
+            }
+
+            if (roots.Any(root => MediaStorageIdentity.Contains(root, folder))) return (folder, false);
         }
 
-        return null;
+        return (null, heldUngrouped);
     }
 
     private async Task<string?> BoundSeriesFolderAsync(Entry entry, IReadOnlyList<string> roots, CancellationToken cancellationToken)

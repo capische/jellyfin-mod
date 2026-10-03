@@ -33,6 +33,8 @@ public sealed class ImportSettingsController(
     public async Task<ActionResult<ImportSettingsDto>> Patch(ImportSettingsRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
         if (request.Revision != settings.ImportRevision)
             return Conflict(new ProblemDetails
@@ -83,6 +85,8 @@ public sealed class ImportSettingsController(
         CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         var client = await database.AcquisitionDownloadClients.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (client is null) return NotFound();
         if (request.Revision is { } revision && revision != client.Revision)
@@ -90,24 +94,42 @@ public sealed class ImportSettingsController(
             {
                 Status = 409, Type = "revision_conflict", Title = "This client changed since it was loaded. Reload and try again."
             });
+        // The version is required: a replacement that does not say which mappings it read is refused (final review, finding 4).
+        if (request.MappingsVersion != ImportPaths.MappingsVersion(await database.DownloadClientPathMappings
+                .AsNoTracking().Where(mapping => mapping.DownloadClientId == id).ToListAsync(cancellationToken)))
+            return Conflict(new ProblemDetails
+            {
+                Status = 409, Type = "revision_conflict", Title = "These mappings changed since they were loaded. Reload and try again."
+            });
         if (probe.Validate(request.PathMappings) is { } error)
             return BadRequest(new ProblemDetails { Status = 400, Type = error.Code, Title = error.Message });
-        database.DownloadClientPathMappings.RemoveRange(await database.DownloadClientPathMappings
-            .Where(mapping => mapping.DownloadClientId == id).ToListAsync(cancellationToken));
-        await database.SaveChangesAsync(cancellationToken);
+        // Every mapping is probed before anything changes, and the old set is replaced by the new one in one transaction: an
+        // interrupted request keeps the old mappings, and no import ever sees the client with none (whole-review chunk 3b,
+        // P2 2).
         var now = DateTime.UtcNow;
+        var replacements = new List<DownloadClientPathMapping>(request.PathMappings.Length);
         for (var index = 0; index < request.PathMappings.Length; index++)
         {
             var local = ImportPaths.Normalize(request.PathMappings[index].LocalPathPrefix)!;
             var result = probe.Probe(local);
-            database.DownloadClientPathMappings.Add(new DownloadClientPathMapping
+            replacements.Add(new DownloadClientPathMapping
             {
                 DownloadClientId = id, Order = index, ClientPathPrefix = ImportPaths.Normalize(request.PathMappings[index].ClientPathPrefix)!,
                 LocalPathPrefix = local, VerifiedAt = result.Ok ? now : null, VerificationReason = result.Ok ? null : result.Code
             });
         }
 
-        await database.SaveChangesAsync(cancellationToken);
+        await using (var transaction = await SqliteBusy.RetryAsync(() => database.Database.BeginTransactionAsync(cancellationToken),
+                         cancellationToken))
+        {
+            database.DownloadClientPathMappings.RemoveRange(await database.DownloadClientPathMappings
+                .Where(mapping => mapping.DownloadClientId == id).ToListAsync(cancellationToken));
+            await database.SaveChangesAsync(cancellationToken);
+            database.DownloadClientPathMappings.AddRange(replacements);
+            await database.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+
         monitor?.Wake();
         return await Mappings(id, cancellationToken);
     }

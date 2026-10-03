@@ -72,6 +72,9 @@ public static class AutomationReasons
     /// <summary>The best candidate had fewer seeders than the profile's minimum.</summary>
     public const string BelowMinimumSeeders = "below_minimum_seeders";
 
+    /// <summary>When its grab was committed the target was unmonitored or its file state had changed (whole-review chunk 2c, P2 1).</summary>
+    public const string NoLongerWanted = "no_longer_wanted";
+
     /// <summary>A grab for the target is still active.</summary>
     public const string ActiveGrabExists = "active_grab_exists";
 

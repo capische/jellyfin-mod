@@ -96,11 +96,15 @@ public sealed class TorznabClient(IHttpClientFactory clients, ILogger<TorznabCli
         return capabilities;
     }
 
-    /// <summary>Fetches one search page with the given, already capability-checked parameters.</summary>
+    /// <summary>
+    /// Fetches one search page with the given, already capability-checked parameters. <paramref name="sending"/> runs once the
+    /// request is about to be handed to HTTP, after a last cancellation check, and may wait for the indexer's next permitted
+    /// time: a search cancelled before it returns sent nothing.
+    /// </summary>
     public async Task<TorznabPage> SearchAsync(TorznabEndpoint endpoint, IReadOnlyList<(string Key, string Value)> parameters,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, Func<CancellationToken, ValueTask>? sending = null)
     {
-        var document = await GetXmlAsync(endpoint, parameters, MaxFeedBytes, cancellationToken).ConfigureAwait(false);
+        var document = await GetXmlAsync(endpoint, parameters, MaxFeedBytes, cancellationToken, sending).ConfigureAwait(false);
         var channel = document.Root?.Name.LocalName == "rss" ? document.Root.Element("channel") : null;
         if (channel is null) throw new TorznabException("malformed_response", "The indexer did not return a feed.");
         var response = channel.Elements().FirstOrDefault(element => element.Name.LocalName == "response");
@@ -191,13 +195,17 @@ public sealed class TorznabClient(IHttpClientFactory clients, ILogger<TorznabCli
     }
 
     private async Task<XDocument> GetXmlAsync(TorznabEndpoint endpoint, IReadOnlyList<(string Key, string Value)> parameters,
-        int maxBytes, CancellationToken cancellationToken)
+        int maxBytes, CancellationToken cancellationToken, Func<CancellationToken, ValueTask>? sending = null)
     {
         var query = parameters.Select(parameter => $"{parameter.Key}={Uri.EscapeDataString(parameter.Value)}").ToList();
         if (!string.IsNullOrEmpty(endpoint.ApiKey)) query.Add("apikey=" + Uri.EscapeDataString(endpoint.ApiKey));
         var uri = new UriBuilder(endpoint.BaseUrl) { Query = string.Join('&', query) }.Uri;
         using var client = clients.CreateClient(HttpClientName);
         HttpResponseMessage response;
+        // From here the request may reach the indexer, so it counts as sent even when HTTP then gives up on it: an indexer is
+        // never charged less than it may have received (Pi review 1, finding 1).
+        cancellationToken.ThrowIfCancellationRequested();
+        if (sending is not null) await sending(cancellationToken).ConfigureAwait(false);
         try
         {
             response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
@@ -219,7 +227,19 @@ public sealed class TorznabClient(IHttpClientFactory clients, ILogger<TorznabCli
                 throw new TorznabException("rate_limited", "The indexer is rate limiting searches.", RetryAfter(response));
             if (!response.IsSuccessStatusCode)
                 throw new TorznabException("unavailable", $"The indexer answered HTTP {(int)response.StatusCode}.");
-            var bytes = await ReadBoundedAsync(response, maxBytes, cancellationToken).ConfigureAwait(false);
+            byte[] bytes;
+            try
+            {
+                bytes = await ReadBoundedAsync(response, maxBytes, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is IOException or HttpRequestException && !cancellationToken.IsCancellationRequested)
+            {
+                // An answer cut off after its headers is the indexer failing, reported as such: it never escapes the search as an
+                // unexpected error (final Pi review, finding 2).
+                logger.LogWarning("Torznab indexer {Host} cut its answer off: {Error}", endpoint.BaseUrl.Host, error.GetType().Name);
+                throw new TorznabException("unavailable", "The indexer's answer was cut off.");
+            }
+
             XDocument document;
             try
             {

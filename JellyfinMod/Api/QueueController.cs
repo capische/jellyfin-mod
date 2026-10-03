@@ -166,8 +166,9 @@ public sealed class QueueController(
     }
 
     /// <summary>
-    /// Removes a row. Never touches a library file. With <c>removeFromClient</c>, removes the torrent and its data only
-    /// when this plugin added it; with <c>blocklist</c>, Phase 4 scoring rejects the release afterwards.
+    /// Removes a row. Never deletes a file. With <c>removeFromClient</c>, has the client forget the torrent, only when this
+    /// plugin added it, and keeps its files for the manual cleanup; with <c>blocklist</c>, Phase 4 scoring rejects the
+    /// release afterwards.
     /// </summary>
     [HttpDelete("Queue/{id:guid}"), Authorize(Policy = Policies.RequiresElevation)]
     public async Task<ActionResult<ImportOperationDto>> Remove(Guid id, [FromBody] QueueRemoveRequest? request,
@@ -206,15 +207,22 @@ public sealed class QueueController(
                     return Refuse(409, SeedReleaseReasons.NotOwned, "JellyfinMod did not add this torrent; remove it in the client.");
                 var mappings = await database.DownloadClientPathMappings.AsNoTracking()
                     .Where(mapping => mapping.DownloadClientId == client.Id).ToListAsync(cancellationToken);
-                var dataPaths = torrent.Files.Select(file => ImportPaths.Normalize((torrent.DownloadDirectory ?? string.Empty) + "/" + file.Name))
-                    .Select(path => path is null ? null : ImportPaths.Map(path, mappings, client)).ToArray();
-                if (dataPaths.Any(path => path is null || InsideLibrary(path)))
+                // Every path the removal deletes, resolved through every symbolic link: an alias in the download folder that
+                // points into a library must not let the client delete library media (whole-review P1 9).
+                var dataPaths = ImportPaths.ResolveTorrentData(torrent, mappings, client, files);
+                var verified = dataPaths is null ? null : TorrentDataRemoval.Inspect(torrent, dataPaths, files);
+                if (dataPaths is null || verified is null || dataPaths.Any(InsideLibrary) || verified.Any(file => InsideLibrary(file.Path)))
                     return Refuse(409, SeedReleaseReasons.SeedingInsideLibrary,
                         "The torrent's data is not in a mapped download folder outside every library; remove it in the client.");
+                // The client only forgets the torrent and nothing is deleted: the checked files are recorded on the
+                // operation first, so a restart keeps them, and stay on disk for the administrator to remove (Codex delta
+                // reviews 1 and 5; user decisions 2026-10-02: 0.1.0.0 never deletes a download; a cleanup tool is planned for a later version).
+                operation.CleanupManifest = TorrentDataRemoval.Serialize(verified);
+                await database.SaveChangesAsync(CancellationToken.None);
                 try
                 {
                     var connection = await configuration.ConnectAsync(client, cancellationToken);
-                    await driver.RemoveAsync(connection, operation.InfoHash, deleteData: true, cancellationToken);
+                    await driver.RemoveAsync(connection, operation.InfoHash, deleteData: false, cancellationToken);
                     removedFromClient = true;
                 }
                 catch (Exception error) when (error is DownloadClientRejectedException or DownloadClientUnavailableException or
@@ -254,7 +262,7 @@ public sealed class QueueController(
             database.History.Add(new HistoryRecord
             {
                 EntryId = entryId, EventType = "queue_removed", CreatedAt = now,
-                Summary = ImportService.Bound("Removed from the queue" + (removedFromClient ? " and from the download client: " : ": ") +
+                Summary = ImportService.Bound("Removed from the queue" + (removedFromClient ? " and from the download client; its files are kept on disk: " : ": ") +
                     operation.ReleaseTitle),
                 Data = JsonSerializer.Serialize(new
                 {
@@ -273,7 +281,7 @@ public sealed class QueueController(
                 {
                     EntryId = entryId, EventType = "blocklisted", CreatedAt = now,
                     Summary = ImportService.Bound("Blocklisted " + operation.ReleaseTitle),
-                    Data = JsonSerializer.Serialize(new { operationId = operation.Id, operation.InfoHash })
+                    Data = JsonSerializer.Serialize(new { operationId = operation.Id, operation.EpisodeId, operation.InfoHash })
                 });
             }
         }
@@ -287,12 +295,25 @@ public sealed class QueueController(
     public async Task<ActionResult<IReadOnlyList<SeedingDto>>> Seeding(CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
         var seeds = await database.SeedReleaseOperations.AsNoTracking().Where(seed => SeedReleaseStates.Open.Contains(seed.State))
             .OrderBy(seed => seed.PreparedAt).ToListAsync(cancellationToken);
+        // The same target visibility as the queue: an administrator limited to some libraries sees no seed, hash or path of
+        // another library's download (whole-review chunk 3a, P2 5).
+        var entryIds = seeds.Where(seed => seed.EntryId.HasValue).Select(seed => seed.EntryId!.Value).Distinct().ToArray();
+        var episodeIds = seeds.Where(seed => seed.EpisodeId.HasValue).Select(seed => seed.EpisodeId!.Value).Distinct().ToArray();
+        var entries = await database.Entries.AsNoTracking().Where(entry => entryIds.Contains(entry.Id))
+            .ToDictionaryAsync(entry => entry.Id, cancellationToken);
+        var episodes = await database.Episodes.AsNoTracking().Where(episode => episodeIds.Contains(episode.Id))
+            .ToDictionaryAsync(episode => episode.Id, cancellationToken);
         var result = new List<SeedingDto>();
         foreach (var seed in seeds)
         {
+            var entry = seed.EntryId is { } entryId ? entries.GetValueOrDefault(entryId) : null;
+            var episode = seed.EpisodeId is { } episodeId ? episodes.GetValueOrDefault(episodeId) : null;
+            if (!CanSee(user, true, entry, episode)) continue;
             var torrent = snapshots.Latest(seed.DownloadClientId)?.Find(seed.InfoHash);
             var goal = torrent is null ? null : SeedReleaseService.Evaluate(torrent, seed.IndexerRatio, seed.IndexerSeconds, settings);
             result.Add(new SeedingDto(seed.Id, seed.ImportOperationId, seed.EntryId, seed.EpisodeId, seed.InfoHash, seed.State, seed.Reason,

@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Text.Json;
 using JellyfinMod.Data;
 using JellyfinMod.Services.Acquisition;
@@ -19,13 +18,15 @@ public sealed record SeedGoal(double? Ratio, string? RatioSource, long? Seconds,
     IReadOnlyList<string> WaitingFor);
 
 /// <summary>
-/// Owns the seeding copy of every completed import: waits for the effective goal, then removes the torrent and its data
-/// through the client, and accounts honestly for the disk that removal frees (P5.I6).
+/// Owns the seeding copy of every completed import: waits for the effective goal, then has the client forget the torrent
+/// (P5.I6). Nothing is ever deleted here: the torrent's checked files are recorded on the release before the client is
+/// asked, and they stay on disk for the administrator to remove (Codex delta review 5; user decisions 2026-10-02:
+/// 0.1.0.0 never deletes a download; a cleanup tool is planned for a later version).
 /// </summary>
 /// <remarks>
 /// Serialized with retention through <see cref="RetentionExecutionGate"/>: a release never runs while a retention
-/// operation on the same inode is prepared or unlinked, and it never deletes a library file. Keep and favourites protect
-/// the library file only, so they never delay a release.
+/// operation on the same inode is prepared or unlinked. Keep and favourites protect the library file only, so they never
+/// delay a release.
 /// </remarks>
 public sealed class SeedReleaseService(
     ModDbContext database,
@@ -37,9 +38,6 @@ public sealed class SeedReleaseService(
     TimeProvider time,
     ILogger<SeedReleaseService> logger)
 {
-    /// <summary>How long a removed torrent's file may linger before the release reports it survived.</summary>
-    public static readonly TimeSpan RemovalGrace = TimeSpan.FromMinutes(10);
-
     private DateTime Now => time.GetUtcNow().UtcDateTime;
 
     /// <summary>
@@ -108,7 +106,26 @@ public sealed class SeedReleaseService(
 
         if (torrent is null)
         {
-            // Removed outside the plugin: the plugin deletes nothing and cannot prove what was freed.
+            // A release that recorded its files for a detach that did not finish (a retry sent it back to waiting or blocked)
+            // keeps them: the torrent leaving the client does not resolve them (Codex delta review 7, P2 5).
+            if (seed.CleanupManifest is not null)
+            {
+                await DetachAsync(seed, "The torrent left the download client outside JellyfinMod. Nothing was deleted; its recorded "
+                    + "files stay on disk.").ConfigureAwait(false);
+                return;
+            }
+
+            // A torrent gone from the client says nothing about its data (final review, finding 1). Only a seeding file
+            // confirmed gone completes the release; one still there, or one that cannot be read, is kept: the release is
+            // detached for a manual cleanup with its seeding file, which retention never unlinks.
+            if (files.Probe(seed.SeedingPath) != PathPresence.Absent)
+            {
+                await DetachAsync(seed, "The torrent left the download client outside JellyfinMod. Nothing was deleted; its "
+                    + "downloaded files stay on disk and need a manual cleanup.").ConfigureAwait(false);
+                return;
+            }
+
+            // Removed outside the plugin, data included: the plugin deletes nothing and cannot prove what was freed.
             await FinishAsync(seed, SeedReleaseReasons.CopyMissing, null, null, "seeding_copy_missing",
                 "The seeding copy was removed outside JellyfinMod; the library file is unaffected.").ConfigureAwait(false);
             return;
@@ -126,6 +143,13 @@ public sealed class SeedReleaseService(
         if (goal.Met && seed.GoalMetAt is null)
         {
             seed.GoalMetAt = Now;
+            changed = true;
+        }
+        else if (!goal.Met && seed.GoalMetAt is not null)
+        {
+            // A goal that is no longer met (a raised floor, a recheck that found missing pieces) protects the library file
+            // again; a historical completion must not stand in for the current goal (whole-review chunk 1, P2 4).
+            seed.GoalMetAt = null;
             changed = true;
         }
 
@@ -149,10 +173,37 @@ public sealed class SeedReleaseService(
         await ReleaseAsync(seed, torrent, cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Checks every precondition, then asks the client to remove the torrent with its data.</summary>
-    private async Task ReleaseAsync(SeedReleaseOperation seed, ClientTorrentStatus torrent, CancellationToken cancellationToken)
+    /// <summary>Checks every precondition, records the torrent's files, then has the client forget the torrent, deleting nothing.</summary>
+    private async Task ReleaseAsync(SeedReleaseOperation seed, ClientTorrentStatus snapshot, CancellationToken cancellationToken)
     {
         await using var lease = await retentionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        // The tick's snapshot predates the wait for the gate; the torrent may have moved since (Codex re-review P1-a).
+        var (read, torrent) = await ReadNowAsync(seed, cancellationToken).ConfigureAwait(false);
+        if (!read || torrent is null) return;
+        var (client, seeding, verified) = await CheckReleasableAsync(seed, torrent, cancellationToken).ConfigureAwait(false);
+        if (client is null) return;
+
+        seed.State = SeedReleaseStates.Removing;
+        seed.Reason = null;
+        seed.Error = null;
+        seed.HardlinkCountBefore = seeding.HardlinkCount;
+        seed.RemovingAt = seed.UpdatedAt = Now;
+        // The checked files are stored before the client forgets the torrent, so a restart in between still knows them.
+        seed.CleanupManifest = TorrentDataRemoval.Serialize(verified);
+        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        logger.LogInformation("Seed release {Seed} detaches torrent {Hash} after its goal; its files are kept", seed.Id, seed.InfoHash);
+        if (await RemoveFromClientAsync(seed, client, cancellationToken).ConfigureAwait(false))
+            await DetachAsync(seed).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Every safeguard a removal with data needs, read now: before the first request and again before every retry, so a
+    /// check made before an interrupted request never authorizes a later deletion (whole-review P1 7). Returns the client
+    /// and the seeding file, or a null client after blocking or waiting the release.
+    /// </summary>
+    private async Task<(AcquisitionDownloadClient? Client, UnixFileSnapshot Seeding, IReadOnlyList<VerifiedTorrentFile> Verified)>
+        CheckReleasableAsync(SeedReleaseOperation seed, ClientTorrentStatus torrent, CancellationToken cancellationToken)
+    {
         var grab = await database.GrabOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == seed.GrabId, cancellationToken)
             .ConfigureAwait(false);
         var client = await database.AcquisitionDownloadClients.AsNoTracking()
@@ -163,21 +214,51 @@ public sealed class SeedReleaseService(
         {
             await BlockAsync(seed, SeedReleaseReasons.NotOwned, "The torrent does not carry JellyfinMod's ownership labels.")
                 .ConfigureAwait(false);
-            return;
+            return (null, default, []);
         }
 
-        if (IsInsideLibrary(seed.SeedingPath))
+        // The goal is decided on the torrent as it is now, under the current settings: a torrent turned incomplete, or a goal
+        // raised, while the release waited goes back to waiting, before the first removal and before every retry (Codex
+        // delta review 1, P2).
+        var settings = await database.AcquisitionSettings.AsNoTracking()
+            .SingleOrDefaultAsync(value => value.Id == AcquisitionSettings.SingletonId, cancellationToken).ConfigureAwait(false) ??
+            new AcquisitionSettings();
+        var goal = Evaluate(torrent, seed.IndexerRatio, seed.IndexerSeconds, settings);
+        if (!goal.Met || !settings.SeedReleaseEnabled)
+        {
+            if (!goal.Met) seed.GoalMetAt = null;
+            seed.State = SeedReleaseStates.Waiting;
+            seed.Reason = !goal.Met
+                ? torrent.Complete ? SeedReleaseReasons.GoalUnmet : SeedReleaseReasons.Incomplete
+                : SeedReleaseReasons.Disabled;
+            seed.UpdatedAt = Now;
+            await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+            return (null, default, []);
+        }
+
+        // The client deletes the files where the torrent is now, which a relocation can have moved into a library. Every
+        // current file must map to this server, resolve outside every library, and still include the recorded seeding copy
+        // (whole-review P1 5).
+        var mappings = await database.DownloadClientPathMappings.AsNoTracking()
+            .Where(mapping => mapping.DownloadClientId == client.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var current = ImportPaths.ResolveTorrentData(torrent, mappings, client, files);
+        if (IsInsideLibrary(seed.SeedingPath) || current is null || current.Any(IsInsideLibrary))
         {
             await BlockAsync(seed, SeedReleaseReasons.SeedingInsideLibrary,
-                "The seeding copy lies inside a library folder; removing its data could delete library media.").ConfigureAwait(false);
-            return;
+                "The torrent's data is not in a mapped download folder outside every library; removing it could delete library media.")
+                .ConfigureAwait(false);
+            return (null, default, []);
         }
 
-        if (!files.TryInspect(seed.SeedingPath, out var seeding) || seeding.PhysicalIdentity != seed.SeedingPhysicalIdentity)
+        var verified = TorrentDataRemoval.Inspect(torrent, current, files);
+        if (!files.TryInspect(seed.SeedingPath, out var seeding) || seeding.PhysicalIdentity != seed.SeedingPhysicalIdentity ||
+            !current.Contains(seeding.CanonicalPath, StringComparer.Ordinal) || verified is null ||
+            !verified.Any(file => file.Path == seeding.CanonicalPath && file.PhysicalIdentity == seed.SeedingPhysicalIdentity))
         {
             await BlockAsync(seed, SeedReleaseReasons.SeedingUnavailable,
-                "The seeding copy is not where the import found it; nothing was removed.").ConfigureAwait(false);
-            return;
+                "The seeding copy is not where the import found it, or the torrent no longer holds it; nothing was removed.")
+                .ConfigureAwait(false);
+            return (null, default, []);
         }
 
         if (await database.RetentionOperations.AnyAsync(operation => operation.PhysicalIdentity == seed.SeedingPhysicalIdentity &&
@@ -185,7 +266,7 @@ public sealed class SeedReleaseService(
                 cancellationToken).ConfigureAwait(false))
         {
             await WaitAsync(seed, SeedReleaseReasons.RetentionOpen).ConfigureAwait(false);
-            return;
+            return (null, default, []);
         }
 
         var libraryLinkPresent = files.TryInspect(seed.LibraryPath, out var libraryFile) &&
@@ -194,26 +275,25 @@ public sealed class SeedReleaseService(
         {
             await BlockAsync(seed, SeedReleaseReasons.LibraryLinkUnexpected,
                 "The library file is gone but no retention operation removed it; nothing was removed.").ConfigureAwait(false);
-            return;
+            return (null, default, []);
         }
 
-        seed.State = SeedReleaseStates.Removing;
-        seed.Reason = null;
-        seed.Error = null;
-        seed.HardlinkCountBefore = seeding.HardlinkCount;
-        seed.RemovingAt = seed.UpdatedAt = Now;
-        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
-        logger.LogInformation("Seed release {Seed} removes torrent {Hash} after its goal", seed.Id, seed.InfoHash);
-        await RemoveFromClientAsync(seed, client, cancellationToken).ConfigureAwait(false);
+        return (client, seeding, verified);
     }
 
-    private async Task RemoveFromClientAsync(SeedReleaseOperation seed, AcquisitionDownloadClient client, CancellationToken cancellationToken)
+    /// <summary>
+    /// Has the client forget the torrent without deleting anything (Codex delta reviews 1 and 5). Returns whether the client
+    /// confirmed; otherwise the next tick retries.
+    /// </summary>
+    private async Task<bool> RemoveFromClientAsync(SeedReleaseOperation seed, AcquisitionDownloadClient client,
+        CancellationToken cancellationToken)
     {
-        if (drivers.Get(client.Kind) is not { } driver) return;
+        if (drivers.Get(client.Kind) is not { } driver) return false;
         try
         {
             var connection = await configuration.ConnectAsync(client, cancellationToken).ConfigureAwait(false);
-            await driver.RemoveAsync(connection, seed.InfoHash, deleteData: true, cancellationToken).ConfigureAwait(false);
+            await driver.RemoveAsync(connection, seed.InfoHash, deleteData: false, cancellationToken).ConfigureAwait(false);
+            return true;
         }
         catch (Exception error) when (error is DownloadClientRejectedException or DownloadClientUnavailableException or
             HttpRequestException or TaskCanceledException)
@@ -222,63 +302,110 @@ public sealed class SeedReleaseService(
             seed.Error = ImportService.Bound("The client did not confirm the removal: " + error.GetType().Name);
             seed.UpdatedAt = Now;
             await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+            return false;
         }
     }
 
-    /// <summary>Finishes a removal found in progress, including after a restart between the request and the inspection.</summary>
-    private async Task ContinueRemovalAsync(SeedReleaseOperation seed, ClientTorrentStatus? torrent, CancellationToken cancellationToken)
+    /// <summary>
+    /// Reads the torrent from its client now, under the retention gate, for the checks right before a removal with data:
+    /// never the tick's snapshot, which is older than the wait for the gate (Codex re-review P1-a). Not read when the client
+    /// cannot be asked; a null torrent when the client no longer holds it.
+    /// </summary>
+    private async Task<(bool Read, ClientTorrentStatus? Torrent)> ReadNowAsync(SeedReleaseOperation seed, CancellationToken cancellationToken)
+    {
+        var client = await database.AcquisitionDownloadClients.AsNoTracking()
+            .SingleOrDefaultAsync(value => value.Id == seed.DownloadClientId, cancellationToken).ConfigureAwait(false);
+        if (client is null || drivers.Get(client.Kind) is not { } driver) return (false, null);
+        try
+        {
+            var connection = await configuration.ConnectAsync(client, cancellationToken).ConfigureAwait(false);
+            var torrents = await driver.GetStatusAsync(connection, [seed.InfoHash], cancellationToken).ConfigureAwait(false);
+            return (true, torrents.FirstOrDefault(value => string.Equals(value.InfoHash, seed.InfoHash, StringComparison.OrdinalIgnoreCase)));
+        }
+        catch (Exception error) when (error is DownloadClientRejectedException or DownloadClientUnavailableException or
+            HttpRequestException or TaskCanceledException)
+        {
+            return (false, null);
+        }
+    }
+
+    /// <summary>
+    /// Whether a seed's goal is met by its torrent as the client shows it now: complete, and seeded enough under the client's
+    /// current requirements and the current floor. Retention asks before it reclaims a library file this seed shares, since the
+    /// last observation may predate a torrent turning incomplete or its goal being raised (Codex round 2 P2). Null when the
+    /// client cannot be asked or no longer holds the torrent.
+    /// </summary>
+    public async Task<SeedGoal?> CurrentGoalAsync(SeedReleaseOperation seed, AcquisitionSettings settings, CancellationToken cancellationToken)
+    {
+        var (read, torrent) = await ReadNowAsync(seed, cancellationToken).ConfigureAwait(false);
+        return read && torrent is not null ? Evaluate(torrent, seed.IndexerRatio, seed.IndexerSeconds, settings) : null;
+    }
+
+    /// <summary>Finishes a detach found in progress, including after a restart between recording the files and the request.</summary>
+    private async Task ContinueRemovalAsync(SeedReleaseOperation seed, ClientTorrentStatus? snapshot, CancellationToken cancellationToken)
     {
         await using var lease = await retentionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        // Read again under the gate, as before the first request (Codex re-review P1-a); the snapshot only says a detach is due.
+        var (read, torrent) = snapshot is null ? (true, null) : await ReadNowAsync(seed, cancellationToken).ConfigureAwait(false);
+        if (!read) return;
         if (torrent is not null)
         {
-            var client = await database.AcquisitionDownloadClients.AsNoTracking()
-                .SingleOrDefaultAsync(value => value.Id == seed.DownloadClientId, cancellationToken).ConfigureAwait(false);
-            var grab = await database.GrabOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == seed.GrabId, cancellationToken)
-                .ConfigureAwait(false);
-            if (client is not null && grab is not null && torrent.Labels.Contains(GrabService.OwnerLabel(grab.Id), StringComparer.Ordinal))
-                await RemoveFromClientAsync(seed, client, cancellationToken).ConfigureAwait(false);
+            // A retry is a new detach: every safeguard and the goal are read again first, and the files recorded afresh
+            // (whole-review P1 7, Codex delta review 1).
+            var (client, _, verified) = await CheckReleasableAsync(seed, torrent, cancellationToken).ConfigureAwait(false);
+            if (client is null) return;
+            seed.CleanupManifest = TorrentDataRemoval.Serialize(verified);
+            await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+            if (await RemoveFromClientAsync(seed, client, cancellationToken).ConfigureAwait(false))
+                await DetachAsync(seed).ConfigureAwait(false);
             return;
         }
 
-        var presence = files.Probe(seed.SeedingPath);
-        if (presence == PathPresence.Unknown) return;
-        if (presence == PathPresence.Present)
-        {
-            if (seed.RemovingAt is { } started && Now - started > RemovalGrace)
-                await BlockAsync(seed, SeedReleaseReasons.SeedingSurvived,
-                    "The client removed the torrent but its file is still on disk.").ConfigureAwait(false);
-            return;
-        }
-
-        // The seeding path is gone. Hardlink counts decide what was actually freed (P3.T3).
-        long? released;
-        Guid? credited = null;
-        string summary;
-        var libraryLinkPresent = files.TryInspect(seed.LibraryPath, out var libraryFile) &&
-            libraryFile.PhysicalIdentity == seed.SeedingPhysicalIdentity;
-        if (libraryLinkPresent)
-        {
-            released = 0;
-            summary = "Released the seeding copy after its goal; the library file keeps the data (0 B freed).";
-        }
-        else
-        {
-            var reclaim = await ReclaimedByRetentionAsync(seed, cancellationToken).ConfigureAwait(false);
-            credited = reclaim?.Id;
-            released = seed.HardlinkCountBefore == 1 ? seed.SourceLogicalBytes : seed.HardlinkCountBefore > 1 ? 0 : null;
-            summary = released is > 0
-                ? $"Released the seeding copy after its goal. Freed {FormatBytes(released.Value)} previously reported as 0 B."
-                : "Released the seeding copy after its goal.";
-        }
-
-        seed.RemovedAt = Now;
-        await FinishAsync(seed, SeedReleaseReasons.Released, released, credited, "seeding_released", summary).ConfigureAwait(false);
+        // The client forgot the torrent (a restart came between the request and its confirmation). Its files stay where they
+        // are. A release from an older build, which recorded no list of them, is left for manual cleanup with its seeding
+        // path rather than trusted to that one path (Codex delta review 5, P2).
+        await DetachAsync(seed).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Records that the client forgot the torrent and nothing was deleted. The release leaves the open states, so no tick
+    /// and no missing torrent completes it; its recorded files wait for the administrator's manual cleanup, and a release
+    /// without a trustworthy list of them is marked for manual cleanup (Codex delta review 5, P2).
+    /// </summary>
+    private async Task DetachAsync(SeedReleaseOperation seed, string? summary = null)
+    {
+        var listed = TorrentDataRemoval.Deserialize(seed.CleanupManifest);
+        if (listed is null) seed.CleanupManifest = null;
+        var now = Now;
+        seed.State = SeedReleaseStates.Detached;
+        seed.Reason = listed is null ? SeedReleaseReasons.ManualCleanup : SeedReleaseReasons.CleanupPending;
+        seed.Error = null;
+        seed.RemovedAt = seed.UpdatedAt = now;
+        var grab = await database.GrabOperations.SingleOrDefaultAsync(value => value.Id == seed.GrabId).ConfigureAwait(false);
+        if (grab is not null)
+        {
+            grab.ActiveHash = null;
+            grab.ActiveTarget = null;
+            grab.UpdatedAt = now;
+        }
+
+        AddHistory(seed, "seeding_released", summary ?? (listed is null
+            ? "Stopped seeding after its goal. Nothing was deleted; its downloaded files need a manual cleanup."
+            : "Stopped seeding after its goal. Nothing was deleted; its downloaded files stay on disk."),
+            released: null, credited: null, now);
+        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        logger.LogInformation("Seed release {Seed} detached; {Count} file(s) kept on disk", seed.Id, listed?.Count ?? 0);
+    }
+
+    /// <summary>
+    /// The retention operation that reclaimed this import's own library link: the same physical file, reclaimed after this
+    /// release was prepared. A reclamation of an earlier file at the same pathname is not evidence about this one
+    /// (whole-review P1 6).
+    /// </summary>
     private async Task<RetentionOperation?> ReclaimedByRetentionAsync(SeedReleaseOperation seed, CancellationToken cancellationToken) =>
         await database.RetentionOperations.AsNoTracking()
             .Where(operation => operation.State == RetentionOperationStates.Completed &&
-                (operation.PhysicalIdentity == seed.SeedingPhysicalIdentity || operation.MediaPath == seed.LibraryPath))
+                operation.PhysicalIdentity == seed.SeedingPhysicalIdentity && operation.PreparedAt >= seed.PreparedAt)
             .OrderByDescending(operation => operation.CompletedAt).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
 
     private bool IsInsideLibrary(string path)
@@ -334,33 +461,28 @@ public sealed class SeedReleaseService(
             grab.UpdatedAt = now;
         }
 
-        if (seed.EntryId is { } entryId && await database.Entries.AnyAsync(entry => entry.Id == entryId).ConfigureAwait(false) &&
-            !await database.History.AnyAsync(history => history.Id == seed.Id).ConfigureAwait(false))
-            database.History.Add(new HistoryRecord
-            {
-                Id = seed.Id, EntryId = entryId, EventType = eventType, CreatedAt = now, Summary = ImportService.Bound(summary),
-                Data = JsonSerializer.Serialize(new
-                {
-                    seedReleaseId = seed.Id, seed.ImportOperationId, seed.EpisodeId, logicalBytes = seed.SourceLogicalBytes,
-                    physicalBytesReleased = released, creditedRetentionOperationId = credited, observedRatio = seed.ObservedRatio,
-                    observedSeedingSeconds = seed.ObservedSeedingSeconds, goalRatio = seed.GoalRatio, goalSeconds = seed.GoalSeconds
-                })
-            });
+        AddHistory(seed, eventType, summary, released, credited, now);
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         logger.LogInformation("Seed release {Seed} finished: {Reason}", seed.Id, reason);
     }
 
-    private static string FormatBytes(long bytes)
+    /// <summary>Adds the release's one history event, keyed by the release, unless its entry is gone or it was written already.</summary>
+    private void AddHistory(SeedReleaseOperation seed, string eventType, string summary, long? released, Guid? credited, DateTime now)
     {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        double value = bytes;
-        var unit = 0;
-        while (value >= 1000 && unit < units.Length - 1)
+        if (seed.EntryId is not { } entryId || !database.Entries.Any(entry => entry.Id == entryId) ||
+            database.History.Any(history => history.Id == seed.Id) ||
+            database.History.Local.Any(history => history.Id == seed.Id))
+            return;
+        database.History.Add(new HistoryRecord
         {
-            value /= 1000;
-            unit++;
-        }
-
-        return value.ToString(unit == 0 ? "0" : "0.#", CultureInfo.InvariantCulture) + " " + units[unit];
+            Id = seed.Id, EntryId = entryId, EventType = eventType, CreatedAt = now, Summary = ImportService.Bound(summary),
+            Data = JsonSerializer.Serialize(new
+            {
+                seedReleaseId = seed.Id, seed.ImportOperationId, seed.EpisodeId, logicalBytes = seed.SourceLogicalBytes,
+                physicalBytesReleased = released, creditedRetentionOperationId = credited, observedRatio = seed.ObservedRatio,
+                observedSeedingSeconds = seed.ObservedSeedingSeconds, goalRatio = seed.GoalRatio, goalSeconds = seed.GoalSeconds,
+                filesKept = TorrentDataRemoval.Deserialize(seed.CleanupManifest)?.Count
+            })
+        });
     }
 }

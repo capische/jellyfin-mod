@@ -327,6 +327,41 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
             enabled = false, reclaimAfterDays = 9, watchedUserMode = "allUsers", exemptFavourites = true, revision = 1
         }), 409, "revision_conflict", "A stale retention revision is refused");
 
+        // Whole-review chunk 3a P2 3 and 3b P2 3: two changes made from the same revision at the same moment. Exactly one is
+        // saved; the other answers 409 rather than silently overwriting it with the same next revision.
+        var concurrentEndpoints = new (string Path, Func<int, int, object> Body)[]
+        {
+            ("Settings/Retention", (revision, variant) => new
+            {
+                enabled = false, reclaimAfterDays = 20 + variant, watchedUserMode = "allUsers", exemptFavourites = true, revision
+            }),
+            ("Settings/Import", (revision, variant) => new
+            {
+                importEnabled = true, seedReleaseEnabled = false, seedFloorRatio = 1.0 + variant, seedFloorHours = (int?)null, importPollSeconds = 15,
+                videoExtensions = new[] { "mkv" }, stalledAfterHours = 24, scanTimeoutMinutes = 10, queueVisibleToUsers = false, revision
+            })
+        };
+        foreach (var (path, body) in concurrentEndpoints)
+            for (var round = 0; round < 6; round++)
+            {
+                var current = (await Read(admin.GetAsync("/JellyfinMod/" + path), 200, path + " reads")).GetProperty("revision").GetInt32();
+                var answers = await Task.WhenAll(Enumerable.Range(0, 2).Select(variant =>
+                    admin.PatchAsJsonAsync("/JellyfinMod/" + path, body(current, round * 2 + variant))));
+                var codes = answers.Select(answer => (int)answer.StatusCode).OrderBy(code => code).ToArray();
+                var after = (await Read(admin.GetAsync("/JellyfinMod/" + path), 200, path + " re-reads")).GetProperty("revision").GetInt32();
+                Assert(codes.SequenceEqual([200, 409]) && after == current + 1,
+                    $"Of two {path} changes from revision {current} one is saved and the other answers 409 (whole-review c3af3/c3bf3): " +
+                    $"{string.Join(",", codes)}, revision now {after}");
+            }
+
+        // Retention goes back to the values the rest of this run expects, at revision 2 + 6 rounds + this change.
+        var retentionRevision = (await Read(admin.GetAsync("/JellyfinMod/Settings/Retention"), 200, "Retention reads")).GetProperty("revision").GetInt32();
+        await Read(admin.PatchAsJsonAsync("/JellyfinMod/Settings/Retention", new
+        {
+            enabled = false, reclaimAfterDays = 7, watchedUserMode = "selectedUser", selectedUserId = world.Ordinary.Id, exemptFavourites = false,
+            revision = retentionRevision
+        }), 200, "Administrator restores retention");
+
         // ---- Setup state and Overview, before indexers and profiles exist.
         var setup = await Read(admin.GetAsync("/JellyfinMod/Setup/State"), 200, "Setup state reads");
         string Status(JsonElement state, string id) => state.GetProperty("steps").EnumerateArray()
@@ -409,7 +444,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
             discovery.GetProperty("revision").GetInt32() == 5, "Discovery survives a restart, still verified");
         Assert(seed.GetProperty("source").GetString() == "acquisitionClient" && seed.GetProperty("revision").GetInt32() == 5,
             "Seed protection survives a restart");
-        Assert(retention.GetProperty("revision").GetInt32() == 2 && retention.GetProperty("reclaimAfterDays").GetInt32() == 7,
+        Assert(retention.GetProperty("revision").GetInt32() == 9 && retention.GetProperty("reclaimAfterDays").GetInt32() == 7,
             "Retention survives a restart");
         Assert(setup.GetProperty("complete").GetBoolean(), "Setup stays complete after a restart");
     }

@@ -98,8 +98,22 @@ public sealed class AcquisitionConfiguration(AcquisitionSecretStore secrets, Dow
     {
         var reference = indexer.ApiKeySecretRef;
         if (indexer.ProwlarrSourceId is { } sourceId && database is not null)
-            reference = await database.ProwlarrSources.AsNoTracking().Where(source => source.Id == sourceId)
-                .Select(source => source.ApiKeySecretRef).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        {
+            // The feed's address and the source's key are read together, in one statement, and must agree with each other
+            // and with the row the caller holds: a search that read the row before the source moved would otherwise send
+            // the new key to the old host (whole-review P1 c3bf1).
+            var current = await database.AcquisitionIndexers.AsNoTracking().Where(row => row.Id == indexer.Id)
+                .Join(database.ProwlarrSources.AsNoTracking().Where(source => source.Id == sourceId), row => row.ProwlarrSourceId,
+                    source => source.Id, (row, source) => new { row.BaseUrl, SourceBaseUrl = source.BaseUrl, source.ApiKeySecretRef })
+                .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            if (current is null || !string.Equals(current.BaseUrl, indexer.BaseUrl, StringComparison.Ordinal) ||
+                !Uri.TryCreate(current.BaseUrl, UriKind.Absolute, out var feed) ||
+                !Uri.TryCreate(current.SourceBaseUrl.TrimEnd('/') + "/", UriKind.Absolute, out var sourceBase) ||
+                !sourceBase.IsBaseOf(feed))
+                throw new TorznabException("source_changed", "The Prowlarr source changed while this request was prepared; try again.");
+            reference = current.ApiKeySecretRef;
+        }
+
         var key = await secrets.GetAsync(reference, cancellationToken).ConfigureAwait(false);
         if (reference is not null && key is null)
             throw new TorznabException("secret_unavailable", "The saved API key is no longer available; enter it again.");

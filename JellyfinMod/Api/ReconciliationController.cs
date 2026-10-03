@@ -53,6 +53,22 @@ public sealed class ReconciliationController(
     public async Task<ActionResult<IReadOnlyList<EpisodeConflictDto>>> Conflicts(CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Only conflicts of titles and episodes this administrator may read (whole-review chunk 3b, P2 5): an administrator
+        // limited to some libraries neither sees nor resolves another library's.
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
+        var open = await (from conflict in database.EpisodeConflicts.AsNoTracking()
+                join entry in database.Entries.AsNoTracking() on conflict.EntryId equals entry.Id
+                join episode in database.Episodes.AsNoTracking() on conflict.EpisodeId equals episode.Id
+                where conflict.State == EpisodeConflictStates.Open
+                select new { conflict.Id, Entry = entry, Episode = episode })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var readableEntries = access.ReadableEntryIds(user, open.Select(row => row.Entry).DistinctBy(entry => entry.Id));
+        var readableEpisodes = await access.ReadableEpisodeIdsAsync(database, user, open.Select(row => row.Entry).DistinctBy(entry => entry.Id).ToArray(),
+            open.Where(row => readableEntries.Contains(row.Entry.Id)).Select(row => row.Episode).DistinctBy(episode => episode.Id).ToArray(),
+            cancellationToken).ConfigureAwait(false);
+        var readable = open.Where(row => readableEntries.Contains(row.Entry.Id) && readableEpisodes.Contains(row.Episode.Id))
+            .Select(row => row.Id).ToHashSet();
         var rows = await (from conflict in database.EpisodeConflicts.AsNoTracking()
                 join entry in database.Entries.AsNoTracking() on conflict.EntryId equals entry.Id
                 join episode in database.Episodes.AsNoTracking() on conflict.EpisodeId equals episode.Id
@@ -62,7 +78,7 @@ public sealed class ReconciliationController(
                     episode.TmdbId, episode.SeasonNumber, episode.EpisodeNumber, conflict.ObservedTmdbId,
                     conflict.ObservedSeasonNumber, conflict.ObservedEpisodeNumber))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
-        return Ok(rows);
+        return Ok(rows.Where(row => readable.Contains(row.Id)).ToList());
     }
 
     /// <summary>Moves the native episode to the identity Jellyfin now reports, writing one history event.</summary>
@@ -78,11 +94,18 @@ public sealed class ReconciliationController(
     private async Task<IActionResult> ResolveAsync(Guid id, bool rebind, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
         var visible = await database.EpisodeConflicts.AsNoTracking().Where(conflict => conflict.Id == id)
             .Join(database.Entries.AsNoTracking(), conflict => conflict.EntryId, entry => entry.Id,
-                (conflict, entry) => new { conflict.State, entry.TargetLibraryId })
+                (conflict, entry) => new { conflict.State, conflict.EpisodeId, Entry = entry })
             .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
-        if (visible is null || visible.State != EpisodeConflictStates.Open || visible.TargetLibraryId is not { } libraryId)
+        if (visible is null || visible.State != EpisodeConflictStates.Open || visible.Entry.TargetLibraryId is not { } libraryId ||
+            !access.CanRead(user, visible.Entry))
+            return NotFound();
+        // The episode itself must be readable too: the same concealed 404 as for a conflict that does not exist.
+        if (await database.Episodes.AsNoTracking().SingleOrDefaultAsync(episode => episode.Id == visible.EpisodeId, cancellationToken)
+                .ConfigureAwait(false) is not { } conflictEpisode || !access.CanReadEpisode(user, conflictEpisode))
             return NotFound();
 
         // Serialized with retention and reconciliation, so a rebind never races an unlink or a scan.

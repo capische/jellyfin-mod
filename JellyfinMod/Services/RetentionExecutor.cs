@@ -82,6 +82,9 @@ public sealed class RetentionExecutor(
         {
             if (!TryInspect(item, out var observed, out var inspectionReason))
                 return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
+            // Still the very file the binding recorded (whole-review P1 1), read again just before it is prepared.
+            if (await FingerprintReasonAsync(item, observed, cancellationToken).ConfigureAwait(false) is { } fingerprintReason)
+                return RetentionExecutionResult.NotStarted(bindingId, fingerprintReason);
             // A read-only mount or directory would fail every run; never prepare an operation for it.
             if (!files.CanUnlink(observed.CanonicalPath))
                 return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.MediaNotWritable);
@@ -169,6 +172,8 @@ public sealed class RetentionExecutor(
             return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.SharedPathNotAllEligible);
         if (!TryInspect(candidate, out var observed, out var inspectionReason))
             return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
+        if (await FingerprintReasonAsync(candidate, observed, cancellationToken).ConfigureAwait(false) is { } fingerprintReason)
+            return RetentionExecutionResult.NotStarted(bindingId, fingerprintReason);
         if (!files.CanUnlink(observed.CanonicalPath))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.MediaNotWritable);
         if (await IdentityUnverifiedAsync(bindingId, cancellationToken).ConfigureAwait(false))
@@ -241,7 +246,7 @@ public sealed class RetentionExecutor(
         operation.UnlinkedAt = clock.GetUtcNow().UtcDateTime;
         operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
         await SaveAfterUnlinkAsync([operation]).ConfigureAwait(false);
-        TryRemoveNative(operation);
+        await TryRemoveNativeAsync(operation).ConfigureAwait(false);
         return await CompleteUnderLeaseAsync([operation], bindingId, CancellationToken.None).ConfigureAwait(false);
     }
 
@@ -446,6 +451,9 @@ public sealed class RetentionExecutor(
             if (unlinkedPresence == PathPresence.Present)
                 return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
                     RetentionExecutionReasons.MediaReappeared, null, CancellationToken.None).ConfigureAwait(false);
+            // The process stopped between the unlink and the native cleanup: clean up now, or leave a retryable failure on
+            // the operation, so a stale item never stays behind unnoticed (whole-review chunk 1, P2 5).
+            foreach (var operation in operations) await TryRemoveNativeAsync(operation).ConfigureAwait(false);
             return await CompleteUnderLeaseAsync(operations, selected.BindingId, CancellationToken.None).ConfigureAwait(false);
         }
 
@@ -552,6 +560,14 @@ public sealed class RetentionExecutor(
             return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
                 RetentionExecutionReasons.BindingSetChanged, null, cancellationToken).ConfigureAwait(false);
 
+        // A download JellyfinMod keeps on disk is never unlinked automatically, also when the library path
+        // is another name for its directory entry through a bind mount or an aliased folder (Codex delta reviews 7, P1 2 and
+        // 9, P1 2).
+        if (await Import.RetainedDownloads.ProtectionAsync(database, files, operations[0].MediaPath,
+                cancellationToken).ConfigureAwait(false) is { } retained)
+            return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                RetentionExecutionReasons.RetainedDownload, new IOException(retained), cancellationToken).ConfigureAwait(false);
+
         // The last point at which cancellation is honoured; everything after the unlink must finish.
         cancellationToken.ThrowIfCancellationRequested();
         var unlink = files.UnlinkPinned(operations[0].MediaPath, operations[0].PhysicalIdentity);
@@ -570,7 +586,7 @@ public sealed class RetentionExecutor(
             operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
         }
         await SaveAfterUnlinkAsync(operations).ConfigureAwait(false);
-        foreach (var operation in operations) TryRemoveNative(operation);
+        foreach (var operation in operations) await TryRemoveNativeAsync(operation).ConfigureAwait(false);
         return await CompleteUnderLeaseAsync(operations, requestedBindingId, CancellationToken.None).ConfigureAwait(false);
     }
 
@@ -783,6 +799,8 @@ public sealed class RetentionExecutor(
     public async Task<int> RetryNativeCleanupAsync(CancellationToken cancellationToken)
     {
         await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        // Read as stored now: an operation this context tracked from an earlier step would keep its old values.
+        database.ChangeTracker.Clear();
         var pending = await database.RetentionOperations
             .Where(operation => operation.State == RetentionOperationStates.Completed &&
                 operation.Reason == RetentionExecutionReasons.ReclaimedNativeCleanupFailed)
@@ -790,22 +808,61 @@ public sealed class RetentionExecutor(
         var cleaned = 0;
         foreach (var operation in pending)
         {
-            if (!TryRemoveNative(operation)) continue;
+            // Under the locks reconciliation takes, so the title cannot be re-bound between the check and the removal.
+            await using var libraryLease = await AcquireLibrariesAsync(
+                LibrariesContaining(operation.MediaPath).Append(operation.TargetLibraryId), cancellationToken).ConfigureAwait(false);
+            if (!await TryRemoveNativeAsync(operation).ConfigureAwait(false)) continue;
             operation.Reason = RetentionExecutionReasons.Reclaimed;
             operation.Error = null;
             cleaned++;
+            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
 
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return cleaned;
     }
 
-    private bool TryRemoveNative(RetentionOperation operation)
+    /// <summary>
+    /// Removes the native item of an unlinked file, file deletion off. True when nothing is left to do: the item is gone,
+    /// or the cleanup is obsolete because the file is back at its path or another binding owns the item (a title reacquired
+    /// there can get the same item id, and its new item must not be removed; whole-review chunk 1, P2 6). False leaves a
+    /// retryable failure on the operation.
+    /// </summary>
+    private async Task<bool> TryRemoveNativeAsync(RetentionOperation operation)
     {
         try
         {
+            switch (files.Probe(operation.MediaPath))
+            {
+                case PathPresence.Present:
+                    logger.LogInformation("Native cleanup of {ItemId} retired: its file is back at its path", operation.JellyfinItemId);
+                    return true;
+                case PathPresence.Unknown:
+                    operation.Error = Bound("The media path cannot be read, so the native item is left until it can.");
+                    return false;
+            }
+
+            if (await database.EntryBindings.AsNoTracking().AnyAsync(binding => binding.JellyfinItemId == operation.JellyfinItemId &&
+                    binding.Id != operation.BindingId, CancellationToken.None).ConfigureAwait(false) ||
+                await database.EpisodeBindings.AsNoTracking().AnyAsync(binding => binding.JellyfinItemId == operation.JellyfinItemId &&
+                    binding.Id != operation.BindingId, CancellationToken.None).ConfigureAwait(false))
+            {
+                logger.LogInformation("Native cleanup of {ItemId} retired: another binding owns the item", operation.JellyfinItemId);
+                return true;
+            }
+
             var native = library.GetItemById(operation.JellyfinItemId);
             if (native is null) return true;
+            switch (string.IsNullOrEmpty(native.Path) ? PathPresence.Absent : files.Probe(native.Path))
+            {
+                case PathPresence.Present:
+                    logger.LogInformation("Native cleanup of {ItemId} retired: the item now names a file that is there", operation.JellyfinItemId);
+                    return true;
+                case PathPresence.Unknown:
+                    operation.Error = Bound("The item's media path cannot be read, so the native item is left until it can.");
+                    return false;
+            }
+
             library.DeleteItem(native, new DeleteOptions
             {
                 DeleteFileLocation = false,
@@ -882,6 +939,24 @@ public sealed class RetentionExecutor(
                 .Select(binding => binding.StorageIdentity).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         return await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == candidate.BindingId)
             .Select(binding => binding.StorageIdentity).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Why the file on disk is not the one the binding recorded, or null when it is (whole-review P1 1): a replacement at
+    /// the bound path keeps the item and its watched state, and only the stored fingerprint tells it apart.
+    /// </summary>
+    private async Task<string?> FingerprintReasonAsync(RetentionRepresentationDto candidate, UnixFileSnapshot observed,
+        CancellationToken cancellationToken)
+    {
+        var stored = candidate.EpisodeId.HasValue
+            ? await database.EpisodeBindings.AsNoTracking().Where(binding => binding.Id == candidate.BindingId)
+                .Select(binding => binding.FileFingerprint).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
+            : await database.EntryBindings.AsNoTracking().Where(binding => binding.Id == candidate.BindingId)
+                .Select(binding => binding.FileFingerprint).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrEmpty(stored)) return RetentionExecutionReasons.MediaIdentityUnverified;
+        return string.Equals(stored, observed.FileFingerprint, StringComparison.Ordinal)
+            ? null
+            : RetentionPreviewReasons.MediaIdentityChanged;
     }
 
     private bool IsStorageCurrent(RetentionOperation operation)
@@ -1034,6 +1109,9 @@ public sealed record RetentionExecutionResult(
 
 internal static class RetentionExecutionReasons
 {
+    /// <summary>The library path is a download JellyfinMod keeps on disk, or another name for one.</summary>
+    public const string RetainedDownload = "retained_download";
+
     public const string BindingUnavailable = "binding_unavailable";
     public const string PolicyChanged = "policy_changed";
     public const string ActionPathMismatch = "action_path_mismatch";

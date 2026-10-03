@@ -130,7 +130,8 @@ public sealed record DownloadClientSettingsDto(
     [property: JsonPropertyName("apiVersion"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ApiVersion,
     [property: JsonPropertyName("verifiedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? VerifiedAt,
     [property: JsonPropertyName("lastError"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? LastError,
-    [property: JsonPropertyName("pathMappings")] IReadOnlyList<PathMappingDto> PathMappings);
+    [property: JsonPropertyName("pathMappings")] IReadOnlyList<PathMappingDto> PathMappings,
+    [property: JsonPropertyName("mappingsVersion")] string MappingsVersion);
 
 /// <summary>Download client write contract. PATCH must echo the current revision.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -179,6 +180,13 @@ public sealed class DownloadClientSettingsRequest
     /// <summary>Gets or sets the ordered path mappings (P5.I2); null keeps the saved mappings.</summary>
     [JsonPropertyName("pathMappings")]
     public PathMappingRequest[]? PathMappings { get; set; }
+
+    /// <summary>
+    /// Gets or sets the version of the mappings being replaced (<c>mappingsVersion</c>); required by a PATCH that sends
+    /// <c>pathMappings</c>, so a stale copy never replaces newer mappings (final review, finding 4).
+    /// </summary>
+    [MaxLength(64), JsonPropertyName("mappingsVersion")]
+    public string? MappingsVersion { get; set; }
 
     /// <summary>Gets or sets the revision being replaced; required by PATCH.</summary>
     [JsonPropertyName("revision")]

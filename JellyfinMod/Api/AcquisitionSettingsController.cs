@@ -4,6 +4,7 @@ using JellyfinMod.Api.Contracts;
 using JellyfinMod.Data;
 using JellyfinMod.Services;
 using JellyfinMod.Services.Acquisition;
+using JellyfinMod.Services.Import;
 using MediaBrowser.Common.Api;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -71,6 +72,8 @@ public sealed partial class AcquisitionSettingsController(
     public async Task<ActionResult<IndexerSettingsDto>> PatchIndexer(Guid id, IndexerSettingsRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         if (ValidateIndexer(request, creating: false) is { } error) return Invalid(error);
         var indexer = await database.AcquisitionIndexers.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (indexer is null) return NotFound();
@@ -200,11 +203,17 @@ public sealed partial class AcquisitionSettingsController(
         CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         if (ValidateClient(request, creating: false) is { } error) return Invalid(error);
         if (ValidateMappings(request.PathMappings) is { } mappingError) return Invalid(mappingError.Code, mappingError.Message);
         var client = await database.AcquisitionDownloadClients.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (client is null) return NotFound();
         if (request.Revision != client.Revision) return RevisionConflict();
+        // Saving mappings does not advance the client's revision: a PATCH that replaces them must name the version it read.
+        if (request.PathMappings is not null && request.MappingsVersion != ImportPaths.MappingsVersion(await database.DownloadClientPathMappings
+                .AsNoTracking().Where(mapping => mapping.DownloadClientId == id).ToListAsync(cancellationToken)))
+            return Conflict(ProblemBody("revision_conflict", "These mappings changed since they were loaded. Reload and try again."));
         var destination = destinations.Check(request.LocalDirectory.Trim());
         if (!destination.Ok) return Invalid(destination.Code, destination.Message);
         var previous = client.PasswordSecretRef;
@@ -321,6 +330,8 @@ public sealed partial class AcquisitionSettingsController(
     public async Task<ActionResult<QualityProfileDto>> PatchQualityProfile(Guid id, QualityProfileRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         if (ValidateProfile(request) is { } error) return Invalid(error, ProfileMessage(error));
         var profile = await database.AcquisitionQualityProfiles.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (profile is null) return NotFound();
@@ -361,6 +372,13 @@ public sealed partial class AcquisitionSettingsController(
     public async Task<ActionResult<AcquisitionSettingsDto>> PatchAcquisition(AcquisitionSettingsRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
+        // One write transaction from the revision check to the last save (whole-review chunk 3a, P2 3 and 4): a concurrent
+        // change waits and then meets the new revision, and an interrupted or refused update leaves nothing behind, not
+        // even the acquisition switch it turns off while the proposed configuration is checked.
+        await using var transaction = await SqliteBusy.RetryAsync(() => database.Database.BeginTransactionAsync(cancellationToken),
+            cancellationToken);
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
         if (request.Revision != settings.Revision) return RevisionConflict();
         if (request.DownloadClientId is { } clientId &&
@@ -369,19 +387,33 @@ public sealed partial class AcquisitionSettingsController(
         if (request.DefaultQualityProfileId is { } profileId &&
             !await database.AcquisitionQualityProfiles.AnyAsync(value => value.Id == profileId, cancellationToken))
             return Invalid("invalid_quality_profile");
-        var previous = (settings.DownloadClientId, settings.DefaultQualityProfileId, settings.Enabled);
+        if (request.DefaultQualityProfileId != settings.DefaultQualityProfileId)
+        {
+            // Titles that inherit the default now search with another profile: their backoff starts afresh, as for a
+            // title switched to another profile (whole-review chunk 2c, P2 7).
+            var now = DateTime.UtcNow;
+            foreach (var row in await database.AutomationTargets
+                         .Where(row => database.Entries.Any(entry => entry.Id == row.EntryId && entry.QualityProfileId == null))
+                         .ToListAsync(cancellationToken))
+            {
+                row.ConsecutiveEmpty = 0;
+                row.NextSearchAt = now;
+            }
+        }
+
         settings.DownloadClientId = request.DownloadClientId;
         settings.DefaultQualityProfileId = request.DefaultQualityProfileId;
         settings.Enabled = false;
         await database.SaveChangesAsync(cancellationToken);
         if (request.Enabled)
         {
+            // Readiness is read from the proposed configuration, saved only inside this transaction.
             var state = await configuration.GetStateAsync(database, cancellationToken);
             if (!state.Ready)
             {
                 // A refused enable leaves the previous configuration exactly as it was.
-                (settings.DownloadClientId, settings.DefaultQualityProfileId, settings.Enabled) = previous;
-                await database.SaveChangesAsync(cancellationToken);
+                await transaction.RollbackAsync(CancellationToken.None);
+                database.ChangeTracker.Clear();
                 return Conflict(new ProblemDetails
                 {
                     Status = 409, Type = "acquisition_not_ready", Title = "Acquisition is not ready.",
@@ -393,6 +425,7 @@ public sealed partial class AcquisitionSettingsController(
         settings.Enabled = request.Enabled;
         settings.Revision++;
         await database.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         cache.Invalidate();
         return await ToDtoAsync(cancellationToken);
     }
@@ -559,7 +592,8 @@ public sealed partial class AcquisitionSettingsController(
         client.LocalDirectory, client.VerifiedLibraryIds.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(Guid.Parse).ToArray(),
         client.OpenUrl, client.Revision, client.VerifiedRevision == client.Revision, client.ClientVersion, client.ApiVersion,
         client.VerifiedAt is { } verified ? DateTime.SpecifyKind(verified, DateTimeKind.Utc) : null, client.LastError,
-        mappings.Where(mapping => mapping.DownloadClientId == client.Id).OrderBy(mapping => mapping.Order).Select(MappingDto).ToArray());
+        mappings.Where(mapping => mapping.DownloadClientId == client.Id).OrderBy(mapping => mapping.Order).Select(MappingDto).ToArray(),
+        JellyfinMod.Services.Import.ImportPaths.MappingsVersion(mappings.Where(mapping => mapping.DownloadClientId == client.Id)));
 
     private static PathMappingDto MappingDto(DownloadClientPathMapping mapping) => new(mapping.Id, mapping.Order,
         mapping.ClientPathPrefix, mapping.LocalPathPrefix,

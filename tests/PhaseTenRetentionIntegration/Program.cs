@@ -65,6 +65,7 @@ try
     try
     {
         await VerifyDecisionTwelveMigrationAsync(folder);
+        await VerifyAbandonedTransactionAsync(folder, loggerFactory);
         await RunAsync(folder, targetCount, rounds);
     }
     finally
@@ -79,6 +80,52 @@ finally
 {
     Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
     Directory.Delete(folder, true);
+}
+
+// Whole-review chunk 3c, P3 6: a save cancelled after its transaction began is rolled back by disposal, which no
+// interceptor reports. A later writer that gives up must name only the writer that really holds the lock.
+static async Task VerifyAbandonedTransactionAsync(string folder, ILoggerFactory loggerFactory)
+{
+    var databasePath = Path.Combine(folder, "abandoned.db");
+    await using (var setup = new ModDbContext(databasePath)) await setup.Database.MigrateAsync();
+    var messages = new System.Collections.Concurrent.ConcurrentQueue<string>();
+    var previous = SqliteWriteDiagnostics.Logger;
+    SqliteWriteDiagnostics.Logger = new CapturingLogger(messages);
+    try
+    {
+        await using (var abandoned = new ModDbContext(databasePath))
+        using (SqliteWriteDiagnostics.Operation("abandoned save"))
+        {
+            var transaction = await abandoned.Database.BeginTransactionAsync();
+            await abandoned.Database.ExecuteSqlRawAsync("UPDATE AcquisitionSettings SET Revision = Revision WHERE 0;");
+            await transaction.DisposeAsync();
+        }
+
+        await using var holder = new ModDbContext(databasePath);
+        using var holding = SqliteWriteDiagnostics.Operation("lock holder");
+        await using var held = await holder.Database.BeginTransactionAsync();
+        await using var loser = new ModDbContext(databasePath);
+        loser.Database.SetCommandTimeout(1);
+        using (SqliteWriteDiagnostics.Operation("late writer"))
+        {
+            try
+            {
+                await loser.Database.ExecuteSqlRawAsync("UPDATE AcquisitionSettings SET Revision = Revision WHERE 0;");
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException)
+            {
+            }
+        }
+
+        var report = messages.FirstOrDefault(message => message.Contains("gave up", StringComparison.Ordinal));
+        if (report is null || !report.Contains("lock holder", StringComparison.Ordinal) || report.Contains("abandoned save", StringComparison.Ordinal))
+            throw new InvalidOperationException("A disposed transaction is not reported as holding the write lock (whole-review c3cf6): " +
+                (report ?? "no report"));
+    }
+    finally
+    {
+        SqliteWriteDiagnostics.Logger = previous;
+    }
 }
 
 static async Task RunAsync(string folder, int targetCount, int rounds)
@@ -653,4 +700,12 @@ internal sealed class ShiftedClock : TimeProvider
     public TimeSpan Offset { get; set; }
 
     public override DateTimeOffset GetUtcNow() => base.GetUtcNow() + Offset;
+}
+
+internal sealed class CapturingLogger(System.Collections.Concurrent.ConcurrentQueue<string> messages) : ILogger
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
+        messages.Enqueue(formatter(state, exception));
 }

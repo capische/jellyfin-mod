@@ -101,7 +101,10 @@ public sealed record HistoryDto([property: JsonPropertyName("id")] Guid Id,
     public Guid? EpisodeId { get; init; }
 
     /// <summary>Reads the episode identity episode events carry in their structured data.</summary>
-    public static Guid? EpisodeOf(string? data)
+    public static Guid? EpisodeOf(string? data) => GuidOf(data, "episodeId");
+
+    /// <summary>Reads one identity property, matched case-insensitively, from an event's structured data.</summary>
+    public static Guid? GuidOf(string? data, string name)
     {
         if (string.IsNullOrWhiteSpace(data)) return null;
         try
@@ -109,7 +112,7 @@ public sealed record HistoryDto([property: JsonPropertyName("id")] Guid Id,
             using var document = System.Text.Json.JsonDocument.Parse(data);
             if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object) return null;
             foreach (var property in document.RootElement.EnumerateObject())
-                if (property.Name.Equals("episodeId", StringComparison.OrdinalIgnoreCase) &&
+                if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase) &&
                     property.Value.ValueKind == System.Text.Json.JsonValueKind.String && property.Value.TryGetGuid(out var id))
                     return id;
         }

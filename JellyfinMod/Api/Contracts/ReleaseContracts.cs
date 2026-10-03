@@ -193,6 +193,10 @@ public sealed record GrabOperationDto(
             "destination_not_same_filesystem" => "The download folder no longer shares a filesystem with the library.",
             "configuration_changed" => "The download client settings changed during the hold; nothing was sent.",
             "acquisition_disabled" => "Grabbing was turned off during the hold; nothing was sent.",
+            "automation_disabled" => "Automatic grabbing was turned off during the hold; nothing was sent.",
+            "episode_upgrades_disabled" => "Episode upgrades were turned off during the hold; nothing was sent.",
+            "reacquire_disabled" => "Reacquiring reclaimed titles was turned off during the hold; nothing was sent.",
+            "no_longer_wanted" => "The title was no longer wanted when the hold ended; nothing was sent.",
             _ => "The grab failed."
         }
     };

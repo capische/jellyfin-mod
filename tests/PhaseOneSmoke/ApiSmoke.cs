@@ -473,6 +473,30 @@ internal static class ApiSmoke
                 (!userRetention.TryGetProperty("deadline", out var userDeadline) || userDeadline.ValueKind == JsonValueKind.Null),
                 "Ordinary users see a public reason and no deadline derived from other users' activity: " + userRetention);
         }
+        // Whole-review chunk 3b, P2 4: the only due episode is hidden from this user by a blocked tag. Browse must neither
+        // list the series as due nor summarize it from that episode.
+        var pilotTags = nativeEpisode.Tags;
+        nativeEpisode.Tags = ["hidden-episode"];
+        user.SetPreference(PreferenceKind.BlockedTags, ["hidden-episode"]);
+        using (var hiddenDue = await client.PostAsJsonAsync("/JellyfinMod/Browse", new
+        {
+            mediaType = "series", targetLibraryId = tvLibrary.Id, dueWithinDays = 7
+        }))
+        using (var hiddenAll = await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "series", targetLibraryId = tvLibrary.Id }))
+        {
+            using var hiddenDueJson = JsonDocument.Parse(await hiddenDue.Content.ReadAsStringAsync());
+            using var hiddenAllJson = JsonDocument.Parse(await hiddenAll.Content.ReadAsStringAsync());
+            var row = hiddenAllJson.RootElement.GetProperty("items").EnumerateArray()
+                .Single(item => item.TryGetProperty("entry", out var entry) && entry.ValueKind == JsonValueKind.Object &&
+                    entry.GetProperty("id").GetString() == seriesId);
+            Assert(hiddenDue.IsSuccessStatusCode && hiddenDueJson.RootElement.GetProperty("totalRecordCount").GetInt32() == 0 &&
+                row.GetProperty("retention").GetProperty("state").GetString() != "scheduled",
+                "A series is not listed as due, nor summarized as scheduled, from an episode hidden from the requester " +
+                "(whole-review c3bf4): " + row.GetProperty("retention"));
+        }
+
+        user.SetPreference(PreferenceKind.BlockedTags, []);
+        nativeEpisode.Tags = pilotTags;
         Assert((await client.PatchAsJsonAsync($"/JellyfinMod/Entries/{seriesId}/Episodes/{episodeId}", new { monitored = false })).StatusCode == HttpStatusCode.Forbidden,
             "Ordinary users cannot change episode monitoring");
         Assert((await client.PostAsync($"/JellyfinMod/Entries/{seriesId}/Refresh", null)).StatusCode == HttpStatusCode.Forbidden,
@@ -564,6 +588,113 @@ internal static class ApiSmoke
                 boundPilot.State == FileState.OnDisk && boundPilot.JellyfinItemId is not null && series.State == seriesStateBefore,
                 $"Refresh keeps reclaimed and bound states and never resets availability: {reclaimed.State}/{boundPilot.State}/{series.State}");
         }
+        // Whole-review chunk 2c, P2 5: TMDB moves an unbound episode onto the number a position-tracked file already holds,
+        // with the same title and air date. Refresh folds the two into one row: the file's row takes the TMDB identity and
+        // the moved row's monitoring and Keep; no TMDB row is left beside the position row.
+        var foldedSeries = new Entry
+        {
+            MediaType = "series", TmdbId = 8800, TargetLibraryId = tvLibrary.Id, Title = "Folded",
+            MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("series", 8800, "Folded", null, null, null, null, null, null, false,
+                null, null, [], [], []))
+        };
+        var movedRow = new Episode { EntryId = foldedSeries.Id, TmdbId = 8803, SeasonNumber = 1, EpisodeNumber = 3, Title = "Fourth",
+            AirDate = new DateTime(2020, 1, 23, 0, 0, 0, DateTimeKind.Utc), Monitored = true, RetentionPolicy = RetentionPolicy.Never };
+        var positionRow = new Episode { EntryId = foldedSeries.Id, TmdbId = 0, SeasonNumber = 1, EpisodeNumber = 4, Title = "Fourth",
+            AirDate = new DateTime(2020, 1, 23, 0, 0, 0, DateTimeKind.Utc), Monitored = false, JellyfinItemId = Guid.NewGuid(),
+            State = FileState.OnDisk };
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.Add(foldedSeries);
+            database.Episodes.AddRange(movedRow, positionRow);
+            await database.SaveChangesAsync();
+        }
+
+        http.Response = uri => uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
+            ? Json("""{"season_number":1,"episodes":[{"id":8803,"season_number":1,"episode_number":4,"name":"Fourth","air_date":"2020-01-23"}]}""")
+            : Json("""{"id":8800,"name":"Folded","seasons":[{"season_number":1,"name":"Season 1","episode_count":1}]}""");
+        using (var folded = await client.PostAsync($"/JellyfinMod/Entries/{foldedSeries.Id}/Refresh", null))
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var rows = await database.Episodes.AsNoTracking().Where(episode => episode.EntryId == foldedSeries.Id).ToListAsync();
+            Assert(folded.IsSuccessStatusCode && rows.Count == 1 && rows[0].Id == positionRow.Id && rows[0].TmdbId == 8803 &&
+                rows[0].SeasonNumber == 1 && rows[0].EpisodeNumber == 4 && rows[0].JellyfinItemId == positionRow.JellyfinItemId &&
+                rows[0].Monitored && rows[0].RetentionPolicy == RetentionPolicy.Never,
+                "Refresh never leaves a TMDB row beside a position row at the same number; with matching evidence they become one " +
+                "row that keeps the file and the moved row's settings (whole-review c2cf5): " +
+                string.Join(", ", rows.Select(row => $"{row.TmdbId} S{row.SeasonNumber}E{row.EpisodeNumber} {row.Monitored} {row.RetentionPolicy}")));
+            database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == foldedSeries.Id));
+            database.History.RemoveRange(database.History.Where(history => history.EntryId == foldedSeries.Id));
+            await database.SaveChangesAsync();
+        }
+
+        // Codex round 2 P1: a recently un-kept, file-less TMDB episode folds into a position row whose schedule expired long
+        // ago. The TMDB row's evaluation goes with it, so its grace must be carried first: the surviving file waits out the
+        // grace instead of becoming due at once. A second TMDB row's one-day window never shortens the position row's
+        // inherited one (P2-d applies to the fold too).
+        var graceSeries = new Entry
+        {
+            MediaType = "series", TmdbId = 8810, TargetLibraryId = tvLibrary.Id, Title = "Grace fold",
+            MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("series", 8810, "Grace fold", null, null, null, null, null, null,
+                false, null, null, [], [], []))
+        };
+        var unkeptRow = new Episode { EntryId = graceSeries.Id, TmdbId = 8813, SeasonNumber = 1, EpisodeNumber = 3, Title = "Fourth",
+            AirDate = new DateTime(2020, 1, 23, 0, 0, 0, DateTimeKind.Utc) };
+        var expiredRow = new Episode { EntryId = graceSeries.Id, TmdbId = 0, SeasonNumber = 1, EpisodeNumber = 4, Title = "Fourth",
+            AirDate = new DateTime(2020, 1, 23, 0, 0, 0, DateTimeKind.Utc), JellyfinItemId = Guid.NewGuid(), State = FileState.OnDisk };
+        var shortRow = new Episode { EntryId = graceSeries.Id, TmdbId = 8815, SeasonNumber = 1, EpisodeNumber = 5, Title = "Sixth",
+            AirDate = new DateTime(2020, 2, 6, 0, 0, 0, DateTimeKind.Utc), RetentionPolicy = RetentionPolicy.Days, ReclaimAfterDays = 1 };
+        var inheritingRow = new Episode { EntryId = graceSeries.Id, TmdbId = 0, SeasonNumber = 1, EpisodeNumber = 6, Title = "Sixth",
+            AirDate = new DateTime(2020, 2, 6, 0, 0, 0, DateTimeKind.Utc), JellyfinItemId = Guid.NewGuid(), State = FileState.OnDisk };
+        var unkeptAt = DateTime.UtcNow.AddHours(-1);
+        var foldedGrabId = Guid.NewGuid();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.Add(graceSeries);
+            database.Episodes.AddRange(unkeptRow, expiredRow, shortRow, inheritingRow);
+            database.RetentionEvaluations.AddRange(
+                new RetentionEvaluation { EntryId = graceSeries.Id, EpisodeId = unkeptRow.Id, TargetId = unkeptRow.Id,
+                    State = "waiting", Reason = "waiting_for_completion", EvaluatedAt = unkeptAt, BaselineAt = unkeptAt.AddDays(-60),
+                    GraceNotBefore = unkeptAt },
+                new RetentionEvaluation { EntryId = graceSeries.Id, EpisodeId = expiredRow.Id, TargetId = expiredRow.Id,
+                    State = "scheduled", Reason = "scheduled", EvaluatedAt = unkeptAt, BaselineAt = unkeptAt.AddDays(-60),
+                    CompletionBasisAt = unkeptAt.AddDays(-50), EligibleAt = unkeptAt.AddDays(-50), Deadline = unkeptAt.AddDays(-36) });
+            // Codex delta review 2: a finished grab of the folded row names the surviving row afterwards, never no episode.
+            database.GrabOperations.Add(new GrabOperation
+            {
+                Id = foldedGrabId, RequestedBy = Guid.NewGuid(), IdempotencyKey = "p1-fold-grab", RequestFingerprint = "p1",
+                EntryId = graceSeries.Id, EpisodeId = unkeptRow.Id, RawTitle = "Grace.Fold.S01E04", State = "cancelled",
+                CreatedAt = unkeptAt, UpdatedAt = unkeptAt, HoldUntil = unkeptAt
+            });
+            await database.SaveChangesAsync();
+        }
+
+        http.Response = uri => uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
+            ? Json("""{"season_number":1,"episodes":[{"id":8813,"season_number":1,"episode_number":4,"name":"Fourth","air_date":"2020-01-23"},{"id":8815,"season_number":1,"episode_number":6,"name":"Sixth","air_date":"2020-02-06"}]}""")
+            : Json("""{"id":8810,"name":"Grace fold","seasons":[{"season_number":1,"name":"Season 1","episode_count":2}]}""");
+        using (var folded = await client.PostAsync($"/JellyfinMod/Entries/{graceSeries.Id}/Refresh", null))
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var rows = await database.Episodes.AsNoTracking().Where(episode => episode.EntryId == graceSeries.Id).ToListAsync();
+            var survivorEvaluation = await database.RetentionEvaluations.AsNoTracking()
+                .SingleOrDefaultAsync(evaluation => evaluation.TargetId == expiredRow.Id);
+            var inheriting = rows.SingleOrDefault(row => row.Id == inheritingRow.Id);
+            Assert(folded.IsSuccessStatusCode && rows.Count == 2 && rows.Any(row => row.Id == expiredRow.Id && row.TmdbId == 8813) &&
+                survivorEvaluation is { State: not "scheduled", Deadline: null, GraceNotBefore: { } grace } &&
+                Math.Abs((grace - unkeptAt).TotalSeconds) < 1,
+                "A fold carries the folded row's grace to the surviving file and drops its expired schedule (Codex round 2 P1): " +
+                $"{survivorEvaluation?.State}/{survivorEvaluation?.Deadline:O}/{survivorEvaluation?.GraceNotBefore:O}");
+            var foldedGrab = await database.GrabOperations.AsNoTracking().SingleAsync(grab => grab.Id == foldedGrabId);
+            Assert(foldedGrab.EpisodeId == expiredRow.Id,
+                $"A fold moves the folded row's records to the surviving row (Codex delta review 2): {foldedGrab.EpisodeId}");
+            database.GrabOperations.Remove(await database.GrabOperations.SingleAsync(grab => grab.Id == foldedGrabId));
+            Assert(inheriting is { TmdbId: 8815, RetentionPolicy: RetentionPolicy.Inherit },
+                "A folded row's shorter window never replaces the surviving row's inherited one: " +
+                $"{inheriting?.TmdbId}/{inheriting?.RetentionPolicy}/{inheriting?.ReclaimAfterDays}");
+            database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == graceSeries.Id));
+            database.History.RemoveRange(database.History.Where(history => history.EntryId == graceSeries.Id));
+            await database.SaveChangesAsync();
+        }
+
         foreach (var malformed in new[] { "{}", "{\"episodes\":{}}", "{\"season_number\":2,\"episodes\":[]}" })
         {
             http.Response = uri => uri.AbsolutePath.Contains("/season/", StringComparison.Ordinal) ? Json(malformed)
@@ -675,7 +806,7 @@ internal static class ApiSmoke
         Assert((await client.PostAsJsonAsync("/JellyfinMod/Browse", new { mediaType = "movie", targetLibraryId = libraryFolder.Id })).StatusCode == HttpStatusCode.NotFound,
             "Combined browse does not disclose an inaccessible library");
         await VerifyStaleAndOrphanedEntriesAsync(client, dbPath, user, libraryFolder.Id);
-        await VerifyEpisodeConflictsAsync(client, dbPath, user, tvLibrary.Id);
+        await VerifyEpisodeConflictsAsync(client, dbPath, user, otherUser, tvLibrary, nativeById);
         await VerifyReclaimedVisibilityAsync(client, dbPath, user, libraryFolder.Id);
         await VerifyDiscoveryBudgetAsync(client, http, user);
         await VerifyContractHygieneAsync(client, dbPath, user, libraryFolder.Id, tvLibrary.Id);
@@ -942,15 +1073,27 @@ internal static class ApiSmoke
     }
 
     /// <summary>P2.R9: administrators rebind or keep a disagreeing episode through real HTTP.</summary>
-    private static async Task VerifyEpisodeConflictsAsync(HttpClient client, string dbPath, User user, Guid libraryId)
+    private static async Task VerifyEpisodeConflictsAsync(HttpClient client, string dbPath, User user, User otherUser,
+        EmptyMovieLibrary tvLibrary, Dictionary<Guid, BaseItem> nativeById)
     {
-        var series = new Entry { MediaType = "series", TmdbId = 88200, TargetLibraryId = libraryId, Title = "Conflicted" };
+        var libraryId = tvLibrary.Id;
+        // A conflict is reported on a bound native series: its two episodes are Jellyfin's own items.
+        var pilotItem = new MediaBrowser.Controller.Entities.TV.Episode { Id = Guid.NewGuid(), Name = "Pilot", ParentIndexNumber = 1, IndexNumber = 1 };
+        var secondItem = new MediaBrowser.Controller.Entities.TV.Episode { Id = Guid.NewGuid(), Name = "Third", ParentIndexNumber = 1, IndexNumber = 3 };
+        var nativeSeries = new TestSeries { Id = Guid.NewGuid(), Name = "Conflicted", SortName = "conflicted", Episodes = [pilotItem, secondItem] };
+        var previousItems = tvLibrary.Items;
+        tvLibrary.Items = [.. previousItems, nativeSeries];
+        nativeById[nativeSeries.Id] = nativeSeries;
+        nativeById[pilotItem.Id] = pilotItem;
+        nativeById[secondItem.Id] = secondItem;
+        var series = new Entry { MediaType = "series", TmdbId = 88200, TargetLibraryId = libraryId, Title = "Conflicted",
+            JellyfinItemId = nativeSeries.Id };
         var pilot = new Episode { EntryId = series.Id, TmdbId = 88201, SeasonNumber = 1, EpisodeNumber = 1, Title = "Pilot",
             State = FileState.OnDisk };
         var second = new Episode { EntryId = series.Id, TmdbId = 88203, SeasonNumber = 1, EpisodeNumber = 3, Title = "Third",
             State = FileState.OnDisk };
-        var pilotNative = Guid.NewGuid();
-        var secondNative = Guid.NewGuid();
+        var pilotNative = pilotItem.Id;
+        var secondNative = secondItem.Id;
         pilot.JellyfinItemId = pilotNative;
         second.JellyfinItemId = secondNative;
         var rebind = new EpisodeConflict { EntryId = series.Id, EpisodeId = pilot.Id, JellyfinItemId = pilotNative,
@@ -972,6 +1115,34 @@ internal static class ApiSmoke
         Assert((await client.PostAsync($"/JellyfinMod/Reconciliation/Conflicts/{rebind.Id}/Rebind", null)).StatusCode ==
             HttpStatusCode.Forbidden, "Ordinary users cannot resolve episode conflicts");
         client.DefaultRequestHeaders.Add("X-Smoke-Role", "admin");
+        // Whole-review chunk 3b, P2 5: an administrator limited to other libraries neither lists nor resolves these
+        // conflicts, and one whose blocked tag hides an episode neither lists nor resolves that episode's conflict.
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", otherUser.Id.ToString());
+        using (var restrictedList = await client.GetAsync("/JellyfinMod/Reconciliation/Conflicts"))
+        {
+            using var restrictedJson = JsonDocument.Parse(await restrictedList.Content.ReadAsStringAsync());
+            Assert(restrictedList.StatusCode == HttpStatusCode.OK && restrictedJson.RootElement.GetArrayLength() == 0 &&
+                (await client.PostAsync($"/JellyfinMod/Reconciliation/Conflicts/{rebind.Id}/Rebind", null)).StatusCode == HttpStatusCode.NotFound,
+                "An administrator without the library neither lists nor rebinds its conflicts (whole-review c3bf5)");
+        }
+
+        client.DefaultRequestHeaders.Remove("X-Smoke-User");
+        client.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
+        secondItem.Tags = ["hidden-episode"];
+        user.SetPreference(PreferenceKind.BlockedTags, ["hidden-episode"]);
+        using (var taggedList = await client.GetAsync("/JellyfinMod/Reconciliation/Conflicts"))
+        {
+            using var taggedJson = JsonDocument.Parse(await taggedList.Content.ReadAsStringAsync());
+            Assert(taggedList.StatusCode == HttpStatusCode.OK && taggedJson.RootElement.GetArrayLength() == 1 &&
+                Guid.Parse(taggedJson.RootElement[0].GetProperty("id").GetString()!) == rebind.Id &&
+                (await client.PostAsync($"/JellyfinMod/Reconciliation/Conflicts/{keep.Id}/Keep", null)).StatusCode == HttpStatusCode.NotFound,
+                "An administrator from whom a blocked tag hides an episode neither lists nor keeps its conflict (whole-review c3bf5): " +
+                taggedJson.RootElement.GetRawText());
+        }
+
+        user.SetPreference(PreferenceKind.BlockedTags, []);
+        secondItem.Tags = [];
         using var listed = await client.GetAsync("/JellyfinMod/Reconciliation/Conflicts");
         using var listedJson = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
         Assert(listed.StatusCode == HttpStatusCode.OK && listedJson.RootElement.GetArrayLength() == 2,
@@ -1005,6 +1176,7 @@ internal static class ApiSmoke
         using var afterwardsJson = JsonDocument.Parse(await afterwards.Content.ReadAsStringAsync());
         Assert(afterwardsJson.RootElement.GetArrayLength() == 0, "Resolved conflicts leave the admin view");
         client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+        tvLibrary.Items = previousItems;
     }
 
     /// <summary>P2.R7: stale and orphaned entries stay manageable by administrators.</summary>
@@ -1069,8 +1241,13 @@ internal static class ApiSmoke
     private sealed class TestSeries : Folder
     {
         public IReadOnlyList<BaseItem> Episodes { get; init; } = [];
-        protected override MediaBrowser.Model.Querying.QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query) =>
-            new() { Items = Episodes, TotalRecordCount = Episodes.Count };
+        // Like Jellyfin, a user's blocked tags hide an episode from that user's queries.
+        protected override MediaBrowser.Model.Querying.QueryResult<BaseItem> GetItemsInternal(InternalItemsQuery query)
+        {
+            var blocked = query.User?.GetPreference(PreferenceKind.BlockedTags) ?? [];
+            var items = Episodes.Where(episode => !episode.Tags.Intersect(blocked, StringComparer.OrdinalIgnoreCase).Any()).ToArray();
+            return new() { Items = items, TotalRecordCount = items.Length };
+        }
     }
 }
 

@@ -68,11 +68,14 @@ internal static partial class Phase5
         var tvAdmin = new User("tvadmin", "auth", "reset") { Id = Guid.NewGuid() };
         var ordinary = new User("viewer", "auth", "reset") { Id = Guid.NewGuid() };
         var moviesOnly = new User("moviefan", "auth", "reset") { Id = Guid.NewGuid() };
+        // A list the run can add to: the manual cleanup case adds a library reached through a second bind mount.
+        var libraries = new List<TestLibrary> { movies, tv, farLibrary };
         var native = new NativeWorld
         {
-            Libraries = [movies, tv, farLibrary],
-            UserLibraries = userId => userId == admin.Id || userId == ordinary.Id ? [movies, tv] :
-                userId == tvAdmin.Id ? [tv] : userId == moviesOnly.Id ? [movies] : []
+            Libraries = libraries,
+            // The administrator also sees the libraries the cleanup case adds through the second bind mount.
+            UserLibraries = userId => userId == admin.Id ? [movies, tv, .. libraries.Where(library => library.Name.StartsWith("Alias", StringComparison.Ordinal))] :
+                userId == ordinary.Id ? [movies, tv] : userId == tvAdmin.Id ? [tv] : userId == moviesOnly.Id ? [movies] : []
         };
         BaseItem.LibraryManager = native.Library;
         var world = new World
@@ -283,10 +286,14 @@ internal static partial class Phase5
             revision = acquisition.GetProperty("revision").GetInt32()
         }), 200, "Acquisition is enabled");
 
-        // ---- I2 path mappings: validation names the rule; a valid mapping is verified by a real hardlink probe.
+        // ---- I2 path mappings: validation names the rule; a valid mapping is verified by a real hardlink probe. Every
+        // replacement names the version of the mappings it read (final review, finding 4).
+        async Task<string> MappingsVersionOf(Guid id) => Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/DownloadClients"))
+            .EnumerateArray().Single(client => client.GetProperty("id").AsGuid() == id).GetProperty("mappingsVersion").GetString()!;
         await ExpectAsync(admin.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings", new
         {
-            pathMappings = new[] { new { clientPathPrefix = "/data/inside", localPathPrefix = Path.Combine(media, "movies", "inside") } }
+            pathMappings = new[] { new { clientPathPrefix = "/data/inside", localPathPrefix = Path.Combine(media, "movies", "inside") } },
+            mappingsVersion = await MappingsVersionOf(clientId)
         }), 400, "mapping_inside_library", "A mapping into a library folder is refused with the rule named");
         await ExpectAsync(admin.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings", new
         {
@@ -294,18 +301,87 @@ internal static partial class Phase5
             {
                 new { clientPathPrefix = "/other/torrents", localPathPrefix = Path.Combine(far, "downloads") },
                 new { clientPathPrefix = "/other/torrents/", localPathPrefix = Path.Combine(far, "downloads") }
-            }
+            },
+            mappingsVersion = await MappingsVersionOf(clientId)
         }), 400, "duplicate_mapping", "Duplicate client prefixes are refused");
         Assert((await ordinary.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings",
             new { pathMappings = Array.Empty<object>() })).StatusCode == HttpStatusCode.Forbidden, "Ordinary users cannot change mappings");
         var mappings = await ReadAsync(await admin.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings", new
         {
-            pathMappings = new[] { new { clientPathPrefix = "/other/torrents", localPathPrefix = Path.Combine(far, "downloads") } }
+            pathMappings = new[] { new { clientPathPrefix = "/other/torrents", localPathPrefix = Path.Combine(far, "downloads") } },
+            mappingsVersion = await MappingsVersionOf(clientId)
         }), 200, "Administrator saves a mapping");
         Assert(mappings.EnumerateArray().Single().GetProperty("verifiedAt").ValueKind == JsonValueKind.String,
             "A mapping whose folder can hardlink into a library records VerifiedAt");
+        // Whole-review chunk 3b, P2 2: a replacement whose save fails part-way (here, inserting the new set) keeps the
+        // existing mappings rather than leaving the client with none.
+        await using (var trigger = new ModDbContext(dbPath))
+            await trigger.Database.ExecuteSqlRawAsync("CREATE TRIGGER jfmod_fail_mapping BEFORE INSERT ON DownloadClientPathMappings " +
+                "BEGIN SELECT RAISE(ABORT, 'injected: the replacement fails'); END;");
+        HttpResponseMessage interruptedMapping;
+        var versionBeforeInterrupt = await MappingsVersionOf(clientId);
+        try
+        {
+            interruptedMapping = await admin.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings", new
+            {
+                pathMappings = new[] { new { clientPathPrefix = "/elsewhere/torrents", localPathPrefix = Path.Combine(far, "downloads") } },
+                mappingsVersion = versionBeforeInterrupt
+            });
+        }
+        finally
+        {
+            await using var drop = new ModDbContext(dbPath);
+            await drop.Database.ExecuteSqlRawAsync("DROP TRIGGER jfmod_fail_mapping;");
+        }
+
+        var keptMappings = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings"));
+        Assert(!interruptedMapping.IsSuccessStatusCode && keptMappings.GetArrayLength() == 1 &&
+            keptMappings[0].GetProperty("clientPathPrefix").GetString() == "/other/torrents",
+            "An interrupted mapping replacement keeps the existing mappings (whole-review c3bf2): " + keptMappings.GetRawText());
         Assert(!Directory.EnumerateFiles(far, ".jfmod-probe-*", SearchOption.AllDirectories).Any() &&
             !Directory.EnumerateFiles(media, ".jfmod-probe-*", SearchOption.AllDirectories).Any(), "The probe's dot-prefixed files are removed");
+        // Codex delta review 6, P2: a mapping save does not advance the client's revision, so the mappings carry a version of
+        // their own. Another administrator saves the same mappings again; a copy read before that is refused, and the mappings
+        // stay as the other administrator saved them.
+        var readMappings = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/DownloadClients")).EnumerateArray()
+            .Single(client => client.GetProperty("id").AsGuid() == clientId);
+        var staleVersion = readMappings.GetProperty("mappingsVersion").GetString();
+        var revisionBefore = readMappings.GetProperty("revision").GetInt32();
+        await ReadAsync(await admin.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings", new
+        {
+            pathMappings = new[] { new { clientPathPrefix = "/other/torrents", localPathPrefix = Path.Combine(far, "downloads") } },
+            mappingsVersion = staleVersion
+        }), 200, "Another administrator saves the mappings with the version they read");
+        var staleSave = await admin.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings", new
+        {
+            pathMappings = Array.Empty<object>(), revision = revisionBefore, mappingsVersion = staleVersion
+        });
+        var afterStale = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings"));
+        Assert(staleSave.StatusCode == HttpStatusCode.Conflict && (await staleSave.Content.ReadAsStringAsync()).Contains("revision_conflict",
+                StringComparison.Ordinal) && afterStale.GetArrayLength() == 1,
+            $"A mapping save from a stale copy is refused even though the client's revision did not move (Codex delta review 6, P2): " +
+            $"{(int)staleSave.StatusCode}, {afterStale.GetArrayLength()} mapping(s) left");
+        // Final review, finding 4: a replacement that names no version is refused, and so is a client PATCH that replaces the
+        // mappings from a stale copy; the mappings stay as they are.
+        var unversioned = await admin.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings",
+            new { pathMappings = Array.Empty<object>() });
+        var clientNow = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/DownloadClients")).EnumerateArray()
+            .Single(client => client.GetProperty("id").AsGuid() == clientId);
+        object ClientPatch(string? version) => new
+        {
+            name = clientNow.GetProperty("name").GetString(), kind = clientNow.GetProperty("kind").GetString(),
+            baseUrl = clientNow.GetProperty("baseUrl").GetString(), username = clientNow.GetProperty("username").GetString() ?? "",
+            password = new { action = "unchanged" }, enabled = clientNow.GetProperty("enabled").GetBoolean(),
+            label = clientNow.GetProperty("label").GetString(), downloadDirectory = clientNow.GetProperty("downloadDirectory").GetString(),
+            localDirectory = clientNow.GetProperty("localDirectory").GetString(), openUrl = (string?)null,
+            pathMappings = Array.Empty<object>(), mappingsVersion = version, revision = clientNow.GetProperty("revision").GetInt32()
+        };
+        var stalePatch = await admin.PatchAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}", ClientPatch(staleVersion));
+        var afterPatch = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/PathMappings"));
+        Assert(unversioned.StatusCode == HttpStatusCode.Conflict && stalePatch.StatusCode == HttpStatusCode.Conflict &&
+            (await stalePatch.Content.ReadAsStringAsync()).Contains("revision_conflict", StringComparison.Ordinal) && afterPatch.GetArrayLength() == 1,
+            $"A mapping replacement without a version, or a client PATCH from a stale copy, is refused (final review, finding 4): " +
+            $"{(int)unversioned.StatusCode}, {(int)stalePatch.StatusCode}, {afterPatch.GetArrayLength()} mapping(s) left");
         var unmappedTest = await ReadAsync(await admin.PostAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{clientId}/TestImportPath",
             new { clientPath = "/nowhere/else" }), 200, "Import path test answers");
         Assert(!unmappedTest.GetProperty("ok").GetBoolean() && unmappedTest.GetProperty("code").GetString() == "path_unmapped",
@@ -324,7 +400,8 @@ internal static partial class Phase5
         // ================= Movie A: grab → download → import → bind → seed (I3–I5).
         var (grabA, hashA) = await GrabAsync(admin, ids["movieA"], null, fixtures["movieA"]);
         var importA = await WaitAsync(async () => await ImportFor(dbPath, grabA), "An accepted grab gets an import operation");
-        Assert(importA.State == ImportStates.Waiting && importA.Progress is null, "The import waits with no invented progress");
+        // The background monitor may already have read the torrent (0 % done): the progress is what the client reports, or none.
+        Assert(importA.State == ImportStates.Waiting && importA.Progress is null or 0, $"The import waits with no invented progress: {importA.State}, {importA.Progress}");
         var queue = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue"));
         var rowA = Row(queue, importA.Id);
         Assert(rowA.GetProperty("state").GetString() == "queued" &&
@@ -455,36 +532,104 @@ internal static partial class Phase5
         preview = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview"));
         Assert(PreviewItem(preview, completedA.BindingId!.Value).GetProperty("state").GetString() == "due",
             "Once the plugin's effective goal is met, the library file is due");
+        // Whole-review chunk 1, P2 4: the floor is raised above what the torrent has seeded. The goal met earlier no longer
+        // counts: the library file is blocked again until the new goal is met, and lowering the floor frees it.
+        await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Import", ImportSettings(2, floorRatio: 5.0)), 200,
+            "Administrator raises the seed floor");
+        preview = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview"));
+        var raised = PreviewItem(preview, completedA.BindingId!.Value);
+        Assert(raised.GetProperty("state").GetString() == "blocked" && raised.GetProperty("reason").GetString() == "seed_goal_unmet",
+            $"A goal met under the old floor does not override the raised one (whole-review c1f4): {raised.GetProperty("state")}/{raised.GetProperty("reason")}");
+        await Tick();
+        await using (var database = new ModDbContext(dbPath))
+            Assert((await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedA.Id)).GoalMetAt is null,
+                "The seed release forgets a goal that is no longer met");
+        await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Import", ImportSettings(3)), 200, "Administrator restores the floor");
+        await Tick();
+        preview = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview"));
+        Assert(PreviewItem(preview, completedA.BindingId!.Value).GetProperty("state").GetString() == "due",
+            "With the goal met again under the current floor, the library file is due again");
+        // Codex round 2 P2: what the torrent last showed is not enough. Before the next seed tick, the client reports the
+        // torrent incomplete, then raises its own ratio goal above what it has seeded: the library file is blocked each time.
+        var heldSeedA = transmission.Torrents[hashA];
+        var seededBytes = heldSeedA.Files[0].Completed;
+        heldSeedA.Files[0].Completed = seededBytes - 1;
+        var incomplete = PreviewItem(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview")), completedA.BindingId!.Value);
+        heldSeedA.Files[0].Completed = seededBytes;
+        var (ratioMode, ratioLimit) = (heldSeedA.SeedRatioMode, heldSeedA.SeedRatioLimit);
+        (heldSeedA.SeedRatioMode, heldSeedA.SeedRatioLimit) = (1, 3.0);
+        var clientRaised = PreviewItem(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview")), completedA.BindingId!.Value);
+        (heldSeedA.SeedRatioMode, heldSeedA.SeedRatioLimit) = (ratioMode, ratioLimit);
+        Assert(incomplete.GetProperty("reason").GetString() == "seeding_incomplete" &&
+            clientRaised.GetProperty("reason").GetString() == "seed_goal_unmet",
+            $"Retention asks the client before a seed-shared file is due: {incomplete.GetProperty("state")}/{incomplete.GetProperty("reason")}, " +
+            $"{clientRaised.GetProperty("state")}/{clientRaised.GetProperty("reason")}");
         var reclaim = await host.Service<RetentionExecutor>().ReclaimAsync(completedA.BindingId!.Value, CancellationToken.None);
         Assert(reclaim.State == "completed" && reclaim.PhysicalBytesReleased == 0 && !File.Exists(destinationA) &&
             inspector.TryInspect(sourceA, out var afterReclaim) && afterReclaim.HardlinkCount == 1,
-            "Retention unlinks only the library path and honestly reports 0 bytes released while the seeding copy remains");
-        await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Import", ImportSettings(2, seedRelease: true)), 200,
+            $"Retention unlinks only the library path and honestly reports 0 bytes released while the seeding copy remains: {reclaim.State}/{reclaim.Reason}");
+        // Codex delta reviews 1 and 5, P1: right after the release reads the torrent under the gate, the client relocates it
+        // into a library folder holding a file of the same name. The release deletes nothing at all: the client only forgets
+        // the torrent, and the checked download stays on disk for the administrator's manual cleanup (user decision
+        // 2026-10-02).
+        transmission.Roots["/data/library"] = world.Movies.Location;
+        var heldA = transmission.Torrents[hashA];
+        var relocatedAFolder = Path.Combine(world.Movies.Location, "Relocated A");
+        Directory.CreateDirectory(relocatedAFolder);
+        var decoyA = Path.Combine(relocatedAFolder, heldA.Files[0].Name);
+        await File.WriteAllBytesAsync(decoyA, new byte[2048]);
+        // The tick reads the torrent first; the release then reads it again under the gate. The second read is the gated one.
+        var readsOfA = 0;
+        transmission.AfterGet = asked =>
+        {
+            if (asked is null || !asked.Contains(hashA) || ++readsOfA < 2) return Task.CompletedTask;
+            heldA.DownloadDir = "/data/library/Relocated A";
+            transmission.AfterGet = null;
+            return Task.CompletedTask;
+        };
+        await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Import", ImportSettings(4, seedRelease: true)), 200,
             "Administrator turns seed release on");
         await WaitAsync(async () =>
         {
             await Tick();
             await using var database = new ModDbContext(dbPath);
             return (await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedA.Id)).State ==
-                SeedReleaseStates.Completed ? true : (bool?)null;
-        }, "The seed release completes after the late reclaim");
+                SeedReleaseStates.Detached ? true : (bool?)null;
+        }, "The seed release detaches the torrent after the late reclaim");
+        transmission.AfterGet = null;
+        Assert(File.Exists(decoyA) && File.Exists(sourceA) && !transmission.Torrents.ContainsKey(hashA) &&
+            transmission.RemoveDeletedData.All(deleted => !deleted),
+            $"A torrent relocated into a library right after the gated read is only forgotten by the client; nothing is deleted " +
+            $"(Codex delta reviews 1 and 5): library file {File.Exists(decoyA)}, download {File.Exists(sourceA)}, " +
+            $"delete-data requests {transmission.RemoveDeletedData.Count(deleted => deleted)}");
+        File.Delete(decoyA);
+        Directory.Delete(relocatedAFolder);
         await using (var database = new ModDbContext(dbPath))
         {
             var seed = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedA.Id);
-            var retention = await database.RetentionOperations.AsNoTracking().SingleAsync(value => value.Id == reclaim.OperationId);
-            Assert(seed.PhysicalBytesReleased == Size && seed.CreditedRetentionOperationId == retention.Id && seed.HardlinkCountBefore == 1 &&
-                !File.Exists(sourceA) && !transmission.Torrents.ContainsKey(hashA),
-                "Removing the last link frees the logical size and credits the earlier reclaim");
+            var manifestA = TorrentDataRemoval.Deserialize(seed.CleanupManifest);
+            Assert(seed.Reason == SeedReleaseReasons.CleanupPending && seed.PhysicalBytesReleased is null && seed.HardlinkCountBefore == 1 &&
+                manifestA is { Count: 1 } && inspector.TryInspect(sourceA, out var keptA) && manifestA[0].Path == keptA.CanonicalPath &&
+                manifestA[0].PhysicalIdentity == keptA.PhysicalIdentity && manifestA[0].Size == Size,
+                $"The detached release keeps its checked file listed for the manual cleanup and claims nothing freed: {seed.Reason}, " +
+                $"{seed.CleanupManifest}");
             var released = await database.History.AsNoTracking().SingleAsync(history => history.Id == seed.Id);
-            Assert(released.EventType == "seeding_released" && released.Summary.Contains("previously reported as 0 B", StringComparison.Ordinal),
-                "History shows the freed bytes that were reported as 0 B earlier");
+            Assert(released.EventType == "seeding_released" && released.Summary.Contains("Nothing was deleted", StringComparison.Ordinal),
+                "History says seeding stopped and nothing was deleted: " + released.Summary);
             Assert((await database.GrabOperations.AsNoTracking().SingleAsync(value => value.Id == grabA)).ActiveHash is null,
-                "The grab gives its hash back once the seeding copy is gone");
+                "The grab gives its hash back once the client forgot the torrent");
         }
+
+        // A detached release stays detached: later ticks, with the torrent long gone from the client, never complete it.
+        await Tick();
+        await Tick();
+        await using (var database = new ModDbContext(dbPath))
+            Assert((await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedA.Id)).State ==
+                SeedReleaseStates.Detached && File.Exists(sourceA), "A detached release survives ticks with its files kept (Codex delta review 5, P2)");
 
         queue = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue"));
         Assert(!queue.GetProperty("items").EnumerateArray().Any(item => item.GetProperty("id").AsGuid() == completedA.Id),
-            "A released seeding copy leaves the queue");
+            "A detached seeding copy leaves the queue");
 
         // ================= I6 case 1: seed goal first; the library file survives with link count 1.
         var foreignHash = new string('f', 40);
@@ -497,20 +642,166 @@ internal static partial class Phase5
         transmission.Progress(hashB, 1.0);
         var completedB = await CompleteAsync(dbPath, grabB, Tick);
         Assert(completedB.VersionLabel == "1080p BluRay", "The version label uses resolution and source");
-        transmission.Torrents[hashB].UploadRatio = 1.5;
-        await WaitAsync(async () =>
+
+        // ================= Whole-review P1 5, 6 and 7: every removal with data checks the torrent as it is now.
+        async Task<SeedReleaseOperation> SeedB()
         {
-            await Tick();
             await using var database = new ModDbContext(dbPath);
-            return (await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedB.Id)).State ==
-                SeedReleaseStates.Completed ? true : (bool?)null;
-        }, "The seed release completes once the ratio is met");
+            return await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedB.Id);
+        }
+
+        var heldB = transmission.Torrents[hashB];
+        var (downloadDirB, fileB) = (heldB.DownloadDir, heldB.Files[0]);
+        var destinationB = completedB.DestinationPath!;
+        // P1 5: the torrent is re-pointed at its library hardlink, the original download left where it was. Saved-path checks
+        // pass, but the client would delete the files where the torrent is now: the library file.
+        transmission.Roots["/data/library"] = world.Movies.Location;
+        heldB.DownloadDir = "/data/library/" + Path.GetFileName(Path.GetDirectoryName(destinationB));
+        heldB.Files[0] = new HeldFile { Name = Path.GetFileName(destinationB), Length = fileB.Length, Completed = fileB.Completed };
+        heldB.UploadRatio = 1.5;
+        await Tick();
+        await Tick();
+        var relocated = await SeedB();
+        Assert(relocated.State == SeedReleaseStates.Blocked && relocated.Reason == SeedReleaseReasons.SeedingInsideLibrary &&
+            File.Exists(destinationB) && transmission.Torrents.ContainsKey(hashB),
+            $"A torrent now located in a library is never removed with its data (whole-review P1 5): {relocated.State}/{relocated.Reason}");
+        heldB.DownloadDir = downloadDirB;
+        heldB.Files[0] = fileB;
+
+        // P1 6: the library link goes missing, and an older reclamation at the same pathname (another file) is on record.
+        var awayB = destinationB + ".away";
+        File.Move(destinationB, awayB);
         await using (var database = new ModDbContext(dbPath))
         {
             var seed = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedB.Id);
-            Assert(seed.PhysicalBytesReleased == 0 && seed.CreditedRetentionOperationId is null && seed.Reason == SeedReleaseReasons.Released &&
-                inspector.TryInspect(completedB.DestinationPath!, out var libraryB) && libraryB.HardlinkCount == 1 &&
-                !File.Exists(completedB.SourceLocalPath!), "The library file survives with link count 1 and 0 bytes are claimed");
+            database.RetentionOperations.Add(new RetentionOperation
+            {
+                ActionId = Guid.NewGuid(), BindingId = Guid.NewGuid(), EntryId = ids["movieB"], JellyfinItemId = Guid.NewGuid(),
+                TargetLibraryId = world.Movies.Id, PolicyVersion = 1, MediaPath = seed.LibraryPath, StorageIdentity = "earlier",
+                PhysicalIdentity = "an-earlier-file", LogicalBytes = Size, HardlinkCountBefore = 1, State = "completed", Reason = "reclaimed",
+                PreparedAt = seed.PreparedAt.AddDays(-2), CompletedAt = seed.PreparedAt.AddDays(-2)
+            });
+            await database.SaveChangesAsync();
+        }
+
+        await Tick();
+        await Tick();
+        var stale = await SeedB();
+        Assert(stale.State == SeedReleaseStates.Blocked && stale.Reason == SeedReleaseReasons.LibraryLinkUnexpected &&
+            File.Exists(completedB.SourceLocalPath!) && transmission.Torrents.ContainsKey(hashB),
+            $"A reclamation of an earlier file at the same pathname does not authorize deleting this download's last copy " +
+            $"(whole-review P1 6): {stale.State}/{stale.Reason}");
+
+        // P1 7: a removal left in progress (the client rejected it) is retried only after every safeguard is read again.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedB.Id);
+            seed.State = SeedReleaseStates.Removing;
+            seed.Reason = null;
+            seed.HardlinkCountBefore = 2;
+            seed.RemovingAt = time.GetUtcNow().UtcDateTime;
+            await database.SaveChangesAsync();
+        }
+
+        await Tick();
+        await Tick();
+        var retried = await SeedB();
+        Assert(retried.State == SeedReleaseStates.Blocked && retried.Reason == SeedReleaseReasons.LibraryLinkUnexpected &&
+            File.Exists(completedB.SourceLocalPath!) && transmission.Torrents.ContainsKey(hashB),
+            $"A retried removal re-checks the library link and keeps the last copy (whole-review P1 7): {retried.State}/{retried.Reason}");
+        File.Move(awayB, destinationB);
+        await using (var database = new ModDbContext(dbPath))
+        {
+            await database.RetentionOperations.Where(value => value.PhysicalIdentity == "an-earlier-file").ExecuteDeleteAsync();
+        }
+
+        // Codex re-review P1-a: the release has read the client and waits for the retention gate; meanwhile the torrent is
+        // re-pointed at its library hardlink. The removal must be decided on the torrent as it is after the wait. The tick's
+        // own read is observed before the torrent moves (Codex delta review 1, P2).
+        async Task WhileReleaseWaitsAsync(Action change)
+        {
+            var gateLease = await host.Service<RetentionExecutionGate>().AcquireAsync(CancellationToken.None);
+            var callsBefore = transmission.GetCalls;
+            var waitingTick = Tick();
+            await WaitAsync(() => Task.FromResult(transmission.GetCalls > callsBefore ? true : (bool?)null),
+                "The tick reads the client before the change");
+            change();
+            await gateLease.DisposeAsync();
+            await waitingTick;
+        }
+
+        heldB.UploadRatio = 1.5;
+        await WhileReleaseWaitsAsync(() =>
+        {
+            heldB.DownloadDir = "/data/library/" + Path.GetFileName(Path.GetDirectoryName(destinationB));
+            heldB.Files[0] = new HeldFile { Name = Path.GetFileName(destinationB), Length = fileB.Length, Completed = fileB.Completed };
+        });
+        var movedDuringWait = await SeedB();
+        Assert(File.Exists(destinationB) && transmission.Torrents.ContainsKey(hashB) && movedDuringWait.State == SeedReleaseStates.Blocked &&
+            movedDuringWait.Reason == SeedReleaseReasons.SeedingInsideLibrary,
+            $"A torrent moved into a library while its release waited for the gate is never removed with its data (Codex re-review P1-a): " +
+            $"{movedDuringWait.State}/{movedDuringWait.Reason}, library file {File.Exists(destinationB)}");
+        heldB.DownloadDir = downloadDirB;
+        heldB.Files[0] = fileB;
+
+        // Codex delta review 1, P2: the client raises the torrent's ratio goal while the release waits for the gate. The fresh
+        // read decides: the release goes back to waiting and nothing is removed.
+        await WhileReleaseWaitsAsync(() => (heldB.SeedRatioMode, heldB.SeedRatioLimit) = (1, 5.0));
+        var raisedDuringWait = await SeedB();
+        Assert(raisedDuringWait is { State: SeedReleaseStates.Waiting, Reason: SeedReleaseReasons.GoalUnmet } &&
+            transmission.Torrents.ContainsKey(hashB) && File.Exists(completedB.SourceLocalPath!),
+            $"A goal raised while the release waited sends it back to waiting (Codex delta review 1, P2): {raisedDuringWait.State}/{raisedDuringWait.Reason}");
+        (heldB.SeedRatioMode, heldB.SeedRatioLimit) = (2, 2);
+
+        // The client refuses the first removal; the retry finds the goal raised meanwhile and goes back to waiting. Two
+        // refusals cover a tick of the import monitor's own that may land before the goal is raised.
+        transmission.FailRemoves = 2;
+        await Tick();
+        var refused = await SeedB();
+        (heldB.SeedRatioMode, heldB.SeedRatioLimit) = (1, 5.0);
+        await Tick();
+        var raisedBeforeRetry = await SeedB();
+        Assert(refused.State == SeedReleaseStates.Removing && refused.Error is not null &&
+            raisedBeforeRetry is { State: SeedReleaseStates.Waiting, Reason: SeedReleaseReasons.GoalUnmet } &&
+            transmission.Torrents.ContainsKey(hashB) && File.Exists(completedB.SourceLocalPath!),
+            $"A retried removal checks the goal again first (Codex delta review 1, P2): {refused.State} then {raisedBeforeRetry.State}/{raisedBeforeRetry.Reason}");
+
+        // Codex delta review 1, P1: the client refuses again; on the retry, after its gated read and before it carries out the
+        // request, it relocates the torrent onto the library file. The retry only has the client forget the torrent: the
+        // library file and the download both stay. Both are armed while the goal is still unmet, so the import monitor's own
+        // ticks, which run beside the test's, meet them in the same order.
+        var removeCallsBeforeRetry = transmission.RemoveCalls;
+        transmission.FailRemoves = 1;
+        transmission.OnRemove = removed =>
+        {
+            if (!removed.Contains(hashB)) return Task.CompletedTask;
+            transmission.OnRemove = null;
+            heldB.DownloadDir = "/data/library/" + Path.GetFileName(Path.GetDirectoryName(destinationB));
+            heldB.Files[0] = new HeldFile { Name = Path.GetFileName(destinationB), Length = fileB.Length, Completed = fileB.Completed };
+            return Task.CompletedTask;
+        };
+        (heldB.SeedRatioMode, heldB.SeedRatioLimit) = (2, 2);
+        var relocatedRetry = await WaitAsync(async () =>
+        {
+            await Tick();
+            var seed = await SeedB();
+            return seed.State == SeedReleaseStates.Detached ? seed : null;
+        }, "The refused removal is retried and the client forgets the torrent");
+        transmission.OnRemove = null;
+        Assert(transmission.RemoveCalls - removeCallsBeforeRetry >= 2 && transmission.FailRemoves <= 0 &&
+            File.Exists(destinationB) && File.Exists(completedB.SourceLocalPath!) && !transmission.Torrents.ContainsKey(hashB) &&
+            transmission.RemoveDeletedData.All(deleted => !deleted),
+            $"A retry whose torrent is relocated into a library after its gated read deletes nothing (Codex delta reviews 1 and 5): " +
+            $"{transmission.RemoveCalls - removeCallsBeforeRetry} remove request(s), {relocatedRetry.State}/{relocatedRetry.Reason}, " +
+            $"library file {File.Exists(destinationB)}");
+
+        // The release detached with the relocated retry above: its accounting is checked as it stands.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedB.Id);
+            Assert(seed.PhysicalBytesReleased is null && seed.CreditedRetentionOperationId is null && seed.Reason == SeedReleaseReasons.CleanupPending &&
+                inspector.TryInspect(completedB.DestinationPath!, out var libraryB) && libraryB.HardlinkCount == 2 &&
+                File.Exists(completedB.SourceLocalPath!), "The library file and its download link both stay, and nothing is claimed freed");
             Assert(await database.History.CountAsync(history => history.EntryId == ids["movieB"] && history.EventType == "seeding_released") == 1,
                 "One seeding_released event");
             Assert((await database.Entries.AsNoTracking().SingleAsync(value => value.Id == ids["movieB"])).State == FileState.OnDisk,
@@ -583,6 +874,11 @@ internal static partial class Phase5
         var seedingList = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Seeding"));
         Assert(seedingList.EnumerateArray().Any(item => item.GetProperty("importOperationId").AsGuid() == completedC.Id &&
             item.GetProperty("goalSecondsSource").GetString() == "indexer"), "GET /Seeding names where each goal comes from");
+        // Whole-review chunk 3a, P2 5: an administrator limited to TV sees no movie's seed, hash or path.
+        var tvSeeding = Json.Parse(await tvAdmin.GetStringAsync("/JellyfinMod/Seeding"));
+        Assert(!tvSeeding.EnumerateArray().Any(item => item.GetProperty("importOperationId").AsGuid() == completedC.Id ||
+                item.GetProperty("infoHash").GetString() == hashC),
+            "A TV-only administrator's seeding list leaves out a movie's seed (whole-review c3af5): " + tvSeeding.GetRawText());
         transmission.Torrents[hashC].SecondsSeeding = (long)TimeSpan.FromDays(14).TotalSeconds;
         await WaitAsync(async () =>
         {
@@ -627,7 +923,8 @@ internal static partial class Phase5
 
         var (grabK, hashK) = await GrabAsync(admin, ids["movieK"], null, fixtures["movieK"]);
         transmission.Progress(hashK, 1.0);
-        Assert((await BlockedAsync(dbPath, grabK, Tick)).Reason == ImportReasons.NoVideoFile, "A torrent without video blocks as no_video_file");
+        var blockedK = await BlockedAsync(dbPath, grabK, Tick);
+        Assert(blockedK.Reason == ImportReasons.NoVideoFile, "A torrent without video blocks as no_video_file");
 
         var (grabH, hashH) = await GrabAsync(admin, ids["movieH"], null, fixtures["movieH"]);
         transmission.Progress(hashH, 1.0);
@@ -647,11 +944,43 @@ internal static partial class Phase5
             File.Exists(transmission.Local("/data/torrents/jfmod/Ambiguous.Movie.2021.1080p.WEB-DL-GRP/part.one.mkv")),
             "Removing without the client leaves the torrent and its data");
         var archiveData = transmission.Local("/data/torrents/jfmod/Archive.Movie.2021.1080p.WEB-DL-GRP/archive.rar");
+        var archiveFolder = Path.GetDirectoryName(archiveData)!;
         var libraryFilesBeforeRemove = LibraryFiles(world);
+        var inspectedArchive = inspector.TryInspect(archiveData, out var archiveBefore);
+        // Codex delta reviews 3 and 5, P1: while the plugin has the client forget the torrent, the client really moves the
+        // torrent's folder into a library, and another file appears at the archive's old name. Nothing is deleted at all: the
+        // removal only records the checked files for the administrator's manual cleanup (user decision 2026-10-02).
+        var relocatedG = Path.Combine(world.Movies.Location, "Relocated G");
+        transmission.OnRemove = removed =>
+        {
+            if (!removed.Contains(hashG)) return Task.CompletedTask;
+            transmission.OnRemove = null;
+            Directory.Move(archiveFolder, relocatedG);
+            Directory.CreateDirectory(archiveFolder);
+            File.WriteAllBytes(archiveData, new byte[777]);
+            return Task.CompletedTask;
+        };
         var removedG = await ReadAsync(await admin.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"/JellyfinMod/Queue/{blockedG.Id}")
             { Content = JsonContent.Create(new { removeFromClient = true, blocklist = true }) }), 200, "Remove with the client and a blocklist");
-        Assert(removedG.GetProperty("state").GetString() == "cancelled" && !transmission.Torrents.ContainsKey(hashG) && !File.Exists(archiveData) &&
-            LibraryFiles(world).SequenceEqual(libraryFilesBeforeRemove), "The torrent and its data are removed; the library is untouched");
+        transmission.OnRemove = null;
+        var relocatedArchive = Path.Combine(relocatedG, "archive.rar");
+        Assert(removedG.GetProperty("state").GetString() == "cancelled" && !transmission.Torrents.ContainsKey(hashG) &&
+            File.Exists(relocatedArchive) && File.Exists(archiveData) && new FileInfo(archiveData).Length == 777 &&
+            transmission.RemoveDeletedData.All(deleted => !deleted),
+            $"A queue removal deletes nothing: neither what the client moved into a library nor a different file at a checked name " +
+            $"(Codex delta reviews 3 and 5, P1): relocated {File.Exists(relocatedArchive)}, replacement {File.Exists(archiveData)}");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var listedG = TorrentDataRemoval.Deserialize((await database.ImportOperations.AsNoTracking().SingleAsync(value => value.Id == blockedG.Id))
+                .CleanupManifest);
+            Assert(inspectedArchive && listedG is { Count: 3 } && listedG.Any(file => file.Path == archiveBefore.CanonicalPath &&
+                    file.PhysicalIdentity == archiveBefore.PhysicalIdentity && file.Size == Size),
+                $"The removal records every checked file, as it was checked, for the manual cleanup: {listedG?.Count} listed");
+        }
+
+        Directory.Delete(relocatedG, true);
+        Directory.Delete(archiveFolder, true);
+        Assert(LibraryFiles(world).SequenceEqual(libraryFilesBeforeRemove), "The library is as it was");
         queue = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue"));
         Assert(!queue.GetProperty("items").EnumerateArray().Any(item => item.GetProperty("id").AsGuid() == blockedF.Id ||
             item.GetProperty("id").AsGuid() == blockedG.Id), "Removed rows leave the queue");
@@ -662,6 +991,35 @@ internal static partial class Phase5
             .Any(rejection => rejection.GetProperty("code").GetString() == "blocklisted"), "A blocklisted release is rejected by a fresh search");
         Assert(await HistoryCount(dbPath, ids["movieG"], "blocklisted") == 1 && await HistoryCount(dbPath, ids["movieG"], "queue_removed") == 1,
             "Removal and blocklisting are recorded in history");
+
+        // Whole-review P1 9: an alias in the download folder points into a library. The mapped path looks like a download,
+        // but the client would delete the library file through it.
+        var victimFolder = Path.Combine(world.Movies.Location, "Alias Victim (2020)");
+        Directory.CreateDirectory(victimFolder);
+        var victim = Path.Combine(victimFolder, "Alias Victim (2020).mkv");
+        await File.WriteAllBytesAsync(victim, new byte[1024]);
+        var alias = transmission.Local("/data/torrents/jfmod/alias");
+        File.CreateSymbolicLink(alias, victimFolder);
+        var heldK = transmission.Torrents[hashK];
+        var (downloadDirK, filesK) = (heldK.DownloadDir, heldK.Files.ToList());
+        heldK.DownloadDir = "/data/torrents/jfmod/alias";
+        heldK.Files.Clear();
+        heldK.Files.Add(new HeldFile { Name = Path.GetFileName(victim), Length = 1024, Completed = 1024 });
+        using (var aliasRemoval = await admin.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"/JellyfinMod/Queue/{blockedK.Id}")
+               { Content = JsonContent.Create(new { removeFromClient = true, blocklist = false }) }))
+        {
+            var aliasBody = await aliasRemoval.Content.ReadAsStringAsync();
+            Assert(aliasRemoval.StatusCode == HttpStatusCode.Conflict && aliasBody.Contains(SeedReleaseReasons.SeedingInsideLibrary, StringComparison.Ordinal) &&
+                File.Exists(victim) && transmission.Torrents.ContainsKey(hashK),
+                $"Queue removal resolves symbolic links and never deletes library media through an alias (whole-review P1 9): " +
+                $"{(int)aliasRemoval.StatusCode} {aliasBody} victim={File.Exists(victim)}");
+        }
+
+        heldK.DownloadDir = downloadDirK;
+        heldK.Files.Clear();
+        heldK.Files.AddRange(filesK);
+        File.Delete(alias);
+        Directory.Delete(victimFolder, true);
 
         // ================= Episodes: only the imported episode becomes available; mismatches, existing files and collisions block.
         var seriesFolder = Path.Combine(world.Tv.Location, "Example Show (2023)");
@@ -713,7 +1071,7 @@ internal static partial class Phase5
             "A colliding name blocks as destination_collision and leaves the existing file untouched");
 
         // ================= I7 visibility and polling cost.
-        await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Import", ImportSettings(3, seedRelease: true, visible: true)), 200,
+        await ReadAsync(await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Import", ImportSettings(5, seedRelease: true, visible: true)), 200,
             "Administrator lets users see the queue");
         var userQueue = Json.Parse(await ordinary.GetStringAsync("/JellyfinMod/Queue"));
         Assert(userQueue.GetProperty("items").GetArrayLength() > 0 && userQueue.GetProperty("items").EnumerateArray()
@@ -808,25 +1166,28 @@ internal static partial class Phase5
             world.Native.ScanRequests.Count(path => path == scanningS.DestinationPath) == 2 && repeatedS.ScanRequestedAt > scanningS.ScanRequestedAt,
             "A scan requested before a restart is reported once more after it and completes without escalating (live finding 12)");
 
-        // A seed release that died between asking the client and inspecting the result ends once, with one event.
-        await StopAsync();
+        // Codex delta reviews 3 and 5, P2: a seed release records its checked files, the client forgets the torrent and drops the
+        // connection before answering, and the process stops before the release learns the outcome. Everything here is the
+        // production path: the list is the one the release wrote. After the restart the release detaches once, with one
+        // event, every file of the torrent still on disk and still listed.
+        var heldH = transmission.Torrents[hashH];
+        var filesH = heldH.Files.Select(file => transmission.Local(heldH.DownloadDir + "/" + file.Name)).Where(File.Exists).ToList();
+        heldH.UploadRatio = 10;
+        heldH.SecondsSeeding = (long)TimeSpan.FromDays(30).TotalSeconds;
+        transmission.DropRemoveAnswers = 1;
+        await WaitAsync(async () =>
+        {
+            await Tick();
+            await using var database = new ModDbContext(dbPath);
+            var seed = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedH.Id);
+            return seed.State == SeedReleaseStates.Removing && seed.Error is not null && !transmission.Torrents.ContainsKey(hashH)
+                ? true : (bool?)null;
+        }, "The release records its files and asks the client, which forgets the torrent without answering");
+        string? listedBeforeRestart;
         await using (var database = new ModDbContext(dbPath))
-        {
-            var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedH.Id);
-            seed.State = SeedReleaseStates.Removing;
-            seed.HardlinkCountBefore = 2;
-            seed.RemovingAt = time.GetUtcNow().UtcDateTime;
-            await database.SaveChangesAsync();
-        }
-
-        // The client did remove the torrent and its data before the process died.
-        transmission.Torrents.TryRemove(hashH, out var removedH);
-        foreach (var file in removedH!.Files)
-        {
-            var data = transmission.Local(removedH.DownloadDir + "/" + file.Name);
-            if (File.Exists(data)) File.Delete(data);
-        }
-
+            listedBeforeRestart = (await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedH.Id))
+                .CleanupManifest;
+        await StopAsync();
         await StartAsync();
         admin = host.Client(world.Admin, true);
         monitor = host.Service<ImportMonitor>();
@@ -835,10 +1196,317 @@ internal static partial class Phase5
             await Tick();
             await using var database = new ModDbContext(dbPath);
             return (await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedH.Id)).State ==
-                SeedReleaseStates.Completed ? true : (bool?)null;
-        }, "An interrupted removal is inspected and finished after a restart");
+                SeedReleaseStates.Detached ? true : (bool?)null;
+        }, "An interrupted detach is finished after a restart");
         await Tick();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedH.Id);
+            var listedH = TorrentDataRemoval.Deserialize(seed.CleanupManifest) ?? [];
+            Assert(seed.Reason == SeedReleaseReasons.CleanupPending && seed.CleanupManifest == listedBeforeRestart && filesH.Count > 1 &&
+                filesH.All(File.Exists) && filesH.All(path => inspector.TryInspect(path, out var file) && listedH.Any(item => item.Path == file.CanonicalPath)),
+                $"After a restart the interrupted release keeps every file of the forgotten torrent on disk and listed (Codex delta reviews 3 " +
+                $"and 5, P2): {seed.State}/{seed.Reason}, {filesH.Count(File.Exists)} of {filesH.Count} files on disk, {listedH.Count} listed");
+        }
+
         Assert(await HistoryCount(dbPath, ids["movieH"], "seeding_released") == 1, "The interrupted release writes exactly one history event");
+
+        // ================= Detach and keep (user decisions 2026-10-02: the client only forgets a torrent and nothing is deleted;
+        // 0.1.0.0 has no cleanup tool, which is planned for a later version). Nothing above deleted a download. The recorded
+        // files stay on disk, and automatic retention never unlinks one, also not through another name for it.
+        // Codex delta review 7, P2 5: a release whose detach had recorded its files, sent back to waiting by a retry (its seed
+        // goal rose), whose torrent then leaves the client outside JellyfinMod. It detaches again with its files still listed;
+        // it does not complete with them unresolved.
+        string? manifestB;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedB.Id);
+            manifestB = seed.CleanupManifest;
+            Assert(manifestB is not null && !transmission.Torrents.ContainsKey(hashB), "Precondition: release B recorded its files and its torrent is gone");
+            seed.State = SeedReleaseStates.Waiting;
+            seed.Reason = SeedReleaseReasons.GoalUnmet;
+            await database.SaveChangesAsync();
+        }
+
+        await Tick();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var again = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedB.Id);
+            Assert(again is { State: SeedReleaseStates.Detached, Reason: SeedReleaseReasons.CleanupPending } && again.CleanupManifest == manifestB &&
+                again.CompletedAt is null, $"A waiting release with recorded files whose torrent left the client detaches with them listed: " +
+                $"{again.State}/{again.Reason}, list kept {again.CleanupManifest == manifestB}");
+        }
+
+        // An older build's release, detached without a list of its files, is shown for manual cleanup and never resolved
+        // automatically (Codex delta review 5, P2). No path of this build leaves that state, so it is written as the older build
+        // left it: removing, no list, the torrent gone.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedB.Id);
+            seed.State = SeedReleaseStates.Removing;
+            seed.Reason = null;
+            seed.CleanupManifest = null;
+            await database.SaveChangesAsync();
+        }
+
+        await Tick();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var legacy = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedB.Id);
+            Assert(legacy is { State: SeedReleaseStates.Detached, Reason: SeedReleaseReasons.ManualCleanup, CleanupManifest: null } &&
+                File.Exists(completedB.SourceLocalPath!), $"A release without a trustworthy list is marked for manual cleanup: {legacy.State}/{legacy.Reason}");
+        }
+
+
+        // Every torrent's files must resolve for a seed-indexed reclaim: the foreign torrent's data exists.
+        var foreignData = transmission.Local("/data/torrents/jfmod/Foreign.Torrent.mkv");
+        if (!File.Exists(foreignData)) await File.WriteAllBytesAsync(foreignData, new byte[1000]);
+        // Codex delta reviews 5 and 7, P1: a download folder that a second bind mount also shows inside a library. The queue
+        // removal records the file (its path is not under any library path), and automatic retention must not unlink it through
+        // the library's name for it. The Pi runner mounts one folder twice for this.
+        var aliasA = Environment.GetEnvironmentVariable("JFMOD_ALIAS_A");
+        var aliasB = Environment.GetEnvironmentVariable("JFMOD_ALIAS_B");
+        Assert(aliasA is { Length: > 0 } && aliasB is { Length: > 0 } && Directory.Exists(aliasA) && Directory.Exists(aliasB),
+            "The bind-mount case runs: JFMOD_ALIAS_A and JFMOD_ALIAS_B name two mounts of one folder (the Pi runner sets them)");
+        // One host folder, mounted twice: its "dl" subfolder is the download folder through the first mount and a library
+        // ("Alias Downloads") through the second. Its "lib" subfolder is an ordinary library on the download side's mount, so
+        // the client's mapping for the folder verifies by hardlinking into it.
+        var aliasRoot = "p5-" + Guid.NewGuid().ToString("N")[..8];
+        var aliasFolder = Path.Combine(aliasB!, aliasRoot);
+        Directory.CreateDirectory(Path.Combine(aliasB!, aliasRoot, "lib"));
+        Directory.CreateDirectory(Path.Combine(aliasB!, aliasRoot, "dl"));
+        var aliasLibraries = (List<TestLibrary>)world.Native.Libraries;
+        aliasLibraries.Add(new TestLibrary
+        {
+            Id = Guid.NewGuid(), Name = "Alias Movies", CollectionType = Jellyfin.Data.Enums.CollectionType.movies,
+            Location = Path.Combine(aliasB!, aliasRoot, "lib")
+        });
+        var aliasDownloads = new TestLibrary
+        {
+            Id = Guid.NewGuid(), Name = "Alias Downloads", CollectionType = Jellyfin.Data.Enums.CollectionType.movies,
+            Location = Path.Combine(aliasA!, aliasRoot, "dl")
+        };
+        aliasLibraries.Add(aliasDownloads);
+        transmission.Roots["/data/alias"] = Path.Combine(aliasB!, aliasRoot);
+        // The client's own mapping for the aliased folder, saved through the API as an administrator would.
+        var aliasClient = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/DownloadClients")).EnumerateArray().First();
+        var aliasClientId = aliasClient.GetProperty("id").AsGuid();
+        var aliasMappings = aliasClient.GetProperty("pathMappings").EnumerateArray()
+            .Select(mapping => new { clientPathPrefix = mapping.GetProperty("clientPathPrefix").GetString(),
+                localPathPrefix = mapping.GetProperty("localPathPrefix").GetString() })
+            .Append(new { clientPathPrefix = (string?)"/data/alias/dl", localPathPrefix = (string?)Path.Combine(aliasB!, aliasRoot, "dl") }).ToArray();
+        var mappedAlias = await ReadAsync(await admin.PutAsJsonAsync($"/JellyfinMod/Settings/DownloadClients/{aliasClientId}/PathMappings",
+            new { pathMappings = aliasMappings, mappingsVersion = await MappingsVersionOf(aliasClientId) }), 200,
+            "Administrator maps the aliased download folder");
+        Assert(mappedAlias.EnumerateArray().Single(mapping => mapping.GetProperty("clientPathPrefix").GetString() == "/data/alias/dl")
+            .GetProperty("verifiedAt").ValueKind == JsonValueKind.String, "The aliased download folder's mapping verifies");
+        // The torrent's one file is a movie in its own folder, as the alias library will scan it.
+        var heldAliasK = transmission.Torrents[hashK];
+        heldAliasK.DownloadDir = "/data/alias/dl";
+        heldAliasK.Files.Clear();
+        heldAliasK.Files.Add(new HeldFile { Name = "Alias Movie (2021) [tmdbid-121]/Alias Movie (2021).mkv", Length = Size, Completed = Size });
+        var aliasFile = transmission.Local("/data/alias/dl/" + heldAliasK.Files[0].Name);
+        Directory.CreateDirectory(Path.GetDirectoryName(aliasFile)!);
+        await File.WriteAllBytesAsync(aliasFile, new byte[Size]);
+        await ReadAsync(await admin.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"/JellyfinMod/Queue/{blockedK.Id}")
+            { Content = JsonContent.Create(new { removeFromClient = true, blocklist = false }) }), 200, "Remove the aliased torrent from the queue");
+        // The alias library scans the same directory entry under its own name, and the catalog binds it.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            AddEntry(database, ids, "movieAlias", "movie", 121, "Alias Movie", 2021, "tt0000121", null, aliasDownloads.Id);
+            await database.SaveChangesAsync();
+        }
+
+        var aliasLibraryPath = Path.Combine(aliasA!, aliasRoot, "dl", "Alias Movie (2021) [tmdbid-121]", "Alias Movie (2021).mkv");
+        world.Native.Scan(aliasLibraryPath);
+        var aliasBinding = await WaitAsync(async () =>
+        {
+            await using var database = new ModDbContext(dbPath);
+            return await database.EntryBindings.AsNoTracking().FirstOrDefaultAsync(value => value.EntryId == ids["movieAlias"]);
+        }, "The alias library's file is bound");
+        // As for the first title: retention sees it watched, then the window passes and it is due. The earlier torrent in an
+        // unmapped folder would block every seed-indexed reclaim (the index is incomplete); it leaves the client for this step.
+        var unmappedTorrents = transmission.Torrents.Where(pair => pair.Value.Files.Any(file => file.Name.Contains("Unmapped.", StringComparison.Ordinal)))
+            .ToList();
+        foreach (var (hash, _) in unmappedTorrents) transmission.Torrents.TryRemove(hash, out _);
+        await host.Service<RetentionPolicyService>().SyncAsync(configuration, CancellationToken.None);
+        await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
+        time.Offset += TimeSpan.FromDays(2);
+        var aliasDue = PreviewItem(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview")), aliasBinding.Id);
+        Assert(aliasDue.GetProperty("state").GetString() == "due",
+            $"The alias library's file is due for retention: {aliasDue.GetProperty("state")}/{aliasDue.GetProperty("reason")}");
+        var aliasReclaim = await host.Service<RetentionExecutor>().ReclaimAsync(aliasBinding.Id, CancellationToken.None);
+        Assert(aliasReclaim.Reason == "retained_download" && File.Exists(aliasFile) && File.Exists(aliasLibraryPath),
+            $"Automatic retention never unlinks a download kept for the cleanup through a library's other name for it (Codex delta " +
+            $"review 7, P1 2): {aliasReclaim.State}/{aliasReclaim.Reason}, file kept {File.Exists(aliasFile)}");
+
+        // Codex delta reviews 9, P1 2 and 11, P1 1: the cases retention once missed. Each title is a movie in its own folder of
+        // the aliased download folder, scanned through the alias library and made due; its reclaim must be refused.
+        async Task<RetentionExecutionResult> ReclaimThroughAliasAsync(string key, int tmdb, string title, int year)
+        {
+            await using (var database = new ModDbContext(dbPath))
+            {
+                AddEntry(database, ids, key, "movie", tmdb, title, year, $"tt{tmdb:D7}", null, aliasDownloads.Id);
+                await database.SaveChangesAsync();
+            }
+
+            world.Native.Scan(Path.Combine(aliasA!, aliasRoot, "dl", $"{title} ({year}) [tmdbid-{tmdb}]", $"{title} ({year}).mkv"));
+            var binding = await WaitAsync(async () =>
+            {
+                await using var database = new ModDbContext(dbPath);
+                return await database.EntryBindings.AsNoTracking().FirstOrDefaultAsync(value => value.EntryId == ids[key]);
+            }, $"{title} is bound through the alias library");
+            await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
+            time.Offset += TimeSpan.FromDays(2);
+            var due = PreviewItem(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Retention/Preview")), binding.Id);
+            Assert(due.GetProperty("state").GetString() == "due", $"{title} is due: {due.GetProperty("state")}/{due.GetProperty("reason")}");
+            return await host.Service<RetentionExecutor>().ReclaimAsync(binding.Id, CancellationToken.None);
+        }
+
+        string DownloadSide(string title, int year, int tmdb)
+        {
+            var path = Path.Combine(aliasB!, aliasRoot, "dl", $"{title} ({year}) [tmdbid-{tmdb}]", $"{title} ({year}).mkv");
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllBytes(path, new byte[4096]);
+            return path;
+        }
+
+        async Task SetManifestKAsync(Func<IReadOnlyList<VerifiedTorrentFile>, IReadOnlyList<VerifiedTorrentFile>> change)
+        {
+            await using var database = new ModDbContext(dbPath);
+            var operation = await database.ImportOperations.SingleAsync(value => value.Id == blockedK.Id);
+            operation.CleanupManifest = TorrentDataRemoval.Serialize(change(TorrentDataRemoval.Deserialize(operation.CleanupManifest) ?? []).ToList());
+            await database.SaveChangesAsync();
+        }
+
+        // (1) A waiting release with no list of its files yet, whose torrent is removed from the client outside JellyfinMod
+        // with its data kept (final review, finding 1): the data is still there, so the release is detached for a manual
+        // cleanup, not completed, and its seeding file stays protected through the alias.
+        var legacyDownload = DownloadSide("Legacy Alias", 2020, 123);
+        string legacySeeding;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedB.Id);
+            Assert(seed is { State: SeedReleaseStates.Detached, Reason: SeedReleaseReasons.ManualCleanup, CleanupManifest: null } &&
+                !transmission.Torrents.ContainsKey(hashB), "Precondition: release B has no list and its torrent is gone");
+            legacySeeding = seed.SeedingPath;
+            seed.SeedingPath = inspector.TryCanonicalize(legacyDownload, out var canonicalLegacy) ? canonicalLegacy : legacyDownload;
+            seed.State = SeedReleaseStates.Waiting;
+            seed.Reason = SeedReleaseReasons.GoalUnmet;
+            await database.SaveChangesAsync();
+        }
+
+        await Tick();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedB.Id);
+            Assert(seed is { State: SeedReleaseStates.Detached, Reason: SeedReleaseReasons.ManualCleanup } && File.Exists(legacyDownload),
+                $"A waiting release whose torrent left the client with its data kept is detached for a manual cleanup, not completed: " +
+                $"{seed.State}/{seed.Reason}");
+        }
+
+        var legacyReclaim = await ReclaimThroughAliasAsync("movieLegacyAlias", 123, "Legacy Alias", 2020);
+        await using (var database = new ModDbContext(dbPath))
+        {
+            (await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedB.Id)).SeedingPath = legacySeeding;
+            await database.SaveChangesAsync();
+        }
+
+        Assert(legacyReclaim.Reason == "retained_download" && File.Exists(legacyDownload),
+            $"A release detached for a manual cleanup without a list keeps its seeding file from retention through an alias: " +
+            $"{legacyReclaim.State}/{legacyReclaim.Reason}, kept {File.Exists(legacyDownload)}");
+
+        // (2) A listed download replaced at the same path and scanned again through the alias: a new file, the same entry.
+        var replacedDownload = DownloadSide("Replaced Alias", 2019, 124);
+        Assert(inspector.TryInspect(replacedDownload, out var replacedBefore), "The replaced download is read before it is replaced");
+        await SetManifestKAsync(files => [.. files, new VerifiedTorrentFile(replacedBefore.CanonicalPath, replacedBefore.PhysicalIdentity,
+            Path.GetDirectoryName(Path.GetDirectoryName(replacedBefore.CanonicalPath)!)!, 4096)]);
+        File.Delete(replacedDownload);
+        await File.WriteAllBytesAsync(replacedDownload, new byte[4096]);
+        Assert(inspector.TryInspect(replacedDownload, out var replacedAfter) && replacedAfter.PhysicalIdentity != replacedBefore.PhysicalIdentity,
+            "Precondition: the download at the listed path is a different file now");
+        var replacedReclaim = await ReclaimThroughAliasAsync("movieReplacedAlias", 124, "Replaced Alias", 2019);
+        Assert(replacedReclaim.Reason == "retained_download" && File.Exists(replacedDownload),
+            $"A listed download replaced at its path and scanned again through an alias is still kept from retention: " +
+            $"{replacedReclaim.State}/{replacedReclaim.Reason}, kept {File.Exists(replacedDownload)}");
+
+        // (3) A listed download whose folder cannot be read (its parent is closed to this process) and a library file of the
+        // same name: whether they are the same entry cannot be established, so retention refuses (Codex delta review 11, P1 1).
+        var lockedDownload = DownloadSide("Locked Alias", 2018, 125);
+        var lockedParent = Path.Combine(world.Folder, "locked-parent");
+        var lockedRecorded = Path.Combine(lockedParent, "dl", "Locked Alias (2018).mkv");
+        Directory.CreateDirectory(Path.GetDirectoryName(lockedRecorded)!);
+        await SetManifestKAsync(files => [.. files, new VerifiedTorrentFile(lockedRecorded, "recorded-before-it-was-locked", lockedParent, 4096)]);
+        if (!OperatingSystem.IsLinux()) throw new PlatformNotSupportedException("Phase 5 runs on Linux");
+        File.SetUnixFileMode(lockedParent, UnixFileMode.None);
+        Assert(inspector.Probe(Path.GetDirectoryName(lockedRecorded)!) == PathPresence.Unknown,
+            "Precondition: the listed download's folder cannot be read (this case needs a test process that is not root)");
+        var lockedReclaim = await ReclaimThroughAliasAsync("movieLockedAlias", 125, "Locked Alias", 2018);
+        File.SetUnixFileMode(lockedParent, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        Assert(lockedReclaim.Reason == "retained_download" && File.Exists(lockedDownload),
+            $"A listed download whose folder cannot be read is never treated as absent: {lockedReclaim.State}/{lockedReclaim.Reason}, " +
+            $"kept {File.Exists(lockedDownload)}");
+        await SetManifestKAsync(files => [.. files.Where(file => file.Path != lockedRecorded && file.Path != replacedBefore.CanonicalPath)]);
+        Directory.Delete(lockedParent, true);
+        foreach (var (hash, held) in unmappedTorrents) transmission.Torrents[hash] = held;
+
+        // Nothing in this build deletes a recorded download: every one is still on disk.
+        Assert(File.Exists(sourceA) && filesH.All(File.Exists) && File.Exists(completedB.SourceLocalPath!) && File.Exists(aliasFile) &&
+            transmission.RemoveDeletedData.All(deleted => !deleted),
+            "Every recorded download is still on disk, and no request ever asked the client to delete data");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seedH = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == completedH.Id);
+            Assert(seedH is { State: SeedReleaseStates.Detached, Reason: SeedReleaseReasons.CleanupPending } &&
+                (TorrentDataRemoval.Deserialize(seedH.CleanupManifest) ?? []).Count == filesH.Count,
+                $"A released torrent stays detached with every file it left listed: {seedH.State}/{seedH.Reason}");
+        }
+
+        // A database that ran the withdrawn cleanup-run migrations (only test instances did): at the next start their table and
+        // history rows go, and the plugin starts normally (user decision 2026-10-02).
+        await StopAsync();
+        await using (var raw = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}"))
+        {
+            await raw.OpenAsync();
+            await using var command = raw.CreateCommand();
+            command.CommandText = """
+                CREATE TABLE "DownloadCleanupRuns" ("Id" TEXT NOT NULL CONSTRAINT "PK_DownloadCleanupRuns" PRIMARY KEY, "UserId" TEXT NOT NULL,
+                    "CreatedAt" TEXT NOT NULL, "DeletedCount" INTEGER NOT NULL, "KeptCount" INTEGER NOT NULL, "FreedBytes" INTEGER NOT NULL,
+                    "Data" TEXT NOT NULL, "State" TEXT NOT NULL DEFAULT 'completed');
+                CREATE INDEX "IX_DownloadCleanupRuns_CreatedAt" ON "DownloadCleanupRuns" ("CreatedAt");
+                INSERT INTO "DownloadCleanupRuns" VALUES ('8f5c2a8e-0000-4000-8000-000000000001', '8f5c2a8e-0000-4000-8000-000000000002',
+                    '2026-10-02 06:00:00', 1, 0, 5, '{}', 'completed');
+                INSERT INTO "__EFMigrationsHistory" ("MigrationId", "ProductVersion") VALUES ('20261002015135_WholeReviewDownloadCleanupRuns', '10.0.11');
+                INSERT INTO "__EFMigrationsHistory" ("MigrationId", "ProductVersion") VALUES ('20261002031344_WholeReviewCleanupRunState', '10.0.11');
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        await StartAsync();
+        admin = host.Client(world.Admin, true);
+        monitor = host.Service<ImportMonitor>();
+        await using (var raw = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}"))
+        {
+            await raw.OpenAsync();
+            await using var command = raw.CreateCommand();
+            command.CommandText = """
+                SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'DownloadCleanupRuns'),
+                       (SELECT COUNT(*) FROM "__EFMigrationsHistory" WHERE "MigrationId" LIKE '20261002015135%' OR "MigrationId" LIKE '20261002031344%')
+                """;
+            await using var reader = await command.ExecuteReaderAsync();
+            await reader.ReadAsync();
+            Assert(reader.GetInt64(0) == 0 && reader.GetInt64(1) == 0,
+                $"The withdrawn cleanup-run table and migrations are gone after a start: table {reader.GetInt64(0)}, history rows {reader.GetInt64(1)}");
+        }
+
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        Assert((await admin.GetAsync("/JellyfinMod/Queue")).StatusCode == HttpStatusCode.OK && File.Exists(aliasFile),
+            "The plugin starts normally on such a database, and nothing is deleted");
+
+        aliasLibraries.Remove(aliasDownloads);
+        aliasLibraries.RemoveAt(aliasLibraries.Count - 1);
+        Directory.Delete(aliasFolder, true);
 
         // ================= Scan timeout: re-requested once, then binding_not_observed; a later scan still completes it.
         world.Native.AutoScan = false;
@@ -918,6 +1586,24 @@ internal static partial class Phase5
         using (var stream = new FileStream(localR, FileMode.Open, FileAccess.Write)) stream.SetLength(fileR.Length); // full length, still incomplete
         await Tick();
         Assert((await ImportFor(dbPath, grabR)).LinkedAt is null, "A full-length preallocated file is not linked while the client reports it incomplete");
+        // Whole-review chunk 2b, P2 4: the process stopped after identification persisted `linking`, before the hardlink, and
+        // a recheck meanwhile found missing pieces. Recovery must not link the incomplete file it identified before.
+        Assert(inspector.TryInspect(localR, out var preallocated), "The preallocated file can be inspected");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var interrupted = await database.ImportOperations.SingleAsync(value => value.GrabId == grabR);
+            interrupted.State = ImportStates.Linking;
+            interrupted.SourceLocalPath = preallocated.CanonicalPath;
+            interrupted.SourcePhysicalIdentity = preallocated.PhysicalIdentity;
+            interrupted.SourceLogicalBytes = (long)preallocated.LogicalBytes;
+            interrupted.DestinationPath = null;
+            await database.SaveChangesAsync();
+        }
+
+        await Tick();
+        var recoveredR = await ImportFor(dbPath, grabR);
+        Assert(recoveredR.LinkedAt is null && recoveredR.State == ImportStates.Waiting,
+            $"Recovery from linking checks the client's completion again and links nothing incomplete (whole-review c2bf4): {recoveredR.State}");
         File.Delete(localR);
         transmission.Progress(hashR, 1.0);
         var doneR = await WaitAsync(async () =>
@@ -1115,9 +1801,10 @@ internal static partial class Phase5
 
     // ---------------------------------------------------------------- helpers
 
-    private static object ImportSettings(int revision, string[]? extensions = null, bool seedRelease = false, bool visible = false) => new
+    private static object ImportSettings(int revision, string[]? extensions = null, bool seedRelease = false, bool visible = false,
+        double floorRatio = 1.0) => new
     {
-        importEnabled = true, seedReleaseEnabled = seedRelease, seedFloorRatio = 1.0, seedFloorHours = (int?)null, importPollSeconds = 1,
+        importEnabled = true, seedReleaseEnabled = seedRelease, seedFloorRatio = floorRatio, seedFloorHours = (int?)null, importPollSeconds = 1,
         videoExtensions = extensions ?? ["mkv", "mp4"], stalledAfterHours = 24, scanTimeoutMinutes = 10, queueVisibleToUsers = visible,
         revision
     };

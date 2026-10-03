@@ -52,7 +52,24 @@ public sealed class AutomationController(
     {
         if (!readiness.IsReady) return StatusCode(503);
         if (startIndex < 0 || limit is < 1 or > 200) return BadRequest();
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
         var query = database.AutomationDecisions.AsNoTracking().AsQueryable();
+        // Only decisions about titles and episodes this administrator may read (whole-review chunk 3b, P2 5); a decision
+        // about no title (a run's own outcome) stays. The log is capped, so its distinct targets are bounded.
+        var decidedEntryIds = await query.Where(decision => decision.EntryId != null).Select(decision => decision.EntryId!.Value).Distinct()
+            .ToListAsync(cancellationToken);
+        var decidedEntries = await database.Entries.AsNoTracking().Where(value => decidedEntryIds.Contains(value.Id)).ToListAsync(cancellationToken);
+        var readableEntries = access.ReadableEntryIds(user, decidedEntries);
+        var hiddenEntries = decidedEntryIds.Where(id => !readableEntries.Contains(id)).ToArray();
+        var decidedEpisodeIds = await query.Where(decision => decision.EpisodeId != null).Select(decision => decision.EpisodeId!.Value).Distinct()
+            .ToListAsync(cancellationToken);
+        var decidedEpisodes = await database.Episodes.AsNoTracking().Where(value => decidedEpisodeIds.Contains(value.Id)).ToListAsync(cancellationToken);
+        var readableEpisodes = await access.ReadableEpisodeIdsAsync(database, user, decidedEntries,
+            decidedEpisodes.Where(value => readableEntries.Contains(value.EntryId)).ToArray(), cancellationToken);
+        var hiddenEpisodes = decidedEpisodeIds.Where(id => !readableEpisodes.Contains(id)).ToArray();
+        if (hiddenEntries.Length > 0) query = query.Where(decision => decision.EntryId == null || !hiddenEntries.Contains(decision.EntryId.Value));
+        if (hiddenEpisodes.Length > 0) query = query.Where(decision => decision.EpisodeId == null || !hiddenEpisodes.Contains(decision.EpisodeId.Value));
         if (entryId is { } entry) query = query.Where(decision => decision.EntryId == entry);
         if (episodeId is { } episode) query = query.Where(decision => decision.EpisodeId == episode);
         if (!string.IsNullOrWhiteSpace(kind)) query = query.Where(decision => decision.Kind == kind);
@@ -85,6 +102,13 @@ public sealed class AutomationController(
             ? await database.Episodes.AsNoTracking().Where(value => value.EntryId == entry.Id).OrderBy(value => value.SeasonNumber)
                 .ThenBy(value => value.EpisodeNumber).ToListAsync(cancellationToken)
             : [];
+        // Only episodes this administrator may read, as the entry's own episode list (whole-review chunk 3b, P2 5).
+        if (episodes.Count > 0)
+        {
+            var readable = await access.ReadableEpisodeIdsAsync(database, user, [entry], episodes, cancellationToken);
+            episodes = episodes.Where(value => readable.Contains(value.Id)).ToList();
+        }
+
         var targetIds = entry.MediaType == "series" ? episodes.Select(value => value.Id).ToArray() : [entry.Id];
         var rows = await database.AutomationTargets.AsNoTracking().Where(row => targetIds.Contains(row.TargetId))
             .ToDictionaryAsync(row => row.TargetId, cancellationToken);
@@ -120,6 +144,8 @@ public sealed class AutomationController(
     public async Task<ActionResult<AutomationSettingsDto>> PatchSettings(AutomationSettingsRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
         if (request.Revision != settings.AutomationRevision)
             return Conflict(new ProblemDetails

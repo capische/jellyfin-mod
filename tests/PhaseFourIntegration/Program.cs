@@ -13,6 +13,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 
 // Phase 4 acquisition integration: a real Kestrel plugin host with authentication, authorization, MVC
 // serialization, EF migrations and SQLite, talking real HTTP to a Torznab boundary server and a Transmission RPC
@@ -161,7 +162,9 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         new("Example.Show.S01E02.1080p.WEB-DL.DDP5.1.H.264-GRP", "tv-4", dl("e2"), 1_500_000_000, 35, []),
         new("Example Show - 101 [1080p WEB-DL]", "tv-5", dl("missing"), 1_500_000_000, 10, []),
         new("Example.Show.S01E03.1080p.WEB-DL.DDP5.1.H.264-GRP", "tv-6", dl("e3"), 1_500_000_000, 30, []),
-        new("Example.Show.S00E01.1080p.WEB-DL-GRP", "tv-7", dl("missing"), 1_500_000_000, 30, [])
+        new("Example.Show.S00E01.1080p.WEB-DL-GRP", "tv-7", dl("missing"), 1_500_000_000, 30, []),
+        // Whole-review chunk 2a, P2 7: a double episode in 1x01-02 numbering.
+        new("Example.Show.1x01-02.1080p.WEB-DL-GRP", "tv-8", dl("missing"), 3_000_000_000, 10, [])
     ]);
     torznab.Indexers["good"] = good;
     var queryOnly = new IndexerScript { ApiKey = "q-key", Caps = TorznabBoundary.Caps("q", "q") };
@@ -169,14 +172,31 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
     // Same title, wrong year: a text-only match must still be refused on the year (user decision 2026-09-20).
     queryOnly.MovieItems.Add(new("Example.Movie.1998.1080p.WEB-DL-QOLD", "q-b", dl("movie"), 4_000_000_000, 60, []));
     torznab.Indexers["qonly"] = queryOnly;
+    // Whole-review chunk 2a, P2 6: text-only episode matches. The series is from 2023; another series shares its name.
+    var queryTv = new IndexerScript { ApiKey = "qtv-key", Caps = TorznabBoundary.Caps("q", "q") };
+    queryTv.TvItems.Add(new("Example.Show.2023.S01E01.1080p.WEB-DL-QTV", "q-tv-a", dl("missing"), 1_500_000_000, 60, []));
+    queryTv.TvItems.Add(new("Example.Show.2019.S01E01.1080p.WEB-DL-QTVOLD", "q-tv-b", dl("missing"), 1_500_000_000, 60, []));
+    queryTv.TvItems.Add(new("Example.Show.S01E01.1080p.WEB-DL-QTVNY", "q-tv-c", dl("missing"), 1_500_000_000, 60, []));
+    torznab.Indexers["qtv"] = queryTv;
+    // Whole-review chunk 2a, P2 4: an indexer that finds nothing, so every search falls back through all its queries.
+    var sparse = new IndexerScript { ApiKey = "sparse-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
+    torznab.Indexers["sparse"] = sparse;
     torznab.Indexers["slow"] = new IndexerScript
     {
         ApiKey = "slow-key", Caps = TorznabBoundary.Caps("q,imdbid", "q"),
         Override = async context =>
         {
             if (context.Request.Query["t"] == "caps") return false;
-            await Task.Delay(TimeSpan.FromSeconds(6));
-            return false;
+            // It never answers: the search gives up on it at its timeout, however long that is.
+            try
+            {
+                await Task.Delay(Timeout.Infinite, context.RequestAborted);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            return true;
         }
     };
     torznab.Indexers["malformed"] = new IndexerScript
@@ -383,6 +403,20 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         Assert(settings.GetProperty("enabled").GetBoolean() && settings.GetProperty("ready").GetBoolean() &&
             settings.GetProperty("holdSeconds").GetInt32() == 2 && settings.GetProperty("seedProtectionMatchesClient").GetBoolean(),
             "Enabled acquisition reports its hold, and with no XML endpoint seed protection reads the selected client (P7.S7 default 12)");
+        // Whole-review chunk 3a, P2 4: an update that fails after the proposed configuration was checked (here, its final
+        // save) changes nothing at all: not the default profile, and not the acquisition switch.
+        await using (var trigger = new ModDbContext(dbPath))
+            await trigger.Database.ExecuteSqlRawAsync("CREATE TRIGGER jfmod_fail_acquisition BEFORE UPDATE OF Revision ON AcquisitionSettings " +
+                "BEGIN SELECT RAISE(ABORT, 'injected: the final save fails'); END;");
+        var interruptedUpdate = await admin.PatchAsJsonAsync("/JellyfinMod/Settings/Acquisition",
+            new { enabled = true, downloadClientId = clientId, defaultQualityProfileId = sdId, revision = settings.GetProperty("revision").GetInt32() });
+        await using (var trigger = new ModDbContext(dbPath))
+            await trigger.Database.ExecuteSqlRawAsync("DROP TRIGGER jfmod_fail_acquisition;");
+        var afterInterrupted = await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition settings read");
+        Assert(!interruptedUpdate.IsSuccessStatusCode && afterInterrupted.GetProperty("enabled").GetBoolean() &&
+            afterInterrupted.GetProperty("defaultQualityProfileId").AsGuid() == hdId &&
+            afterInterrupted.GetProperty("revision").GetInt32() == settings.GetProperty("revision").GetInt32(),
+            $"An interrupted acquisition update leaves the previous settings in place (whole-review c3af4): {afterInterrupted.GetRawText()}");
         configuration.TransmissionRpcUrl = transmission.Endpoint.ToString();
         settings = await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition settings read");
         Assert(settings.GetProperty("seedProtectionMatchesClient").GetBoolean(), "Seed protection reading the same Transmission is reported: " + settings.GetRawText());
@@ -480,6 +514,9 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
 
         // Picker profile changes rescore one search without touching the entry's saved profile.
         var small = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}&profileId={sdId}"), 200, "Rescored search");
+        var smallGood = small.GetProperty("indexers").EnumerateArray().Single(value => value.GetProperty("name").GetString() == "Good");
+        Assert(smallGood.GetProperty("status").GetString() == "ok" && smallGood.GetProperty("resultCount").GetInt32() == 10,
+            "The rescored search has every row of the verified indexer: " + smallGood.GetRawText());
         var smallRows = small.GetProperty("candidates").EnumerateArray().ToDictionary(row => row.GetProperty("rawTitle").GetString()!);
         Assert(small.GetProperty("profile").GetProperty("id").AsGuid() == sdId && !small.GetProperty("profile").GetProperty("inherited").GetBoolean() &&
             !smallRows["Example.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP"].GetProperty("eligible").GetBoolean() &&
@@ -500,6 +537,420 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             }), 200, "Noisy indexer disabled");
         }
 
+        async Task<Guid> AddIndexerAsync(string name, int dailyQueryBudget = 200, int minIntervalSeconds = 0) => (await ReadAsync(await admin.PostAsJsonAsync(
+            "/JellyfinMod/Settings/Indexers", new
+            {
+                name, baseUrl = new Uri(torznab.Address, $"/{name}/api").ToString(), enabled = true, categories = new[] { 2000, 5000 },
+                priority = 5, minIntervalSeconds, dailyQueryBudget, apiKey = new { action = "replace", value = torznab.Indexers[name].ApiKey }
+            }), 201, "Indexer " + name + " created")).GetProperty("id").AsGuid();
+        async Task DisableIndexerAsync(Guid id)
+        {
+            var current = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/Indexers")).EnumerateArray()
+                .Single(value => value.GetProperty("id").AsGuid() == id);
+            await ReadAsync(await admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Indexers/{id}", new
+            {
+                name = current.GetProperty("name").GetString(), baseUrl = current.GetProperty("baseUrl").GetString(), enabled = false,
+                categories = new[] { 2000, 5000 }, priority = 5, revision = current.GetProperty("revision").GetInt32()
+            }), 200, "Indexer disabled");
+        }
+
+        // Whole-review chunk 2a, P2 4: two units of budget left. Two concurrent searches that each fall back through every
+        // query the indexer allows may send two queries between them, not one batch each.
+        var sparseId = await AddIndexerAsync("sparse", dailyQueryBudget: 2);
+        var concurrentSearches = await Task.WhenAll(admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"),
+            admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"));
+        var sparseQueries = sparse.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal));
+        int storedSparse;
+        await using (var database = new ModDbContext(dbPath))
+            storedSparse = (await database.IndexerBudgets.AsNoTracking().SingleAsync(value => value.IndexerId == sparseId)).QueriesUsed;
+        // Codex round 2 P2: both searches answer (a concurrent first budget row is not an error), and the row stores both.
+        Assert(sparseQueries == 2 && concurrentSearches.All(response => response.StatusCode == HttpStatusCode.OK) && storedSparse == 2,
+            $"An indexer's daily budget stops queries at its limit, across pages, fallbacks and concurrent searches " +
+            $"(whole-review c2af4): {sparseQueries} queries for a budget of 2, statuses " +
+            $"{string.Join("/", concurrentSearches.Select(response => (int)response.StatusCode))}, stored {storedSparse}");
+        var exhausted = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "Search after the budget");
+        Assert(exhausted.GetProperty("indexers").EnumerateArray().Single(value => value.GetProperty("name").GetString() == "sparse")
+                .GetProperty("status").GetString() == "budget_exhausted" &&
+            sparse.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal)) == 2,
+            "Once the budget is used up the indexer is not asked again and says why");
+        await DisableIndexerAsync(sparseId);
+
+        // Codex round 2 P2: another search saves a higher count while this one is under way. This search's save comes last
+        // and must not move the stored count backwards.
+        var ordered = new IndexerScript { ApiKey = "ordered-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
+        torznab.Indexers["ordered"] = ordered;
+        var orderedId = await AddIndexerAsync("ordered");
+        ordered.Override = async context =>
+        {
+            if (context.Request.Query["t"] == "caps") return false;
+            await using var database = new ModDbContext(dbPath);
+            await database.IndexerBudgets.Where(value => value.IndexerId == orderedId)
+                .ExecuteUpdateAsync(set => set.SetProperty(value => value.QueriesUsed, 50));
+            return false;
+        };
+        await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "Search while another saves its count");
+        ordered.Override = null;
+        int storedOrdered;
+        await using (var database = new ModDbContext(dbPath))
+            storedOrdered = (await database.IndexerBudgets.AsNoTracking().SingleAsync(value => value.IndexerId == orderedId)).QueriesUsed;
+        Assert(storedOrdered >= 50, $"A search's saved query count never moves the stored count backwards (Codex round 2 P2): {storedOrdered}");
+        await DisableIndexerAsync(orderedId);
+
+        // Final review, finding 5 (whole-review c2a-F4): a search cancelled after one indexer received its queries, while
+        // another has not answered, still stores the queries that went out; a restart reads them from the stored row.
+        var sentScript = new IndexerScript { ApiKey = "sent-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        sentScript.Override = context =>
+        {
+            if (context.Request.Query["t"] != "caps") reached.TrySetResult();
+            return Task.FromResult(false);
+        };
+        torznab.Indexers["sent"] = sentScript;
+        torznab.Indexers["hang"] = new IndexerScript
+        {
+            ApiKey = "hang-key", Caps = TorznabBoundary.Caps("q,imdbid", "q"),
+            Override = async context =>
+            {
+                if (context.Request.Query["t"] == "caps") return false;
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, context.RequestAborted);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+
+                return true;
+            }
+        };
+        var sentId = await AddIndexerAsync("sent");
+        var hangId = await AddIndexerAsync("hang");
+        using (var cancel = new CancellationTokenSource())
+        {
+            var searching = admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}", cancel.Token);
+            await reached.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            await Task.Delay(1000);
+            cancel.Cancel();
+            try
+            {
+                await searching;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        var sentQueries = sentScript.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal));
+        int storedSent = 0;
+        for (var attempt = 0; attempt < 100 && storedSent < sentQueries; attempt++)
+        {
+            await Task.Delay(100);
+            await using var database = new ModDbContext(dbPath);
+            storedSent = (await database.IndexerBudgets.AsNoTracking().SingleOrDefaultAsync(value => value.IndexerId == sentId))?.QueriesUsed ?? 0;
+        }
+
+        Assert(sentQueries > 0 && storedSent == sentQueries,
+            $"A cancelled search stores every query that went out (final review, finding 5): {sentQueries} sent, {storedSent} stored");
+        await DisableIndexerAsync(sentId);
+        await DisableIndexerAsync(hangId);
+
+        // Final review 2, finding 2: a search cancelled after an indexer's full first page arrived, while the plugin is still
+        // reading it, never stores the next page's query, which is never sent. The page is large, so reading it takes a while;
+        // the search is cancelled as soon as the indexer has written it. Over three searches the stored count must equal the
+        // queries the indexer received, whichever side of the next page each cancellation lands on.
+        var heavyFeed = new System.Text.StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?><rss version=\"2.0\" " +
+            "xmlns:torznab=\"http://torznab.com/schemas/2015/feed\"><channel><title>paged</title>");
+        for (var item = 0; item < 100; item++)
+        {
+            heavyFeed.Append($"<item><title>Unrelated.Release.{item}.2010.1080p.WEB-DL-GRP</title><guid>paged-{item}</guid>");
+            for (var attribute = 0; attribute < 900; attribute++) heavyFeed.Append($"<torznab:attr name=\"x{attribute}\" value=\"{attribute}\"/>");
+            heavyFeed.Append("</item>");
+        }
+
+        heavyFeed.Append("</channel></rss>");
+        var heavyBytes = System.Text.Encoding.UTF8.GetBytes(heavyFeed.ToString());
+        var pageWritten = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pagedScript = new IndexerScript { ApiKey = "paged-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
+        pagedScript.Override = async context =>
+        {
+            if (context.Request.Query["t"] == "caps") return false;
+            context.Response.ContentType = "application/rss+xml";
+            context.Response.ContentLength = heavyBytes.Length;
+            await context.Response.Body.WriteAsync(heavyBytes);
+            await context.Response.CompleteAsync();
+            pageWritten.TrySetResult();
+            return true;
+        };
+        torznab.Indexers["paged"] = pagedScript;
+        var pagedId = await AddIndexerAsync("paged");
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            pageWritten = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var cancel = new CancellationTokenSource();
+            var searching = admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}", cancel.Token);
+            await pageWritten.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            cancel.Cancel();
+            try
+            {
+                await searching;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            await Task.Delay(1500);
+        }
+
+        var pagedReceived = pagedScript.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal));
+        int pagedStored = -1;
+        for (var attempt = 0; attempt < 50 && pagedStored != pagedReceived; attempt++)
+        {
+            await Task.Delay(100);
+            await using var database = new ModDbContext(dbPath);
+            pagedStored = (await database.IndexerBudgets.AsNoTracking().SingleOrDefaultAsync(value => value.IndexerId == pagedId))?.QueriesUsed ?? 0;
+        }
+
+        // At least one cancellation must land between a page and the next, or the case proves nothing: each search sends at
+        // least its first page, and a search that also sent its next page sent two.
+        Assert(pagedReceived >= 3 && pagedReceived < 6 && pagedStored == pagedReceived,
+            $"A search cancelled between one page and the next stores only the queries the indexer received (final review 2, finding 2): " +
+            $"{pagedReceived} received, {pagedStored} stored");
+        await DisableIndexerAsync(pagedId);
+
+        // Final Pi review, finding 2: an indexer that sends its headers and then cuts its answer off fails as that indexer, not
+        // as the search: the search answers, reports the indexer unavailable, and stores the query it sent, so a restart cannot
+        // spend it again.
+        var cut = new IndexerScript { ApiKey = "cut-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
+        cut.Override = async context =>
+        {
+            if (context.Request.Query["t"] == "caps") return false;
+            context.Response.ContentType = "application/rss+xml";
+            context.Response.ContentLength = 100_000;
+            await context.Response.Body.WriteAsync(System.Text.Encoding.UTF8.GetBytes(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><rss version=\"2.0\"><channel><title>cut</title>"));
+            await context.Response.Body.FlushAsync();
+            context.Abort();
+            return true;
+        };
+        torznab.Indexers["cut"] = cut;
+        var cutId = await AddIndexerAsync("cut");
+        string? cutOutcome = null;
+        int cutStatus;
+        using (var cutSearch = await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"))
+        {
+            cutStatus = (int)cutSearch.StatusCode;
+            if (cutSearch.IsSuccessStatusCode)
+            {
+                cutOutcome = Json.Parse(await cutSearch.Content.ReadAsStringAsync()).GetProperty("indexers").EnumerateArray()
+                    .Single(value => value.GetProperty("name").GetString() == "cut").GetProperty("status").GetString();
+            }
+        }
+
+        var cutReceived = cut.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal));
+        int cutStored = -1;
+        for (var attempt = 0; attempt < 50 && cutStored != cutReceived; attempt++)
+        {
+            await Task.Delay(100);
+            await using var database = new ModDbContext(dbPath);
+            cutStored = (await database.IndexerBudgets.AsNoTracking().SingleOrDefaultAsync(value => value.IndexerId == cutId))?.QueriesUsed ?? 0;
+        }
+
+        Assert(cutStatus == 200 && cutOutcome == "unavailable" && cutReceived == 1 && cutStored == 1,
+            $"An indexer that cuts its answer off fails alone and its sent query is stored (final Pi review, finding 2): search {cutStatus}, " +
+            $"outcome {cutOutcome}, {cutReceived} received, {cutStored} stored");
+        await DisableIndexerAsync(cutId);
+
+        // Good paces its own queries ten seconds apart, so while it is enabled every search here lasts until its next slot,
+        // and the pacing these two cases time is hidden behind it. They run with only their own indexer enabled.
+        async Task SetGoodEnabledAsync(bool enabled)
+        {
+            var revision = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/Indexers")).EnumerateArray()
+                .Single(value => value.GetProperty("id").AsGuid() == goodId).GetProperty("revision").GetInt32();
+            await ReadAsync(await admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Indexers/{goodId}", new
+            {
+                name = "Good", baseUrl = new Uri(torznab.Address, "/good/api").ToString(), enabled, categories = new[] { 2000, 5000 },
+                priority = 1, minimumSeedRatio = 1.0, minimumSeedMinutes = 2880, revision, apiKey = new { action = "unchanged" }
+            }), 200, enabled ? "Good indexer enabled again" : "Good indexer set aside");
+        }
+
+        await SetGoodEnabledAsync(false);
+
+        // Codex round 2 P2: a search abandoned while it waits out the minimum interval sent nothing, so it gives back its
+        // unit of the budget: with two units, the first search and a later one both run.
+        var paced = new IndexerScript { ApiKey = "paced-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
+        // It answers the first query, so a search sends one query and falls back through nothing.
+        paced.MovieItems.Add(new("Example.Movie.2024.1080p.WEB-DL-PACED", "p-a", dl("movie"), 4_000_000_000, 60, []));
+        torznab.Indexers["paced"] = paced;
+        // Ten seconds apart, so the abandoned search is still waiting when it is cancelled however slowly the first one ends.
+        var pacedId = await AddIndexerAsync("paced", dailyQueryBudget: 2, minIntervalSeconds: 10);
+        bool PacedQuery(string query) => !query.Contains("t=caps", StringComparison.Ordinal);
+        // A search the caller abandons: run in this process, as automation runs it, and cancelled while it waits.
+        async Task AbandonedSearchAsync(CancellationToken token)
+        {
+            using var scope = host.Service<IServiceScopeFactory>().CreateScope();
+            var database = scope.ServiceProvider.GetRequiredService<ModDbContext>();
+            var target = await database.Entries.AsNoTracking().SingleAsync(value => value.Id == movieId);
+            var profile = await database.AcquisitionQualityProfiles.AsNoTracking().OrderBy(value => value.Name).FirstAsync();
+            var revision = (await database.AcquisitionSettings.AsNoTracking().SingleAsync()).Revision;
+            try
+            {
+                await scope.ServiceProvider.GetRequiredService<ReleaseSearchService>().SearchAsync(world.Admin.Id,
+                    ReleaseTargets.For(target, null), new EvaluationProfile(profile.Id, profile.Name, profile.Revision,
+                        AcquisitionConfiguration.Qualities(profile), profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
+                    true, revision, token);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                // Given up while it waited for its slot.
+            }
+        }
+
+        var pacedClock = Stopwatch.StartNew();
+        var pacedArrivals = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        paced.Override = context =>
+        {
+            if (context.Request.Query["t"] != "caps") pacedArrivals.Enqueue($"{pacedClock.Elapsed.TotalSeconds:F1}s");
+            return Task.FromResult(false);
+        };
+        await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "The first paced search runs at once");
+        var pacedAfterFirst = pacedClock.Elapsed.TotalSeconds;
+        using (var abandon = new CancellationTokenSource(TimeSpan.FromMilliseconds(800)))
+            await AbandonedSearchAsync(abandon.Token);
+
+        var pacedBefore = paced.Queries.Count(PacedQuery);
+        var later = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "A later paced search");
+        var laterStatus = later.GetProperty("indexers").EnumerateArray().Single(value => value.GetProperty("name").GetString() == "paced")
+            .GetProperty("status").GetString();
+        Assert(pacedBefore == 1 && laterStatus != "budget_exhausted" && paced.Queries.Count(PacedQuery) == 2,
+            $"An abandoned wait gives its unit of the budget back (Codex round 2 P2): {pacedBefore} sent before, then {laterStatus}, " +
+            $"{paced.Queries.Count(PacedQuery)} in all, arriving {string.Join(",", pacedArrivals)}; first search done {pacedAfterFirst:F1}s");
+        await DisableIndexerAsync(pacedId);
+
+        // Codex delta review 2: three searches queue on an indexer ten seconds apart. The second is abandoned while it waits;
+        // the third moves up into its slot instead of waiting behind a query that was never sent.
+        var queued = new IndexerScript { ApiKey = "queued-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
+        queued.MovieItems.Add(new("Example.Movie.2024.1080p.WEB-DL-QUEUED", "u-a", dl("movie"), 4_000_000_000, 60, []));
+        torznab.Indexers["queued"] = queued;
+        var queuedId = await AddIndexerAsync("queued", dailyQueryBudget: 10, minIntervalSeconds: 10);
+        bool QueuedQuery(string query) => !query.Contains("t=caps", StringComparison.Ordinal);
+        await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "The first queued search runs at once");
+        using var abandonSecond = new CancellationTokenSource();
+        var second = AbandonedSearchAsync(abandonSecond.Token);
+        await Task.Delay(300);
+        var thirdClock = Stopwatch.StartNew();
+        var third = admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}");
+        await Task.Delay(700);
+        await abandonSecond.CancelAsync();
+        await second;
+
+        using (var thirdResponse = await third)
+        {
+            thirdClock.Stop();
+            Assert(thirdResponse.IsSuccessStatusCode && thirdClock.Elapsed < TimeSpan.FromSeconds(15) && queued.Queries.Count(QueuedQuery) == 2,
+                $"A search behind an abandoned wait moves up into its slot (Codex delta review 2): third answered after " +
+                $"{thirdClock.Elapsed.TotalSeconds:F1}s, {queued.Queries.Count(QueuedQuery)} queries sent");
+        }
+
+        await DisableIndexerAsync(queuedId);
+
+        // Pi review 1, finding 2: a query counts on the day it is sent. A search's first query reserved just before UTC midnight
+        // waits out the minimum interval and goes out after it; the stored row then holds that one query on the new day,
+        // not two on the old one, where the new day would not see it.
+        var midnight = new IndexerScript { ApiKey = "midnight-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
+        midnight.MovieItems.Add(new("Example.Movie.2024.1080p.WEB-DL-MIDNIGHT", "m-a", dl("movie"), 4_000_000_000, 60, []));
+        torznab.Indexers["midnight"] = midnight;
+        var midnightId = await AddIndexerAsync("midnight", dailyQueryBudget: 6, minIntervalSeconds: 10);
+        var midnightClock = Stopwatch.StartNew();
+        var midnightArrivals = new System.Collections.Concurrent.ConcurrentQueue<double>();
+        midnight.Override = context =>
+        {
+            if (context.Request.Query["t"] != "caps") midnightArrivals.Enqueue(midnightClock.Elapsed.TotalSeconds);
+            return Task.FromResult(false);
+        };
+        var offsetBeforeMidnight = time.Offset;
+        var shiftedNow = time.GetUtcNow().UtcDateTime;
+        time.Offset += shiftedNow.Date.AddDays(1) - shiftedNow - TimeSpan.FromSeconds(6);
+        var newDay = time.GetUtcNow().UtcDateTime.Date.AddDays(1);
+        try
+        {
+            await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "The search before midnight runs at once");
+            var reservedBefore = time.GetUtcNow().UtcDateTime < newDay;
+            await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "The search that waits past midnight");
+            IndexerBudgetState? midnightRow = null;
+            for (var attempt = 0; attempt < 50 && midnightRow?.Day != newDay; attempt++)
+            {
+                await Task.Delay(100);
+                await using var database = new ModDbContext(dbPath);
+                midnightRow = await database.IndexerBudgets.AsNoTracking().SingleOrDefaultAsync(value => value.IndexerId == midnightId);
+            }
+
+            var midnightSent = midnight.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal));
+            Assert(reservedBefore && midnightSent == 2 && midnightRow is { } row && row.Day == newDay && row.QueriesUsed == 1,
+                $"A query reserved before midnight and sent after it counts on the day it is sent (Pi review 1, finding 2): " +
+                $"reserved before midnight {reservedBefore}, {midnightSent} sent, stored {midnightRow?.Day:yyyy-MM-dd} " +
+                $"{midnightRow?.QueriesUsed} for {newDay:yyyy-MM-dd}");
+
+            // Pi reviews 3 and 4: searches already queued when the clock is set back keep their order and spacing, and none
+            // waits for the old clock. Three wait ten seconds apart; the clock goes back about a day; a fourth search, which
+            // reads the budget row stored before the change, queues behind them; then the first is abandoned, and every one
+            // behind it moves up a slot. They are answered about ten seconds apart, the last about thirty seconds in: a queue
+            // that did not move up would answer the last about forty seconds in, with a twenty-second gap.
+            midnightArrivals.Clear();
+            var queuedAt = midnightClock.Elapsed.TotalSeconds;
+            using var abandonQueued = new CancellationTokenSource();
+            var abandonedQueued = AbandonedSearchAsync(abandonQueued.Token);
+            await Task.Delay(300);
+            var secondQueued = admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}");
+            await Task.Delay(300);
+            var thirdQueued = admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}");
+            await Task.Delay(300);
+            time.Offset = offsetBeforeMidnight;
+            var afterChange = admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}");
+            await Task.Delay(600);
+            await abandonQueued.CancelAsync();
+            await abandonedQueued;
+            var queuedStatuses = (await Task.WhenAll(secondQueued, thirdQueued, afterChange)).Select(response => (int)response.StatusCode).ToArray();
+            var arrivals = midnightArrivals.Select(at => at - queuedAt).OrderBy(at => at).ToArray();
+            var gaps = arrivals.Zip(arrivals.Skip(1), (gapFrom, gapTo) => gapTo - gapFrom).ToArray();
+            Assert(queuedStatuses.All(status => status == 200) && arrivals.Length == 3 && gaps.All(gap => gap is >= 9.5 and <= 13)
+                && arrivals[^1] < 35,
+                $"Searches queued across a clock set back keep their spacing, move up when one ahead is abandoned, and none waits for " +
+                $"the old clock (Pi reviews 3 and 4): statuses {string.Join("/", queuedStatuses)}, arrivals " +
+                $"{string.Join(",", arrivals.Select(at => at.ToString("F1")))} s");
+
+            // Pi review 2, finding 1: the day already counted is kept after the clock was set back: with a budget of six and
+            // four queries on the new day, two more searches are sent and a third is refused, and the stored row holds all
+            // six on the new day. The interval is counted from now, not from the later last request.
+            var backStatuses = new List<string?>();
+            for (var backSearch = 0; backSearch < 3; backSearch++)
+            {
+                var back = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "A search after the clock was set back");
+                backStatuses.Add(back.GetProperty("indexers").EnumerateArray()
+                    .Single(value => value.GetProperty("name").GetString() == "midnight").GetProperty("status").GetString());
+            }
+
+            IndexerBudgetState? backRow = null;
+            for (var attempt = 0; attempt < 50 && backRow?.QueriesUsed != 6; attempt++)
+            {
+                await Task.Delay(100);
+                await using var database = new ModDbContext(dbPath);
+                backRow = await database.IndexerBudgets.AsNoTracking().SingleOrDefaultAsync(value => value.IndexerId == midnightId);
+            }
+
+            var backSent = midnight.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal)) - midnightSent - 3;
+            Assert(backSent == 2 && backStatuses[2] == "budget_exhausted" && backRow is { } kept && kept.Day == newDay && kept.QueriesUsed == 6,
+                $"A clock set back keeps counting against the later day (Pi review 2, finding 1): {backSent} sent after it, statuses " +
+                $"{string.Join("/", backStatuses)}, stored {backRow?.Day:yyyy-MM-dd} {backRow?.QueriesUsed} for {newDay:yyyy-MM-dd}");
+        }
+        finally
+        {
+            time.Offset = offsetBeforeMidnight;
+        }
+
+        await DisableIndexerAsync(midnightId);
+        await SetGoodEnabledAsync(true);
+        var queryTvId = await AddIndexerAsync("qtv");
+
         // Episodes: one stable episode per search; packs, multi-episode, absolute numbering and specials are refused.
         await ExpectAsync(admin.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}"), 400, "episode_required", "Series searches need an episode");
         Assert((await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}&episodeId={episodeIds[0]}")).StatusCode == HttpStatusCode.BadRequest,
@@ -517,6 +968,17 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         byTitle = tvRows;
         Assert(tvRows["Example.Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP"].GetProperty("eligible").GetBoolean(), "The matching episode is eligible");
         Rejected("Example.Show.S01E01E02.1080p.WEB-DL-GRP", "multi_episode");
+        Rejected("Example.Show.1x01-02.1080p.WEB-DL-GRP", "multi_episode");
+        string Identity(string title) => byTitle[title].GetProperty("match").GetProperty("identity").GetString()!;
+        Assert(byTitle["Example.Show.2023.S01E01.1080p.WEB-DL-QTV"].GetProperty("eligible").GetBoolean() &&
+            Identity("Example.Show.2023.S01E01.1080p.WEB-DL-QTV") == "title",
+            "A text-only episode release carrying the series' own year matches as a title match: " +
+            byTitle["Example.Show.2023.S01E01.1080p.WEB-DL-QTV"].GetRawText());
+        Rejected("Example.Show.2019.S01E01.1080p.WEB-DL-QTVOLD", "year_mismatch");
+        Assert(byTitle["Example.Show.S01E01.1080p.WEB-DL-QTVNY"].GetProperty("eligible").GetBoolean() &&
+            Identity("Example.Show.S01E01.1080p.WEB-DL-QTVNY") == "title_without_year",
+            "A text-only episode release without a year stays grabbable by hand but is marked as unconfirmed by year");
+        await DisableIndexerAsync(queryTvId);
         Rejected("Example.Show.S01.1080p.WEB-DL-GRP", "season_pack");
         Rejected("Example.Show.S01E03.1080p.WEB-DL.DDP5.1.H.264-GRP", "episode_mismatch");
         Rejected("Example Show - 101 [1080p WEB-DL]", "absolute_numbering");
@@ -750,6 +1212,31 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             "Accepted grabs and their single history event survive a restart");
         var afterRestartTest = await ReadAsync(await restarted.PostAsync($"/JellyfinMod/Settings/Indexers/{goodId}/Test", null), 200, "Indexer test after restart");
         Assert(afterRestartTest.GetProperty("ok").GetBoolean(), "Stored secrets survive a restart");
+        // Codex delta review 2: after the restart, the count another search saved while the "ordered" search ran still holds.
+        // With the indexer's budget at that count, a search is refused rather than given the allowance back.
+        var orderedRow = Json.Parse(await restarted.GetStringAsync("/JellyfinMod/Settings/Indexers")).EnumerateArray()
+            .Single(value => value.GetProperty("id").AsGuid() == orderedId);
+        await ReadAsync(await restarted.PatchAsJsonAsync($"/JellyfinMod/Settings/Indexers/{orderedId}", new
+        {
+            name = orderedRow.GetProperty("name").GetString(), baseUrl = orderedRow.GetProperty("baseUrl").GetString(), enabled = true,
+            categories = new[] { 2000, 5000 }, priority = 5, dailyQueryBudget = 50, minIntervalSeconds = 0,
+            revision = orderedRow.GetProperty("revision").GetInt32()
+        }), 200, "The ordered indexer is enabled with a budget of 50");
+        var orderedQueriesBefore = ordered.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal));
+        var afterRestartSearch = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200,
+            "Search after the restart");
+        var orderedAfterRestart = afterRestartSearch.GetProperty("indexers").EnumerateArray()
+            .Single(value => value.GetProperty("name").GetString() == "ordered").GetProperty("status").GetString();
+        Assert(orderedAfterRestart == "budget_exhausted" &&
+            ordered.Queries.Count(query => !query.Contains("t=caps", StringComparison.Ordinal)) == orderedQueriesBefore,
+            $"A restart keeps the highest query count any search saved (Codex delta review 2): {orderedAfterRestart}");
+        orderedRow = Json.Parse(await restarted.GetStringAsync("/JellyfinMod/Settings/Indexers")).EnumerateArray()
+            .Single(value => value.GetProperty("id").AsGuid() == orderedId);
+        await ReadAsync(await restarted.PatchAsJsonAsync($"/JellyfinMod/Settings/Indexers/{orderedId}", new
+        {
+            name = orderedRow.GetProperty("name").GetString(), baseUrl = orderedRow.GetProperty("baseUrl").GetString(), enabled = false,
+            categories = new[] { 2000, 5000 }, priority = 5, revision = orderedRow.GetProperty("revision").GetInt32()
+        }), 200, "The ordered indexer is disabled again");
 
         // The administrator removed the torrent in Transmission: a recheck frees the target, history stays.
         transmission.Torrents.TryRemove(movieTorrent.InfoHash, out _);
