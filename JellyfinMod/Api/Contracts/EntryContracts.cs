@@ -150,6 +150,10 @@ public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto 
     /// <summary>Gets a movie's upgrade state; administrators only, null otherwise.</summary>
     [JsonPropertyName("upgrade"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public UpgradeStateDto? Upgrade { get; init; }
+
+    /// <summary>Gets the title's ratings, one per source in its own scale; empty while ratings are off (P9.R5).</summary>
+    [JsonPropertyName("ratings")]
+    public IReadOnlyList<RatingDto> Ratings { get; init; } = [];
 }
 
 /// <summary>Filtered remote page with an explicit continuation, not a misleading remote total.</summary>

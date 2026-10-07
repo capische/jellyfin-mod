@@ -98,6 +98,18 @@ public class ModDbContext : DbContext
     /// <summary>Gets titles whose watch history arrived from Trakt, per user (P7.Q16).</summary>
     public DbSet<TraktObservation> TraktObservations => Set<TraktObservation>();
 
+    /// <summary>Gets the singleton ratings settings (P9.R2).</summary>
+    public DbSet<RatingsSettings> RatingsSettings => Set<RatingsSettings>();
+
+    /// <summary>Gets the singleton ratings provider state (P9.R3).</summary>
+    public DbSet<RatingsProviderState> RatingsProviderStates => Set<RatingsProviderState>();
+
+    /// <summary>Gets the stored ratings per entry, source and provider (P9.R2).</summary>
+    public DbSet<TitleRating> TitleRatings => Set<TitleRating>();
+
+    /// <summary>Gets the latest ratings fetch attempt per entry (P9.R3).</summary>
+    public DbSet<RatingsFetch> RatingsFetches => Set<RatingsFetch>();
+
     /// <summary>
     /// Saves, and saves again after a pause when SQLite reported the database busy (another writer held the write lock past
     /// the busy timeout). A failed save wrote nothing and leaves every tracked change in place, so the retry is the same
@@ -303,6 +315,18 @@ public class ModDbContext : DbContext
             e.HasIndex(x => new { x.UserId, x.JellyfinItemId }).IsUnique();
             e.HasIndex(x => new { x.UserId, x.SeriesId });
             e.HasIndex(x => new { x.UserId, x.SeasonId });
+        });
+        b.Entity<TitleRating>(e =>
+        {
+            e.HasIndex(x => new { x.EntryId, x.Source, x.Provider }).IsUnique();
+            // Ratings belong to the title; removing the entry removes them.
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
+        });
+        b.Entity<RatingsFetch>(e =>
+        {
+            e.HasIndex(x => x.EntryId).IsUnique();
+            e.HasIndex(x => x.AttemptedAt);
+            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
         });
     }
 }

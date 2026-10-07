@@ -132,7 +132,7 @@ public class HealthController : ControllerBase
     /// (P7.S2); <c>ui.web</c> says this build also serves that interface's bundle itself (P7.S3);
     /// <c>ui.takeover</c> says it can replace the host's own document at <c>/web</c> (P7.S4). The <c>settings.*</c>
     /// names and <c>setup</c> are the typed settings contract and first-run state of P7.S7. <c>trakt.history</c> is
-    /// <c>GET /JellyfinMod/Trakt/Items/{itemId}</c>, the detail page's Trakt indicator (P7.Q16).
+    /// <c>GET /JellyfinMod/Trakt/Items/{itemId}</c>, the detail page's Trakt indicator (P7.Q16). <c>ratings*</c> are Phase 9's.
     /// </remarks>
     public static readonly IReadOnlyList<string> Capabilities =
     [
@@ -168,6 +168,11 @@ public class HealthController : ControllerBase
         "settings.retention",
         "setup",
         "acquisition.prowlarr",
-        "trakt.history"
+        "trakt.history",
+        // Phase 9: ratings on detail pages and Ratings/Items (ratings), the card source on Browse (ratings.cards), and the
+        // administrator's Settings/Ratings, Test, Status and manual refresh (settings.ratings).
+        "ratings",
+        "ratings.cards",
+        "settings.ratings"
     ];
 }
