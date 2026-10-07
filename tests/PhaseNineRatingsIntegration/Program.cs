@@ -871,6 +871,71 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert((await waitingSave.WaitAsync(TimeSpan.FromSeconds(60))).Status == HttpStatusCode.OK, "The waiting ratings save goes through once the database is free");
     test = await Send(admin, HttpMethod.Post, "JellyfinMod/Settings/Ratings/Test");
     Assert(test.Body.GetProperty("ok").GetBoolean(), "Test works again afterwards");
+
+    // ---- The same bound on an ordinary manual refresh, at the claim and at the recording (review round 4, P2 1): a save's
+    // transaction (BEGIN IMMEDIATE, COMMIT) runs on the connection with its own default timeout, which is bounded too.
+    async Task<Microsoft.Data.Sqlite.SqliteConnection> HoldWriter()
+    {
+        var writer = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}");
+        await writer.OpenAsync();
+        await using var begin = writer.CreateCommand();
+        begin.CommandText = "BEGIN IMMEDIATE";
+        await begin.ExecuteNonQueryAsync();
+        return writer;
+    }
+
+    // A pooled connection keeps an open transaction when it is closed, so the lock is ended explicitly.
+    static async Task ReleaseWriter(Microsoft.Data.Sqlite.SqliteConnection writer)
+    {
+        await using var rollback = writer.CreateCommand();
+        rollback.CommandText = "ROLLBACK";
+        await rollback.ExecuteNonQueryAsync();
+    }
+
+    async Task<double> SecondsUntilQueueEmpty(Stopwatch watch)
+    {
+        while (watch.Elapsed < TimeSpan.FromSeconds(90))
+        {
+            if ((await Status()).GetProperty("queued").GetInt32() == 0) return watch.Elapsed.TotalSeconds;
+            await Task.Delay(100);
+        }
+
+        return watch.Elapsed.TotalSeconds;
+    }
+
+    var bound = RatingsRefreshRunner.DatabaseLimit.TotalSeconds + 5;
+    var claimCalls = boundary.CallsFor("movie", 9104);
+    var keptAt = (await EntryRatings(admin, extra[1]))["imdb"].GetProperty("fetchedAt").GetDateTime();
+    var attemptBefore = (await Attempt(9104)).AttemptedAt;
+    await using (var writer = await HoldWriter())
+    {
+        var watch = Stopwatch.StartNew();
+        Assert((await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{extra[1]}/Ratings/Refresh")).Status == HttpStatusCode.Accepted,
+            "A manual refresh is queued while another writer holds the database");
+        var seconds = await SecondsUntilQueueEmpty(watch);
+        Assert(seconds < bound && boundary.CallsFor("movie", 9104) == claimCalls,
+            "The claim gives up within its bound and no call is made", new { seconds, bound });
+        await ReleaseWriter(writer);
+    }
+
+    Assert((await Attempt(9104)).AttemptedAt == attemptBefore, "Nothing of the refused claim was written");
+    boundary.HoldTitle = 9104;
+    Assert((await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{extra[1]}/Ratings/Refresh")).Status == HttpStatusCode.Accepted, "A manual refresh is queued");
+    await boundary.Held.Task.WaitAsync(TimeSpan.FromSeconds(30));
+    await using (var writer = await HoldWriter())
+    {
+        var watch = Stopwatch.StartNew();
+        boundary.Release.TrySetResult();
+        var seconds = await SecondsUntilQueueEmpty(watch);
+        Assert(seconds < bound && boundary.CallsFor("movie", 9104) == claimCalls + 1,
+            "Its answer arrives while another writer holds the database: the recording gives up within its bound and frees the gate",
+            new { seconds, bound });
+        await ReleaseWriter(writer);
+    }
+
+    boundary.ResetHold();
+    Assert((await Attempt(9104)).Outcome == "pending" && (await EntryRatings(admin, extra[1]))["imdb"].GetProperty("fetchedAt").GetDateTime() == keptAt,
+        "Nothing of the answer was recorded: the claim stays pending (the next run counts it as interrupted) and the stored values are kept");
     settings = await Settings();
 
     // ---- Ratings off: absent everywhere, nothing fetched.
