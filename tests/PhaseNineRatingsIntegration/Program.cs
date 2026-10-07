@@ -440,6 +440,10 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert(boundary.Calls.Count == callsBefore + 1 && refused.Body.GetProperty("type").GetString() == "breaker_open",
         "While the breaker is open nothing is called; a manual refresh is 409 breaker_open");
     boundary.Mode = "full";
+    revision = (await Settings()).GetProperty("revision").GetInt32();
+    Assert((await Patch(new { revision, apiKey = new { action = "replace", value = Key } })).Status == HttpStatusCode.OK &&
+        !(await Status()).GetProperty("breaker").GetProperty("open").GetBoolean(),
+        "Replacing the key closes a breaker opened by a 429: the daily quota is the key's");
     time.Offset = TimeSpan.FromDays(61);
 
     // ---- 5xx, malformed and timeout: transient failures, a one-hour breaker after five in a row; values unchanged.
