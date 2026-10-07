@@ -93,19 +93,17 @@ public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, 
         var candidates = new List<RatingDto>();
         if (Snapshot(entry) is { } tmdb)
             candidates.Add(new RatingDto(RatingSources.Tmdb, RatingSources.Round(tmdb.Score, RatingSources.Ten), RatingSources.Ten, tmdb.Votes,
-                RatingSources.ProviderTmdb, null, null, false));
+                RatingSources.ProviderTmdb, null, false));
         foreach (var row in stored.Where(row => RatingSources.IsKnown(row.Source) && row.Scale != RatingSources.Unknown))
         {
             var at = DateTime.SpecifyKind(row.FetchedAt, DateTimeKind.Utc);
-            // Links are checked again on the way out, so a row stored before the check can never carry anything else.
-            candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, row.Votes, row.Provider, at, RatingSources.SafeUrl(row.Source, row.Url),
-                now - at > window));
+            candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, row.Votes, row.Provider, at, now - at > window));
         }
 
         // The host's values are as old as the item's last metadata refresh, and are marked stale by the same window
         // (review 2026-10-07, P3 8).
         foreach (var row in hosted)
-            candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, null, row.Provider, row.FetchedAt, null, now - row.FetchedAt > window));
+            candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, null, row.Provider, row.FetchedAt, now - row.FetchedAt > window));
         var result = new List<RatingDto>();
         foreach (var source in RatingSources.Known)
         {

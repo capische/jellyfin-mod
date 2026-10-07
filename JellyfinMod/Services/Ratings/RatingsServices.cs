@@ -14,6 +14,7 @@ public static class RatingsServices
     public static void Add(IServiceCollection services, Func<PluginConfiguration> configuration)
     {
         services.AddSingleton<RatingsRunGate>();
+        services.AddSingleton<RatingsCredentialGate>();
         services.AddSingleton<RatingsRefreshQueue>();
         services.AddSingleton(RatingsOptions.Default);
         services.AddTransient<HostRatingsReader>();

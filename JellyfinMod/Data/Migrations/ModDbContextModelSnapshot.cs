@@ -1391,9 +1391,6 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<DateTime>("AttemptedAt")
                         .HasColumnType("TEXT");
 
-                    b.Property<Guid>("EntryId")
-                        .HasColumnType("TEXT");
-
                     b.Property<string>("Error")
                         .HasMaxLength(200)
                         .HasColumnType("TEXT");
@@ -1401,19 +1398,24 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<bool>("Manual")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("MediaType")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("Outcome")
                         .IsRequired()
                         .HasMaxLength(16)
                         .HasColumnType("TEXT");
 
-                    b.Property<DateTime?>("RetryAfter")
-                        .HasColumnType("TEXT");
+                    b.Property<int>("TmdbId")
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
                     b.HasIndex("AttemptedAt");
 
-                    b.HasIndex("EntryId")
+                    b.HasIndex("MediaType", "TmdbId")
                         .IsUnique();
 
                     b.ToTable("RatingsFetches");
@@ -2026,10 +2028,6 @@ namespace JellyfinMod.Data.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("Url")
-                        .HasMaxLength(512)
-                        .HasColumnType("TEXT");
-
                     b.Property<double>("Value")
                         .HasColumnType("REAL");
 
@@ -2320,15 +2318,6 @@ namespace JellyfinMod.Data.Migrations
                     b.HasOne("JellyfinMod.Data.AcquisitionIndexer", null)
                         .WithMany()
                         .HasForeignKey("IndexerId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-                });
-
-            modelBuilder.Entity("JellyfinMod.Data.RatingsFetch", b =>
-                {
-                    b.HasOne("JellyfinMod.Data.Entry", null)
-                        .WithMany()
-                        .HasForeignKey("EntryId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });

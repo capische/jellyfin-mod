@@ -15,7 +15,8 @@ public sealed record RatingsEndpoint(Uri BaseAddress)
 }
 
 /// <summary>One rating as MDBList reported it, already mapped to a source and scale.</summary>
-public sealed record FetchedRating(string Source, string Scale, double Value, int? Votes, string? Url);
+/// <remarks>The provider's own link for the source is never read or kept (review 2026-10-07 round 2, P1).</remarks>
+public sealed record FetchedRating(string Source, string Scale, double Value, int? Votes);
 
 /// <summary>What one MDBList call produced. Never carries the key, the request URL or a response body.</summary>
 /// <param name="Outcome">A <see cref="RatingsOutcomes"/> code.</param>
@@ -110,26 +111,28 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
         var result = new List<FetchedRating>();
         foreach (var item in ratings.EnumerateArray())
         {
-            // Structure is checked, not guessed (review 2026-10-07, P2 5): an item that is not an object, a source that is not a
-            // string, or a value of the wrong kind makes the whole answer malformed, so it changes no stored value and counts
-            // as a provider failure. A value MDBList simply does not have (null, "", "N/A") is absent, which is not malformed.
+            // Structure is checked, not guessed (review 2026-10-07, P2 5 and round 2, P2 6): an item that is not an object, a
+            // source that is not a string, or a value, score or vote count of the wrong kind makes the whole answer malformed, so
+            // it changes no stored value and counts as a provider failure. A number MDBList simply does not have (null, "",
+            // "N/A") is absent, which is not malformed.
             if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty("source", out var name) || name.ValueKind != JsonValueKind.String)
                 return Done(RatingsOutcomes.Malformed, status);
-            if (!TryValue(item, out var value) || !TryVotes(item, out var votes)) return Done(RatingsOutcomes.Malformed, status);
+            if (!TryNumber(item, "value", out var value) || !TryNumber(item, "score", out _) || !TryVotes(item, out var votes))
+                return Done(RatingsOutcomes.Malformed, status);
             var source = name.GetString();
             if (RatingSources.FromMdbList(source, value, votes) is not { } mapped) continue;
-            var url = item.TryGetProperty("url", out var link) && link.ValueKind == JsonValueKind.String ? link.GetString() : null;
-            result.Add(new FetchedRating(mapped.Source, mapped.Scale, mapped.Value, votes is > 0 ? votes : null, RatingSources.SafeUrl(mapped.Source, url)));
+            result.Add(new FetchedRating(mapped.Source, mapped.Scale, mapped.Value, votes is > 0 ? votes : null));
         }
 
         // One value per source; MDBList has been seen to repeat a source.
         return new MdbListResult(RatingsOutcomes.Ok, result.DistinctBy(rating => rating.Source).ToArray(), null, status);
     }
 
-    private static bool TryValue(JsonElement item, out double? value)
+    /// <summary>Reads an optional number: absent, null, "" or "N/A" is no value; a number or numeric text is read; anything else is malformed.</summary>
+    private static bool TryNumber(JsonElement item, string property, out double? value)
     {
         value = null;
-        if (!item.TryGetProperty("value", out var raw)) return true;
+        if (!item.TryGetProperty(property, out var raw)) return true;
         switch (raw.ValueKind)
         {
             case JsonValueKind.Null:
@@ -159,7 +162,8 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
 
     /// <summary>
     /// When the provider asked to be called again: the later of <c>Retry-After</c> and <c>X-RateLimit-Reset</c>, so a short
-    /// Retry-After never hides a reset days away (review 2026-10-07, P2 6). Null when neither says.
+    /// Retry-After never hides a reset days away (review 2026-10-07, P2 6). Null when neither says. A long delay is kept as
+    /// given, however far away, and one past the last representable moment saturates to it (round 2, P3 7).
     /// </summary>
     private DateTime? RetryAfter(HttpResponseMessage response)
     {
@@ -168,7 +172,7 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
         void Consider(DateTime candidate) => latest = latest is { } known && known >= candidate ? known : candidate;
         if (response.Headers.RetryAfter is { } retry)
         {
-            if (retry.Delta is { } delta && delta >= TimeSpan.Zero && delta < TimeSpan.FromDays(366)) Consider(now + delta);
+            if (retry.Delta is { } delta && delta >= TimeSpan.Zero) Consider(delta >= DateTime.MaxValue - now ? DateTime.MaxValue : now + delta);
             else if (retry.Date is { } date) Consider(date.UtcDateTime);
         }
 
