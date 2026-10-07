@@ -99,6 +99,9 @@
 .jfmod-settings .emby-button.raised:not(.button-submit):not(.button-delete):hover:not(:focus),.jfmod-sheet .emby-button.raised:not(.button-submit):not(.button-delete):hover:not(:focus){background:linear-gradient(rgba(255,255,255,.12),rgba(255,255,255,.12)) #424242;background:linear-gradient(rgba(var(--jf-palette-text-primaryChannel)/.12),rgba(var(--jf-palette-text-primaryChannel)/.12)) var(--jf-palette-Button-inheritContainedBg,#424242)}
 .jfmod-settings .emby-button.raised.button-submit:hover:not(:focus),.jfmod-sheet .emby-button.raised.button-submit:hover:not(:focus){background:#33b6e3;background:var(--jf-palette-primary-light,#33b6e3)}
 .jfmod-settings .emby-button.raised.raised:focus,.jfmod-sheet .emby-button.raised.raised:focus{background:#00a4dc;background:var(--jf-palette-secondary-main,#00a4dc);color:rgba(0,0,0,.87)}
+/* The focus fill is the primary's own cyan in most schemes, so a focused blue button would look unchanged; every focused
+   button also takes a ring in the text colour. A shadow, as upstream's .emby-button forbids outlines with !important. */
+.jfmod-settings .emby-button.raised.raised:focus,.jfmod-sheet .emby-button.raised.raised:focus{box-shadow:0 0 0 .16em #fff;box-shadow:0 0 0 .16em var(--jf-palette-text-primary,#fff)}
 .jfmod-inlineactions{display:flex;align-items:center;flex-wrap:wrap;margin-bottom:1.4em}
 .jfmod-inlineactions>*{margin-right:.6em;margin-top:.3em}
 .jfmod-testline{display:flex;align-items:center;flex-wrap:wrap;margin:-.6em 0 1.6em}
