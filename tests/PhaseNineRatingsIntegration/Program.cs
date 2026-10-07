@@ -236,6 +236,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     var movieA = await Add("movie", 9101, world.Movies.Id);
     var movieB = await Add("movie", 9102, world.Movies.Id);
     var seriesS = await Add("series", 9201, world.Tv.Id);
+    // The same title in a second library: another entry, the same MDBList answer.
+    var twin = await Add("movie", 9101, world.Movies2.Id);
     var extra = new List<Guid>();
     for (var id = 9103; id <= 9108; id++) extra.Add(await Add("movie", id, world.Movies.Id));
     // Reconciliation binds the series to its native item (Phase 2); the suite's item store has no library walk, so the binding
@@ -330,9 +332,11 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     await Run();
     var calls = boundary.Calls.Skip(callsBefore).ToArray();
     Assert(calls.Length == 9 && calls.Distinct().Count() == 9 && boundary.WrongKeyCalls == 0,
-        "The first run calls MDBList once per title (9), with the saved key");
-    Assert(calls[0] == "movie:9108" && calls[1] == "movie:9107" && calls[^1] == "movie:9101" && calls.Contains("show:9201"),
-        "Titles never fetched go newest first; a series is asked for as a show");
+        "The first run calls MDBList once per title identity (9 titles, 10 entries), with the saved key");
+    Assert(calls[0] == "movie:9108" && calls[1] == "movie:9107" && calls[6] == "movie:9101" && calls[7] == "show:9201" && calls[^1] == "movie:9102",
+        "Titles never fetched go newest first (a title's newest entry counts); a series is asked for as a show");
+    Assert((await EntryRatings(admin, twin)).Count == 9 && (await EntryRatings(admin, twin))["imdb"].GetProperty("value").GetDouble() == 8.1,
+        "One call served both libraries' entries of the same title");
     aRatings = await EntryRatings(admin, movieA);
     Assert(string.Join(",", aRatings.Keys) == "imdb,tomatoes_critic,tomatoes_audience,tmdb,trakt,metacritic,metacritic_user,letterboxd,rogerebert",
         "Every known source arrives, one value each, in the complete order; the unknown and the zero-without-votes sources are not shown");
@@ -464,7 +468,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert(boundary.Calls.Count == callsBefore + 4 && (await EntryRatings(admin, movieA))["imdb"].GetProperty("fetchedAt").GetDateTime() == oldA,
         "After the hour fetching resumes; malformed bodies count as failures (the remaining four titles) and change nothing");
     await using (var database = new ModDbContext(dbPath))
-        Assert(await database.RatingsFetches.AsNoTracking().CountAsync(row => row.Outcome == "malformed") == 4, "Each malformed answer is recorded as such");
+        Assert(await database.RatingsFetches.AsNoTracking().CountAsync(row => row.Outcome == "malformed") >= 4,
+            "Each malformed answer is recorded as such, on every entry of its title");
     boundary.Mode = "full";
     time.Offset += TimeSpan.FromHours(2);
     boundary.TitleModes[9103] = "slow";

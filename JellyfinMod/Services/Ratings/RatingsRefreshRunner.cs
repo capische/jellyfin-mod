@@ -131,9 +131,13 @@ public sealed class RatingsRefreshRunner(
         var key = await secrets.GetAsync(settings.ApiKeyRef, cancellationToken).ConfigureAwait(false);
         if (Refusal(settings, _state, key is not null, Now) is { } refusal) return refusal;
         var entry = await database.Entries.AsNoTracking().Where(row => row.Id == entryId)
-            .Select(row => new DueEntry(row.Id, row.MediaType, row.TmdbId)).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            .Select(row => new { row.MediaType, row.TmdbId }).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         if (entry is null) return RatingsOutcomes.NotFound;
-        return await FetchUnderGateAsync(entry, key!, true, cancellationToken).ConfigureAwait(false) ?? RatingsOutcomes.NotFound;
+        // The same title in another library is the same MDBList answer: one call serves every entry of the identity.
+        var siblings = await database.Entries.AsNoTracking().Where(row => row.MediaType == entry.MediaType && row.TmdbId == entry.TmdbId)
+            .Select(row => row.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
+        return await FetchUnderGateAsync(new DueTitle(entry.MediaType, entry.TmdbId, siblings), key!, true, cancellationToken).ConfigureAwait(false)
+            ?? RatingsOutcomes.NotFound;
     }
 
     /// <summary>The Test button: one call for a fixed well-known title, counted in the budget, not refused by it.</summary>
@@ -170,72 +174,88 @@ public sealed class RatingsRefreshRunner(
 
     private DateTime Now => clock.GetUtcNow().UtcDateTime;
 
-    /// <summary>Claims, calls and applies one title. Returns null when the title vanished before its claim.</summary>
-    private async Task<string?> FetchUnderGateAsync(DueEntry entry, string key, bool manual, CancellationToken cancellationToken)
+    /// <summary>
+    /// Claims, calls and applies one title identity for each of its entries (one call, however many libraries hold it). Returns
+    /// null when every entry vanished before its claim.
+    /// </summary>
+    private async Task<string?> FetchUnderGateAsync(DueTitle title, string key, bool manual, CancellationToken cancellationToken)
     {
-        var state = _state;
-        // The claim and the budget in one commit, before the call.
-        var fetch = await database.RatingsFetches.SingleOrDefaultAsync(row => row.EntryId == entry.Id, cancellationToken).ConfigureAwait(false);
-        if (fetch is null)
+        // The claims and the budget in one commit, before the call.
+        var ids = await ExistingAsync(title.EntryIds, cancellationToken).ConfigureAwait(false);
+        if (ids.Count == 0) return null;
+        var claimedAt = Now;
+        var fetches = await database.RatingsFetches.Where(row => ids.Contains(row.EntryId)).ToDictionaryAsync(row => row.EntryId, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var id in ids)
         {
-            fetch = new RatingsFetch { EntryId = entry.Id };
-            database.RatingsFetches.Add(fetch);
+            if (!fetches.TryGetValue(id, out var fetch))
+            {
+                fetch = new RatingsFetch { EntryId = id };
+                database.RatingsFetches.Add(fetch);
+            }
+
+            (fetch.AttemptedAt, fetch.Outcome, fetch.RetryAfter, fetch.Error, fetch.Manual) = (claimedAt, RatingsOutcomes.Pending, null, null, manual);
         }
 
-        fetch.AttemptedAt = Now;
-        fetch.Outcome = RatingsOutcomes.Pending;
-        fetch.RetryAfter = null;
-        fetch.Error = null;
-        fetch.Manual = manual;
-        Spend(state);
+        Spend(_state);
         try
         {
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (DbUpdateException)
         {
-            // The entry was removed meanwhile: nothing was called, and the budget increment is given back.
+            // An entry was removed meanwhile: nothing was called and nothing was committed, the budget increment included.
             database.ChangeTracker.Clear();
             _state = await RatingsStore.GetStateAsync(database, CancellationToken.None).ConfigureAwait(false);
             return null;
         }
 
         await PaceAsync(cancellationToken).ConfigureAwait(false);
-        var result = await client.FetchAsync(key, entry.MediaType, entry.TmdbId, cancellationToken).ConfigureAwait(false);
-        fetch.Outcome = result.Outcome;
-        fetch.RetryAfter = result.RetryAfter;
-        fetch.Error = result.Outcome == RatingsOutcomes.Ok ? null : result.Status is { } status ? $"HTTP {status}" : result.Outcome;
-        if (result.Outcome == RatingsOutcomes.Ok)
-        {
-            // What arrived replaces this title's MDBList values; a source missing from this answer is gone.
-            var old = await database.TitleRatings.Where(row => row.EntryId == entry.Id && row.Provider == RatingSources.ProviderMdbList)
-                .ToListAsync(CancellationToken.None).ConfigureAwait(false);
-            database.TitleRatings.RemoveRange(old);
-            var at = Now;
-            database.TitleRatings.AddRange(result.Ratings.Select(rating => new TitleRating
-            {
-                EntryId = entry.Id, Source = rating.Source, Provider = RatingSources.ProviderMdbList, Value = rating.Value, Scale = rating.Scale,
-                Votes = rating.Votes, FetchedAt = at, Url = rating.Url
-            }));
-        }
-
-        Observe(state, result);
+        var result = await client.FetchAsync(key, title.MediaType, title.TmdbId, cancellationToken).ConfigureAwait(false);
+        Observe(_state, result);
+        await ApplyAsync(ids, result).ConfigureAwait(false);
         try
         {
             await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         }
         catch (DbUpdateException)
         {
-            // The entry went while its call was out; its rows went with it. The call was made, so the state still counts it.
+            // An entry went while the call was out; its rows went with it. The call was made, so the state still counts it, and
+            // the entries that remain get the answer.
             database.ChangeTracker.Clear();
             _state = await RatingsStore.GetStateAsync(database, CancellationToken.None).ConfigureAwait(false);
             Observe(_state, result);
+            await ApplyAsync(await ExistingAsync(ids, CancellationToken.None).ConfigureAwait(false), result).ConfigureAwait(false);
             await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
-            return null;
         }
 
-        logger.LogDebug("Ratings fetch for entry {EntryId}: {Outcome}", entry.Id, result.Outcome);
+        logger.LogDebug("Ratings fetch for {MediaType} {TmdbId} ({Entries} entries): {Outcome}", title.MediaType, title.TmdbId, ids.Count, result.Outcome);
         return result.Outcome;
+    }
+
+    private async Task<List<Guid>> ExistingAsync(IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken) =>
+        await database.Entries.AsNoTracking().Where(row => ids.Contains(row.Id)).Select(row => row.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
+
+    /// <summary>Records the outcome on each entry's claim; an answer with ratings replaces that entry's MDBList values.</summary>
+    private async Task ApplyAsync(IReadOnlyCollection<Guid> ids, MdbListResult result)
+    {
+        var fetches = await database.RatingsFetches.Where(row => ids.Contains(row.EntryId)).ToListAsync(CancellationToken.None).ConfigureAwait(false);
+        var error = result.Outcome == RatingsOutcomes.Ok ? null : result.Status is { } status ? $"HTTP {status}" : result.Outcome;
+        foreach (var fetch in fetches) (fetch.Outcome, fetch.RetryAfter, fetch.Error) = (result.Outcome, result.RetryAfter, error);
+        if (result.Outcome != RatingsOutcomes.Ok) return;
+        // What arrived replaces the title's MDBList values; a source missing from this answer is gone.
+        var old = await database.TitleRatings.Where(row => ids.Contains(row.EntryId) && row.Provider == RatingSources.ProviderMdbList)
+            .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+        database.TitleRatings.RemoveRange(old);
+        var at = Now;
+        foreach (var id in ids)
+        {
+            database.TitleRatings.AddRange(result.Ratings.Select(rating => new TitleRating
+            {
+                EntryId = id, Source = rating.Source, Provider = RatingSources.ProviderMdbList, Value = rating.Value, Scale = rating.Scale,
+                Votes = rating.Votes, FetchedAt = at, Url = rating.Url
+            }));
+        }
     }
 
     /// <summary>What an answer means for the provider state: blocker, breaker and the failure streak.</summary>
@@ -310,10 +330,14 @@ public sealed class RatingsRefreshRunner(
         logger.LogWarning("Ratings: {Count} fetch(es) were interrupted and count as failed attempts", claims.Count);
     }
 
-    private sealed record DueEntry(Guid Id, string MediaType, int TmdbId);
+    /// <summary>One title identity and every entry that holds it (the same title can sit in more than one library).</summary>
+    private sealed record DueTitle(string MediaType, int TmdbId, IReadOnlyList<Guid> EntryIds);
 
-    /// <summary>Never attempted, newest first; then attempted titles whose window passed, the oldest attempt first.</summary>
-    private async Task<IReadOnlyList<DueEntry>> DueAsync(RatingsSettings settings, DateTime now, CancellationToken cancellationToken)
+    /// <summary>
+    /// Titles with an entry never attempted (newest first); then titles whose oldest attempt passed its window, the oldest attempt
+    /// first. A title is one identity: one call serves every entry that holds it.
+    /// </summary>
+    private async Task<IReadOnlyList<DueTitle>> DueAsync(RatingsSettings settings, DateTime now, CancellationToken cancellationToken)
     {
         var entries = await database.Entries.AsNoTracking().Where(entry => entry.TmdbId > 0)
             .Select(entry => new { entry.Id, entry.MediaType, entry.TmdbId, entry.AddedAt }).ToListAsync(cancellationToken).ConfigureAwait(false);
@@ -321,11 +345,19 @@ public sealed class RatingsRefreshRunner(
             .ToDictionary(row => row.EntryId);
         var refresh = now - TimeSpan.FromDays(Math.Max(1, settings.RefreshDays));
         var retry = now - options.FailureRetry;
-        var fresh = entries.Where(entry => !fetches.ContainsKey(entry.Id)).OrderByDescending(entry => entry.AddedAt).ThenBy(entry => entry.Id);
-        var again = entries.Where(entry => fetches.TryGetValue(entry.Id, out var fetch) && fetch.Outcome != RatingsOutcomes.Pending &&
-                fetch.AttemptedAt <= (fetch.Outcome is RatingsOutcomes.Ok or RatingsOutcomes.NotFound ? refresh : retry) &&
-                (fetch.RetryAfter is not { } after || after <= now))
-            .OrderBy(entry => fetches[entry.Id].AttemptedAt).ThenBy(entry => entry.Id);
-        return fresh.Concat(again).Select(entry => new DueEntry(entry.Id, entry.MediaType, entry.TmdbId)).ToArray();
+        bool Due(RatingsFetch fetch) => fetch.Outcome != RatingsOutcomes.Pending &&
+            fetch.AttemptedAt <= (fetch.Outcome is RatingsOutcomes.Ok or RatingsOutcomes.NotFound ? refresh : retry) &&
+            (fetch.RetryAfter is not { } after || after <= now);
+        var titles = entries.GroupBy(entry => (entry.MediaType, entry.TmdbId)).Select(group => new
+        {
+            Title = new DueTitle(group.Key.MediaType, group.Key.TmdbId, group.Select(entry => entry.Id).Order().ToArray()),
+            Fresh = group.Any(entry => !fetches.ContainsKey(entry.Id)),
+            Again = group.Any(entry => fetches.TryGetValue(entry.Id, out var fetch) && Due(fetch)),
+            Newest = group.Max(entry => entry.AddedAt),
+            Oldest = group.Where(entry => fetches.ContainsKey(entry.Id)).Select(entry => fetches[entry.Id].AttemptedAt).DefaultIfEmpty(DateTime.MaxValue).Min()
+        }).ToList();
+        var fresh = titles.Where(title => title.Fresh).OrderByDescending(title => title.Newest).ThenBy(title => title.Title.TmdbId);
+        var again = titles.Where(title => !title.Fresh && title.Again).OrderBy(title => title.Oldest).ThenBy(title => title.Title.TmdbId);
+        return fresh.Concat(again).Select(title => title.Title).ToArray();
     }
 }
