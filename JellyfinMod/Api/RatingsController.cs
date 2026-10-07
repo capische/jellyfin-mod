@@ -69,9 +69,11 @@ public sealed class RatingsController(
             settings.ApiKeyRef = request.ApiKey.Action == "replace" ? await secrets.AddAsync(request.ApiKey.Value!.Trim(), cancellationToken) : null;
             settings.VerifiedRevision = null;
             settings.VerifiedAt = null;
-            // A new key gets a fresh start; the old one's refusal says nothing about it.
+            // A new key gets a fresh start: the old one's refusal says nothing about it, and MDBList's daily quota is the key's,
+            // so a breaker opened by a 429 closes too. A breaker opened by provider errors stays: those are the provider's.
             var state = await RatingsStore.GetStateAsync(database, cancellationToken);
             if (state.Blocker == RatingsOutcomes.Unauthorized) state.Blocker = null;
+            if (state.BreakerReason == RatingsOutcomes.RateLimited) (state.BreakerUntil, state.BreakerReason) = (null, null);
         }
 
         settings.Revision++;
