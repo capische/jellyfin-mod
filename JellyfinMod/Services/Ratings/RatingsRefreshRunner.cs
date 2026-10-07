@@ -1,4 +1,5 @@
 using JellyfinMod.Data;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -228,16 +229,28 @@ public sealed class RatingsRefreshRunner(
 
     private const int CommandSeconds = 4;
 
-    /// <summary>Limits each SQLite command's busy wait while the credential gate is held; dispose to restore the default.</summary>
+    /// <summary>
+    /// Limits every SQLite busy wait while the credential gate is held: EF's commands, and the connection's own statements —
+    /// the BEGIN IMMEDIATE and COMMIT of a save's transaction run on the connection with its default timeout (30 s), which a
+    /// cancellation token does not interrupt (review round 4, P2 1). Dispose to restore both values as they were.
+    /// </summary>
     private IDisposable BoundDatabase()
     {
+        var command = database.Database.GetCommandTimeout();
+        var connection = database.Database.GetDbConnection() as SqliteConnection;
+        var defaultTimeout = connection?.DefaultTimeout;
         database.Database.SetCommandTimeout(CommandSeconds);
-        return new Restore(database);
+        if (connection is not null) connection.DefaultTimeout = CommandSeconds;
+        return new Restore(database, command, connection, defaultTimeout);
     }
 
-    private sealed class Restore(ModDbContext database) : IDisposable
+    private sealed class Restore(ModDbContext database, int? command, SqliteConnection? connection, int? defaultTimeout) : IDisposable
     {
-        public void Dispose() => database.Database.SetCommandTimeout(null);
+        public void Dispose()
+        {
+            database.Database.SetCommandTimeout(command);
+            if (connection is not null && defaultTimeout is { } previous) connection.DefaultTimeout = previous;
+        }
     }
 
     /// <summary>Saves within <see cref="DatabaseLimit"/>; false when the database stayed busy (nothing was written).</summary>
