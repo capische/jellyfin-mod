@@ -139,7 +139,13 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
         new PluginPageInfo
         {
             Name = Name,
-            EmbeddedResourcePath = $"{GetType().Namespace}.Configuration.configPage.html"
+            EmbeddedResourcePath = $"{GetType().Namespace}.Configuration.configPage.html",
+
+            // Listed under Plugins in the Dashboard's drawer, one click from anywhere in the Dashboard. The icon is a
+            // Material Icons ligature, which the drawer renders through MUI's Icon.
+            EnableInMainMenu = true,
+            DisplayName = "JellyfinMod",
+            MenuIcon = "video_library"
         }
     ];
 }
