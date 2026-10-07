@@ -189,4 +189,7 @@ public static class RatingsOutcomes
 
     /// <summary>No key is configured.</summary>
     public const string NotConfigured = "not_configured";
+
+    /// <summary>The database stayed busy past the fetcher's bound, so the step did not happen or was not recorded.</summary>
+    public const string DatabaseBusy = "database_busy";
 }
