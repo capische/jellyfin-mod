@@ -1002,9 +1002,11 @@
       function clearNotice(slot) { notice(slot, 'ok', ''); }
 
       // Every failure path lands here, so a stale revision always reads the same way.
-      function fail(slot, error) {
+      // `current`, when given, is asked again once the error body is read: the answer is dropped if it no longer belongs.
+      function fail(slot, error, current) {
         Dashboard.hideLoadingMsg();
         return problem(error).then(function (detail) {
+          if (current && !current()) return;
           if (detail.status === 409) {
             notice(slot, 'err', detail.text + ' ' + CONFLICT_MESSAGE, 'Reload', function () {
               loadAll().then(function () { clearNotice(slot); });
@@ -2881,15 +2883,16 @@
         busy(control, true, control.classList.contains('jfmod-iconbtn') ? null : 'Testing…');
         settingsRequest('POST', path).then(function (result) {
           busy(control, false);
-          if (!current || current()) {
-            notice(section, result.ok ? 'ok' : 'err', result.message + ' (' + result.code + ')' +
-              (result.version ? ' · Transmission ' + result.version : ''));
-          }
+          // An answer that no longer belongs is dropped whole: no notice and no reload, which would also replace any
+          // edits made since (Codex re-review 3).
+          if (current && !current()) return;
+          notice(section, result.ok ? 'ok' : 'err', result.message + ' (' + result.code + ')' +
+            (result.version ? ' · Transmission ' + result.version : ''));
           return loadAll();
         }, function (error) {
           busy(control, false);
-          if (current && !current()) return loadAll();
-          return fail(section, error);
+          if (current && !current()) return;
+          return fail(section, error, current);
         });
       }
       $('#TestSeedProtection').addEventListener('click', function (event) {
