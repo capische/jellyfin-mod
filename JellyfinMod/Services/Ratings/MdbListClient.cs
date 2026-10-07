@@ -170,10 +170,24 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
         var now = clock.GetUtcNow().UtcDateTime;
         DateTime? latest = null;
         void Consider(DateTime candidate) => latest = latest is { } known && known >= candidate ? known : candidate;
-        if (response.Headers.RetryAfter is { } retry)
+        // A delay in seconds is read from the header's own text, digit by digit, so a number too large for .NET's parser (which
+        // then reports no header at all) still saturates to the last representable moment (review round 3, P3 6).
+        if (response.Headers.NonValidated.TryGetValues("Retry-After", out var raw) && raw.Count == 1 &&
+            raw.ToString().Trim() is { Length: > 0 } text && text.All(char.IsAsciiDigit))
         {
-            if (retry.Delta is { } delta && delta >= TimeSpan.Zero) Consider(delta >= DateTime.MaxValue - now ? DateTime.MaxValue : now + delta);
-            else if (retry.Date is { } date) Consider(date.UtcDateTime);
+            var left = (DateTime.MaxValue - now).TotalSeconds;
+            var delay = 0d;
+            foreach (var digit in text)
+            {
+                delay = delay * 10 + (digit - '0');
+                if (delay >= left - 1) break;
+            }
+
+            Consider(delay >= left - 1 ? DateTime.MaxValue : now.AddSeconds(delay));
+        }
+        else if (response.Headers.RetryAfter?.Date is { } date)
+        {
+            Consider(date.UtcDateTime);
         }
 
         if (response.Headers.TryGetValues("X-RateLimit-Reset", out var values) &&

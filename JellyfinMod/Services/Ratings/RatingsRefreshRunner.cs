@@ -157,7 +157,7 @@ public sealed class RatingsRefreshRunner(
         state = await RatingsStore.GetStateAsync(database, CancellationToken.None).ConfigureAwait(false);
         (state.LastRunStartedAt, state.LastRunFetched, state.LastRunFailed, state.LastRunFinishedAt) = (startedAt, fetched, failed, Now);
         state.LastRunStopReason = stop is "budget_spent" or "breaker_open" or "ratings_disabled" or RatingsOutcomes.NotConfigured
-            or RatingsOutcomes.Unauthorized ? stop : null;
+            or RatingsOutcomes.Unauthorized or RatingsOutcomes.DatabaseBusy ? stop : null;
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         logger.LogInformation("Ratings run: {Due} due, {Fetched} fetched, {Failed} failed, stopped by {Reason}", due.Count, fetched, failed,
             state.LastRunStopReason ?? "nothing");
@@ -187,11 +187,12 @@ public sealed class RatingsRefreshRunner(
         using var lease = await gate.AcquireAsync(cancellationToken).ConfigureAwait(false);
         await PaceAsync(cancellationToken).ConfigureAwait(false);
         using var held = await credential.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        using var bounded = BoundDatabase();
         var current = await CurrentAsync(cancellationToken).ConfigureAwait(false);
         if (current.Key is null) return new MdbListResult(RatingsOutcomes.NotConfigured, [], null, null);
         if (TestRefusal(current.Settings, current.State, Now) is { } refusal) return new MdbListResult(refusal, [], null, null);
         Spend(current.State);
-        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        if (!await SaveBoundedAsync(cancellationToken).ConfigureAwait(false)) return new MdbListResult(RatingsOutcomes.DatabaseBusy, [], null, null);
         gate.LastCallAt = DateTime.UtcNow;
         var result = await client.FetchAsync(current.Key, "movie", MdbListClient.TestTmdbId, cancellationToken).ConfigureAwait(false);
         Observe(current.State, result);
@@ -205,12 +206,56 @@ public sealed class RatingsRefreshRunner(
             current.Settings.VerifiedRevision = null;
         }
 
-        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        // The state and the verification in one bounded save: all of it or, when the database stays busy, none of it.
+        if (!await SaveBoundedAsync(CancellationToken.None).ConfigureAwait(false))
+        {
+            logger.LogWarning("Ratings Test: the answer ({Outcome}) could not be recorded, the database stayed busy", result.Outcome);
+            return new MdbListResult(RatingsOutcomes.DatabaseBusy, [], null, result.Status);
+        }
+
         logger.LogInformation("Ratings Test: {Outcome} (HTTP {Status})", result.Outcome, result.Status);
         return result;
     }
 
     private DateTime Now => clock.GetUtcNow().UtcDateTime;
+
+    /// <summary>
+    /// How long the database work done under the credential gate may take in all, per step: the claim before the call, and the
+    /// recording after it. With each SQLite command limited to <see cref="CommandSeconds"/>, a busy database holds the gate —
+    /// and with it a waiting settings save — for at most about this long (review round 3, P2 1).
+    /// </summary>
+    public static TimeSpan DatabaseLimit { get; } = TimeSpan.FromSeconds(8);
+
+    private const int CommandSeconds = 4;
+
+    /// <summary>Limits each SQLite command's busy wait while the credential gate is held; dispose to restore the default.</summary>
+    private IDisposable BoundDatabase()
+    {
+        database.Database.SetCommandTimeout(CommandSeconds);
+        return new Restore(database);
+    }
+
+    private sealed class Restore(ModDbContext database) : IDisposable
+    {
+        public void Dispose() => database.Database.SetCommandTimeout(null);
+    }
+
+    /// <summary>Saves within <see cref="DatabaseLimit"/>; false when the database stayed busy (nothing was written).</summary>
+    private async Task<bool> SaveBoundedAsync(CancellationToken cancellationToken)
+    {
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        limit.CancelAfter(DatabaseLimit);
+        try
+        {
+            await database.SaveChangesAsync(limit.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception failure) when (!cancellationToken.IsCancellationRequested && (failure is OperationCanceledException || SqliteBusy.IsBusy(failure)))
+        {
+            database.ChangeTracker.Clear();
+            return false;
+        }
+    }
 
     /// <summary>The settings, key and provider state as they are now, read afresh, and whether a call may be made.</summary>
     private sealed record Current(RatingsSettings Settings, RatingsProviderState State, string? Key, string? Refusal);
@@ -233,6 +278,7 @@ public sealed class RatingsRefreshRunner(
     {
         await PaceAsync(cancellationToken).ConfigureAwait(false);
         using var held = await credential.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        using var bounded = BoundDatabase();
         // The last look, after the pause and under the gate the settings save takes: what it sees is what the call uses.
         var current = await CurrentAsync(cancellationToken).ConfigureAwait(false);
         if (current.Refusal is { } refusal) return (null, refusal);
@@ -248,31 +294,45 @@ public sealed class RatingsRefreshRunner(
 
         (attempt.AttemptedAt, attempt.Outcome, attempt.Error, attempt.Manual) = (Now, RatingsOutcomes.Pending, null, manual);
         Spend(current.State);
-        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        if (!await SaveBoundedAsync(cancellationToken).ConfigureAwait(false)) return (null, RatingsOutcomes.DatabaseBusy);
 
         gate.LastCallAt = DateTime.UtcNow;
         var result = await client.FetchAsync(current.Key!, title.MediaType, title.TmdbId, cancellationToken).ConfigureAwait(false);
         var error = result.Outcome == RatingsOutcomes.Ok ? null : result.Status is { } status ? $"HTTP {status}" : result.Outcome;
-        for (var tries = 0; ; tries++)
+        // The recording is bounded too, so the gate a settings save waits on is held for the call's limit plus at most
+        // DatabaseLimit (review round 3, P2 1). It is one save: all of it or nothing. When the database stays busy past the
+        // bound, nothing is recorded, the claim stays pending (the next run counts it as interrupted) and this run stops.
+        using var limit = new CancellationTokenSource(DatabaseLimit);
+        try
         {
-            // Recorded from what is in the database now (the claim and the budget are already there): the state, the title's
-            // attempt and, for an answer with ratings, the values of every entry that still holds the title.
+            for (var tries = 0; ; tries++)
+            {
+                // Recorded from what is in the database now (the claim and the budget are already there): the state, the
+                // title's attempt and, for an answer with ratings, the values of every entry that still holds the title.
+                database.ChangeTracker.Clear();
+                var state = await RatingsStore.GetStateAsync(database, limit.Token).ConfigureAwait(false);
+                Observe(state, result);
+                var recorded = await database.RatingsFetches.SingleAsync(row => row.MediaType == title.MediaType && row.TmdbId == title.TmdbId,
+                    limit.Token).ConfigureAwait(false);
+                (recorded.Outcome, recorded.Error) = (result.Outcome, error);
+                if (result.Outcome == RatingsOutcomes.Ok) await StoreAsync(title, result.Ratings, limit.Token).ConfigureAwait(false);
+                try
+                {
+                    await database.SaveChangesAsync(limit.Token).ConfigureAwait(false);
+                    break;
+                }
+                catch (DbUpdateException update) when (tries < 2 && !SqliteBusy.IsBusy(update))
+                {
+                    // An entry went while its values were being written; the next pass writes them for the entries that remain.
+                }
+            }
+        }
+        catch (Exception failure) when (failure is OperationCanceledException || SqliteBusy.IsBusy(failure))
+        {
             database.ChangeTracker.Clear();
-            var state = await RatingsStore.GetStateAsync(database, CancellationToken.None).ConfigureAwait(false);
-            Observe(state, result);
-            var recorded = await database.RatingsFetches.SingleAsync(row => row.MediaType == title.MediaType && row.TmdbId == title.TmdbId,
-                CancellationToken.None).ConfigureAwait(false);
-            (recorded.Outcome, recorded.Error) = (result.Outcome, error);
-            if (result.Outcome == RatingsOutcomes.Ok) await StoreAsync(title, result.Ratings).ConfigureAwait(false);
-            try
-            {
-                await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
-                break;
-            }
-            catch (DbUpdateException) when (tries < 2)
-            {
-                // An entry went while its values were being written; the next pass writes them for the entries that remain.
-            }
+            logger.LogWarning("Ratings fetch for {MediaType} {TmdbId}: the answer ({Outcome}) could not be recorded, the database stayed busy",
+                title.MediaType, title.TmdbId, result.Outcome);
+            return (RatingsOutcomes.DatabaseBusy, RatingsOutcomes.DatabaseBusy);
         }
 
         logger.LogDebug("Ratings fetch for {MediaType} {TmdbId}: {Outcome}", title.MediaType, title.TmdbId, result.Outcome);
@@ -285,11 +345,11 @@ public sealed class RatingsRefreshRunner(
             .Select(row => row.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
 
     /// <summary>What arrived replaces the title's MDBList values on every entry that holds it; a source missing from this answer is gone.</summary>
-    private async Task StoreAsync(DueTitle title, IReadOnlyList<FetchedRating> ratings)
+    private async Task StoreAsync(DueTitle title, IReadOnlyList<FetchedRating> ratings, CancellationToken cancellationToken)
     {
-        var ids = await HoldersAsync(title, CancellationToken.None).ConfigureAwait(false);
+        var ids = await HoldersAsync(title, cancellationToken).ConfigureAwait(false);
         var old = await database.TitleRatings.Where(row => ids.Contains(row.EntryId) && row.Provider == RatingSources.ProviderMdbList)
-            .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
         database.TitleRatings.RemoveRange(old);
         var at = Now;
         foreach (var id in ids)
@@ -398,19 +458,19 @@ public sealed class RatingsRefreshRunner(
     /// </summary>
     private async Task AdoptSiblingsAsync(CancellationToken cancellationToken)
     {
+        // One read of every entry and every stored MDBList value, so the decisions below rest on one snapshot: an entry or its
+        // values removed meanwhile cannot leave a title half-read (review round 3, P2 2).
         var entries = await database.Entries.AsNoTracking().Where(entry => entry.TmdbId > 0)
             .Select(entry => new { entry.Id, entry.MediaType, entry.TmdbId }).ToListAsync(cancellationToken).ConfigureAwait(false);
-        var rated = (await database.TitleRatings.AsNoTracking().Where(row => row.Provider == RatingSources.ProviderMdbList)
-            .Select(row => row.EntryId).Distinct().ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet();
+        var stored = (await database.TitleRatings.AsNoTracking().Where(row => row.Provider == RatingSources.ProviderMdbList)
+            .ToListAsync(cancellationToken).ConfigureAwait(false)).ToLookup(row => row.EntryId);
         var adopted = 0;
         foreach (var group in entries.GroupBy(entry => (entry.MediaType, entry.TmdbId)))
         {
             var ids = group.Select(entry => entry.Id).ToArray();
-            var missing = ids.Where(id => !rated.Contains(id)).ToArray();
-            if (missing.Length == 0 || missing.Length == ids.Length) continue;
-            var stored = await database.TitleRatings.AsNoTracking()
-                .Where(row => ids.Contains(row.EntryId) && row.Provider == RatingSources.ProviderMdbList).ToListAsync(cancellationToken).ConfigureAwait(false);
-            var source = stored.GroupBy(row => row.EntryId).OrderByDescending(rows => rows.Max(row => row.FetchedAt)).First();
+            var missing = ids.Where(id => !stored.Contains(id)).ToArray();
+            var source = ids.Where(stored.Contains).Select(id => stored[id].ToArray()).OrderByDescending(rows => rows.Max(row => row.FetchedAt)).FirstOrDefault();
+            if (missing.Length == 0 || source is null) continue;
             foreach (var id in missing)
             {
                 database.TitleRatings.AddRange(source.Select(row => new TitleRating
@@ -420,20 +480,21 @@ public sealed class RatingsRefreshRunner(
                 }));
             }
 
-            adopted += missing.Length;
+            // Each title on its own: an entry removed meanwhile fails only its own title, which the next run adopts again.
+            try
+            {
+                await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                adopted += missing.Length;
+            }
+            catch (DbUpdateException failure)
+            {
+                database.ChangeTracker.Clear();
+                logger.LogInformation("Ratings: {MediaType} {TmdbId} could not take its stored values now ({ErrorType}); the next run tries again",
+                    group.Key.MediaType, group.Key.TmdbId, failure.GetType().Name);
+            }
         }
 
-        if (adopted == 0) return;
-        try
-        {
-            await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            logger.LogInformation("Ratings: {Count} entr(y/ies) took the ratings their title already has", adopted);
-        }
-        catch (DbUpdateException)
-        {
-            // An entry went meanwhile; the next run adopts what is left.
-            database.ChangeTracker.Clear();
-        }
+        if (adopted > 0) logger.LogInformation("Ratings: {Count} entr(y/ies) took the ratings their title already has", adopted);
     }
 
     /// <summary>One title identity (the same title can sit in more than one library; one call serves them all).</summary>

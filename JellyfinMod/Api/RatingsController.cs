@@ -46,10 +46,12 @@ public sealed class RatingsController(
     public async Task<ActionResult<RatingsSettingsDto>> PatchSettings(RatingsSettingsRequest request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
-        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
-        // The fetcher's gate too: a call already out finishes and is recorded first, and none starts with what this save
-        // replaces (review 2026-10-07 round 2, P2 2-4). It waits at most for that one call.
+        // The fetcher's gate first, then the settings gate every settings write shares: while this save waits for a ratings
+        // call already out, it holds nothing any other settings write needs (review round 3, P2 1). The fetcher never takes
+        // the settings gate, so the order cannot deadlock. A call out finishes and is recorded first, and none starts with
+        // what this save replaces (round 2, P2 2-4); that wait is bounded by the call's limit and the bounded recording.
         using var held = await credential.AcquireAsync(cancellationToken);
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
         if (request.Revision is null) return Invalid("revision_required");
         if (request.ApiKey is null) return Invalid("invalid_secret_change");
         if (ValidateSecret(request.ApiKey) is { } error) return Invalid(error);
@@ -111,6 +113,7 @@ public sealed class RatingsController(
             RatingsOutcomes.NotFound => "MDBList accepted the request but did not know the test title.",
             "budget_spent" => "Today's ratings budget is spent, so no call was made; try again tomorrow or raise the budget.",
             "breaker_open" => "Fetching is paused after provider errors or the provider's daily limit, so no call was made; try again later.",
+            RatingsOutcomes.DatabaseBusy => "The database was too busy to record the test; try again in a moment.",
             _ => "MDBList answered with an error."
         }, sources);
     }
