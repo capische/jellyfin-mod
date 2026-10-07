@@ -91,14 +91,14 @@
    Upstream's `.raised:hover` and `.raised:focus` outrank `.button-delete`, and its hover and focus fills leave light text
    under 4.5:1, so the states are set here, for this page only: grey and red text white, blue text dark (white on the
    Apple TV scheme's cyan is 2.9:1), blue's hover lighter rather than darker, grey's hover its own fill with 12% of the
-   text colour over it (Purple Haze's hover fill is a bright cyan), and dark text on the cyan focus fill. Plain colours
-   precede each var() for old webOS. */
+   text colour over it (Purple Haze's hover fill is a bright cyan), and dark text on the focus fill in every scheme (the
+   Apple TV scheme computes white there, 2.9:1). Plain colours precede each var() for old webOS. */
 .jfmod-settings .emby-button.raised:not(.button-submit):not(.button-delete),.jfmod-sheet .emby-button.raised:not(.button-submit):not(.button-delete){color:#fff;color:var(--jf-palette-text-primary,#fff)}
 .jfmod-settings .emby-button.raised.button-delete:hover:not(:focus),.jfmod-sheet .emby-button.raised.button-delete:hover:not(:focus){background:#8a1c1c;background:var(--jf-palette-error-dark,#8a1c1c)}
 .jfmod-settings .emby-button.raised.button-submit,.jfmod-sheet .emby-button.raised.button-submit{color:rgba(0,0,0,.87)}
 .jfmod-settings .emby-button.raised:not(.button-submit):not(.button-delete):hover:not(:focus),.jfmod-sheet .emby-button.raised:not(.button-submit):not(.button-delete):hover:not(:focus){background:linear-gradient(rgba(255,255,255,.12),rgba(255,255,255,.12)) #424242;background:linear-gradient(rgba(var(--jf-palette-text-primaryChannel)/.12),rgba(var(--jf-palette-text-primaryChannel)/.12)) var(--jf-palette-Button-inheritContainedBg,#424242)}
 .jfmod-settings .emby-button.raised.button-submit:hover:not(:focus),.jfmod-sheet .emby-button.raised.button-submit:hover:not(:focus){background:#33b6e3;background:var(--jf-palette-primary-light,#33b6e3)}
-.jfmod-settings .emby-button.raised.raised:focus,.jfmod-sheet .emby-button.raised.raised:focus{background:#00a4dc;background:var(--jf-palette-secondary-main,#00a4dc);color:rgba(0,0,0,.87);color:var(--jf-palette-secondary-contrastText,rgba(0,0,0,.87))}
+.jfmod-settings .emby-button.raised.raised:focus,.jfmod-sheet .emby-button.raised.raised:focus{background:#00a4dc;background:var(--jf-palette-secondary-main,#00a4dc);color:rgba(0,0,0,.87)}
 .jfmod-inlineactions{display:flex;align-items:center;flex-wrap:wrap;margin-bottom:1.4em}
 .jfmod-inlineactions>*{margin-right:.6em;margin-top:.3em}
 .jfmod-testline{display:flex;align-items:center;flex-wrap:wrap;margin:-.6em 0 1.6em}
@@ -128,7 +128,7 @@
 .jfmod-iconbtn-red{color:#fff;color:var(--jf-palette-error-contrastText,#fff);background:#c62828;background:var(--jf-palette-error-main,#c62828)}
 .jfmod-iconbtn-grey:hover{background:linear-gradient(rgba(255,255,255,.12),rgba(255,255,255,.12)) #424242;background:linear-gradient(rgba(var(--jf-palette-text-primaryChannel)/.12),rgba(var(--jf-palette-text-primaryChannel)/.12)) var(--jf-palette-Button-inheritContainedBg,#424242)}
 .jfmod-iconbtn-red:hover{background:#8a1c1c;background:var(--jf-palette-error-dark,#8a1c1c)}
-.jfmod-iconbtn:focus{outline:0;background:#00a4dc;background:var(--jf-palette-secondary-main,#00a4dc);color:rgba(0,0,0,.87);color:var(--jf-palette-secondary-contrastText,rgba(0,0,0,.87))}
+.jfmod-iconbtn:focus{outline:.16em solid #fff;outline:.16em solid var(--jf-palette-text-primary,#fff);outline-offset:.12em;background:#00a4dc;background:var(--jf-palette-secondary-main,#00a4dc);color:rgba(0,0,0,.87)}
 .jfmod-iconbtn[aria-disabled="true"]{opacity:.45}
 .jfmod-secret-below{margin:.5em 0 1.4em}
 .jfmod-secret-below .jfmod-notice{margin-top:.5em}
@@ -945,7 +945,9 @@
           element.setAttribute('aria-describedby', describedBy);
         } else {
           element.removeAttribute('aria-disabled');
-          element.removeAttribute('title');
+          // An icon button's title is its tooltip, its name; any other control's title was only the reason.
+          if (element.classList.contains('jfmod-iconbtn')) element.title = element.getAttribute('aria-label');
+          else element.removeAttribute('title');
           element.removeAttribute('aria-describedby');
           var stale = describedBy && document.getElementById(describedBy);
           if (stale) stale.textContent = '';
@@ -1022,7 +1024,13 @@
         TmdbReadAccessToken: {
           id: 'TestDiscovery', label: 'Test token', slot: 'discovery-test',
           help: 'Asks TMDB whether it accepts the saved token. Save a new token first.',
-          run: function (control) { connectionTest(control, 'Discovery/Test', 'discovery-test'); }
+          // The revision a result belongs to: a later save (replace or clear) leaves it stale (Codex review 1, P2 2).
+          revision: function () { return state.discovery ? String(state.discovery.revision) : ''; },
+          run: function (control) {
+            var slot = $('[data-notice="discovery-test"]');
+            if (slot) slot.setAttribute('data-for-revision', this.revision());
+            connectionTest(control, 'Discovery/Test', 'discovery-test');
+          }
         }
       };
       function iconButton(label, icon, red, action, handler) {
@@ -1048,6 +1056,8 @@
         var focused = slot.contains(document.activeElement) && document.activeElement.getAttribute('data-secret-action');
         var result = test && $('[data-notice="' + test.slot + '"]');
         if (result) result.parentNode.removeChild(result);
+        // A result is shown only beside the saved token it tested.
+        if (result && (pending || !configured || result.getAttribute('data-for-revision') !== test.revision())) result.innerHTML = '';
         slot.className = 'inputContainer jfmod-secret';
         slot.innerHTML = '';
         var caption = document.createElement('span');
