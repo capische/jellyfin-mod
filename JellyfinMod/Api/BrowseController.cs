@@ -19,7 +19,8 @@ namespace JellyfinMod.Api;
 [ApiController, Authorize, Route("JellyfinMod/Browse")]
 public sealed class BrowseController(ModDbContext database, DatabaseInitializer readiness, LibraryAccess access,
     CatalogSortName sortNames, IDtoService dto, IUserDataManager userData, IMediaSourceManager mediaSources,
-    IAuthorizationService? authorization = null, JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null) : ControllerBase
+    IAuthorizationService? authorization = null, JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null,
+    JellyfinMod.Services.Ratings.RatingsStore? ratings = null, JellyfinMod.Services.Ratings.HostRatingsReader? hostRatings = null) : ControllerBase
 {
     private static readonly HashSet<string> SupportedSorts = ["SortName", "DateCreated", "ProductionYear", "PremiereDate", "CommunityRating", "CriticRating", "Runtime", "DateLastContentAdded", "OfficialRating", "DatePlayed", "PlayCount", "Random", "SeriesDatePlayed"];
 
@@ -33,7 +34,8 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         if (request.TargetLibraryId.HasValue && !access.CanUseLibrary(user, request.MediaType, request.TargetLibraryId)) return NotFound();
         if (request.SortBy is null || request.State is null || request.SortBy.Length is < 1 or > 3 || request.SortBy.Any(field => !SupportedSorts.Contains(field)) ||
             request.State.Any(value => !Enum.GetValues<FileState>().Any(state => FileStates.ToWire(state) == value)) ||
-            (request.SortBy.Contains("Random") && string.IsNullOrWhiteSpace(request.RandomSeed))) return BadRequest();
+            (request.SortBy.Contains("Random") && string.IsNullOrWhiteSpace(request.RandomSeed)) ||
+            request.RatingSource is not null && !JellyfinMod.Services.Ratings.RatingSources.IsKnown(request.RatingSource)) return BadRequest();
         var filters = request.Filters;
         if (filters is null || new object?[] { filters.Genres, filters.Years, filters.OfficialRatings, filters.Tags, filters.StudioIds, filters.Status,
             filters.SeriesStatus, filters.Features, filters.VideoBasicFilter, filters.VideoTypes, filters.AudioLanguages, filters.SubtitleLanguages }.Any(value => value is null)) return BadRequest();
@@ -136,11 +138,39 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         var isAdmin = authorization is not null &&
             (await authorization.AuthorizeAsync(User, MediaBrowser.Common.Api.Policies.RequiresElevation)).Succeeded;
         var options = new DtoOptions { Fields = [ItemFields.PrimaryImageAspectRatio, ItemFields.MediaSourceCount, ItemFields.DateCreated] };
+        var pageRows = page.ToArray();
+        page = pageRows;
+        var cardRatings = await CardRatingsAsync(request.RatingSource, pageRows, cancellationToken).ConfigureAwait(false);
         var rows = page.Select(row => new BrowseRow(row.Native is null ? "entry" : "native",
             row.Native is null ? null : dto.GetBaseItemDto(row.Native, options, user), row.Entry is null ? null : new EntryDto(row.Entry, projections.GetValueOrDefault(row.Entry.Id)),
             row.Entry is null ? null : RetentionSummaries.ForViewer(
-                RetentionSummaries.ForEntry(row.Entry, retentionPolicy, evaluations), isAdmin))).ToArray();
+                RetentionSummaries.ForEntry(row.Entry, retentionPolicy, evaluations), isAdmin))
+        {
+            Rating = cardRatings?.GetValueOrDefault(row.Identity)
+        }).ToArray();
         return new BrowseResult(rows, filtered.Length, entries.Length > 0);
+    }
+
+    /// <summary>
+    /// The one source a card may show, per row of this page (P9.R5, R7): only when the request names it, from SQLite and the
+    /// host's in-memory items, never from a provider.
+    /// </summary>
+    private async Task<Dictionary<string, RatingDto>?> CardRatingsAsync(string? source, IReadOnlyList<Candidate> rows, CancellationToken cancellationToken)
+    {
+        if (source is null || ratings is null) return null;
+        var settings = await ratings.ReadSettingsAsync(cancellationToken).ConfigureAwait(false);
+        if (!settings.Enabled) return null;
+        var byEntry = await ratings.ForEntriesAsync(rows.Where(row => row.Entry is not null).Select(row => row.Entry!).ToArray(), settings,
+            cancellationToken).ConfigureAwait(false);
+        var result = new Dictionary<string, RatingDto>(StringComparer.Ordinal);
+        foreach (var row in rows)
+        {
+            var values = row.Entry is not null ? byEntry.GetValueOrDefault(row.Entry.Id)
+                : row.Native is not null && hostRatings is not null ? ratings.Project(null, [], hostRatings.Read(row.Native), settings) : null;
+            if (values?.FirstOrDefault(rating => rating.Source == source) is { } chosen) result[row.Identity] = chosen;
+        }
+
+        return result;
     }
 
     /// <summary>The evaluations of movies, series and of the episodes this user may read, as the detail page reads them.</summary>

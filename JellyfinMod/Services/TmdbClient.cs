@@ -220,7 +220,9 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             Number(item, "runtime"), Array(item, "genres").Select(g => Text(g, "name")).OfType<string>().ToArray(),
             certifications.Distinct().ToArray(), Array(item, "seasons").Select(s => new TmdbSeason(Number(s, "season_number") ?? 0,
                 Text(s, "name") ?? string.Empty, Number(s, "episode_count") ?? 0, Text(s, "air_date"), Text(s, "poster_path"))).ToArray(),
-            Text(item, mediaType == "movie" ? "original_title" : "original_name"));
+            Text(item, mediaType == "movie" ? "original_title" : "original_name"),
+            // The vote count beside the score, from the same response (P9.R4).
+            Number(item, "vote_count") is { } votes && votes > 0 ? votes : null);
     }
 
     private static string? Text(JsonElement item, string name) => item.ValueKind == JsonValueKind.Object && item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
@@ -249,7 +251,8 @@ public sealed record TmdbMetadata(
     [property: JsonPropertyName("genres")] string[] Genres,
     [property: JsonPropertyName("certifications")] TmdbCertification[] Certifications,
     [property: JsonPropertyName("seasons")] TmdbSeason[] Seasons,
-    [property: JsonPropertyName("originalTitle")] string? OriginalTitle = null);
+    [property: JsonPropertyName("originalTitle")] string? OriginalTitle = null,
+    [property: JsonPropertyName("voteCount")] int? VoteCount = null);
 
 /// <summary>A regional parental certification.</summary>
 public sealed record TmdbCertification(

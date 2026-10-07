@@ -29,7 +29,8 @@ public sealed class EntriesController(
     UnixFileInspector? files = null,
     TimeProvider? clock = null,
     MediaBrowser.Controller.Library.ILibraryManager? library = null,
-    MediaBrowser.Controller.Library.IUserDataManager? userData = null) : ControllerBase
+    MediaBrowser.Controller.Library.IUserDataManager? userData = null,
+    JellyfinMod.Services.Ratings.RatingsStore? ratings = null) : ControllerBase
 {
     /// <summary>The main item of a native version, or null when the item is its own main item or cannot be read (V1).</summary>
     private Guid? MainVersionOf(Guid itemId)
@@ -997,7 +998,10 @@ public sealed class EntriesController(
                 ? await versions.ForAsync(entry.Id, null, evaluations.GetValueOrDefault(entry.Id), isAdmin, cancellationToken, user)
                 : [],
             Upgrade = isAdmin && entry.MediaType == "movie" ? await versions.UpgradeAsync(entry, cancellationToken) : null,
-            RetentionWarning = entry.MediaType == "movie" ? warnings.GetValueOrDefault(entry.Id) : null
+            RetentionWarning = entry.MediaType == "movie" ? warnings.GetValueOrDefault(entry.Id) : null,
+            // Display only (user decision 7): read from SQLite and the host's item, never fetched here (P9.R5).
+            Ratings = ratings is null ? [] : await ratings.ForEntryAsync(entry, await ratings.ReadSettingsAsync(cancellationToken).ConfigureAwait(false),
+                cancellationToken).ConfigureAwait(false)
         };
     }
 }
