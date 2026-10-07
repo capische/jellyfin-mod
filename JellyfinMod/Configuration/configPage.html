@@ -123,8 +123,9 @@
 .jfmod-lock::before{content:"";position:absolute;left:.12em;right:.12em;top:-.5em;height:.45em;border:.12em solid var(--jf-palette-primary-main,#00a4dc);border-bottom:0;border-radius:.4em .4em 0 0}
 .jfmod-secret-edit{margin-top:.5em}
 .jfmod-secret-edit .inputContainer{margin-bottom:.4em}
-/* Test, Replace and Clear are round icon buttons in the box (user, 2026-10-07): at least 40 px, centred, grey or red as
-   the labelled buttons are; focus takes the cyan fill with dark glyphs, as upstream's .raised does. */
+/* Test, Replace and Clear are round icon buttons in the box (user, 2026-10-07), and so is every action of a list row (user,
+   2026-10-08): at least 40 px, centred, grey or red as the labelled buttons are; focus takes the cyan fill with dark
+   glyphs, as upstream's .raised does. */
 .jfmod-iconbtn{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;width:2.5em;height:2.5em;min-width:40px;min-height:40px;margin:0 0 0 .6em;padding:0;border:0;border-radius:50%;font:inherit;font-size:1rem;line-height:1;cursor:pointer;color:#fff;color:var(--jf-palette-text-primary,#fff);background:#424242;background:var(--jf-palette-Button-inheritContainedBg,#424242)}
 .jfmod-iconbtn:first-of-type{margin-left:.86em}
 .jfmod-iconbtn .material-icons{font-size:1.4em}
@@ -133,6 +134,7 @@
 .jfmod-iconbtn-red:hover{background:#8a1c1c;background:var(--jf-palette-error-dark,#8a1c1c)}
 .jfmod-iconbtn:focus{outline:.16em solid #fff;outline:.16em solid var(--jf-palette-text-primary,#fff);outline-offset:.12em;background:#00a4dc;background:var(--jf-palette-secondary-main,#00a4dc);color:rgba(0,0,0,.87)}
 .jfmod-iconbtn[aria-disabled="true"]{opacity:.45}
+.jfmod-mapfoot>.jfmod-rowactions{margin-left:auto;margin-right:0}
 .jfmod-secret-below{margin:.5em 0 1.4em}
 .jfmod-secret-below .jfmod-notice{margin-top:.5em}
 
@@ -258,7 +260,7 @@
     </div>
     <ol class="jfmod-check-steps" id="JfmodRailSteps"></ol>
     <div class="jfmod-check-links">
-      <a is="emby-linkbutton" class="button-link" href="#/dashboard/tasks">Scheduled tasks</a>
+      <a is="emby-linkbutton" class="button-link" href="#/dashboard/tasks">Scheduled Tasks</a>
       <a is="emby-linkbutton" class="button-link" href="#/dashboard/plugins">Plugins</a>
     </div>
   </aside>
@@ -297,7 +299,7 @@
       <footer class="jfmod-check-secfoot">
         <button is="emby-button" type="button" class="raised button-submit" data-submit="discovery"><span>Save</span></button>
         <span class="jfmod-savemeta" data-savemeta="discovery"></span>
-        <button type="button" class="jfmod-next" data-goto="client">Next: Download client →</button>
+        <button type="button" class="jfmod-next" data-goto="client">Next: Download Client →</button>
       </footer>
     </section>
 
@@ -306,15 +308,15 @@
       <header class="jfmod-check-sechead">
         <div>
           <div class="jfmod-eyebrow">Step 2 of 10</div>
-          <h2 id="jfmod-h-client" tabindex="-1">Download client</h2>
+          <h2 id="jfmod-h-client" tabindex="-1">Download Client</h2>
           <span class="jfmod-state" data-secstate="client"><i aria-hidden="true"></i><span></span></span>
         </div>
         <div class="jfmod-sec-actions">
           <div class="selectContainer" id="ClientPickerContainer" hidden>
             <select is="emby-select" id="ClientPicker" label="Editing"></select>
           </div>
-          <a is="emby-linkbutton" class="button-link jfmod-btn-sm" id="ClientOpenLink" target="_blank" rel="noopener" hidden>Open the client ↗</a>
-          <button is="emby-button" type="button" class="raised" id="NewClient"><span>New download client</span></button>
+          <a is="emby-linkbutton" class="button-link jfmod-btn-sm" id="ClientOpenLink" target="_blank" rel="noopener" hidden>Open the Client ↗</a>
+          <button is="emby-button" type="button" class="raised" id="NewClient"><span>New Download Client</span></button>
         </div>
       </header>
       <div class="jfmod-check-secbody">
@@ -351,7 +353,7 @@
           <button is="emby-button" type="submit" class="jfmod-visually-hidden">Save</button>
         </form>
         <div class="jfmod-group">
-          <h3 class="jfmod-grouptitle">Path mappings</h3>
+          <h3 class="jfmod-grouptitle">Path Mappings</h3>
           <div class="fieldDescription jfmod-lead">
             Only needed when the client reports paths Jellyfin sees differently. The longest matching
             client prefix wins; the folder pair above is always tried last. Each mapping is probed with
@@ -360,8 +362,8 @@
           </div>
           <div id="MappingRows"></div>
           <div class="jfmod-inlineactions">
-            <button is="emby-button" type="button" class="raised" id="AddMapping"><span>Add mapping</span></button>
-            <button is="emby-button" type="button" class="raised" id="SaveMappings"><span>Save mappings</span></button>
+            <button is="emby-button" type="button" class="raised" id="AddMapping"><span>Add Mapping</span></button>
+            <button is="emby-button" type="button" class="raised" id="SaveMappings"><span>Save Mappings</span></button>
             <span class="fieldDescription" data-savemeta="mappings"></span>
           </div>
           <div class="inputContainer">
@@ -369,7 +371,7 @@
             <div class="fieldDescription">Maps it, checks it exists and tries a hardlink into each library on the same mount. Nothing is added to the client.</div>
           </div>
           <div class="jfmod-testline">
-            <button is="emby-button" type="button" class="raised" id="TestImportPath"><span>Test import path</span></button>
+            <button is="emby-button" type="button" class="raised" id="TestImportPath"><span>Test Import Path</span></button>
             <span class="jfmod-state" id="TestImportResult" hidden><i aria-hidden="true"></i><span></span></span>
           </div>
           <div class="fieldDescription" id="TestImportDetail"></div>
@@ -377,7 +379,7 @@
       </div>
       <footer class="jfmod-check-secfoot">
         <button is="emby-button" type="button" class="raised button-submit" data-submit="client"><span>Save</span></button>
-        <button is="emby-button" type="button" class="raised button-delete" id="DeleteClient"><span>Delete this client</span></button>
+        <button is="emby-button" type="button" class="raised button-delete" id="DeleteClient"><span>Delete This Client</span></button>
         <span class="jfmod-savemeta" data-savemeta="client"></span>
         <button type="button" class="jfmod-next" data-goto="indexers">Next: Indexers →</button>
       </footer>
@@ -392,7 +394,7 @@
           <span class="jfmod-state" data-secstate="indexers"><i aria-hidden="true"></i><span></span></span>
         </div>
         <div class="jfmod-sec-actions">
-          <button is="emby-button" type="button" class="raised button-submit" id="NewIndexer"><span>New indexer</span></button>
+          <button is="emby-button" type="button" class="raised button-submit" id="NewIndexer"><span>New Indexer</span></button>
         </div>
       </header>
       <div class="jfmod-check-secbody">
@@ -401,7 +403,7 @@
       </div>
       <footer class="jfmod-check-secfoot">
         <span class="jfmod-savemeta">Each indexer saves on its own, in its editor.</span>
-        <button type="button" class="jfmod-next" data-goto="profiles">Next: Quality profiles →</button>
+        <button type="button" class="jfmod-next" data-goto="profiles">Next: Quality Profiles →</button>
       </footer>
     </section>
 
@@ -410,11 +412,11 @@
       <header class="jfmod-check-sechead">
         <div>
           <div class="jfmod-eyebrow">Step 4 of 10</div>
-          <h2 id="jfmod-h-profiles" tabindex="-1">Quality profiles</h2>
+          <h2 id="jfmod-h-profiles" tabindex="-1">Quality Profiles</h2>
           <span class="jfmod-state" data-secstate="profiles"><i aria-hidden="true"></i><span></span></span>
         </div>
         <div class="jfmod-sec-actions">
-          <button is="emby-button" type="button" class="raised button-submit" id="NewProfile"><span>New profile</span></button>
+          <button is="emby-button" type="button" class="raised button-submit" id="NewProfile"><span>New Profile</span></button>
         </div>
       </header>
       <div class="jfmod-check-secbody">
@@ -457,7 +459,7 @@
             </div>
           </div>
           <div class="jfmod-group">
-            <h3 class="jfmod-grouptitle">How grabs behave</h3>
+            <h3 class="jfmod-grouptitle">How Grabs Behave</h3>
             <dl class="jfmod-kv">
               <dt>Grab hold</dt><dd id="GrabHold"></dd>
               <dt>Seed protection</dt><dd id="GrabSeedProtection"></dd>
@@ -469,7 +471,7 @@
       <footer class="jfmod-check-secfoot">
         <button is="emby-button" type="button" class="raised button-submit" data-submit="grabbing"><span>Save</span></button>
         <span class="jfmod-savemeta" data-savemeta="grabbing"></span>
-        <button type="button" class="jfmod-next" data-goto="import">Next: Import and seeding →</button>
+        <button type="button" class="jfmod-next" data-goto="import">Next: Import and Seeding →</button>
       </footer>
     </section>
 
@@ -478,7 +480,7 @@
       <header class="jfmod-check-sechead">
         <div>
           <div class="jfmod-eyebrow">Step 6 of 10</div>
-          <h2 id="jfmod-h-import" tabindex="-1">Import and seeding</h2>
+          <h2 id="jfmod-h-import" tabindex="-1">Import and Seeding</h2>
           <span class="jfmod-state" data-secstate="import"><i aria-hidden="true"></i><span></span></span>
         </div>
         <div class="jfmod-sec-actions"></div>
@@ -498,7 +500,7 @@
             <label class="checkboxContainer"><input is="emby-checkbox" type="checkbox" id="QueueVisibleToUsers" /><span>Let every user see the download queue for libraries they can access</span></label>
           </div>
           <div class="jfmod-group">
-            <h3 class="jfmod-grouptitle">Seed floor</h3>
+            <h3 class="jfmod-grouptitle">Seed Floor</h3>
             <div class="jfmod-two">
               <div class="inputContainer">
                 <input is="emby-input" type="number" id="SeedFloorRatio" min="0" max="100" step="0.1" label="Minimum ratio before release" />
@@ -511,7 +513,7 @@
             </div>
           </div>
           <div class="jfmod-group">
-            <h3 class="jfmod-grouptitle">Cadence and files</h3>
+            <h3 class="jfmod-grouptitle">Cadence and Files</h3>
             <div class="jfmod-three">
               <div class="inputContainer"><input is="emby-input" type="number" id="ImportPollSeconds" min="1" max="3600" label="Check downloads every (seconds)" /></div>
               <div class="inputContainer"><input is="emby-input" type="number" id="StalledAfterHours" min="1" max="8760" label="Stalled after (hours)" /></div>
@@ -572,7 +574,7 @@
             <div class="fieldDescription jfmod-lead" id="RetentionLastRun"></div>
           </div>
           <div class="jfmod-group">
-            <h3 class="jfmod-grouptitle">Seed protection</h3>
+            <h3 class="jfmod-grouptitle">Seed Protection</h3>
             <div data-notice="seedprotection"></div>
             <div class="selectContainer">
               <select is="emby-select" id="SeedProtectionSource" label="Read seeding state from">
@@ -614,7 +616,7 @@
           <span class="jfmod-state" data-secstate="automation"><i aria-hidden="true"></i><span></span></span>
         </div>
         <div class="jfmod-sec-actions">
-          <button is="emby-button" type="button" class="raised" id="RunAutomation"><span>Run now</span></button>
+          <button is="emby-button" type="button" class="raised" id="RunAutomation"><span>Run Now</span></button>
         </div>
       </header>
       <div class="jfmod-check-secbody">
@@ -638,7 +640,7 @@
             </div>
           </div>
           <div class="jfmod-group">
-            <h3 class="jfmod-grouptitle">Limits and floors</h3>
+            <h3 class="jfmod-grouptitle">Limits and Floors</h3>
             <div class="jfmod-three">
               <div class="inputContainer"><input is="emby-input" type="number" id="NewEpisodeDelayMinutes" min="0" max="10080" label="Wait after air time before searching an episode (minutes)" /></div>
               <div class="inputContainer"><input is="emby-input" type="number" id="MaxConcurrentImports" min="0" max="100" label="Open imports before automatic grabs pause" /></div>
@@ -658,7 +660,7 @@
             </div>
           </div>
           <div class="jfmod-group">
-            <h3 class="jfmod-grouptitle">Recent decisions</h3>
+            <h3 class="jfmod-grouptitle">Recent Decisions</h3>
             <div class="jfmod-loglist" id="AutomationDecisions"></div>
           </div>
           <button is="emby-button" type="submit" class="jfmod-visually-hidden">Save</button>
@@ -696,7 +698,7 @@
               <dt>Server</dt><dd id="InterfaceServer"></dd>
             </dl>
             <div class="jfmod-inlineactions">
-              <button is="emby-button" type="button" class="raised button-delete" id="RestoreStock"><span>Restore stock page now</span></button>
+              <button is="emby-button" type="button" class="raised button-delete" id="RestoreStock"><span>Restore Stock Page Now</span></button>
               <span class="fieldDescription">Puts the host's page back without changing the switch. The next startup re-applies the takeover if it is still on.</span>
             </div>
             <div class="fieldDescription jfmod-lead" id="InterfaceRecovery"></div>
@@ -727,7 +729,7 @@
           <span class="jfmod-state" data-secstate="diagnostics"><i aria-hidden="true"></i><span></span></span>
         </div>
         <div class="jfmod-sec-actions">
-          <a is="emby-linkbutton" class="button-link jfmod-btn-sm" href="#/dashboard/tasks">Scheduled tasks ↗</a>
+          <a is="emby-linkbutton" class="button-link jfmod-btn-sm" href="#/dashboard/tasks">Scheduled Tasks ↗</a>
         </div>
       </header>
       <div class="jfmod-check-secbody">
@@ -743,11 +745,11 @@
           <div class="fieldDescription">Run <strong>Reconcile JellyfinMod catalog</strong> from Dashboard → Scheduled Tasks to backfill or repair bindings.</div>
         </div>
         <div class="jfmod-group">
-          <h3 class="jfmod-grouptitle">Episode conflicts</h3>
+          <h3 class="jfmod-grouptitle">Episode Conflicts</h3>
           <div class="jfmod-blist" id="EpisodeConflicts"></div>
         </div>
         <div class="jfmod-group">
-          <h3 class="jfmod-grouptitle">Entries in removed libraries</h3>
+          <h3 class="jfmod-grouptitle">Entries in Removed Libraries</h3>
           <div class="jfmod-blist" id="OrphanedEntries"></div>
         </div>
       </div>
@@ -1027,7 +1029,7 @@
       // test's words and its result sit under the box, in its own notice slot.
       var secretTests = {
         TmdbReadAccessToken: {
-          id: 'TestDiscovery', label: 'Test token', slot: 'discovery-test',
+          id: 'TestDiscovery', label: 'Test Token', slot: 'discovery-test',
           help: 'Asks TMDB whether it accepts the saved token. Save a new token first.',
           // The revision a result belongs to: a later save (replace or clear) leaves it stale (Codex review 1, P2 2).
           revision: function () { return state.discovery ? String(state.discovery.revision) : ''; },
@@ -1056,6 +1058,14 @@
         glyph.setAttribute('aria-hidden', 'true');
         element.appendChild(glyph);
         element.addEventListener('click', handler);
+        return element;
+      }
+      // Every action of a list row is a round icon too (user, 2026-10-08), named after the row it acts on ("Remove
+      // Prowlarr 1337x"): its aria-label and its tooltip. Red only when it destroys.
+      function rowIcon(label, icon, red, action, handler) {
+        var element = iconButton(label, icon, red, action, handler);
+        element.removeAttribute('data-secret-action');
+        element.setAttribute('data-row-action', action);
         return element;
       }
       function renderSecret(key, label, configured) {
@@ -1180,11 +1190,11 @@
       // ---------------------------------------------------------------------
       var SECTIONS = [
         { id: 'discovery', title: 'Discovery' },
-        { id: 'client', title: 'Download client' },
+        { id: 'client', title: 'Download Client' },
         { id: 'indexers', title: 'Indexers' },
-        { id: 'profiles', title: 'Quality profiles' },
+        { id: 'profiles', title: 'Quality Profiles' },
         { id: 'grabbing', title: 'Grabbing' },
-        { id: 'import', title: 'Import and seeding' },
+        { id: 'import', title: 'Import and Seeding' },
         { id: 'retention', title: 'Retention' },
         { id: 'automation', title: 'Automation' },
         { id: 'interface', title: 'Interface' },
@@ -1674,16 +1684,21 @@
           foot.appendChild(status);
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
-          actions.appendChild(button('↑', 'raised', function () { moveMapping(index, -1); }));
-          actions.appendChild(button('↓', 'raised', function () { moveMapping(index, 1); }));
-          actions.appendChild(button('Remove', 'raised button-delete', function () {
+          var named = 'Mapping ' + (index + 1) + (mapping.clientPathPrefix || mapping.localPathPrefix
+            ? ' (' + (mapping.clientPathPrefix || '…') + ' → ' + (mapping.localPathPrefix || '…') + ')' : '');
+          var up = rowIcon('Move ' + named + ' Up', 'arrow_upward', false, 'up', function () { moveMapping(index, -1); });
+          var down = rowIcon('Move ' + named + ' Down', 'arrow_downward', false, 'down', function () { moveMapping(index, 1); });
+          actions.appendChild(up);
+          actions.appendChild(down);
+          actions.appendChild(rowIcon('Remove ' + named, 'delete', true, 'remove', function () {
             state.mappings.splice(index, 1);
             renderMappings();
             $('#AddMapping').focus();
           }));
-          actions.querySelector('button').setAttribute('aria-label', 'Move mapping ' + (index + 1) + ' up');
-          actions.querySelectorAll('button')[1].setAttribute('aria-label', 'Move mapping ' + (index + 1) + ' down');
           foot.appendChild(actions);
+          // A move with nowhere to go is refused, not disabled, so the remote keeps its place on it.
+          refuse(up, index === 0 ? 'Already the first mapping.' : null);
+          refuse(down, index === state.mappings.length - 1 ? 'Already the last mapping.' : null);
           row.appendChild(foot);
           if (mapping.verificationReason) {
             var reason = document.createElement('div');
@@ -1749,6 +1764,10 @@
 
       function renderIndexers() {
         var container = $('#IndexerList');
+        // A test reloads the list: the remote keeps its place on the same row's same action.
+        var active = document.activeElement;
+        var focused = container.contains(active) && active.getAttribute('data-row-action') && active.closest('[data-indexer]')
+          ? { id: active.closest('[data-indexer]').getAttribute('data-indexer'), action: active.getAttribute('data-row-action') } : null;
         container.innerHTML = '';
         if (!state.indexers.length) {
           var empty = document.createElement('div');
@@ -1762,6 +1781,7 @@
           if (budget && budget.breakerOpenUntil && !breaker) breaker = { name: indexer.name, until: budget.breakerOpenUntil };
           var row = document.createElement('div');
           row.className = 'jfmod-brow' + (indexer.lastError ? ' jfmod-brow-err' : '');
+          row.setAttribute('data-indexer', indexer.id);
           var main = document.createElement('div');
           main.className = 'jfmod-brow-main';
           var name = document.createElement('strong');
@@ -1801,9 +1821,9 @@
 
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
-          var test = button('Test', 'raised', function () { testIndexer(indexer, test); });
+          var test = rowIcon('Test ' + indexer.name, 'network_check', false, 'test', function () { testIndexer(indexer, test); });
           actions.appendChild(test);
-          actions.appendChild(button('Edit', 'raised', function () { openIndexerSheet(indexer); }));
+          actions.appendChild(rowIcon('Edit ' + indexer.name, 'edit', false, 'edit', function () { openIndexerSheet(indexer); }));
           row.appendChild(actions);
 
           if (indexer.lastError) {
@@ -1814,6 +1834,11 @@
           }
           container.appendChild(row);
         });
+        if (focused) {
+          var again = $$('#IndexerList [data-indexer]').filter(function (node) { return node.getAttribute('data-indexer') === focused.id; })[0];
+          var control = again && again.querySelector('[data-row-action="' + focused.action + '"]');
+          if (control) control.focus();
+        }
         if (breaker) {
           notice('indexers', 'warn', breaker.name + ' is paused by its circuit breaker until ' +
             when(breaker.until) + ' after repeated failures. A passing test clears it.');
@@ -1825,7 +1850,9 @@
       }
 
       function testIndexer(indexer, control) {
-        busy(control, true, 'Testing…');
+        if (refused(control)) return;
+        // An icon keeps its glyph while it tests; its busy look and aria-disabled say so.
+        busy(control, true, null);
         settingsRequest('POST', 'Indexers/' + indexer.id + '/Test').then(function (result) {
           busy(control, false);
           notice('indexers', result.ok ? 'ok' : 'err', indexer.name + ': ' + result.message + ' (' + result.code + ')');
@@ -1865,7 +1892,7 @@
           'Off is safer: without an id match, a same-named film can be grabbed instead.'));
         content.appendChild(main);
 
-        var limits = group('Limits and seeding');
+        var limits = group('Limits and Seeding');
         var limitPair = columns(2);
         limitPair.appendChild(inputField('IndexerMinInterval', 'Seconds between searches', 'number',
           indexer && indexer.minIntervalSeconds !== undefined ? indexer.minIntervalSeconds : 10, { min: '0', max: '3600' }));
@@ -1883,7 +1910,7 @@
 
         openSheet({
           opener: opener,
-          title: indexer ? 'Indexer · ' + indexer.name : 'New indexer',
+          title: indexer ? 'Indexer · ' + indexer.name : 'New Indexer',
           content: content,
           meta: indexer ? 'Saved · revision ' + indexer.revision : 'Not saved yet.',
           onSave: function () { saveIndexer(indexer); },
@@ -1927,7 +1954,7 @@
       }
 
       function deleteIndexer(indexer) {
-        Dashboard.confirm('Remove ' + indexer.name + '? Grabs already made keep their history.', 'Remove indexer', function (confirmed) {
+        Dashboard.confirm('Remove ' + indexer.name + '? Grabs already made keep their history.', 'Remove Indexer', function (confirmed) {
           if (!confirmed) return;
           settingsRequest('DELETE', 'Indexers/' + indexer.id).then(function () {
             closeSheet();
@@ -1983,9 +2010,9 @@
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
           if (!profile.isDefault) {
-            actions.appendChild(button('Make default', 'raised', function () { makeDefaultProfile(profile); }));
+            actions.appendChild(rowIcon('Make ' + profile.name + ' Default', 'star_border', false, 'default', function () { makeDefaultProfile(profile); }));
           }
-          actions.appendChild(button('Edit', 'raised', function () { openProfileSheet(profile); }));
+          actions.appendChild(rowIcon('Edit ' + profile.name, 'edit', false, 'edit', function () { openProfileSheet(profile); }));
           row.appendChild(actions);
           container.appendChild(row);
         });
@@ -2021,7 +2048,7 @@
         main.appendChild(inputField('ProfileName', 'Name', 'text', profile ? profile.name : ''));
         var listLabel = document.createElement('div');
         listLabel.className = 'jfmod-secret-label';
-        listLabel.textContent = 'Allowed qualities, best first';
+        listLabel.textContent = 'Allowed Qualities, Best First';
         main.appendChild(listLabel);
         var list = document.createElement('ol');
         list.className = 'jfmod-qlist';
@@ -2046,7 +2073,7 @@
         upgrades.appendChild(upgradePair);
         content.appendChild(upgrades);
 
-        var limits = group('Size and automatic grabs');
+        var limits = group('Size and Automatic Grabs');
         var sizePair = columns(2);
         sizePair.appendChild(inputField('ProfileMinimum', 'Minimum GB per hour (optional)', 'number',
           profile && profile.minimumBytesPerHour ? profile.minimumBytesPerHour / 1e9 : '', { min: '0', step: '0.1' }));
@@ -2063,7 +2090,7 @@
 
         openSheet({
           opener: opener,
-          title: profile ? 'Quality profile · ' + profile.name : 'New quality profile',
+          title: profile ? 'Quality Profile · ' + profile.name : 'New Quality Profile',
           content: content,
           meta: profile ? 'Saved · revision ' + profile.revision : 'Not saved yet.',
           onSave: function () { saveProfile(profile); },
@@ -2102,22 +2129,21 @@
           }
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
-          var up = button('↑', 'raised', function () { moveQuality(index, -1, known); });
-          up.setAttribute('aria-label', 'Move ' + quality + ' up');
-          var down = button('↓', 'raised', function () { moveQuality(index, 1, known); });
-          down.setAttribute('aria-label', 'Move ' + quality + ' down');
-          var remove = button('Remove', 'raised button-delete', function () {
+          var up = rowIcon('Move ' + quality + ' Up', 'arrow_upward', false, 'up', function () { moveQuality(index, -1, known); });
+          var down = rowIcon('Move ' + quality + ' Down', 'arrow_downward', false, 'down', function () { moveQuality(index, 1, known); });
+          var remove = rowIcon('Remove ' + quality, 'delete', true, 'remove', function () {
             profileOrder.splice(index, 1);
             renderProfileQualities(known, undefined);
             var adderButton = $('#ProfileQualityAdd button', sheet.body);
             if (adderButton) adderButton.focus();
           });
-          remove.setAttribute('aria-label', 'Remove ' + quality);
           actions.appendChild(up);
           actions.appendChild(down);
           actions.appendChild(remove);
           row.appendChild(actions);
           list.appendChild(row);
+          refuse(up, index === 0 ? 'Already the best quality.' : null);
+          refuse(down, index === profileOrder.length - 1 ? 'Already the last quality.' : null);
         });
         if (!profileOrder.length) {
           var empty = document.createElement('li');
@@ -2131,7 +2157,7 @@
         adder.appendChild(selectField('ProfileQualityToAdd', 'Quality to add', remaining.map(function (quality) {
           return { id: quality, name: quality };
         }), ''));
-        var add = button('Add to allowed', 'raised', function () {
+        var add = button('Add to Allowed', 'raised', function () {
           var select = $('#ProfileQualityToAdd', sheet.body);
           if (!select || !select.value) return;
           profileOrder.push(select.value);
@@ -2191,7 +2217,7 @@
       }
 
       function deleteProfile(profile) {
-        Dashboard.confirm('Remove ' + profile.name + '? Titles using it fall back to the default profile.', 'Remove quality profile', function (confirmed) {
+        Dashboard.confirm('Remove ' + profile.name + '? Titles using it fall back to the default profile.', 'Remove Quality Profile', function (confirmed) {
           if (!confirmed) return;
           settingsRequest('DELETE', 'QualityProfiles/' + profile.id).then(function () {
             closeSheet();
@@ -2643,7 +2669,7 @@
         if (refused(control)) return;
         Dashboard.confirm(
           "This puts the host's own interface back at /web right now. The switch above is not changed, so the next startup re-applies the takeover if it is still on.",
-          'Restore the stock page', function (confirmed) {
+          'Restore the Stock Page', function (confirmed) {
             if (!confirmed) return;
             busy(control, true, 'Restoring…');
             settingsRequest('POST', 'Interface/RestoreStock').then(function () {
@@ -2709,9 +2735,10 @@
           row.appendChild(main);
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
-          ['Rebind', 'Keep'].forEach(function (action) {
-            actions.appendChild(button(action, 'raised', function () {
-              modRequest('POST', 'Reconciliation/Conflicts/' + conflict.id + '/' + action).then(loadAll, function (error) {
+          // Rebind takes the episode Jellyfin now reports; Keep stays on the tracked one.
+          [{ action: 'Rebind', icon: 'link' }, { action: 'Keep', icon: 'push_pin' }].forEach(function (choice) {
+            actions.appendChild(rowIcon(choice.action + ' ' + conflict.title, choice.icon, false, choice.action.toLowerCase(), function () {
+              modRequest('POST', 'Reconciliation/Conflicts/' + conflict.id + '/' + choice.action).then(loadAll, function (error) {
                 return fail('diagnostics', error);
               });
             }));
@@ -2871,7 +2898,7 @@
       $('#DeleteClient').addEventListener('click', function (event) {
         if (refused(event.currentTarget) || !state.client) return;
         var client = state.client;
-        Dashboard.confirm('Remove ' + client.name + '? Grabs already sent to it keep their history.', 'Remove download client', function (confirmed) {
+        Dashboard.confirm('Remove ' + client.name + '? Grabs already sent to it keep their history.', 'Remove Download Client', function (confirmed) {
           if (!confirmed) return;
           settingsRequest('DELETE', 'DownloadClients/' + client.id).then(function () {
             state.client = null;
