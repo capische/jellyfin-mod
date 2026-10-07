@@ -38,6 +38,16 @@ internal sealed class Boundary : IAsyncDisposable
 
     public int WrongKeyCalls;
 
+    /// <summary>A second key accepted while a test replaces the key under a running fetch.</summary>
+    public string? AlsoAccept { get; set; }
+
+    /// <summary>Each MDBList call with a short fingerprint of the key it carried (never the key itself), in arrival order.</summary>
+    public ConcurrentQueue<(string Call, string KeyPrint)> CallLog { get; } = new();
+
+    /// <summary>The fingerprint <see cref="CallLog"/> records for a key.</summary>
+    public static string Print(string key) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(key)))[..8];
+
     /// <summary>The X-RateLimit-Reset the "bothheaders" mode advertises.</summary>
     public DateTimeOffset ResetAt { get; set; }
 
@@ -74,6 +84,9 @@ internal sealed class Boundary : IAsyncDisposable
             var boundary = self!;
             boundary.Calls.Enqueue($"{kind}:{id}");
             var key = context.Request.Query["apikey"].ToString();
+            boundary.CallLog.Enqueue(($"{kind}:{id}", Print(key)));
+            // Whether the key is right is decided as the call arrives, as MDBList would, not after a test's hold.
+            var keyOk = key == boundary.ExpectedKey || (boundary.AlsoAccept is { } also && key == also);
             if (boundary.HoldTitle == id || boundary.HoldAny)
             {
                 boundary.Held.TrySetResult();
@@ -81,7 +94,7 @@ internal sealed class Boundary : IAsyncDisposable
             }
 
             var mode = boundary.TitleModes.GetValueOrDefault(id, boundary.Mode);
-            if (key != boundary.ExpectedKey && mode != "errorkey")
+            if (!keyOk && mode != "errorkey")
             {
                 Interlocked.Increment(ref boundary.WrongKeyCalls);
                 return Results.Json(new { error = "Invalid API key!" }, statusCode: 401);
@@ -101,7 +114,8 @@ internal sealed class Boundary : IAsyncDisposable
                 case "malformed": return Results.Text("{\"title\":\"x\",\"ratings\":\"not an array\"", "application/json");
                 case "notfound": return Results.Json(new { error = "Not found" }, statusCode: 404);
                 case "otherid": return Results.Json(MdbList(id + 1, kind, true));
-                // A provider echoing the caller's key in its links, and links to other sites (review 2026-10-07, P1).
+                // A provider echoing the caller's key in its links (review 2026-10-07, P1, and round 2: in a path, a host name and
+                // double-encoded): no link is kept at all, whatever it holds.
                 case "keyurl":
                     return Results.Json(new
                     {
@@ -112,18 +126,27 @@ internal sealed class Boundary : IAsyncDisposable
                             new { source = "letterboxd", value = 4.1, votes = 90000, url = $"https://evil.example/steal?k={key}" },
                             new { source = "trakt", value = 83, votes = 21000, url = $"http://trakt.tv:8080/movies/{id}" },
                             new { source = "tomatoes", value = 91, votes = 310, url = $"https://user:pw@www.rottentomatoes.com/m/{id}" },
-                            new { source = "metacritic", value = 74, votes = 52, url = $"https://www.metacritic.com/apikey/{key}" }
+                            new { source = "metacritic", value = 74, votes = 52, url = $"https://www.metacritic.com/apikey/{key}" },
+                            new { source = "letterboxd", value = 4.1, votes = 90000, url = $"https://letterboxd.com/film/{key}/" },
+                            new { source = "trakt", value = 83, votes = 21000, url = $"https://{key}.trakt.tv/movies/test" },
+                            new { source = "rogerebert", value = 3.5, url = $"https://www.rogerebert.com/%2561pikey/{key}" }
                         }
                     });
                 // Structurally wrong ratings: a numeric source (review 2026-10-07, P2 5).
                 case "badstructure": return Results.Text("{\"ids\":{\"tmdb\":" + id + "},\"ratings\":[{\"source\":42,\"value\":8.1}]}", "application/json");
                 case "badvalue": return Results.Text("{\"ratings\":[{\"source\":\"imdb\",\"value\":{\"x\":1}}]}", "application/json");
+                // A score of the wrong kind beside no value at all (review 2026-10-07 round 2, P2 6).
+                case "badscore": return Results.Text("{\"ratings\":[{\"source\":\"imdb\",\"score\":{\"x\":1}}]}", "application/json");
                 // Absent values MDBList is known to send: still a valid answer.
                 case "absent": return Results.Text("{\"ratings\":[{\"source\":\"imdb\",\"value\":\"N/A\",\"votes\":\"\"},{\"source\":\"tomatoes\",\"value\":null},{\"source\":\"trakt\",\"value\":\"77\",\"votes\":\"1200\"}]}", "application/json");
                 // A short Retry-After beside a reset two days away (review 2026-10-07, P2 6).
                 case "bothheaders":
                     context.Response.Headers.RetryAfter = "60";
                     context.Response.Headers["X-RateLimit-Reset"] = boundary.ResetAt.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return Results.Json(new { error = "API limit reached" }, statusCode: 429);
+                // A quota reset more than a year away (review 2026-10-07 round 2, P3 7).
+                case "longretry":
+                    context.Response.Headers.RetryAfter = "40000000";
                     return Results.Json(new { error = "API limit reached" }, statusCode: 429);
                 case "partial": return Results.Json(MdbList(id, kind, false));
                 default: return Results.Json(MdbList(id, kind, true));
