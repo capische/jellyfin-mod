@@ -416,9 +416,27 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     await Run();
     Assert(boundary.Calls.Count == callsBefore, "A second run inside the refresh window makes no call");
 
-    // ---- A title added to another library joins its title's fetch state (review 2026-10-07, P2 4).
+    // ---- A title added to another library joins its title's fetch state (review 2026-10-07, P2 4). Two titles join at once;
+    // one of them cannot be written (a SQLite trigger stands in for its entry vanishing mid-write, review round 3 P2 2): the
+    // run carries on, the other title adopts, and the next run adopts the one that failed.
     var bTwin = await Add("movie", 9102, world.Movies2.Id);
+    var cTwin = await Add("movie", 9103, world.Movies2.Id);
+    await using (var database = new ModDbContext(dbPath))
+    {
+#pragma warning disable EF1003 // DDL cannot take parameters; the id is a Guid this suite created
+        await database.Database.ExecuteSqlRawAsync(
+            $"CREATE TRIGGER jfmod_test_vanish BEFORE INSERT ON TitleRatings WHEN NEW.EntryId = '{bTwin.ToString().ToUpperInvariant()}' " +
+            "BEGIN SELECT RAISE(ABORT, 'simulated: the entry went meanwhile'); END");
+#pragma warning restore EF1003
+    }
     callsBefore = boundary.Calls.Count;
+    await Run();
+    var runAfterVanish = await Status();
+    Assert(boundary.Calls.Count == callsBefore && (await EntryRatings(admin, cTwin))["imdb"].GetProperty("provider").GetString() == "mdblist" &&
+        !(await EntryRatings(admin, bTwin)).ContainsKey("imdb") && runAfterVanish.GetProperty("lastRun").GetProperty("finishedAt").ValueKind == JsonValueKind.String,
+        "A title whose new entry cannot take its values is skipped; the run finishes and the other title adopts its values (round 3, P2 2)");
+    await using (var database = new ModDbContext(dbPath))
+        await database.Database.ExecuteSqlRawAsync("DROP TRIGGER jfmod_test_vanish");
     await Run();
     var bTwinRatings = await EntryRatings(admin, bTwin);
     Assert(boundary.Calls.Count == callsBefore && bTwinRatings.Count == (await EntryRatings(admin, movieB)).Count &&
@@ -452,8 +470,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     await Run();
     var status = await Status();
     var overdue = boundary.Calls.Skip(callsBefore).ToArray();
-    Assert(overdue.SequenceEqual(["movie:9102", "movie:9108"]),
-        "Among overdue titles the newest go first (9102 was just added to a second library, then 9108), not the oldest attempt (9101)", overdue);
+    Assert(overdue.SequenceEqual(["movie:9103", "movie:9102"]),
+        "Among overdue titles the newest go first (9103, then 9102, were just added to a second library), not the oldest attempt (9101)", overdue);
     Assert(boundary.Calls.Count == callsBefore + 2 && status.GetProperty("budget").GetProperty("used").GetInt32() == 2 &&
         status.GetProperty("lastRun").GetProperty("stopReason").GetString() == "budget_spent" && status.GetProperty("entriesWithoutRatings").GetInt32() >= 0,
         "The budget holds: two calls, then the run stops with budget_spent");
@@ -691,6 +709,14 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     boundary.Mode = "full";
     revision = (await Settings()).GetProperty("revision").GetInt32();
     await Patch(new { revision, apiKey = new { action = "replace", value = Key } });
+    // A delay too large for .NET's header parser saturates to the last representable moment instead of being dropped (round 3, P3 6).
+    boundary.Mode = "hugeretry";
+    Assert(await RefreshAndWait(movieA, 9101) == "rate_limited", "A 429 asking to wait 1,000,000,000,000 seconds");
+    until = (await Status()).GetProperty("breaker").GetProperty("until").GetDateTime();
+    Assert(until.Year == 9999, "The breaker stays open to the last representable moment, not to the end of the day", new { until });
+    boundary.Mode = "full";
+    revision = (await Settings()).GetProperty("revision").GetInt32();
+    await Patch(new { revision, apiKey = new { action = "replace", value = Key } });
     time.Offset = TimeSpan.FromDays(61);
 
     // ---- 5xx, malformed and timeout: transient failures, a one-hour breaker after five in a row; values unchanged.
@@ -715,6 +741,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
             "Each malformed answer is recorded as such, once per title");
     boundary.Mode = "full";
     time.Offset += TimeSpan.FromHours(2);
+    // One good answer ends the failure streak, so the next run's first failure is not the fifth in a row.
+    Assert(await RefreshAndWait(movieA, 9101) == "ok" && (await Status()).GetProperty("breaker").GetProperty("consecutiveFailures").GetInt32() == 0,
+        "A good answer ends the failure streak");
     boundary.TitleModes[9103] = "slow";
     boundary.TitleModes[9104] = "notfound";
     boundary.TitleModes[9105] = "otherid";
@@ -724,7 +753,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     {
         var outcomes = await database.RatingsFetches.AsNoTracking().Where(row => row.MediaType == "movie").ToDictionaryAsync(row => row.TmdbId, row => row.Outcome);
         Assert(outcomes[9103] == "timeout" && outcomes[9104] == "not_found" && outcomes[9105] == "malformed",
-            "A slow provider times out, an unknown title is not_found, an answer about another title is malformed");
+            "A slow provider times out, an unknown title is not_found, an answer about another title is malformed", outcomes);
     }
 
     Assert((await EntryRatings(admin, extra[1])).ContainsKey("imdb"), "not_found keeps the values the title already had");
@@ -798,6 +827,51 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         row.GetProperty("rating").GetProperty("value").GetDouble() == 8.1), "With ratingSource each row carries that one source and nothing else");
     Assert((await Send(viewer, HttpMethod.Post, "JellyfinMod/Browse", new { mediaType = "movie", ratingSource = "google" })).Status == HttpStatusCode.BadRequest,
         "An unknown card source is 400");
+
+    // ---- A ratings save waiting for a call out holds nothing other settings writes need, and the call's recording is bounded
+    // when the database stays busy (review round 3, P2 1).
+    boundary.HoldTitle = MdbListClient.TestTmdbId;
+    var heldTest = Send(admin, HttpMethod.Post, "JellyfinMod/Settings/Ratings/Test");
+    await boundary.Held.Task.WaitAsync(TimeSpan.FromSeconds(30));
+    revision = (await Settings()).GetProperty("revision").GetInt32();
+    var waitingSave = Patch(new { revision, refreshDays = 14 });
+    await Task.Delay(300);
+    var discovery = (await Get(admin, "JellyfinMod/Settings/Discovery")).Body;
+    var otherWatch = Stopwatch.StartNew();
+    var otherSave = await Send(admin, HttpMethod.Patch, "JellyfinMod/Settings/Discovery",
+        new { revision = discovery.GetProperty("revision").GetInt32(), token = new { action = "unchanged" } });
+    Assert(!waitingSave.IsCompleted && otherSave.Status == HttpStatusCode.OK && otherWatch.Elapsed < TimeSpan.FromSeconds(3),
+        "While a ratings save waits for a call out, another settings save goes through at once", new { otherWatch.Elapsed.TotalSeconds, otherSave.Status });
+    // Another writer holds SQLite's write lock as the held call answers: the recording gives up within its bound and frees the
+    // gate, and the waiting save goes through once the database is free.
+    await using (var blocker = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath}"))
+    {
+        await blocker.OpenAsync();
+        await using (var begin = blocker.CreateCommand())
+        {
+            begin.CommandText = "BEGIN IMMEDIATE";
+            await begin.ExecuteNonQueryAsync();
+        }
+
+        var answered = Stopwatch.StartNew();
+        boundary.Release.TrySetResult();
+        var busyTest = await heldTest.WaitAsync(TimeSpan.FromSeconds(60));
+        var boundSeconds = answered.Elapsed.TotalSeconds;
+        Assert(busyTest.Body.GetProperty("code").GetString() == "database_busy" && boundSeconds < RatingsRefreshRunner.DatabaseLimit.TotalSeconds + 5 &&
+            !waitingSave.IsCompleted, "With the database held by another writer, Test gives up recording within its bound and says so",
+            new { boundSeconds, code = busyTest.Body.GetProperty("code").GetString() });
+        await using (var rollback = blocker.CreateCommand())
+        {
+            rollback.CommandText = "ROLLBACK";
+            await rollback.ExecuteNonQueryAsync();
+        }
+    }
+
+    boundary.ResetHold();
+    Assert((await waitingSave.WaitAsync(TimeSpan.FromSeconds(60))).Status == HttpStatusCode.OK, "The waiting ratings save goes through once the database is free");
+    test = await Send(admin, HttpMethod.Post, "JellyfinMod/Settings/Ratings/Test");
+    Assert(test.Body.GetProperty("ok").GetBoolean(), "Test works again afterwards");
+    settings = await Settings();
 
     // ---- Ratings off: absent everywhere, nothing fetched.
     revision = settings.GetProperty("revision").GetInt32();

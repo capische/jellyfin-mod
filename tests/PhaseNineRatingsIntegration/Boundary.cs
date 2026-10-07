@@ -148,6 +148,10 @@ internal sealed class Boundary : IAsyncDisposable
                 case "longretry":
                     context.Response.Headers.RetryAfter = "40000000";
                     return Results.Json(new { error = "API limit reached" }, statusCode: 429);
+                // A delay too large for .NET's own header parser (review round 3, P3 6).
+                case "hugeretry":
+                    context.Response.Headers.RetryAfter = "1000000000000";
+                    return Results.Json(new { error = "API limit reached" }, statusCode: 429);
                 case "partial": return Results.Json(MdbList(id, kind, false));
                 default: return Results.Json(MdbList(id, kind, true));
             }
