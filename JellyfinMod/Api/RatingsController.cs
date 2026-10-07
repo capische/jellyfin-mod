@@ -28,6 +28,7 @@ public sealed class RatingsController(
     AcquisitionSecretStore secrets,
     RatingsStore ratings,
     RatingsRefreshRunner runner,
+    RatingsCredentialGate credential,
     RatingsRefreshQueue queue,
     MdbListClient client,
     TimeProvider clock) : ControllerBase
@@ -46,6 +47,9 @@ public sealed class RatingsController(
     {
         if (!readiness.IsReady) return StatusCode(503);
         await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
+        // The fetcher's gate too: a call already out finishes and is recorded first, and none starts with what this save
+        // replaces (review 2026-10-07 round 2, P2 2-4). It waits at most for that one call.
+        using var held = await credential.AcquireAsync(cancellationToken);
         if (request.Revision is null) return Invalid("revision_required");
         if (request.ApiKey is null) return Invalid("invalid_secret_change");
         if (ValidateSecret(request.ApiKey) is { } error) return Invalid(error);

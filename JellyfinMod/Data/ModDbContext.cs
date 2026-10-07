@@ -324,9 +324,9 @@ public class ModDbContext : DbContext
         });
         b.Entity<RatingsFetch>(e =>
         {
-            e.HasIndex(x => x.EntryId).IsUnique();
+            // One attempt per title identity, outliving any one entry (review 2026-10-07 round 2, P2 5).
+            e.HasIndex(x => new { x.MediaType, x.TmdbId }).IsUnique();
             e.HasIndex(x => x.AttemptedAt);
-            e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
         });
     }
 }

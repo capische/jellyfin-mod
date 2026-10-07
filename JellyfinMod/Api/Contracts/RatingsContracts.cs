@@ -10,7 +10,6 @@ public sealed record RatingDto(
     [property: JsonPropertyName("votes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? Votes,
     [property: JsonPropertyName("provider")] string Provider,
     [property: JsonPropertyName("fetchedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? FetchedAt,
-    [property: JsonPropertyName("url"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Url,
     [property: JsonPropertyName("stale")] bool Stale);
 
 /// <summary>A native item's ratings, for its detail page (P9.R5).</summary>

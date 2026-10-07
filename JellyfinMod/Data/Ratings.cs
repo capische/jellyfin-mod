@@ -117,19 +117,27 @@ public class TitleRating
     /// <summary>Gets or sets when it was fetched.</summary>
     public DateTime FetchedAt { get; set; }
 
-    /// <summary>Gets or sets the provider's page for the title, when given.</summary>
-    [MaxLength(512)]
-    public string? Url { get; set; }
+    // No provider link is kept (review 2026-10-07 round 2, P1): a link the provider writes can carry anything, the key
+    // included, in its path or host, and nothing in JellyfinMod shows one.
 }
 
-/// <summary>The latest ratings fetch attempt for one entry (P9.R3); one row per entry, so it is bounded.</summary>
+/// <summary>
+/// The latest ratings fetch attempt for one title identity (P9.R3): one row per media type and TMDB id, however many entries
+/// (libraries) hold the title, so it is bounded. It is not tied to an entry: removing the entry that was being fetched does not
+/// remove the attempt, so a crash mid-call still counts against the title when another library holds it (review 2026-10-07
+/// round 2, P2 5). A row whose title no entry holds any more is pruned once its retry window has passed.
+/// </summary>
 public class RatingsFetch
 {
     /// <summary>Gets or sets the primary key.</summary>
     public Guid Id { get; set; } = Guid.NewGuid();
 
-    /// <summary>Gets or sets the catalog entry.</summary>
-    public Guid EntryId { get; set; }
+    /// <summary>Gets or sets the title's media type: movie or series.</summary>
+    [MaxLength(16)]
+    public string MediaType { get; set; } = "movie";
+
+    /// <summary>Gets or sets the title's TMDB id.</summary>
+    public int TmdbId { get; set; }
 
     /// <summary>Gets or sets when the attempt was claimed.</summary>
     public DateTime AttemptedAt { get; set; }
@@ -137,9 +145,6 @@ public class RatingsFetch
     /// <summary>Gets or sets the outcome; <c>pending</c> while the call is in flight.</summary>
     [MaxLength(16)]
     public string Outcome { get; set; } = RatingsOutcomes.Pending;
-
-    /// <summary>Gets or sets when the provider asked to be called again, after a 429.</summary>
-    public DateTime? RetryAfter { get; set; }
 
     /// <summary>Gets or sets a short administrator-only description; never a key, URL or body.</summary>
     [MaxLength(200)]
