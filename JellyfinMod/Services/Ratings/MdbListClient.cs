@@ -110,46 +110,74 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
         var result = new List<FetchedRating>();
         foreach (var item in ratings.EnumerateArray())
         {
-            if (item.ValueKind != JsonValueKind.Object) return Done(RatingsOutcomes.Malformed, status);
-            var source = item.TryGetProperty("source", out var name) && name.ValueKind == JsonValueKind.String ? name.GetString() : null;
-            var votes = item.TryGetProperty("votes", out var count) ? Integer(count) : null;
-            var value = item.TryGetProperty("value", out var number) ? Number(number) : null;
+            // Structure is checked, not guessed (review 2026-10-07, P2 5): an item that is not an object, a source that is not a
+            // string, or a value of the wrong kind makes the whole answer malformed, so it changes no stored value and counts
+            // as a provider failure. A value MDBList simply does not have (null, "", "N/A") is absent, which is not malformed.
+            if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty("source", out var name) || name.ValueKind != JsonValueKind.String)
+                return Done(RatingsOutcomes.Malformed, status);
+            if (!TryValue(item, out var value) || !TryVotes(item, out var votes)) return Done(RatingsOutcomes.Malformed, status);
+            var source = name.GetString();
             if (RatingSources.FromMdbList(source, value, votes) is not { } mapped) continue;
-            var url = item.TryGetProperty("url", out var link) ? link.ValueKind switch
-            {
-                JsonValueKind.String => link.GetString(),
-                JsonValueKind.Number => link.GetRawText(),
-                _ => null
-            } : null;
-            result.Add(new FetchedRating(mapped.Source, mapped.Scale, mapped.Value, votes is > 0 ? votes : null,
-                url is { Length: > 0 and <= 512 } ? url : null));
+            var url = item.TryGetProperty("url", out var link) && link.ValueKind == JsonValueKind.String ? link.GetString() : null;
+            result.Add(new FetchedRating(mapped.Source, mapped.Scale, mapped.Value, votes is > 0 ? votes : null, RatingSources.SafeUrl(mapped.Source, url)));
         }
 
         // One value per source; MDBList has been seen to repeat a source.
         return new MdbListResult(RatingsOutcomes.Ok, result.DistinctBy(rating => rating.Source).ToArray(), null, status);
     }
 
+    private static bool TryValue(JsonElement item, out double? value)
+    {
+        value = null;
+        if (!item.TryGetProperty("value", out var raw)) return true;
+        switch (raw.ValueKind)
+        {
+            case JsonValueKind.Null:
+                return true;
+            case JsonValueKind.Number:
+                value = raw.GetDouble();
+                return true;
+            case JsonValueKind.String:
+                var text = raw.GetString()?.Trim() ?? string.Empty;
+                if (text.Length == 0 || text.Equals("N/A", StringComparison.OrdinalIgnoreCase)) return true;
+                if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)) return false;
+                value = parsed;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool TryVotes(JsonElement item, out int? votes)
+    {
+        votes = null;
+        if (!item.TryGetProperty("votes", out var raw) || raw.ValueKind == JsonValueKind.Null) return true;
+        if (raw.ValueKind == JsonValueKind.String && (raw.GetString()?.Trim() ?? string.Empty) is "" or "N/A") return true;
+        votes = Integer(raw);
+        return votes is not null;
+    }
+
+    /// <summary>
+    /// When the provider asked to be called again: the later of <c>Retry-After</c> and <c>X-RateLimit-Reset</c>, so a short
+    /// Retry-After never hides a reset days away (review 2026-10-07, P2 6). Null when neither says.
+    /// </summary>
     private DateTime? RetryAfter(HttpResponseMessage response)
     {
         var now = clock.GetUtcNow().UtcDateTime;
+        DateTime? latest = null;
+        void Consider(DateTime candidate) => latest = latest is { } known && known >= candidate ? known : candidate;
         if (response.Headers.RetryAfter is { } retry)
         {
-            if (retry.Delta is { } delta) return now + delta;
-            if (retry.Date is { } date) return date.UtcDateTime;
+            if (retry.Delta is { } delta && delta >= TimeSpan.Zero && delta < TimeSpan.FromDays(366)) Consider(now + delta);
+            else if (retry.Date is { } date) Consider(date.UtcDateTime);
         }
 
         if (response.Headers.TryGetValues("X-RateLimit-Reset", out var values) &&
-            long.TryParse(values.FirstOrDefault(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds) && seconds > 0)
-            return DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime;
-        return null;
+            long.TryParse(values.FirstOrDefault(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds) &&
+            seconds > 0 && seconds < 253402300799)
+            Consider(DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime);
+        return latest;
     }
-
-    private static double? Number(JsonElement value) => value.ValueKind switch
-    {
-        JsonValueKind.Number when value.TryGetDouble(out var number) => number,
-        JsonValueKind.String when double.TryParse(value.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) => parsed,
-        _ => null
-    };
 
     private static int? Integer(JsonElement value) => value.ValueKind switch
     {

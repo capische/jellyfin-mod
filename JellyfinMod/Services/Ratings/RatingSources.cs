@@ -141,6 +141,37 @@ public static partial class RatingSources
         return Defaults;
     }
 
+    /// <summary>The public sites each source's link may point at; nothing else is kept.</summary>
+    private static readonly Dictionary<string, string[]> LinkHosts = new(StringComparer.Ordinal)
+    {
+        [Imdb] = ["imdb.com"],
+        [Tmdb] = ["themoviedb.org"],
+        [Trakt] = ["trakt.tv"],
+        [TomatoesCritic] = ["rottentomatoes.com"],
+        [TomatoesAudience] = ["rottentomatoes.com"],
+        [Metacritic] = ["metacritic.com"],
+        [MetacriticUser] = ["metacritic.com"],
+        [Letterboxd] = ["letterboxd.com"],
+        [RogerEbert] = ["rogerebert.com"]
+    };
+
+    /// <summary>
+    /// A provider link as it may be stored and shown: an absolute http(s) address on that source's own public site, rebuilt
+    /// as https with its path only — no credentials, query or fragment, so nothing the provider echoes back (a key in a query
+    /// string, review 2026-10-07 P1) can reach a viewer. Anything else is dropped.
+    /// </summary>
+    public static string? SafeUrl(string source, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length > 512 || !LinkHosts.TryGetValue(source, out var hosts) ||
+            !Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri) || uri.Scheme is not ("https" or "http") || uri.UserInfo.Length > 0 ||
+            !uri.IsDefaultPort) return null;
+        var host = uri.IdnHost.ToLowerInvariant();
+        if (!hosts.Any(allowed => host == allowed || host.EndsWith("." + allowed, StringComparison.Ordinal))) return null;
+        var path = uri.AbsolutePath;
+        if (path.Length > 300 || path.Contains("apikey", StringComparison.OrdinalIgnoreCase)) return null;
+        return "https://" + host + path;
+    }
+
     /// <summary>Formats a value for logs and tests only; the interface formats its own.</summary>
     public static string Describe(string source, double value, string scale) =>
         string.Create(CultureInfo.InvariantCulture, $"{source}={value}/{scale}");
