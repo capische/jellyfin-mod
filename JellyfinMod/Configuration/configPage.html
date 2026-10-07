@@ -1027,9 +1027,15 @@
           // The revision a result belongs to: a later save (replace or clear) leaves it stale (Codex review 1, P2 2).
           revision: function () { return state.discovery ? String(state.discovery.revision) : ''; },
           run: function (control) {
+            var test = this;
+            var tested = test.revision();
             var slot = $('[data-notice="discovery-test"]');
-            if (slot) slot.setAttribute('data-for-revision', this.revision());
-            connectionTest(control, 'Discovery/Test', 'discovery-test');
+            if (slot) slot.setAttribute('data-for-revision', tested);
+            // The answer is shown only if the token it tested is still the saved one and no clear is pending: a save or a
+            // Clear made while the request was out leaves it unshown (Codex re-review 2, P2).
+            connectionTest(control, 'Discovery/Test', 'discovery-test', function () {
+              return test.revision() === tested && state.clearSecrets.TmdbReadAccessToken !== true;
+            });
           }
         }
       };
@@ -2868,17 +2874,21 @@
           }, function (error) { return fail('client', error); });
         });
       });
-      function connectionTest(control, path, section) {
+      // `current`, when given, says whether the answer still belongs where it would be shown.
+      function connectionTest(control, path, section, current) {
         if (refused(control)) return;
         // An icon button keeps its glyph; only a labelled one says "Testing…".
         busy(control, true, control.classList.contains('jfmod-iconbtn') ? null : 'Testing…');
         settingsRequest('POST', path).then(function (result) {
           busy(control, false);
-          notice(section, result.ok ? 'ok' : 'err', result.message + ' (' + result.code + ')' +
-            (result.version ? ' · Transmission ' + result.version : ''));
+          if (!current || current()) {
+            notice(section, result.ok ? 'ok' : 'err', result.message + ' (' + result.code + ')' +
+              (result.version ? ' · Transmission ' + result.version : ''));
+          }
           return loadAll();
         }, function (error) {
           busy(control, false);
+          if (current && !current()) return loadAll();
           return fail(section, error);
         });
       }
