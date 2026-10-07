@@ -38,8 +38,14 @@ internal sealed class Boundary : IAsyncDisposable
 
     public int WrongKeyCalls;
 
+    /// <summary>The X-RateLimit-Reset the "bothheaders" mode advertises.</summary>
+    public DateTimeOffset ResetAt { get; set; }
+
     /// <summary>When set, a call for this title waits until <see cref="Release"/> completes.</summary>
     public int? HoldTitle { get; set; }
+
+    /// <summary>When set, the next call (whatever its title) waits until <see cref="Release"/> completes.</summary>
+    public bool HoldAny { get; set; }
 
     public TaskCompletionSource Held { get; private set; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -50,6 +56,7 @@ internal sealed class Boundary : IAsyncDisposable
         Held = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
         HoldTitle = null;
+        HoldAny = false;
     }
 
     public int CallsFor(string kind, int id) => Calls.Count(call => call == $"{kind}:{id}");
@@ -67,7 +74,7 @@ internal sealed class Boundary : IAsyncDisposable
             var boundary = self!;
             boundary.Calls.Enqueue($"{kind}:{id}");
             var key = context.Request.Query["apikey"].ToString();
-            if (boundary.HoldTitle == id)
+            if (boundary.HoldTitle == id || boundary.HoldAny)
             {
                 boundary.Held.TrySetResult();
                 await boundary.Release.Task.WaitAsync(TimeSpan.FromSeconds(60));
@@ -94,6 +101,30 @@ internal sealed class Boundary : IAsyncDisposable
                 case "malformed": return Results.Text("{\"title\":\"x\",\"ratings\":\"not an array\"", "application/json");
                 case "notfound": return Results.Json(new { error = "Not found" }, statusCode: 404);
                 case "otherid": return Results.Json(MdbList(id + 1, kind, true));
+                // A provider echoing the caller's key in its links, and links to other sites (review 2026-10-07, P1).
+                case "keyurl":
+                    return Results.Json(new
+                    {
+                        title = $"Fixture {id}", type = kind, ids = new { tmdb = id },
+                        ratings = new object[]
+                        {
+                            new { source = "imdb", value = 8.1, votes = 250000, url = $"https://www.imdb.com/title/tt{id}/?apikey={key}#frag" },
+                            new { source = "letterboxd", value = 4.1, votes = 90000, url = $"https://evil.example/steal?k={key}" },
+                            new { source = "trakt", value = 83, votes = 21000, url = $"http://trakt.tv:8080/movies/{id}" },
+                            new { source = "tomatoes", value = 91, votes = 310, url = $"https://user:pw@www.rottentomatoes.com/m/{id}" },
+                            new { source = "metacritic", value = 74, votes = 52, url = $"https://www.metacritic.com/apikey/{key}" }
+                        }
+                    });
+                // Structurally wrong ratings: a numeric source (review 2026-10-07, P2 5).
+                case "badstructure": return Results.Text("{\"ids\":{\"tmdb\":" + id + "},\"ratings\":[{\"source\":42,\"value\":8.1}]}", "application/json");
+                case "badvalue": return Results.Text("{\"ratings\":[{\"source\":\"imdb\",\"value\":{\"x\":1}}]}", "application/json");
+                // Absent values MDBList is known to send: still a valid answer.
+                case "absent": return Results.Text("{\"ratings\":[{\"source\":\"imdb\",\"value\":\"N/A\",\"votes\":\"\"},{\"source\":\"tomatoes\",\"value\":null},{\"source\":\"trakt\",\"value\":\"77\",\"votes\":\"1200\"}]}", "application/json");
+                // A short Retry-After beside a reset two days away (review 2026-10-07, P2 6).
+                case "bothheaders":
+                    context.Response.Headers.RetryAfter = "60";
+                    context.Response.Headers["X-RateLimit-Reset"] = boundary.ResetAt.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return Results.Json(new { error = "API limit reached" }, statusCode: 429);
                 case "partial": return Results.Json(MdbList(id, kind, false));
                 default: return Results.Json(MdbList(id, kind, true));
             }

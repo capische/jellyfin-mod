@@ -117,14 +117,15 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     var dbPath = Path.Combine(folder, "jellyfinmod.db");
     await using var boundary = await Boundary.StartAsync();
     const string Key = "mdblist-fixture-key-0123456789abcdef";
+    const string Key2 = "mdblist-replacement-key-fedcba9876543210";
     boundary.ExpectedKey = Key;
 
     // The host's native items with what its metadata providers stored (R1 evidence): a series bound to an entry, and a movie
     // with no entry. The library's fetcher order decides who wrote CommunityRating (plan decision 3).
     var series = new Series { Id = Guid.NewGuid(), Name = "JellyfinMod Ratings Native Series", CommunityRating = 8.082f, CriticRating = 100,
-        DateLastRefreshed = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc) };
+        DateLastRefreshed = DateTime.UtcNow.AddDays(-1) };
     var lonelyMovie = new Movie { Id = Guid.NewGuid(), Name = "JellyfinMod Ratings Native Movie", CommunityRating = 6.5f, CriticRating = 40,
-        DateLastRefreshed = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc) };
+        DateLastRefreshed = DateTime.UtcNow.AddDays(-1) };
     var episode = new MediaBrowser.Controller.Entities.TV.Episode { Id = Guid.NewGuid(), Name = "Episode", SeriesId = series.Id, CommunityRating = 9f };
     var hiddenMovie = new Movie { Id = Guid.NewGuid(), Name = "JellyfinMod Ratings Hidden", CommunityRating = 5f };
     var items = new Dictionary<Guid, BaseItem> { [series.Id] = series, [lonelyMovie.Id] = lonelyMovie, [episode.Id] = episode, [hiddenMovie.Id] = hiddenMovie };
@@ -273,6 +274,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert(item.Status == HttpStatusCode.OK && item.Body.GetProperty("entryId").GetString()!.ToGuid() == seriesS && item.Body.GetProperty("ratings").GetArrayLength() == 2,
         "A native series page reads its entry's ratings and the host's");
     item = await Get(viewer, $"JellyfinMod/Ratings/Items/{lonelyMovie.Id}");
+    Assert(item.Body.GetProperty("ratings").EnumerateArray().All(rating => !rating.GetProperty("stale").GetBoolean()),
+        "The host's values refreshed a day ago are current");
     Assert(item.Status == HttpStatusCode.OK && item.Body.GetProperty("entryId").ValueKind == JsonValueKind.Null &&
         BySource(item.Body.GetProperty("ratings"))["tomatoes_critic"].GetProperty("value").GetDouble() == 40,
         "A native movie with no catalog entry still shows what the host stored");
@@ -328,6 +331,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
 
     // ---- The daily task (R3): every title once, never-fetched first, newest first.
     boundary.TitleModes[9102] = "partial";
+    boundary.TitleModes[9106] = "keyurl";
     var callsBefore = boundary.Calls.Count;
     await Run();
     var calls = boundary.Calls.Skip(callsBefore).ToArray();
@@ -363,14 +367,48 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         Assert(await database.TitleRatings.AnyAsync(row => row.Source == "myanimelist" && row.Scale == "unknown") &&
             !await database.TitleRatings.AnyAsync(row => row.Value == 0), "An unknown source is stored raw and hidden; no zero is ever stored");
 
+    // ---- Provider links (review 2026-10-07, P1): a link echoing the key, or pointing anywhere but the source's own site, is
+    // never stored or shown; the rest are kept as https with their path only.
+    var linked = await EntryRatings(viewer, extra[3]);
+    Assert(linked["imdb"].GetProperty("url").GetString() == "https://www.imdb.com/title/tt9106/" &&
+        linked["letterboxd"].GetProperty("url").ValueKind == JsonValueKind.Null && linked["trakt"].GetProperty("url").ValueKind == JsonValueKind.Null &&
+        linked["tomatoes_critic"].GetProperty("url").ValueKind == JsonValueKind.Null && linked["metacritic"].GetProperty("url").ValueKind == JsonValueKind.Null,
+        "A provider link keeps only the source's own https site and path: a key in its query, another host, a port, credentials or a key in the path are dropped");
+    await using (var database = new ModDbContext(dbPath))
+        Assert(!await database.TitleRatings.AnyAsync(row => row.Url != null && (row.Url.Contains("apikey") || row.Url.Contains(Key) || row.Url.Contains("?"))),
+            "No stored link carries a query or the key");
+    Assert(bodies.All(body => !body.Contains(Key, StringComparison.Ordinal)), "An ordinary user's detail answer never carries the key the provider echoed");
+    // An older row stored before the check is cleaned on the way out too.
+    await using (var database = new ModDbContext(dbPath))
+    {
+        var row = await database.TitleRatings.SingleAsync(rating => rating.EntryId == extra[3] && rating.Source == "imdb");
+        row.Url = $"https://www.imdb.com/title/tt9106/?apikey={Key}";
+        await database.SaveChangesAsync();
+    }
+
+    Assert((await EntryRatings(viewer, extra[3]))["imdb"].GetProperty("url").GetString() == "https://www.imdb.com/title/tt9106/",
+        "A link stored before the check is cleaned when it is shown");
+
     // Within the window nothing is called again.
     callsBefore = boundary.Calls.Count;
     await Run();
     Assert(boundary.Calls.Count == callsBefore, "A second run inside the refresh window makes no call");
 
-    // After the window every title is due once more, oldest attempt first; values are flagged stale only past the window.
+    // ---- A title added to another library joins its title's fetch state (review 2026-10-07, P2 4).
+    var bTwin = await Add("movie", 9102, world.Movies2.Id);
+    callsBefore = boundary.Calls.Count;
+    await Run();
+    var bTwinRatings = await EntryRatings(admin, bTwin);
+    Assert(boundary.Calls.Count == callsBefore && bTwinRatings.Count == (await EntryRatings(admin, movieB)).Count &&
+        bTwinRatings["imdb"].GetProperty("provider").GetString() == "mdblist" && !bTwinRatings.ContainsKey("tomatoes_audience"),
+        "The same title added to another library inside the window makes no call and takes the title's stored values");
+
+    // After the window every title is due once more, newest first; values are flagged stale only past the window.
     time.Offset = TimeSpan.FromDays(15);
     Assert((await EntryRatings(admin, movieA))["imdb"].GetProperty("stale").GetBoolean(), "A value older than the refresh window is marked stale, never presented as current");
+    var lonely = BySource((await Get(viewer, $"JellyfinMod/Ratings/Items/{lonelyMovie.Id}")).Body.GetProperty("ratings"));
+    Assert(lonely["tomatoes_critic"].GetProperty("stale").GetBoolean() && lonely["tmdb"].GetProperty("stale").GetBoolean(),
+        "The host's values are marked stale too once its last metadata refresh is older than the window (review 2026-10-07, P3 8)");
     await Run();
     Assert(boundary.Calls.Count == callsBefore + 9 && boundary.Calls.Skip(callsBefore).Distinct().Count() == 9 &&
         !(await EntryRatings(admin, movieA))["imdb"].GetProperty("stale").GetBoolean(),
@@ -380,14 +418,30 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     revision = (await Settings()).GetProperty("revision").GetInt32();
     Assert((await Patch(new { revision, dailyBudget = 2 })).Status == HttpStatusCode.OK, "The administrator lowers the daily budget to 2");
     time.Offset = TimeSpan.FromDays(30);
+    // The oldest attempt is the first title's; the newest titles still go first (user decision 5, review 2026-10-07 P2 7).
+    await using (var database = new ModDbContext(dbPath))
+    {
+        foreach (var row in await database.RatingsFetches.Where(row => row.EntryId == movieA || row.EntryId == twin).ToListAsync())
+            row.AttemptedAt = time.GetUtcNow().UtcDateTime.AddDays(-100);
+        await database.SaveChangesAsync();
+    }
+
     callsBefore = boundary.Calls.Count;
     await Run();
     var status = await Status();
+    var overdue = boundary.Calls.Skip(callsBefore).ToArray();
+    Assert(overdue.SequenceEqual(["movie:9102", "movie:9108"]),
+        "Among overdue titles the newest go first (9102 was just added to a second library, then 9108), not the oldest attempt (9101)", overdue);
     Assert(boundary.Calls.Count == callsBefore + 2 && status.GetProperty("budget").GetProperty("used").GetInt32() == 2 &&
         status.GetProperty("lastRun").GetProperty("stopReason").GetString() == "budget_spent" && status.GetProperty("entriesWithoutRatings").GetInt32() >= 0,
         "The budget holds: two calls, then the run stops with budget_spent");
     refused = await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{movieA}/Ratings/Refresh");
     Assert(refused.Status == HttpStatusCode.Conflict && refused.Body.GetProperty("type").GetString() == "budget_spent", "A manual refresh inside a spent budget is 409 budget_spent");
+    var testCalls = boundary.CallsFor("movie", 278);
+    test = await Send(admin, HttpMethod.Post, "JellyfinMod/Settings/Ratings/Test");
+    Assert(!test.Body.GetProperty("ok").GetBoolean() && test.Body.GetProperty("code").GetString() == "budget_spent" &&
+        boundary.CallsFor("movie", 278) == testCalls && (await Status()).GetProperty("budget").GetProperty("used").GetInt32() == 2,
+        "Test inside a spent budget makes no call and spends nothing (review 2026-10-07, P2 3)", test.Body);
     revision = (await Settings()).GetProperty("revision").GetInt32();
     await Patch(new { revision, dailyBudget = 500 });
 
@@ -401,14 +455,95 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert((await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{Guid.NewGuid()}/Ratings/Refresh")).Status == HttpStatusCode.NotFound,
         "Refreshing an unknown entry is 404");
 
+    // ---- Structure (review 2026-10-07, P2 5): a wrong-shaped item makes the answer malformed and keeps every stored value.
+    async Task<string> RefreshAndWait(Guid entry, int tmdb)
+    {
+        var before = boundary.CallsFor("movie", tmdb);
+        Assert((await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{entry}/Ratings/Refresh")).Status == HttpStatusCode.Accepted, $"refresh of {tmdb} queued");
+        await WaitFor(() => Task.FromResult(boundary.CallsFor("movie", tmdb) == before + 1), $"the refresh of {tmdb}");
+        string outcome = "pending";
+        await WaitFor(async () =>
+        {
+            await using var database = new ModDbContext(dbPath);
+            outcome = (await database.RatingsFetches.AsNoTracking().SingleAsync(row => row.EntryId == entry)).Outcome;
+            return outcome != "pending";
+        }, $"the outcome of {tmdb}");
+        return outcome;
+    }
+
+    var kept = (await EntryRatings(admin, movieA))["imdb"].GetProperty("fetchedAt").GetDateTime();
+    foreach (var mode in new[] { "badstructure", "badvalue" })
+    {
+        boundary.TitleModes[9101] = mode;
+        var outcome = await RefreshAndWait(movieA, 9101);
+        var after = await EntryRatings(admin, movieA);
+        Assert(outcome == "malformed" && after.Count == 9 && after["imdb"].GetProperty("fetchedAt").GetDateTime() == kept,
+            $"A {mode} answer is malformed and keeps every stored value", new { outcome, sources = after.Count });
+    }
+
+    Assert((await Status()).GetProperty("breaker").GetProperty("consecutiveFailures").GetInt32() == 2, "Both count as provider failures");
+    boundary.TitleModes[9107] = "absent";
+    Assert(await RefreshAndWait(extra[4], 9107) == "ok", "Values MDBList does not have (null, \"\", N/A) are absent, not malformed");
+    var absent = await EntryRatings(admin, extra[4]);
+    Assert(!absent.ContainsKey("imdb") && !absent.ContainsKey("tomatoes_critic") && absent["trakt"].GetProperty("value").GetDouble() == 77 &&
+        absent["trakt"].GetProperty("votes").GetInt32() == 1200 && (await Status()).GetProperty("breaker").GetProperty("consecutiveFailures").GetInt32() == 0,
+        "Numbers sent as text are read; the answer resets the failure streak");
+    boundary.TitleModes.Remove(9101, out _);
+    boundary.TitleModes.Remove(9107, out _);
+
+    // ---- In flight (review 2026-10-07, P2 2): a key replaced while its call is out is not blocked by that call's 401.
+    boundary.HoldTitle = 9102;
+    Assert((await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{movieB}/Ratings/Refresh")).Status == HttpStatusCode.Accepted, "A refresh is queued");
+    await boundary.Held.Task.WaitAsync(TimeSpan.FromSeconds(30));
+    revision = (await Settings()).GetProperty("revision").GetInt32();
+    Assert((await Patch(new { revision, apiKey = new { action = "replace", value = Key2 } })).Status == HttpStatusCode.OK, "The key is replaced while the call is out");
+    boundary.ExpectedKey = Key2;
+    boundary.Release.TrySetResult();
+    await WaitFor(async () =>
+    {
+        await using var database = new ModDbContext(dbPath);
+        return (await database.RatingsFetches.AsNoTracking().SingleAsync(row => row.EntryId == movieB)).Outcome == "unauthorized";
+    }, "the old key's answer");
+    boundary.ResetHold();
+    Assert((await Status()).GetProperty("blocker").ValueKind == JsonValueKind.Null, "The old key's 401 does not block the new key");
+    Assert(await RefreshAndWait(movieB, 9102) == "ok", "The new key fetches at once");
+
+    // A run that is under way stops at its next call when ratings are turned off, and when the budget is lowered.
+    foreach (var change in new[] { "off", "budget" })
+    {
+        boundary.HoldAny = true;
+        callsBefore = boundary.Calls.Count;
+        var running = Run();
+        await boundary.Held.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        revision = (await Settings()).GetProperty("revision").GetInt32();
+        var used = (await Status()).GetProperty("budget").GetProperty("used").GetInt32();
+        await Patch(change == "off" ? new { revision, enabled = (bool?)false, dailyBudget = (int?)null } : new { revision, enabled = (bool?)null, dailyBudget = (int?)used });
+        boundary.Release.TrySetResult();
+        await running;
+        boundary.ResetHold();
+        var stop = (await Status()).GetProperty("lastRun").GetProperty("stopReason").GetString();
+        Assert(boundary.Calls.Count == callsBefore + 1 && stop == (change == "off" ? "ratings_disabled" : "budget_spent"),
+            change == "off" ? "Turning ratings off stops a running fetch after the call already out" : "Lowering the budget stops a running fetch at the new limit",
+            new { calls = boundary.Calls.Count - callsBefore, stop });
+        revision = (await Settings()).GetProperty("revision").GetInt32();
+        await Patch(new { revision, enabled = true, dailyBudget = 500 });
+    }
+
+    // Back to the first key for the rest of the run.
+    revision = (await Settings()).GetProperty("revision").GetInt32();
+    await Patch(new { revision, apiKey = new { action = "replace", value = Key } });
+    boundary.ExpectedKey = Key;
+
     // ---- 401: a blocker until the key is replaced; existing values stay.
     time.Offset = TimeSpan.FromDays(45);
+    boundary.TitleModes.Clear();
     boundary.Mode = "unauthorized";
     callsBefore = boundary.Calls.Count;
     await Run();
     status = await Status();
     Assert(boundary.Calls.Count == callsBefore + 1 && status.GetProperty("blocker").GetString() == "unauthorized" &&
-        status.GetProperty("lastRun").GetProperty("stopReason").GetString() == "unauthorized", "401 stops the run after one call and blocks fetching");
+        status.GetProperty("lastRun").GetProperty("stopReason").GetString() == "unauthorized", "401 stops the run after one call and blocks fetching",
+        new { calls = boundary.Calls.Count - callsBefore, status = status.ToString() });
     Assert((await EntryRatings(admin, movieA)).ContainsKey("imdb"), "Existing values are kept and shown with their fetch time");
     await Run();
     Assert(boundary.Calls.Count == callsBefore + 1, "While blocked, the next run makes no call");
@@ -443,11 +578,24 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     refused = await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{movieA}/Ratings/Refresh");
     Assert(boundary.Calls.Count == callsBefore + 1 && refused.Body.GetProperty("type").GetString() == "breaker_open",
         "While the breaker is open nothing is called; a manual refresh is 409 breaker_open");
+    testCalls = boundary.CallsFor("movie", 278);
+    test = await Send(admin, HttpMethod.Post, "JellyfinMod/Settings/Ratings/Test");
+    Assert(test.Body.GetProperty("code").GetString() == "breaker_open" && boundary.CallsFor("movie", 278) == testCalls,
+        "Test while the breaker is open makes no call (review 2026-10-07, P2 3)", test.Body);
     boundary.Mode = "full";
     revision = (await Settings()).GetProperty("revision").GetInt32();
     Assert((await Patch(new { revision, apiKey = new { action = "replace", value = Key } })).Status == HttpStatusCode.OK &&
         !(await Status()).GetProperty("breaker").GetProperty("open").GetBoolean(),
         "Replacing the key closes a breaker opened by a 429: the daily quota is the key's");
+    boundary.ResetAt = time.GetUtcNow().AddDays(2);
+    boundary.Mode = "bothheaders";
+    Assert(await RefreshAndWait(movieA, 9101) == "rate_limited", "A 429 with a short Retry-After and a reset two days away");
+    until = (await Status()).GetProperty("breaker").GetProperty("until").GetDateTime().ToUniversalTime();
+    Assert(until >= boundary.ResetAt.UtcDateTime.AddSeconds(-1), "The breaker stays open until the later reset, not the shorter Retry-After (review 2026-10-07, P2 6)",
+        new { until, reset = boundary.ResetAt });
+    boundary.Mode = "full";
+    revision = (await Settings()).GetProperty("revision").GetInt32();
+    await Patch(new { revision, apiKey = new { action = "replace", value = Key } });
     time.Offset = TimeSpan.FromDays(61);
 
     // ---- 5xx, malformed and timeout: transient failures, a one-hour breaker after five in a row; values unchanged.
@@ -524,9 +672,13 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
             "After a restart the left claim counts as an interrupted attempt");
     Assert(boundary.CallsFor("movie", 9108) == heldCalls && boundary.CallsFor("movie", 9101) >= 1,
         "The interrupted title is not fetched again that day; the others are");
+    var killTwin = await Add("movie", 9108, world.Movies2.Id);
+    await Run();
+    Assert(boundary.CallsFor("movie", 9108) == heldCalls, "The same title added to another library does not skip the interrupted attempt's wait (review 2026-10-07, P2 4)");
     time.Offset += TimeSpan.FromDays(1.5);
     await Run();
-    Assert(boundary.CallsFor("movie", 9108) == heldCalls + 1, "A day later the interrupted title is fetched once");
+    Assert(boundary.CallsFor("movie", 9108) == heldCalls + 1 && (await EntryRatings(admin, killTwin)).Count == 9,
+        "A day later the interrupted title is fetched once, for both libraries' entries");
 
     // ---- Persistence across the restart.
     settings = await Settings();
@@ -572,10 +724,12 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
             "Its ratings and fetch attempt go with it");
 
     // ---- Leak check: the key never in a response or a log line; the HTTP client's own request logs are redacted.
-    Assert(bodies.Count > 60 && bodies.All(body => !body.Contains(Key, StringComparison.Ordinal) && !body.Contains("sec_", StringComparison.Ordinal)),
+    Assert(bodies.Count > 60 && bodies.All(body => !body.Contains(Key, StringComparison.Ordinal) && !body.Contains(Key2, StringComparison.Ordinal) &&
+            !body.Contains("sec_", StringComparison.Ordinal)),
         $"None of the {bodies.Count} responses carries the key or its secret-store reference");
     var lines = logs.Lines.ToArray();
-    Assert(lines.All(line => !line.Contains(Key, StringComparison.Ordinal)), $"None of the {lines.Length} log lines carries the key");
+    Assert(lines.All(line => !line.Contains(Key, StringComparison.Ordinal) && !line.Contains(Key2, StringComparison.Ordinal)),
+        $"None of the {lines.Length} log lines carries either key");
     Assert(lines.Any(line => line.Contains("System.Net.Http.HttpClient", StringComparison.Ordinal) && line.Contains("/tmdb/movie/", StringComparison.Ordinal)),
         "The HTTP client's own request log lines were captured (at Debug) and are among those checked");
     Console.WriteLine("evidence - a captured HTTP client line: " +
@@ -598,8 +752,9 @@ static async Task WaitFor(Func<Task<bool>> condition, string what)
 static async Task<List<string>> TableNamesAsync(ModDbContext database) =>
     await database.Database.SqlQueryRaw<string>("SELECT name AS Value FROM sqlite_master WHERE type = 'table'").ToListAsync();
 
-static void Assert(bool condition, string message)
+static void Assert(bool condition, string message, object? detail = null)
 {
+    if (!condition && detail is not null) throw new Exception("FAIL: " + message + " :: " + JsonSerializer.Serialize(detail));
     if (!condition) throw new Exception("FAIL: " + message);
     Console.WriteLine("ok - " + message);
 }
