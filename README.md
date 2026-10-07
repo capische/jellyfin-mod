@@ -243,6 +243,18 @@ recorded file lists stay in the plugin database. 0.1.0.0 has no page that lists 
 remove downloads you no longer want in the download client's folders yourself. A cleanup tool that lists the unused files
 and removes them on an administrator's confirmation is planned for a later version.
 
+## Ratings (Phase 9, built, not yet accepted)
+
+Title ratings are display only: nothing in acquisition, automation or retention reads them. One MDBList key (Settings →
+Ratings, write-only, kept in the `0600` secret store) brings IMDb, Rotten Tomatoes critics and audience, TMDB, Trakt,
+Metacritic, Letterboxd and Roger Ebert; a title's own TMDB score stays first-party, and on-disk titles fall back to what the
+server's own metadata stored. The daily task *Refresh JellyfinMod ratings* fetches within a daily budget (500 by default,
+below the free tier's 1,000), newest titles first, every 14 days per title; a refused key stops it, a rate limit pauses it
+to the next UTC day, repeated errors for an hour, and a failure never removes a stored value. Without a key, or with the
+provider down, ratings are simply absent. Contract: `../jellyfin-web/docs/jellyfinmod/API.md` *Ratings (Phase 9)*; design and
+evidence: `PHASE9.md`. The suite is `tests/PhaseNineRatingsIntegration` (set `RATINGS_DB_COPY` to also migrate a copy of a
+real database).
+
 ## Database and local validation
 
 Startup applies pending EF migrations at `Plugin.Instance.DataPath/jellyfinmod.db`. A database
