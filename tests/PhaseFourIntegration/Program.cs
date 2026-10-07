@@ -1158,7 +1158,9 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
                 .GetProperty("acquisition").GetProperty("state").GetString() == "accepted" &&
             seriesDetail.GetProperty("episodes").EnumerateArray().Single(e => e.GetProperty("id").AsGuid() == episodeIds[1])
                 .GetProperty("acquisition").ValueKind == JsonValueKind.Null &&
-            seriesDetail.GetProperty("history").EnumerateArray().Any(h => h.GetProperty("summary").GetString() == "Grabbed S01E01 webdl-1080p from Good"),
+            seriesDetail.GetProperty("history").EnumerateArray().Any(h => h.GetProperty("summary").GetString() is { } summary &&
+                (summary == "Grabbed S01E01 webdl-1080p from Good" ||
+                    System.Text.RegularExpressions.Regex.IsMatch(summary, @"^Grabbed S01E01 webdl-1080p from Good · [0-9.]+ (B|kB|MB|GB|TB)$"))),
             "An episode grab is summarized on that episode only, with one history event naming it");
 
         transmission.RefuseAdd = true;

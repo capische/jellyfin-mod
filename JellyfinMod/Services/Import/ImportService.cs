@@ -728,6 +728,22 @@ public sealed class ImportService(
             files.TryCanonicalize(mediaPath, out var canonical) && string.Equals(canonical, destination, StringComparison.Ordinal));
 
     /// <summary>
+    /// A grab is recorded before any file exists. Once its import has a binding, the grab's event names that file too, so a
+    /// file's own history starts with the grab that brought it (0.1.0.0 detail page design fix, 2026-10-07). Saved with the
+    /// import's own changes.
+    /// </summary>
+    private async Task StampGrabHistoryAsync(Guid entryId, Guid grabId, Guid bindingId, CancellationToken cancellationToken)
+    {
+        if (grabId == Guid.Empty || bindingId == Guid.Empty) return;
+        var marker = "\"operationId\":\"" + grabId.ToString("D") + "\"";
+        var grabs = await database.History.Where(history => history.EntryId == entryId && history.BindingId == null &&
+                (history.EventType == "grabbed" || history.EventType == "auto_grabbed") && history.Data != null &&
+                history.Data.Contains(marker))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var grab in grabs) grab.BindingId = bindingId;
+    }
+
+    /// <summary>
     /// Completes the import in one transaction: one <c>imported</c> event keyed by the operation, a fresh retention
     /// baseline (P3.T7) and a waiting seed release. The grab's target is released; its hash stays owned until the seed
     /// release ends.
@@ -772,7 +788,7 @@ public sealed class ImportService(
                     : null;
                 database.History.Add(new HistoryRecord
                 {
-                    Id = operation.Id, EntryId = entryId, EventType = "imported", CreatedAt = now,
+                    Id = operation.Id, EntryId = entryId, EventType = "imported", CreatedAt = now, BindingId = bindingId,
                     Summary = Bound((episode is null ? "Imported " : $"Imported S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00} ") +
                         (operation.VersionLabel is { } label ? label + " from " : "from ") + operation.ReleaseTitle),
                     Data = JsonSerializer.Serialize(new
@@ -783,6 +799,8 @@ public sealed class ImportService(
                     })
                 });
             }
+
+            await StampGrabHistoryAsync(entryId, operation.GrabId, bindingId, cancellationToken).ConfigureAwait(false);
         }
 
         if (!await database.SeedReleaseOperations.AnyAsync(value => value.ImportOperationId == operation.Id, cancellationToken)

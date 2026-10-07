@@ -100,6 +100,13 @@ public sealed record HistoryDto([property: JsonPropertyName("id")] Guid Id,
     [JsonPropertyName("episodeId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public Guid? EpisodeId { get; init; }
 
+    /// <summary>
+    /// Gets the binding of the one file the event is about, or null for an event about the title or the episode and for
+    /// events recorded before the plugin stamped it (0.1.0.0 detail page design fix, 2026-10-07; Health <c>history.files</c>).
+    /// </summary>
+    [JsonPropertyName("bindingId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public Guid? BindingId { get; init; }
+
     /// <summary>Reads the episode identity episode events carry in their structured data.</summary>
     public static Guid? EpisodeOf(string? data) => GuidOf(data, "episodeId");
 

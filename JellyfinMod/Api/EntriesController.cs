@@ -538,14 +538,14 @@ public sealed class EntriesController(
             database.VersionKeeps.Add(new VersionKeep { EntryId = id, EpisodeId = episode?.Id, MediaPath = path,
                 PhysicalIdentity = identity, CreatedAt = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime });
             database.History.Add(new HistoryRecord { EntryId = id, EventType = "version_kept", Summary = $"Kept {name} indefinitely",
-                Data = JsonSerializer.Serialize(new { episodeId = episode?.Id, bindingId }) });
+                BindingId = bindingId, Data = JsonSerializer.Serialize(new { episodeId = episode?.Id, bindingId }) });
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
         else if (!keep && existing.Count > 0)
         {
             database.VersionKeeps.RemoveRange(existing);
             database.History.Add(new HistoryRecord { EntryId = id, EventType = "version_unkept", Summary = $"Stopped keeping {name}",
-                Data = JsonSerializer.Serialize(new { episodeId = episode?.Id, bindingId }) });
+                BindingId = bindingId, Data = JsonSerializer.Serialize(new { episodeId = episode?.Id, bindingId }) });
             // The file follows its title's retention again with a window of its own from now, never an old deadline that
             // already passed while it was kept (RET2-R2), exactly as un-keeping an episode restarts its grace (Q4).
             using (await RetentionEvaluator.HoldTargetAsync(episode?.Id ?? id, cancellationToken).ConfigureAwait(false))
@@ -839,7 +839,8 @@ public sealed class EntriesController(
         var known = episodes.Select(episode => episode.Id).ToHashSet();
         var readable = readableEpisodes.Select(episode => episode.Id).ToHashSet();
         var restricted = LibraryAccess.HasContentRestrictions(user);
-        var bindingIds = history.Select(record => HistoryDto.GuidOf(record.Data, "bindingId")).OfType<Guid>().Distinct().ToArray();
+        var bindingIds = history.Select(record => record.BindingId ?? HistoryDto.GuidOf(record.Data, "bindingId")).OfType<Guid>()
+            .Distinct().ToArray();
         var bindingItems = new Dictionary<Guid, Guid>();
         if (restricted && bindingIds.Length > 0)
         {
@@ -895,7 +896,7 @@ public sealed class EntriesController(
 
             if (restricted)
             {
-                var bindingId = HistoryDto.GuidOf(record.Data, "bindingId");
+                var bindingId = record.BindingId ?? HistoryDto.GuidOf(record.Data, "bindingId");
                 var itemId = HistoryDto.GuidOf(record.Data, "jellyfinItemId") ??
                     (bindingId is { } binding && bindingItems.TryGetValue(binding, out var bound) ? bound : null);
                 if (itemId is { } item)
@@ -917,7 +918,7 @@ public sealed class EntriesController(
             }
 
             result.Add(new HistoryDto(record.Id, record.EntryId, record.EventType, summary,
-                DateTime.SpecifyKind(record.CreatedAt, DateTimeKind.Utc)) { EpisodeId = episodeId });
+                DateTime.SpecifyKind(record.CreatedAt, DateTimeKind.Utc)) { EpisodeId = episodeId, BindingId = record.BindingId });
         }
 
         return result.ToArray();

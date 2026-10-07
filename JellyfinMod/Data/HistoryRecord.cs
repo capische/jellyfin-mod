@@ -24,6 +24,12 @@ public class HistoryRecord
     /// <summary>Gets or sets structured detail as JSON.</summary>
     public string? Data { get; set; }
 
+    /// <summary>
+    /// Gets or sets the binding of the one file the event is about (grab once bound, import, keep, stop keeping, remove,
+    /// reclaim), or null for an event about the title or the episode. The detail page lists a file's events by it.
+    /// </summary>
+    public Guid? BindingId { get; set; }
+
     /// <summary>Gets or sets when the event happened.</summary>
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }

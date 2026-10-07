@@ -720,6 +720,7 @@ public sealed class RetentionExecutor(
                 Id = operation.Id,
                 EntryId = entryId,
                 EventType = replaced ? "upgrade_replaced" : versionRemoved ? "version_removed" : "reclaimed",
+                BindingId = operation.BindingId == Guid.Empty ? null : operation.BindingId,
                 Summary = versionRemoved
                     ? $"Removed the version {Path.GetFileName(operation.MediaPath)}; the folder and its other files stay" +
                         (lastRemoved ? ". It was the last copy, so this is no longer monitored" : string.Empty)

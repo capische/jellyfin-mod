@@ -144,6 +144,8 @@ public class HealthController : ControllerBase
         // Episode un-Keep and window editor, per-file Keep, multi-episode files (PHASE10 Q3-Q5, 2026-09-24).
         "retention.episodeControls",
         "retention.versionKeep",
+        // History events about one file carry that file's binding (0.1.0.0 detail page design fix, 2026-10-07).
+        "history.files",
         "discover.skipped",
         "reconciliation.conflicts",
         "reconciliation.orphans",

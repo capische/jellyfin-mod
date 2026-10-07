@@ -239,8 +239,8 @@ internal static class Phase6
         }
 
         var health = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Health"));
-        Assert(Strings(health.GetProperty("Capabilities")).Intersect(["automation", "versions"]).Count() == 2,
-            "Health advertises automation and versions");
+        Assert(Strings(health.GetProperty("Capabilities")).Intersect(["automation", "versions", "history.files"]).Count() == 3,
+            "Health advertises automation, versions and per-file history");
 
         // ---- M2 settings and authorization.
         Assert((await anonymous.GetAsync("/JellyfinMod/Automation/Status")).StatusCode == HttpStatusCode.Unauthorized, "Anonymous status is refused");
@@ -599,6 +599,35 @@ internal static class Phase6
                 await database.EntryBindings.CountAsync(value => value.EntryId == ids["filekept"]) == 2 &&
                 !await database.RetentionOperations.AnyAsync(value => value.EntryId == ids["filekept"] && value.State == "completed"),
                 $"A per-file Keep on the older version stops the replacement while the new version is added ({fileKept.State}/{fileKept.Reason})");
+        }
+
+        // 0.1.0.0 detail page design fix (2026-10-07): every history event about one file names that file's binding on the entry
+        // detail API, so the page lists a file's own events; title events name none.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var upReplaced = await database.RetentionOperations.AsNoTracking().SingleAsync(value => value.Id ==
+                database.UpgradeOperations.Where(upgradeRow => upgradeRow.EntryId == ids["up"]).Select(upgradeRow => upgradeRow.ReplacementRetentionOperationId).Single());
+            var upBinding = await database.EntryBindings.AsNoTracking().Where(value => value.EntryId == ids["up"]).Select(value => value.Id).SingleAsync();
+            var upHistory = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["up"]}")).GetProperty("history").EnumerateArray().ToArray();
+            Guid? BindingOf(string eventType) => upHistory.Where(item => item.GetProperty("eventType").GetString() == eventType)
+                .Select(item => item.GetProperty("bindingId").ValueKind == JsonValueKind.String ? item.GetProperty("bindingId").AsGuid() : (Guid?)null)
+                .SingleOrDefault();
+            Assert(BindingOf("imported") == upBinding && BindingOf("auto_grabbed") == upBinding && BindingOf("upgrade_replaced") == upReplaced.BindingId &&
+                upHistory.Where(item => item.GetProperty("eventType").GetString() == "upgrade_added")
+                    .All(item => item.GetProperty("bindingId").ValueKind == JsonValueKind.Null),
+                "History names the imported file on its import and on the grab that brought it, and the replaced file on its removal: " +
+                string.Join(", ", upHistory.Select(item => item.GetProperty("eventType").GetString() + "=" + item.GetProperty("bindingId").GetRawText())));
+            var fileKeptHistory = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["filekept"]}")).GetProperty("history").EnumerateArray()
+                .Where(item => item.GetProperty("eventType").GetString() == "version_kept").ToArray();
+            Assert(fileKeptHistory.Length == 1 && fileKeptHistory[0].GetProperty("bindingId").AsGuid() == fileKeptBinding &&
+                (await database.History.AsNoTracking().SingleAsync(value => value.EntryId == ids["filekept"] && value.EventType == "version_kept")).BindingId ==
+                    fileKeptBinding,
+                "A per-file Keep is stored and served with its file's binding");
+            var grabbed = await database.History.AsNoTracking().Where(value => value.EntryId == ids["up"] && value.EventType == "auto_grabbed").SingleAsync();
+            var grabSize = await database.GrabOperations.AsNoTracking().Where(value => value.EntryId == ids["up"]).Select(value => value.Size).SingleAsync();
+            Assert(grabSize is > 0 ? System.Text.RegularExpressions.Regex.IsMatch(grabbed.Summary, @" from \S.* · [0-9.]+ (B|kB|MB|GB|TB)$")
+                    : !grabbed.Summary.Contains(" · "),
+                $"A grab's summary names the indexer and ends with the release size when the indexer reported one ({grabSize}): {grabbed.Summary}");
         }
 
         // V1 review P1-3: the upgrade service found the file-kept title's new 1080p playable; then, before its replacement step

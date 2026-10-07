@@ -537,7 +537,8 @@ public sealed class GrabService(
         operation.FailureCode = null;
         operation.AcceptedAt = operation.UpdatedAt = Now;
         AddHistory(operation, operation.Automatic ? "auto_grabbed" : "grabbed",
-            (operation.Automatic ? "Automatically grabbed " : "Grabbed ") + Describe(operation) + " from " + operation.IndexerName);
+            (operation.Automatic ? "Automatically grabbed " : "Grabbed ") + Describe(operation) + " from " + operation.IndexerName +
+            (operation.Size is > 0 ? " · " + FormatSize(operation.Size.Value) : string.Empty));
         // Phase 5 owns the download from acceptance on; its import operation is created in the same commit (P5.I3).
         if (!await database.ImportOperations.AnyAsync(value => value.GrabId == operation.Id, CancellationToken.None).ConfigureAwait(false))
             await Import.ImportService.CreateForGrabAsync(database, operation, Now, CancellationToken.None).ConfigureAwait(false);
@@ -642,6 +643,19 @@ public sealed class GrabService(
         var episode = parsed is { SeasonNumber: { } season, EpisodeNumbers: [var number] } ? $"S{season:00}E{number:00} " : string.Empty;
         return episode + quality;
     }
+
+    /// <summary>
+    /// A release size as the web formats it (`783 MB`, `24.1 GB`), for the grab event the detail page's file history shows
+    /// (0.1.0.0 detail page design fix, 2026-10-07).
+    /// </summary>
+    private static string FormatSize(long bytes) => bytes switch
+    {
+        >= 1_000_000_000_000 => (bytes / 1e12).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + " TB",
+        >= 1_000_000_000 => (bytes / 1e9).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " GB",
+        >= 1_000_000 => Math.Round(bytes / 1e6).ToString(System.Globalization.CultureInfo.InvariantCulture) + " MB",
+        >= 1_000 => Math.Round(bytes / 1e3).ToString(System.Globalization.CultureInfo.InvariantCulture) + " kB",
+        _ => bytes.ToString(System.Globalization.CultureInfo.InvariantCulture) + " B"
+    };
 
     /// <summary>The per-operation client label that proves ownership during recovery.</summary>
     public static string OwnerLabel(Guid operationId) => "jfmod-" + operationId.ToString("N");
