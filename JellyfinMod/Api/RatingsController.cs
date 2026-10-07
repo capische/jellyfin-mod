@@ -105,6 +105,8 @@ public sealed class RatingsController(
             RatingsOutcomes.Unreachable => "MDBList could not be reached from this server.",
             RatingsOutcomes.Malformed => "MDBList answered, but not in the shape JellyfinMod reads.",
             RatingsOutcomes.NotFound => "MDBList accepted the request but did not know the test title.",
+            "budget_spent" => "Today's ratings budget is spent, so no call was made; try again tomorrow or raise the budget.",
+            "breaker_open" => "Fetching is paused after provider errors or the provider's daily limit, so no call was made; try again later.",
             _ => "MDBList answered with an error."
         }, sources);
     }
