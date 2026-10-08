@@ -124,9 +124,13 @@ docker pull ghcr.io/capische/jellyfin-mod:0.1.0.0   # or :latest
 **Tags.** Each release is published as its plugin version (`0.1.0.0`, the first public release, for
 Jellyfin 12.0.0) and as `latest`. A version tag is never overwritten: a broken release is fixed by
 publishing the next version (`0.1.0.1`) and moving `latest` to it. Pin a version tag in production.
-The one exception, by the user's decision: `0.1.0.0` was republished on 2026-09-27 with the Trakt
-indicator and the import fixes (see the changelog in `build.yaml`). A volume that already ran the
-first `0.1.0.0` picks the new build up on the next start (see *Plugin install* below).
+The one exception, by the user's decision: `0.1.0.0` has been republished in place, on 2026-09-27
+with the Trakt indicator and the import fixes (see the changelog in `build.yaml`), and on 2026-10-03,
+2026-10-07 and 2026-10-08 with the review and settings fixes. The current index is
+`sha256:5c81e4839c15…a5927`, built from this repository's `f7c274c` (without the Phase 9 ratings below)
+and the web fork's `3364b4da43`; each index is recorded in the web fork's `docs/jellyfinmod/PHASE7.md`.
+A volume that already ran an earlier `0.1.0.0` build picks the new one up on the next start (see
+*Plugin install* below).
 
 To build it yourself from a release directory:
 
