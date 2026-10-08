@@ -762,6 +762,9 @@ public sealed class ReconciliationService(
             });
         }
 
+        // A file newly bound to an episode (a scan or an import found a new episode of a known series) is an arrival too
+        // (user decision 8; review 2026-10-08, P2 1): counted before the save, which turns every added binding unchanged.
+        var addedEpisodeBindings = database.ChangeTracker.Entries<EpisodeBinding>().Count(binding => binding.State == EntityState.Added);
         try
         {
             await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -773,9 +776,9 @@ public sealed class ReconciliationService(
         }
 
         if (!created) await DetachOrphanVersionKeepsAsync([entry.Id], cancellationToken).ConfigureAwait(false);
-        // A title new to the catalog, or a file of it newly bound (a scan, an import): its ratings are fetched within seconds
-        // when they are due (user decision 8). This only wakes the background fetcher.
-        if (created || addedEntryBindings > 0) ratingsFetch?.Arrived(entry.Id);
+        // A title new to the catalog, or a file of it newly bound — the title's own, or an episode's (a scan, an import): its
+        // ratings are fetched within seconds when they are due (user decision 8). This only wakes the background fetcher.
+        if (created || addedEntryBindings > 0 || addedEpisodeBindings > 0) ratingsFetch?.Arrived(entry.Id);
 
         return new(created ? ReconciliationOutcome.Created : entryChanged || entryBindingChanges > 0 || episodeChanges > 0
             ? ReconciliationOutcome.Updated : ReconciliationOutcome.Unchanged, entry.Id, episodeChanges, null)
