@@ -536,6 +536,209 @@ internal static class AbsenceIntegration
                 history.EventType == "media_missing") == 1,
             "The deferred absence pass runs as soon as the active run finishes");
 
+        // Dead bindings (fix/dead-bindings): a media path move gave Jellyfin new items, and the plugin kept rows for ids Jellyfin
+        // now answers 404 for. A row whose file is the same file (device, inode, birth time) as a live binding is dropped, never
+        // touching a file or a retention window; every other dead row is left to absence confirmation.
+        var liveMovie = Movie(9800, "Dead binding movie", moviePath);
+        movies.Add(liveMovie);
+        database.ChangeTracker.Clear();
+        await task.Run(new InlineProgress(), default);
+        database.ChangeTracker.Clear();
+        var deadEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 9800);
+        var liveBinding = await database.EntryBindings.SingleAsync(binding => binding.EntryId == deadEntry.Id);
+        var scheduledAt = DateTime.UtcNow.AddDays(-2);
+        var deadline = DateTime.UtcNow.AddDays(5);
+        var evaluation = await database.RetentionEvaluations.SingleOrDefaultAsync(candidate => candidate.TargetId == deadEntry.Id);
+        if (evaluation is null)
+        {
+            evaluation = new RetentionEvaluation { EntryId = deadEntry.Id, TargetId = deadEntry.Id };
+            database.RetentionEvaluations.Add(evaluation);
+        }
+
+        evaluation.State = "scheduled";
+        evaluation.Reason = "grace_period";
+        evaluation.EligibleAt = scheduledAt;
+        evaluation.Deadline = deadline;
+        evaluation.BaselineAt = scheduledAt.AddDays(-1);
+        evaluation.CompletionBasisAt = scheduledAt;
+        var goneId = Guid.NewGuid();
+        var otherFileId = Guid.NewGuid();
+        var movedMountId = Guid.NewGuid();
+        var watcherId = Guid.NewGuid();
+        var watchedAt = DateTime.UtcNow.AddDays(-2);
+        // What the dead row's item recorded when it was watched: the schedule above was built on it.
+        database.CompletionObservations.Add(new CompletionObservation
+        {
+            EntryId = deadEntry.Id, TargetId = deadEntry.Id, UserId = watcherId, JellyfinItemId = goneId,
+            EvidenceAvailable = true, Played = true, LastPlayedAt = watchedAt, CompletedAt = watchedAt, ObservedAt = watchedAt,
+            SourceReason = "event"
+        });
+        var oldMount = Path.Combine(moviePath, "old-mount");
+        Directory.CreateDirectory(oldMount);
+        var otherFile = Path.Combine(oldMount, "Other file.mkv");
+        await File.WriteAllTextAsync(otherFile, "a different file that only looks like a version");
+        database.EntryBindings.AddRange(
+            // The file is gone, which absence confirmation (not a library event) proves on the library's mounts.
+            new EntryBinding
+            {
+                EntryId = deadEntry.Id, JellyfinItemId = goneId, TargetLibraryId = movieLibrary.Id, VersionGroupId = goneId,
+                MediaPath = Path.Combine(oldMount, "Dead binding movie.mkv"), StorageIdentity = liveBinding.StorageIdentity
+            },
+            new EntryBinding
+            {
+                EntryId = deadEntry.Id, JellyfinItemId = movedMountId, TargetLibraryId = movieLibrary.Id, VersionGroupId = movedMountId,
+                MediaPath = Path.Combine(oldMount, "Dead binding movie other mount.mkv"),
+                StorageIdentity = "9:9|/elsewhere|" + moviePath + "|ext4|/dev/elsewhere"
+            },
+            // A file that exists and is not any live representation's: it may be the one Jellyfin has not reported yet.
+            new EntryBinding
+            {
+                EntryId = deadEntry.Id, JellyfinItemId = otherFileId, TargetLibraryId = movieLibrary.Id, VersionGroupId = otherFileId,
+                MediaPath = otherFile, StorageIdentity = null
+            });
+        await database.SaveChangesAsync();
+        var deadFilesBefore = Directory.EnumerateFiles(moviePath, "*", SearchOption.AllDirectories).Order().ToArray();
+        await provider.GetRequiredService<JellyfinItemReconciliationRunner>().ReconcileAsync(liveMovie.Id, default);
+        database.ChangeTracker.Clear();
+        var afterEvent = await database.EntryBindings.Where(binding => binding.EntryId == deadEntry.Id)
+            .Select(binding => binding.JellyfinItemId).ToListAsync();
+        Assert(afterEvent.Count == 4 && afterEvent.Contains(goneId) && afterEvent.Contains(movedMountId) &&
+            afterEvent.Contains(otherFileId) &&
+            !await database.History.AnyAsync(history => history.EntryId == deadEntry.Id && history.EventType == "dead_binding_removed") &&
+            (await database.CompletionObservations.SingleAsync(candidate => candidate.TargetId == deadEntry.Id)).JellyfinItemId == goneId,
+            "A library event leaves a dead binding whose file is gone, on another mount or a different file to absence confirmation");
+
+        if (OperatingSystem.IsLinux())
+        {
+            // The very same file under the old mount point: one inode, two paths. The old row duplicates the live one.
+            var aliasId = Guid.NewGuid();
+            var aliasPath = Path.Combine(oldMount, "Dead binding movie alias.mkv");
+            Assert(new UnixFileInspector().Link(liveMovie.Path, aliasPath).Linked, "The alias path can be linked for the test");
+            database.EntryBindings.Add(new EntryBinding
+            {
+                EntryId = deadEntry.Id, JellyfinItemId = aliasId, TargetLibraryId = movieLibrary.Id, VersionGroupId = aliasId,
+                MediaPath = aliasPath, StorageIdentity = null
+            });
+            (await database.CompletionObservations.SingleAsync(candidate => candidate.TargetId == deadEntry.Id)).JellyfinItemId = aliasId;
+            await database.SaveChangesAsync();
+            await task.Run(new InlineProgress(), default);
+            database.ChangeTracker.Clear();
+            var aliasEvents = await database.History.Where(history => history.EntryId == deadEntry.Id &&
+                history.EventType == "dead_binding_removed").ToListAsync();
+            var followed = await database.CompletionObservations.SingleAsync(candidate => candidate.TargetId == deadEntry.Id);
+            var afterScan = await database.EntryBindings.Where(binding => binding.EntryId == deadEntry.Id)
+                .Select(binding => binding.JellyfinItemId).ToListAsync();
+            Assert(!afterScan.Contains(aliasId) && afterScan.Contains(liveMovie.Id) && afterScan.Contains(otherFileId) &&
+                afterScan.Contains(movedMountId) && afterScan.Contains(goneId) &&
+                aliasEvents.Count == 1 && aliasEvents[0].Data!.Contains("same_file_as_live_binding", StringComparison.Ordinal) &&
+                aliasEvents[0].Data!.Contains(aliasId.ToString(), StringComparison.OrdinalIgnoreCase),
+                "A scan drops a dead binding that is the same file (device, inode, birth time) as a live binding and records why");
+            Assert(followed.JellyfinItemId == liveMovie.Id && followed.Played && followed.CompletedAt == watchedAt &&
+                followed.UserId == watcherId,
+                "The completion read through the dead item follows the title's live item, so the running window keeps its evidence");
+            var afterEvaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == deadEntry.Id);
+            Assert(afterEvaluation.State == "scheduled" && afterEvaluation.Deadline == deadline &&
+                afterEvaluation.EligibleAt == scheduledAt && afterEvaluation.BaselineAt == scheduledAt.AddDays(-1) &&
+                afterEvaluation.CompletionBasisAt == scheduledAt &&
+                !await database.History.AnyAsync(history => history.EntryId == deadEntry.Id && history.EventType == "retention_reset") &&
+                File.Exists(aliasPath) && File.Exists(liveMovie.Path) && File.Exists(otherFile) &&
+                deadFilesBefore.Concat([aliasPath]).Order().SequenceEqual(Directory.EnumerateFiles(moviePath, "*", SearchOption.AllDirectories).Order()),
+                "Dropping a dead binding keeps the title's retention schedule and every file on disk");
+            await task.Run(new InlineProgress(), default);
+            database.ChangeTracker.Clear();
+            Assert(await database.History.CountAsync(history => history.EntryId == deadEntry.Id &&
+                    history.EventType == "dead_binding_removed") == 1,
+                "A repeat scan records nothing twice");
+
+            // The first reconciliation after a library moved: the new item brings the same file under a new path. It is not a new
+            // file, so the title's window must keep running (the old row's evidence moves with the file).
+            var movedOld = Path.Combine(oldMount, "Moved movie.mkv");
+            await File.WriteAllTextAsync(movedOld, "the file the library moved");
+            var movedNewPath = Path.Combine(moviePath, "Moved movie.mkv");
+            Assert(new UnixFileInspector().Link(movedOld, movedNewPath).Linked, "The moved path can be linked for the test");
+            var movedNative = new Movie { Id = Guid.NewGuid(), Name = "Moved movie", Path = movedNewPath };
+            movedNative.ProviderIds["Tmdb"] = "9810";
+            var movedDeadId = Guid.NewGuid();
+            var movedEntry = new Entry
+            {
+                MediaType = "movie", TmdbId = 9810, TargetLibraryId = movieLibrary.Id, Title = "Moved movie", State = FileState.OnDisk,
+                JellyfinItemId = movedDeadId, Monitored = false
+            };
+            database.Entries.Add(movedEntry);
+            database.EntryBindings.Add(new EntryBinding
+            {
+                EntryId = movedEntry.Id, JellyfinItemId = movedDeadId, TargetLibraryId = movieLibrary.Id, VersionGroupId = movedDeadId,
+                MediaPath = movedOld, StorageIdentity = liveBinding.StorageIdentity
+            });
+            database.RetentionEvaluations.Add(new RetentionEvaluation
+            {
+                EntryId = movedEntry.Id, TargetId = movedEntry.Id, State = "scheduled", Reason = "grace_period", EligibleAt = scheduledAt,
+                Deadline = deadline, BaselineAt = scheduledAt.AddDays(-1), CompletionBasisAt = scheduledAt
+            });
+            database.CompletionObservations.Add(new CompletionObservation
+            {
+                EntryId = movedEntry.Id, TargetId = movedEntry.Id, UserId = watcherId, JellyfinItemId = movedDeadId,
+                EvidenceAvailable = true, Played = true, LastPlayedAt = watchedAt, CompletedAt = watchedAt, ObservedAt = watchedAt,
+                SourceReason = "event"
+            });
+            await database.SaveChangesAsync();
+            movies.Add(movedNative);
+            await provider.GetRequiredService<JellyfinItemReconciliationRunner>().ReconcileAsync(movedNative.Id, default);
+            database.ChangeTracker.Clear();
+            var movedBindings = await database.EntryBindings.Where(binding => binding.EntryId == movedEntry.Id)
+                .Select(binding => binding.JellyfinItemId).ToListAsync();
+            var movedEvaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == movedEntry.Id);
+            Assert(movedBindings.SequenceEqual([movedNative.Id]) &&
+                (await database.CompletionObservations.SingleAsync(candidate => candidate.TargetId == movedEntry.Id)).JellyfinItemId == movedNative.Id &&
+                movedEvaluation.State == "scheduled" && movedEvaluation.Deadline == deadline && movedEvaluation.BaselineAt == scheduledAt.AddDays(-1) &&
+                !await database.History.AnyAsync(history => history.EntryId == movedEntry.Id && history.EventType == "retention_reset") &&
+                File.Exists(movedOld) && File.Exists(movedNewPath),
+                "A moved library's first reconciliation keeps the title's running retention window: the same file is not a new file");
+            movies.Remove(movedNative);
+
+            // The same inode rewritten in place before the library moved: the new item's file is not the file whose watch scheduled the
+            // window, so the replacement path resets it and the dead row (whose evidence belongs to the old content) stays.
+            var rewrittenOld = Path.Combine(oldMount, "Rewritten movie.mkv");
+            await File.WriteAllTextAsync(rewrittenOld, "the original content");
+            Assert(new UnixFileInspector().TryInspect(rewrittenOld, out var original), "The original file can be fingerprinted");
+            await File.WriteAllTextAsync(rewrittenOld, "content written in place after it was watched, and longer");
+            var rewrittenNewPath = Path.Combine(moviePath, "Rewritten movie.mkv");
+            Assert(new UnixFileInspector().Link(rewrittenOld, rewrittenNewPath).Linked, "The rewritten path can be linked for the test");
+            var rewrittenNative = new Movie { Id = Guid.NewGuid(), Name = "Rewritten movie", Path = rewrittenNewPath };
+            rewrittenNative.ProviderIds["Tmdb"] = "9811";
+            var rewrittenDeadId = Guid.NewGuid();
+            var rewrittenEntry = new Entry
+            {
+                MediaType = "movie", TmdbId = 9811, TargetLibraryId = movieLibrary.Id, Title = "Rewritten movie", State = FileState.OnDisk,
+                JellyfinItemId = rewrittenDeadId, Monitored = false
+            };
+            database.Entries.Add(rewrittenEntry);
+            database.EntryBindings.Add(new EntryBinding
+            {
+                EntryId = rewrittenEntry.Id, JellyfinItemId = rewrittenDeadId, TargetLibraryId = movieLibrary.Id,
+                VersionGroupId = rewrittenDeadId, MediaPath = rewrittenOld, StorageIdentity = liveBinding.StorageIdentity,
+                FileFingerprint = original.FileFingerprint
+            });
+            database.RetentionEvaluations.Add(new RetentionEvaluation
+            {
+                EntryId = rewrittenEntry.Id, TargetId = rewrittenEntry.Id, State = "scheduled", Reason = "grace_period",
+                EligibleAt = scheduledAt, Deadline = deadline, BaselineAt = scheduledAt.AddDays(-1), CompletionBasisAt = scheduledAt
+            });
+            await database.SaveChangesAsync();
+            movies.Add(rewrittenNative);
+            await provider.GetRequiredService<JellyfinItemReconciliationRunner>().ReconcileAsync(rewrittenNative.Id, default);
+            database.ChangeTracker.Clear();
+            var rewrittenEvaluation = await database.RetentionEvaluations.SingleAsync(candidate => candidate.TargetId == rewrittenEntry.Id);
+            Assert(rewrittenEvaluation.Deadline is null && rewrittenEvaluation.BaselineAt > scheduledAt &&
+                await database.History.AnyAsync(history => history.EntryId == rewrittenEntry.Id && history.EventType == "retention_reset") &&
+                await database.EntryBindings.AnyAsync(binding => binding.JellyfinItemId == rewrittenDeadId) &&
+                await database.EntryBindings.AnyAsync(binding => binding.JellyfinItemId == rewrittenNative.Id),
+                "A file rewritten in place before the library moved is a new file: its window restarts and the old row keeps its evidence");
+            movies.Remove(rewrittenNative);
+        }
+        else
+            Console.WriteLine("SKIP: the same-file dead binding and the moved-library window need statx (Linux); the Pi run covers them");
+
         // Run rows are pruned to the most recent 50, and a row left running by a stopped process is interrupted.
         for (var index = 0; index < 60; index++)
             database.ReconciliationRuns.Add(new ReconciliationRun

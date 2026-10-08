@@ -91,6 +91,10 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
                 : evaluation is null ? null
                 : new VersionRetentionDto(evaluation.State, administrator ? evaluation.Reason : null);
             var read = TryNative(binding.ItemId, out var native);
+            // A row whose item Jellyfin no longer has is not a version to show or act on (a library that moved leaves them until a
+            // scan clears them); it still counts above, as it does for the removal that follows, so no row claims to be the last copy
+            // while the executor still sees another. A failed read keeps the row.
+            if (library is not null && read && native is null) continue;
             // A further version hidden from the viewer by its own tags or parental rating is not listed, although its main item
             // is readable (review P2-12); it still counts above, so no row claims to be the last copy. A version whose item
             // cannot be read now cannot be shown to be visible, so it is left out too (re-review P-3); Remove and Keep answer

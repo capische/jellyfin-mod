@@ -587,6 +587,16 @@ public sealed class ReconciliationService(
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
         var knownRepresentations = entryBindings.ToDictionary(binding => binding.JellyfinItemId);
         var boundMoviePaths = entryBindings.Select(binding => binding.MediaPath).ToHashSet(StringComparer.Ordinal);
+        // The same file under a new path and a new native id (a library that moved) is not a file that arrived (RET2-R1). It is the
+        // same only if it is unchanged: a recorded fingerprint must match whole (a rewrite in place keeps the inode but not the
+        // content stamp, and its new content needs a fresh watch); a binding recorded before fingerprints existed is judged by
+        // the physical identity of the file it still points at.
+        var boundMovieFingerprints = entryBindings.Where(binding => binding.FileFingerprint is { Length: > 0 })
+            .Select(binding => binding.FileFingerprint!).ToHashSet(StringComparer.Ordinal);
+        var boundMovieIdentities = entryBindings.Where(binding => binding.FileFingerprint is not { Length: > 0 } &&
+                !string.IsNullOrEmpty(binding.MediaPath) && _files.TryInspect(binding.MediaPath, out _))
+            .Select(binding => _files.TryInspect(binding.MediaPath!, out var inspected) ? inspected.PhysicalIdentity : null)
+            .OfType<string>().ToHashSet(StringComparer.Ordinal);
         var arrivedMovieFiles = new List<string?>();
         var replacedMovieFiles = new List<string?>();
         var entryBindingChanges = 0;
@@ -618,7 +628,10 @@ public sealed class ReconciliationService(
             }
 
             // A file this movie did not have before (RET2-R1); the same file under a new native id is not one.
-            if (!boundMoviePaths.Contains(representation.MediaPath)) arrivedMovieFiles.Add(representation.MediaPath);
+            if (!boundMoviePaths.Contains(representation.MediaPath) &&
+                !(fingerprint is not null && (boundMovieFingerprints.Contains(fingerprint) ||
+                    fingerprint.Split('|')[0] is { Length: > 0 } observedFile && boundMovieIdentities.Contains(observedFile))))
+                arrivedMovieFiles.Add(representation.MediaPath);
             addedEntryBindings++;
             database.EntryBindings.Add(new EntryBinding
             {
@@ -645,6 +658,9 @@ public sealed class ReconciliationService(
             database.EntryBindings.Remove(stale);
             entryBindingChanges++;
         }
+
+        var deadBindingsRemoved = created ? 0 : await RemoveDeadBindingsAsync(entry.Id, entryBindings, snapshot,
+            representationIds, cancellationToken).ConfigureAwait(false);
 
         // A movie's retention baseline is the moment it is first tracked, as an episode's is (PHASE10 decision 12): a first
         // watch right after that counts even when it, not a run, triggers the first evaluation (whole-review chunk 1, P2 7).
@@ -773,13 +789,78 @@ public sealed class ReconciliationService(
 
         if (!created) await DetachOrphanVersionKeepsAsync([entry.Id], cancellationToken).ConfigureAwait(false);
 
-        return new(created ? ReconciliationOutcome.Created : entryChanged || entryBindingChanges > 0 || episodeChanges > 0
+        return new(created ? ReconciliationOutcome.Created : entryChanged || entryBindingChanges > 0 || episodeChanges > 0 || deadBindingsRemoved > 0
             ? ReconciliationOutcome.Updated : ReconciliationOutcome.Unchanged, entry.Id, episodeChanges, null)
         {
             EpisodeDiagnostics = snapshot.Episodes.Where(observation => skipped.ContainsKey(observation.JellyfinItemId))
                 .Select(observation => $"S{observation.SeasonNumber:00}E{observation.EpisodeNumber:00}: " +
                     skipped[observation.JellyfinItemId]).ToArray()
         };
+    }
+
+    /// <summary>
+    /// Drops a binding whose Jellyfin item no longer exists when its file is the very file (device, inode and birth time) that an
+    /// observed live representation of the same title already holds, and says so in History. Jellyfin 12 derives an item's id from
+    /// its path, so moving a library (a new mount point for the same folder) makes new items and leaves the plugin's old rows
+    /// pointing at ids Jellyfin answers 404 for. Because the file still exists, absence confirmation can never clear such a row, and
+    /// it excluded the whole title from confirmation, counted as an extra version and offered a second Keep of one file. A row
+    /// whose file is gone is left to absence confirmation, which proves it on the library's mounts, and a file that exists and
+    /// matches no live representation stays: it may be the one Jellyfin has not reported yet. No file is touched, and no retention
+    /// clock starts, moves or is reset: completion evidence read through the dead item moves to the live one, so the title keeps the
+    /// schedule it had (the evaluator only counts evidence of bound items, and forgetting it would clear a running window).
+    /// </summary>
+    private async Task<int> RemoveDeadBindingsAsync(Guid entryId, IReadOnlyList<EntryBinding> entryBindings,
+        NativeTitleSnapshot snapshot, IReadOnlySet<Guid> observedIds, CancellationToken cancellationToken)
+    {
+        if (library is null) return 0;
+        var candidates = entryBindings.Where(binding => !observedIds.Contains(binding.JellyfinItemId) &&
+            !string.IsNullOrEmpty(binding.MediaPath) && database.Entry(binding).State != EntityState.Deleted &&
+            ItemIsGone(binding.JellyfinItemId)).ToArray();
+        if (candidates.Length == 0) return 0;
+
+        var liveFiles = new Dictionary<string, (Guid ItemId, string Fingerprint)>(StringComparer.Ordinal);
+        foreach (var representation in snapshot.Representations)
+            if (!string.IsNullOrEmpty(representation.MediaPath) && _files.TryInspect(representation.MediaPath, out var live))
+                liveFiles.TryAdd(live.PhysicalIdentity, (representation.JellyfinItemId, live.FileFingerprint));
+
+        var removed = 0;
+        foreach (var dead in candidates)
+        {
+            if (!_files.TryInspect(dead.MediaPath!, out var present) ||
+                !liveFiles.TryGetValue(present.PhysicalIdentity, out var heir)) continue;
+            // A file rewritten in place since the row recorded it is the same inode with other content: its evidence is not the
+            // new content's, so the row stays and the new file goes through the replacement path.
+            if (dead.FileFingerprint is { Length: > 0 } recorded && !string.Equals(recorded, heir.Fingerprint, StringComparison.Ordinal))
+                continue;
+            var successor = heir.ItemId;
+            database.EntryBindings.Remove(dead);
+            await RepointRepresentationEvidenceAsync(database, entryId, dead.JellyfinItemId, successor, cancellationToken)
+                .ConfigureAwait(false);
+            database.History.Add(new HistoryRecord
+            {
+                EntryId = entryId,
+                EventType = "dead_binding_removed",
+                Summary = $"Forgot {Path.GetFileName(dead.MediaPath)}: Jellyfin no longer has the item it was recorded under, and the same file is bound again",
+                Data = JsonSerializer.Serialize(new { jellyfinItemId = dead.JellyfinItemId, mediaPath = dead.MediaPath,
+                    reason = "same_file_as_live_binding" })
+            });
+            removed++;
+        }
+
+        return removed;
+    }
+
+    /// <summary>Whether Jellyfin has no item with this id; a failed read says nothing, so it is not gone.</summary>
+    private bool ItemIsGone(Guid itemId)
+    {
+        try
+        {
+            return library!.GetItemById(itemId) is null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return false;
+        }
     }
 
     /// <summary>

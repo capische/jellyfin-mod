@@ -82,6 +82,7 @@ internal static class ApiSmoke
         builder.Services.AddSingleton<ReconciliationLibraryLock>();
         builder.Services.AddSingleton(new LibraryWriteBudget(TimeSpan.FromMilliseconds(500)));
         builder.Services.AddSingleton<RetentionExecutionGate>();
+        builder.Services.AddSingleton(library);
         builder.Services.AddTransient(_ => new LibraryAccess(users, library, localization));
         builder.Services.AddTransient(provider => new RetentionEvaluator(
             provider.GetRequiredService<ModDbContext>(), users,
@@ -209,6 +210,33 @@ internal static class ApiSmoke
                 !(await database.Entries.SingleAsync(entry => entry.Id == raceEntryId)).Monitored &&
                 await database.History.CountAsync(history => history.EntryId == raceEntryId) == 2,
                 "An already-existing duplicate add preserves the administrator's monitoring preference and history");
+        }
+
+        // Dead bindings: a row whose Jellyfin item is gone is not listed as a version (it still counts for the removal that follows).
+        var deadItemId = Guid.NewGuid();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.EntryBindings.Add(new EntryBinding
+            {
+                EntryId = raceEntryId, JellyfinItemId = deadItemId, TargetLibraryId = raceLibrary.Id, VersionGroupId = deadItemId,
+                MediaPath = Path.Combine(folder, "old-mount", "Race winner.mkv")
+            });
+            await database.SaveChangesAsync();
+        }
+
+        using (var deadDetail = await client.GetAsync($"/JellyfinMod/Entries/{raceEntryId}"))
+        {
+            using var deadDetailJson = JsonDocument.Parse(await deadDetail.Content.ReadAsStringAsync());
+            var versions = deadDetailJson.RootElement.GetProperty("versions").EnumerateArray().ToArray();
+            Assert(deadDetail.IsSuccessStatusCode && versions.Length == 1 &&
+                Guid.Parse(versions[0].GetProperty("jellyfinItemId").GetString()!) == raceNative.Id,
+                "A binding whose Jellyfin item is gone is not listed as a version: " + deadDetailJson.RootElement.GetProperty("versions").GetRawText());
+        }
+
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.EntryBindings.RemoveRange(await database.EntryBindings.Where(binding => binding.JellyfinItemId == deadItemId).ToListAsync());
+            await database.SaveChangesAsync();
         }
 
         var seriesRaceNativeEpisode = new MediaBrowser.Controller.Entities.TV.Episode
