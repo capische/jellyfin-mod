@@ -100,6 +100,32 @@ static async Task MigrationAsync(string folder)
             "The converted database passes integrity and foreign-key checks");
     }
 
+    // User decision 9 (2026-10-08): a server still on decision 6's default list takes the new one; an administrator's own list stays.
+    // "untouched" has revision 3: other ratings settings (the key, the budget) were saved, the sources never changed; every Save of
+    // the settings area sends the list as shown, so only the list itself tells a choice apart. "reordered" is decision 6's five in
+    // another order, and "trimmed" decision 6's list without TMDB in another order: both are choices.
+    foreach (var (name, before, after) in new[]
+    {
+        ("untouched", RatingsSettings.FirstDefaultSourcesJson, RatingsSettings.DefaultSourcesJson),
+        ("chosen", "[\"letterboxd\",\"imdb\",\"tmdb\"]", "[\"letterboxd\",\"imdb\",\"tmdb\"]"),
+        ("reordered", "[\"trakt\",\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"tmdb\"]", "[\"trakt\",\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"tmdb\"]"),
+        ("trimmed", "[\"imdb\",\"trakt\",\"tomatoes_critic\"]", "[\"imdb\",\"trakt\",\"tomatoes_critic\"]")
+    })
+    {
+        var path = Path.Combine(folder, $"display-defaults-{name}.db");
+        await using var database = new ModDbContext(path);
+        await database.GetService<IMigrator>().MigrateAsync("20261007073736_PhaseNineRatingsIdentity");
+        await database.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO RatingsSettings (Id, Enabled, ApiKeyRef, RefreshDays, DailyBudget, DefaultSources, Revision, VerifiedRevision, VerifiedAt)
+            VALUES ({RatingsSettings.SingletonId}, 1, NULL, 14, 500, {before}, 3, NULL, NULL)
+            """);
+        await database.Database.MigrateAsync();
+        var kept = (await database.RatingsSettings.AsNoTracking().SingleAsync()).DefaultSources;
+        Assert(kept == after, name == "untouched"
+            ? "A server whose default sources were never changed takes the new defaults in migration PhaseNineRatingsDisplayDefaults (user decision 9)"
+            : $"An administrator's own source list ({name}) is kept by that migration", kept);
+    }
+
     if (Environment.GetEnvironmentVariable("RATINGS_DB_COPY") is { Length: > 0 } source && File.Exists(source))
     {
         var copy = Path.Combine(folder, "instance-copy.db");
@@ -262,15 +288,15 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert(new[] { "ratings", "ratings.cards", "settings.ratings" }.All(name =>
         health.GetProperty("Capabilities").EnumerateArray().Any(value => value.GetString() == name)), "Health lists ratings, ratings.cards and settings.ratings");
 
-    // ---- Defaults (decisions 5-6): on, no key, 14 days, 500 a day, IMDb, RT critics, RT audience, TMDB, Trakt.
+    // ---- Defaults (decisions 5 and 9): on, no key, 14 days, 500 a day, IMDb, RT critics, RT audience, Trakt (TMDB and the rest off).
     var settings = await Settings();
     Assert(settings.GetProperty("enabled").GetBoolean() && !settings.GetProperty("apiKeyConfigured").GetBoolean() &&
         settings.GetProperty("refreshDays").GetInt32() == 14 && settings.GetProperty("dailyBudget").GetInt32() == 500 &&
-        string.Join(",", settings.GetProperty("defaultSources").EnumerateArray().Select(value => value.GetString())) == "imdb,tomatoes_critic,tomatoes_audience,tmdb,trakt" &&
+        string.Join(",", settings.GetProperty("defaultSources").EnumerateArray().Select(value => value.GetString())) == "imdb,tomatoes_critic,tomatoes_audience,trakt" &&
         settings.GetProperty("availableSources").GetArrayLength() == 9 && !settings.GetProperty("verified").GetBoolean(),
-        "The ratings settings start on, without a key, every 14 days, 500 calls a day, in the decided default order");
+        "The ratings settings start on, without a key, every 14 days, 500 calls a day, showing IMDb, RT critics, RT audience and Trakt (user decision 9)");
     var defaults = (await Get(viewer, "JellyfinMod/Ratings/Defaults")).Body;
-    Assert(defaults.GetProperty("enabled").GetBoolean() && defaults.GetProperty("defaultSources").GetArrayLength() == 5 &&
+    Assert(defaults.GetProperty("enabled").GetBoolean() && defaults.GetProperty("defaultSources").GetArrayLength() == 4 &&
         !defaults.TryGetProperty("apiKeyConfigured", out _), "An ordinary user reads the default order and nothing about the key");
 
     // ---- Disposable titles through the real add path: the TMDB snapshot now carries the vote count (R4).
