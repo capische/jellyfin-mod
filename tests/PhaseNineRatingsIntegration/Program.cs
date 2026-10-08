@@ -30,7 +30,8 @@ try
 {
     await MigrationAsync(folder);
     await RunAsync(folder, logs);
-    Console.WriteLine($"PASS: Phase 9 ratings — migration, settings, secret, Test, fetcher, budget, breaker, claims, projection, access ({stopwatch.Elapsed.TotalSeconds:F1}s)");
+    await AutomaticAsync(folder, logs);
+    Console.WriteLine($"PASS: Phase 9 ratings — migration, settings, secret, Test, fetcher, budget, breaker, claims, projection, access, automatic fetching ({stopwatch.Elapsed.TotalSeconds:F1}s)");
 }
 finally
 {
@@ -191,8 +192,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         services.AddSingleton(new AcquisitionSecretStore(folder));
         RatingsServices.Add(services, () => configuration);
         services.AddSingleton(new RatingsEndpoint(boundary.Address));
-        // A call every 20 ms instead of every second; the other bounds are the documented ones.
-        services.AddSingleton(RatingsOptions.Default with { MinInterval = TimeSpan.FromMilliseconds(20) });
+        // A call every 20 ms instead of every second; the other bounds are the documented ones. This part proves the daily task's
+        // own rules, so automatic fetching (user decision 8) is off here; AutomaticAsync below runs it as a real host does.
+        services.AddSingleton(RatingsOptions.Default with { MinInterval = TimeSpan.FromMilliseconds(20), Automatic = false });
         RatingsServices.AddHostedServices(services);
     }
 
@@ -995,6 +997,274 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Console.WriteLine("evidence - a captured HTTP client line: " +
         lines.First(line => line.Contains("System.Net.Http.HttpClient", StringComparison.Ordinal) && line.Contains("/tmdb/movie/", StringComparison.Ordinal))
             .Replace(boundary.Address.Authority, "<boundary>", StringComparison.Ordinal));
+    await host.DisposeAsync();
+}
+
+// ---- Automatic fetching (user decision 8, 2026-10-08): soon after titles arrive and in full at setup, through the same claim,
+// budget, breaker and credential gate as the daily run. A host of its own, on a fresh database, with the documented defaults
+// for the arrival quiet window and the longest wait; only the pause between calls is shortened.
+static async Task AutomaticAsync(string root, CapturingLoggerProvider logs)
+{
+    var folder = Path.Combine(root, "automatic");
+    var media = Path.Combine(folder, "media");
+    foreach (var directory in new[] { "movies", "movies2", "tv", "far" }) Directory.CreateDirectory(Path.Combine(media, directory));
+    var world = new World
+    {
+        Admin = new User("admin", "auth", "reset") { Id = Guid.NewGuid() },
+        SecondAdmin = new User("admin2", "auth", "reset") { Id = Guid.NewGuid() },
+        RestrictedAdmin = new User("tvadmin", "auth", "reset") { Id = Guid.NewGuid() },
+        Ordinary = new User("viewer", "auth", "reset") { Id = Guid.NewGuid() },
+        Movies = new TestLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.movies, Location = Path.Combine(media, "movies") },
+        Movies2 = new TestLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.movies, Location = Path.Combine(media, "movies2") },
+        Tv = new TestLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.tvshows, Location = Path.Combine(media, "tv") },
+        Far = new TestLibrary { Id = Guid.NewGuid(), CollectionType = Jellyfin.Data.Enums.CollectionType.movies, Location = Path.Combine(media, "far") },
+        Folder = folder
+    };
+    var dbPath = Path.Combine(folder, "jellyfinmod.db");
+    await using var boundary = await Boundary.StartAsync();
+    const string Key = "mdblist-automatic-key-0123456789abcdef";
+    const string Key2 = "mdblist-automatic-replacement-fedcba98";
+    boundary.ExpectedKey = Key;
+    var hostLibrary = Stub<ILibraryManager>.Create((method, _) => method.Name switch
+    {
+        "GetLibraryOptions" => new LibraryOptions(),
+        _ => method.ReturnType.IsValueType && method.ReturnType != typeof(void) ? Activator.CreateInstance(method.ReturnType) : null
+    });
+    var time = new ShiftedTimeProvider();
+    var configuration = new PluginConfiguration { TmdbReadAccessToken = "tmdb-fixture-token" };
+    var options = RatingsOptions.Default with { MinInterval = TimeSpan.FromMilliseconds(20) };
+    Assert(options.Automatic && options.ArrivalQuiet == TimeSpan.FromSeconds(2) && options.ArrivalMaxWait == TimeSpan.FromSeconds(30),
+        "Automatic fetching is on by default: a pass starts once arrivals have been quiet for 2 s, or after 30 s of steady arrivals");
+    void Configure(IServiceCollection services)
+    {
+        services.AddSingleton(hostLibrary);
+        services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(), () => configuration,
+            provider.GetRequiredService<ILogger<TmdbClient>>(), null, null, new TmdbEndpoint(boundary.Address)));
+        services.AddSingleton(new AcquisitionSecretStore(folder));
+        RatingsServices.Add(services, () => configuration);
+        services.AddSingleton(new RatingsEndpoint(boundary.Address));
+        services.AddSingleton(options);
+        RatingsServices.AddHostedServices(services);
+        // The production reconciler, which binds a scanned or imported file to its entry (Phase 2, Phase 5).
+        services.AddTransient<ReconciliationService>();
+    }
+
+    var host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(5), configuration, Configure);
+    var admin = host.Client(world.Admin, true);
+    var bodies = new List<string>();
+    async Task<(HttpStatusCode Status, JsonElement Body)> Send(HttpMethod method, string path, object? body = null)
+    {
+        using var request = new HttpRequestMessage(method, path);
+        if (body is not null) request.Content = JsonContent.Create(body);
+        using var response = await admin.SendAsync(request);
+        var text = await response.Content.ReadAsStringAsync();
+        bodies.Add(text);
+        return (response.StatusCode, response.Content.Headers.ContentType?.MediaType?.Contains("json") == true ? Json.Parse(text) : default);
+    }
+
+    async Task<JsonElement> Status() => (await Send(HttpMethod.Get, "JellyfinMod/Ratings/Status")).Body;
+    async Task<int> Revision() => (await Send(HttpMethod.Get, "JellyfinMod/Settings/Ratings")).Body.GetProperty("revision").GetInt32();
+    async Task<(HttpStatusCode Status, JsonElement Body)> Patch(object body) => await Send(HttpMethod.Patch, "JellyfinMod/Settings/Ratings", body);
+    async Task<Guid> Add(int tmdbId, Guid library)
+    {
+        var response = await Send(HttpMethod.Post, "JellyfinMod/Entries", new { mediaType = "movie", tmdbId, targetLibraryId = library });
+        Assert(response.Status == HttpStatusCode.OK, $"movie {tmdbId} is added through the real add path", response.Status);
+        return response.Body.GetProperty("entry").GetProperty("id").GetString()!.ToGuid();
+    }
+
+    async Task<bool> HasMdbList(Guid entry)
+    {
+        var detail = await Send(HttpMethod.Get, $"JellyfinMod/Entries/{entry}");
+        return detail.Body.GetProperty("ratings").EnumerateArray().Any(rating => rating.GetProperty("provider").GetString() == "mdblist");
+    }
+
+    // Quiet for longer than the arrival window and the 20 ms pause, so anything that was going to start has started and ended.
+    async Task Settle()
+    {
+        await Task.Delay(TimeSpan.FromSeconds(3));
+        await WaitFor(async () => (await Status()).GetProperty("running").ValueKind == JsonValueKind.Null, "no pass in progress");
+    }
+
+    int Arrivals() => logs.Lines.Count(line => line.Contains("Ratings run (arrivals)", StringComparison.Ordinal));
+
+    // ---- No key: titles arrive and nothing happens — no call, no run recorded.
+    var first = new List<Guid>();
+    foreach (var id in new[] { 9301, 9302, 9303 })
+    {
+        first.Add(await Add(id, world.Movies.Id));
+        await Task.Delay(15);
+    }
+
+    await Settle();
+    var status = await Status();
+    Assert(boundary.Calls.IsEmpty && status.GetProperty("lastRun").ValueKind == JsonValueKind.Null && status.GetProperty("running").ValueKind == JsonValueKind.Null,
+        "Without a key, arriving titles make no call and record no run; they are left for later", status);
+
+    // ---- A key saved but not yet verified starts nothing by itself (the setup run follows Test, or the next start).
+    Assert((await Patch(new { revision = await Revision(), apiKey = new { action = "replace", value = Key } })).Status == HttpStatusCode.OK,
+        "The administrator saves a key");
+    await Settle();
+    Assert(boundary.Calls.IsEmpty, "Saving a key alone makes no call");
+
+    // ---- Startup with a key and no completed run: a full run at once, newest first.
+    await host.DisposeAsync();
+    var restarted = Stopwatch.StartNew();
+    host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(5), configuration, Configure);
+    admin = host.Client(world.Admin, true);
+    await WaitFor(async () => boundary.Calls.Count == 3 && (await Status()).GetProperty("lastRun").ValueKind == JsonValueKind.Object &&
+        (await Status()).GetProperty("lastRun").GetProperty("finishedAt").ValueKind == JsonValueKind.String, "the startup run");
+    status = await Status();
+    Assert(boundary.Calls.SequenceEqual(["movie:9303", "movie:9302", "movie:9301"]) && status.GetProperty("lastRun").GetProperty("fetched").GetInt32() == 3 &&
+        restarted.Elapsed < TimeSpan.FromSeconds(15) && await HasMdbList(first[0]),
+        "A start with a key saved and no run ever completed fetches every title at once, newest first, and records the run",
+        new { calls = boundary.Calls.ToArray(), restarted.Elapsed.TotalSeconds });
+    var lastRunAt = status.GetProperty("lastRun").GetProperty("startedAt").GetDateTime();
+    await host.DisposeAsync();
+    host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(5), configuration, Configure);
+    admin = host.Client(world.Admin, true);
+    await Settle();
+    Assert(boundary.Calls.Count == 3 && (await Status()).GetProperty("lastRun").GetProperty("startedAt").GetDateTime() == lastRunAt,
+        "Once a run has completed, a start leaves the rest to arrivals and the daily task");
+
+    // ---- A new entry: its title is fetched within seconds, in the background.
+    var arrivalsBefore = Arrivals();
+    var added = Stopwatch.StartNew();
+    var addWatch = Stopwatch.StartNew();
+    var fresh = await Add(9304, world.Movies.Id);
+    var addSeconds = addWatch.Elapsed.TotalSeconds;
+    await WaitFor(async () => boundary.CallsFor("movie", 9304) == 1 && await HasMdbList(fresh), "the new title's ratings");
+    var arrivedSeconds = added.Elapsed.TotalSeconds;
+    Assert(arrivedSeconds < 6 && addSeconds < 2 && Arrivals() == arrivalsBefore + 1,
+        "A title added to the catalog has its ratings within seconds (one arrivals pass), and the add itself did not wait for MDBList",
+        new { arrivedSeconds, addSeconds });
+    Console.WriteLine($"evidence - add answered in {addSeconds:F2}s; the title's ratings were stored {arrivedSeconds:F2}s after the add began");
+    // The same title added to another library joins what its title already has: no call.
+    var twin = await Add(9304, world.Movies2.Id);
+    await WaitFor(() => HasMdbList(twin), "the twin adopts its title's ratings");
+    Assert(boundary.CallsFor("movie", 9304) == 1, "The same title arriving in another library takes the stored values without a call");
+
+    // ---- Ratings off: arrivals do nothing. Switched on again with the key saved: a full run at once.
+    Assert((await Patch(new { revision = await Revision(), enabled = false })).Status == HttpStatusCode.OK, "The administrator turns ratings off");
+    var offRun = (await Status()).GetProperty("lastRun").GetProperty("startedAt").GetDateTime();
+    var whileOff = await Add(9305, world.Movies.Id);
+    await Settle();
+    Assert(boundary.CallsFor("movie", 9305) == 0 && (await Status()).GetProperty("lastRun").GetProperty("startedAt").GetDateTime() == offRun,
+        "With ratings off an arriving title makes no call and records no run");
+    var onWatch = Stopwatch.StartNew();
+    var switchedOn = await Patch(new { revision = await Revision(), enabled = true });
+    var onSeconds = onWatch.Elapsed.TotalSeconds;
+    await WaitFor(async () => boundary.CallsFor("movie", 9305) == 1 && await HasMdbList(whileOff), "the setup run after switching on");
+    Assert(switchedOn.Status == HttpStatusCode.OK && onSeconds < 2 && boundary.Calls.Count == 5,
+        "Switching ratings on with a key saved starts a full run at once; the save answered without waiting for it", new { onSeconds });
+    Console.WriteLine($"evidence - switching ratings on answered in {onSeconds:F2}s");
+
+    // ---- Breaker open: arrivals do nothing; once it has closed, a file bound to the entry (the step an import completes
+    // through) fetches the title.
+    await using (var database = new ModDbContext(dbPath))
+    {
+        var state = await database.RatingsProviderStates.SingleAsync();
+        (state.BreakerUntil, state.BreakerReason) = (time.GetUtcNow().UtcDateTime.AddHours(1), "failures");
+        await database.SaveChangesAsync();
+    }
+
+    var behindBreaker = await Add(9306, world.Movies.Id);
+    await Settle();
+    Assert(boundary.CallsFor("movie", 9306) == 0, "With the breaker open an arriving title makes no call");
+    time.Offset += TimeSpan.FromHours(2);
+    await Settle();
+    Assert(boundary.CallsFor("movie", 9306) == 0, "When the breaker closes nothing is fetched until a trigger or the daily run");
+    async Task<ReconciliationResult> Bind(int tmdbId, string file)
+    {
+        var path = Path.Combine(world.Movies.Location, file);
+        await File.WriteAllTextAsync(path, "fixture");
+        using var scope = host.App.Services.CreateScope();
+        return await scope.ServiceProvider.GetRequiredService<ReconciliationService>().ReconcileAsync(new NativeTitleSnapshot("movie", tmdbId,
+            world.Movies.Id, $"JellyfinMod Ratings Movie {tmdbId}", 2026, null, null, null, null,
+            [new NativeRepresentation(Guid.NewGuid(), world.Movies.Id, true, MediaPath: path)], []), CancellationToken.None);
+    }
+
+    var bound = Stopwatch.StartNew();
+    var binding = await Bind(9306, "imported-9306.mkv");
+    await WaitFor(async () => boundary.CallsFor("movie", 9306) == 1 && await HasMdbList(behindBreaker), "the bound title's ratings");
+    Assert(binding.Outcome == ReconciliationOutcome.Updated && bound.Elapsed < TimeSpan.FromSeconds(6),
+        "A file bound to an entry (an import completing, a scan finding it) fetches its title within seconds", new { binding.Outcome, bound.Elapsed.TotalSeconds });
+    var scanned = await Bind(9307, "scanned-9307.mkv");
+    await WaitFor(() => Task.FromResult(boundary.CallsFor("movie", 9307) == 1), "a title the scan created");
+    Assert(scanned.Outcome == ReconciliationOutcome.Created, "A title new to the catalog from a library scan is fetched within seconds too");
+    // A file bound to a title whose ratings are current is not fetched again: only due titles are.
+    await Bind(9304, "second-copy-9304.mkv");
+    await Settle();
+    Assert(boundary.CallsFor("movie", 9304) == 1, "A file of a title fetched inside its window makes no call");
+
+    // ---- A burst: 50 titles added back to back become one pass, one call at a time, inside the budget.
+    var used = (await Status()).GetProperty("budget").GetProperty("used").GetInt32();
+    Assert((await Patch(new { revision = await Revision(), dailyBudget = used + 20 })).Status == HttpStatusCode.OK, "The budget leaves room for 20 calls today");
+    boundary.MaxInFlight = 0;
+    arrivalsBefore = Arrivals();
+    var callsBefore = boundary.Calls.Count;
+    var burst = new List<Guid>();
+    for (var id = 9400; id < 9450; id++) burst.Add(await Add(id, world.Movies.Id));
+    await WaitFor(() => Task.FromResult(boundary.Calls.Count == callsBefore + 20), "the burst's pass");
+    await Settle();
+    status = await Status();
+    var burstCalls = boundary.Calls.Skip(callsBefore).ToArray();
+    Assert(burstCalls.Length == 20 && burstCalls.SequenceEqual(Enumerable.Range(0, 20).Select(index => $"movie:{9449 - index}")) &&
+        Arrivals() == arrivalsBefore + 1 && boundary.MaxInFlight == 1 &&
+        status.GetProperty("lastRun").GetProperty("fetched").GetInt32() == 20 && status.GetProperty("lastRun").GetProperty("stopReason").GetString() == "budget_spent",
+        "50 titles added back to back are one pass: one call at a time, newest first, stopped by the budget after 20; the other 30 wait",
+        new { calls = burstCalls.Length, passes = Arrivals() - arrivalsBefore, boundary.MaxInFlight });
+    var withoutBefore = status.GetProperty("entriesWithoutRatings").GetInt32();
+    Assert(withoutBefore == 30, "Status counts the 30 titles still without ratings", withoutBefore);
+
+    // ---- A replaced key verified by Test: a full run at once (raising the budget alone starts nothing).
+    Assert((await Patch(new { revision = await Revision(), dailyBudget = 500 })).Status == HttpStatusCode.OK, "The budget is raised again");
+    await Settle();
+    Assert(boundary.Calls.Count == callsBefore + 20, "Raising the budget starts nothing by itself");
+    boundary.ExpectedKey = Key2;
+    Assert((await Patch(new { revision = await Revision(), apiKey = new { action = "replace", value = Key2 } })).Status == HttpStatusCode.OK,
+        "The administrator replaces the key");
+    await Settle();
+    Assert(boundary.Calls.Count == callsBefore + 20, "Replacing the key starts nothing until Test verifies it");
+    var test = await Send(HttpMethod.Post, "JellyfinMod/Settings/Ratings/Test");
+    Assert(test.Body.GetProperty("ok").GetBoolean(), "Test verifies the new key", test.Body);
+    await WaitFor(async () => (await Status()).GetProperty("entriesWithoutRatings").GetInt32() == 0, "the setup run after Test");
+    await Settle();
+    var setupCalls = boundary.Calls.Skip(callsBefore + 20).Where(call => call != "movie:278").ToArray();
+    Assert(setupCalls.Length == 30 && setupCalls.Distinct().Count() == 30 && setupCalls[0] == "movie:9429" && boundary.WrongKeyCalls == 0,
+        "A key verified by Test starts a full run at once: the 30 waiting titles, newest first, with the new key", setupCalls);
+
+    // ---- A save during a run is fast, Status shows the pass, and a trigger during it waits for the next pass.
+    time.Offset += TimeSpan.FromDays(15);
+    boundary.Delay = TimeSpan.FromMilliseconds(150);
+    boundary.MaxInFlight = 0;
+    callsBefore = boundary.Calls.Count;
+    test = await Send(HttpMethod.Post, "JellyfinMod/Settings/Ratings/Test");
+    Assert(test.Body.GetProperty("ok").GetBoolean(), "Test passes again and starts another full run");
+    JsonElement running = default;
+    await WaitFor(async () => (running = (await Status()).GetProperty("running")).ValueKind == JsonValueKind.Object &&
+        running.GetProperty("remaining").GetInt32() > 20, "a pass in progress");
+    Assert(running.GetProperty("kind").GetString() == "setup" && running.GetProperty("startedAt").ValueKind == JsonValueKind.String,
+        "Status shows the pass in progress: started by setup, with how many titles it still has", running);
+    var patchWatch = Stopwatch.StartNew();
+    var duringRun = await Patch(new { revision = await Revision(), refreshDays = 14 });
+    var patchSeconds = patchWatch.Elapsed.TotalSeconds;
+    var stillRunning = (await Status()).GetProperty("running");
+    Assert(duringRun.Status == HttpStatusCode.OK && patchSeconds < 1.5 && stillRunning.ValueKind == JsonValueKind.Object,
+        "A settings save during a run answers at once (it waits at most for the one call out) and the run carries on", new { patchSeconds });
+    Console.WriteLine($"evidence - settings save during a run: {patchSeconds:F2}s; Status during the run: {running}");
+    var lateArrival = await Add(9500, world.Movies.Id);
+    await WaitFor(async () => boundary.CallsFor("movie", 9500) == 1 && await HasMdbList(lateArrival), "the arrival queued during the run");
+    await Settle();
+    var refreshCalls = boundary.Calls.Skip(callsBefore).Where(call => call != "movie:278").ToArray();
+    Assert(boundary.MaxInFlight == 1 && refreshCalls.Distinct().Count() == refreshCalls.Length && refreshCalls[^1] == "movie:9500" &&
+        refreshCalls.Length == 57 + 1,
+        "A title arriving during the run is fetched by the next pass, after it: one call at a time, no title twice",
+        new { refreshCalls.Length, boundary.MaxInFlight, last = refreshCalls[^1] });
+
+    // ---- Leak check for this host.
+    Assert(bodies.All(body => !body.Contains(Key, StringComparison.Ordinal) && !body.Contains(Key2, StringComparison.Ordinal)) &&
+        logs.Lines.All(line => !line.Contains(Key, StringComparison.Ordinal) && !line.Contains(Key2, StringComparison.Ordinal)),
+        $"No response ({bodies.Count}) and no log line carries either automatic-run key");
     await host.DisposeAsync();
 }
 

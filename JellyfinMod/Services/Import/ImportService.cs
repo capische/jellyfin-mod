@@ -56,7 +56,8 @@ public sealed class ImportService(
     SeedReleaseService seedReleases,
     ImportHostSession session,
     TimeProvider time,
-    ILogger<ImportService> logger)
+    ILogger<ImportService> logger,
+    Ratings.RatingsAutoFetch? ratingsFetch = null)
 {
     private DateTime Now => time.GetUtcNow().UtcDateTime;
 
@@ -800,6 +801,9 @@ public sealed class ImportService(
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
         logger.LogInformation("Import {Operation} completed: bound as native item {Item}", operation.Id, nativeItemId);
+        // The imported title's ratings are fetched within seconds when they are due (user decision 8); this only wakes the
+        // background fetcher, after the import's own transaction has committed.
+        if (operation.EntryId is { } imported) ratingsFetch?.Arrived(imported);
     }
 
     private sealed record DestinationPlan(string? Path, string? Root, string? Label, IReadOnlyList<string> MissingDirectories,

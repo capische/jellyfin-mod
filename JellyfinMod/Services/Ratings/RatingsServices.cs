@@ -16,6 +16,7 @@ public static class RatingsServices
         services.AddSingleton<RatingsRunGate>();
         services.AddSingleton<RatingsCredentialGate>();
         services.AddSingleton<RatingsRefreshQueue>();
+        services.AddSingleton<RatingsAutoFetch>();
         services.AddSingleton(RatingsOptions.Default);
         services.AddTransient<HostRatingsReader>();
         services.AddTransient<RatingsStore>();
@@ -25,9 +26,12 @@ public static class RatingsServices
         services.AddTransient<RatingsRefreshRunner>();
     }
 
-    /// <summary>Registers the manual-refresh worker.</summary>
-    public static void AddHostedServices(IServiceCollection services) =>
+    /// <summary>Registers the manual-refresh worker and the automatic fetcher (user decision 8).</summary>
+    public static void AddHostedServices(IServiceCollection services)
+    {
         services.AddSingleton<IHostedService, RatingsRefreshWorker>();
+        services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<RatingsAutoFetch>());
+    }
 }
 
 /// <summary>Manual per-title refreshes waiting for the fetcher (P9.R3); bounded, and one entry is queued once.</summary>

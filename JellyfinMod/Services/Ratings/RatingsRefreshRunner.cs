@@ -14,7 +14,25 @@ public sealed record RatingsOptions(TimeSpan MinInterval, TimeSpan FailureRetry,
 {
     /// <summary>The documented defaults (P9.R3): one call a second, a day before a failed title is retried, five failures, one hour.</summary>
     public static RatingsOptions Default { get; } = new(TimeSpan.FromSeconds(1), TimeSpan.FromDays(1), 5, TimeSpan.FromHours(1));
+
+    /// <summary>
+    /// Gets how long titles must stop arriving before their pass starts (user decision 8): a library scan or a bulk add
+    /// becomes one pass once it has been quiet this long.
+    /// </summary>
+    public TimeSpan ArrivalQuiet { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>Gets the longest a pass waits for arrivals to go quiet, so a steady stream of titles is still fetched.</summary>
+    public TimeSpan ArrivalMaxWait { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Gets a value indicating whether titles are fetched on arrival and at setup (user decision 8). Always on in a real host;
+    /// an integration suite turns it off only where it proves the daily task's own rules in isolation.
+    /// </summary>
+    public bool Automatic { get; init; } = true;
 }
+
+/// <summary>A pass in progress, for Status: what started it, when, and how many titles are still before it.</summary>
+public sealed record RatingsActivity(string Kind, DateTime StartedAt, int Remaining);
 
 /// <summary>
 /// One fetcher at a time in this process: the scheduled run, a manual refresh and Test take turns, so no title is claimed
@@ -26,6 +44,9 @@ public sealed class RatingsRunGate
 
     /// <summary>Gets or sets when the last MDBList call started.</summary>
     internal DateTime LastCallAt { get; set; } = DateTime.MinValue;
+
+    /// <summary>Gets or sets the pass in progress, or null when none is (set only while the gate is held).</summary>
+    public RatingsActivity? Activity { get; set; }
 
     /// <summary>Waits for the gate; dispose the result to release it.</summary>
     public async Task<IDisposable> AcquireAsync(CancellationToken cancellationToken)
@@ -127,41 +148,99 @@ public sealed class RatingsRefreshRunner(
         using var lease = await gate.AcquireAsync(cancellationToken).ConfigureAwait(false);
         var startedAt = Now;
         await RecoverClaimsAsync(cancellationToken).ConfigureAwait(false);
-        var state = await RatingsStore.GetStateAsync(database, cancellationToken).ConfigureAwait(false);
-        (state.LastRunStartedAt, state.LastRunFinishedAt, state.LastRunFetched, state.LastRunFailed, state.LastRunStopReason) =
-            (startedAt, null, 0, 0, null);
-        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await RecordStartAsync(startedAt, cancellationToken).ConfigureAwait(false);
 
         var current = await CurrentAsync(cancellationToken).ConfigureAwait(false);
         await PruneAsync(current.Settings, cancellationToken).ConfigureAwait(false);
         await AdoptSiblingsAsync(cancellationToken).ConfigureAwait(false);
         var stop = current.Refusal;
-        var due = stop is null ? await DueAsync(current.Settings, Now, cancellationToken).ConfigureAwait(false) : [];
-        int fetched = 0, failed = 0;
-        for (var index = 0; stop is null && index < due.Count; index++)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var (outcome, refusal) = await FetchAsync(due[index], false, cancellationToken).ConfigureAwait(false);
-            if (refusal is not null)
-            {
-                stop = refusal;
-                break;
-            }
+        var due = stop is null ? await DueAsync(current.Settings, Now, null, cancellationToken).ConfigureAwait(false) : [];
+        await FetchDueAsync(RatingsPassKinds.Daily, startedAt, due, stop, progress, cancellationToken).ConfigureAwait(false);
+    }
 
-            if (outcome is RatingsOutcomes.Ok or RatingsOutcomes.NotFound) fetched++;
-            else if (outcome is not null) failed++;
-            progress?.Report(100.0 * (index + 1) / due.Count);
-            stop = (await CurrentAsync(cancellationToken).ConfigureAwait(false)).Refusal;
+    /// <summary>
+    /// An automatic pass (user decision 8), under the same gate, claim, budget, breaker and credential gate as the daily run.
+    /// With <paramref name="arrived"/> it is an arrivals pass: every title never attempted, plus the arrived entries' titles
+    /// that are due by the usual rule; the refresh of other titles stays with the daily run. Without it, it is a full run
+    /// (setup or first start): exactly what the daily run fetches. A pass that may not fetch now does nothing at all — no
+    /// adoption, no recovery, no run recorded — and leaves its titles to the daily run; a pass with nothing due records no run.
+    /// </summary>
+    /// <returns>The refusal that stopped the pass before it started, or null when it ran (or had nothing to do).</returns>
+    public async Task<string?> RunAutomaticAsync(string kind, IReadOnlyCollection<Guid>? arrived, CancellationToken cancellationToken)
+    {
+        using var lease = await gate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        var current = await CurrentAsync(cancellationToken).ConfigureAwait(false);
+        if (current.Refusal is { } refusal)
+        {
+            logger.LogDebug("Ratings {Kind} pass not started: {Refusal}", kind, refusal);
+            return refusal;
+        }
+
+        await RecoverClaimsAsync(cancellationToken).ConfigureAwait(false);
+        await AdoptSiblingsAsync(cancellationToken).ConfigureAwait(false);
+        HashSet<(string MediaType, int TmdbId)>? also = null;
+        if (arrived is not null)
+        {
+            var ids = arrived.ToArray();
+            also = (await database.Entries.AsNoTracking().Where(entry => ids.Contains(entry.Id) && entry.TmdbId > 0)
+                    .Select(entry => new { entry.MediaType, entry.TmdbId }).ToListAsync(cancellationToken).ConfigureAwait(false))
+                .Select(entry => (entry.MediaType, entry.TmdbId)).ToHashSet();
+        }
+
+        var due = await DueAsync(current.Settings, Now, also, cancellationToken).ConfigureAwait(false);
+        if (due.Count == 0) return null;
+        var startedAt = Now;
+        await RecordStartAsync(startedAt, cancellationToken).ConfigureAwait(false);
+        await FetchDueAsync(kind, startedAt, due, null, null, cancellationToken).ConfigureAwait(false);
+        return null;
+    }
+
+    private async Task RecordStartAsync(DateTime startedAt, CancellationToken cancellationToken)
+    {
+        database.ChangeTracker.Clear();
+        var state = await RatingsStore.GetStateAsync(database, cancellationToken).ConfigureAwait(false);
+        (state.LastRunStartedAt, state.LastRunFinishedAt, state.LastRunFetched, state.LastRunFailed, state.LastRunStopReason) =
+            (startedAt, null, 0, 0, null);
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Fetches the due titles in order until a refusal stops it, then records the run; Status sees it while it runs.</summary>
+    private async Task FetchDueAsync(string kind, DateTime startedAt, IReadOnlyList<DueTitle> due, string? stop, IProgress<double>? progress,
+        CancellationToken cancellationToken)
+    {
+        int fetched = 0, failed = 0;
+        try
+        {
+            for (var index = 0; stop is null && index < due.Count; index++)
+            {
+                gate.Activity = new RatingsActivity(kind, startedAt, due.Count - index);
+                cancellationToken.ThrowIfCancellationRequested();
+                var (outcome, refusal) = await FetchAsync(due[index], false, cancellationToken).ConfigureAwait(false);
+                if (refusal is not null)
+                {
+                    stop = refusal;
+                    break;
+                }
+
+                if (outcome is RatingsOutcomes.Ok or RatingsOutcomes.NotFound) fetched++;
+                else if (outcome is not null) failed++;
+                progress?.Report(100.0 * (index + 1) / due.Count);
+                stop = (await CurrentAsync(cancellationToken).ConfigureAwait(false)).Refusal;
+            }
+        }
+        finally
+        {
+            gate.Activity = null;
         }
 
         database.ChangeTracker.Clear();
-        state = await RatingsStore.GetStateAsync(database, CancellationToken.None).ConfigureAwait(false);
+        var state = await RatingsStore.GetStateAsync(database, CancellationToken.None).ConfigureAwait(false);
         (state.LastRunStartedAt, state.LastRunFetched, state.LastRunFailed, state.LastRunFinishedAt) = (startedAt, fetched, failed, Now);
         state.LastRunStopReason = stop is "budget_spent" or "breaker_open" or "ratings_disabled" or RatingsOutcomes.NotConfigured
             or RatingsOutcomes.Unauthorized or RatingsOutcomes.DatabaseBusy ? stop : null;
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
-        logger.LogInformation("Ratings run: {Due} due, {Fetched} fetched, {Failed} failed, stopped by {Reason}", due.Count, fetched, failed,
-            state.LastRunStopReason ?? "nothing");
+        logger.LogInformation("Ratings run ({Kind}): {Due} due, {Fetched} fetched, {Failed} failed, stopped by {Reason}", kind, due.Count, fetched,
+            failed, state.LastRunStopReason ?? "nothing");
         progress?.Report(100);
     }
 
@@ -518,7 +597,12 @@ public sealed class RatingsRefreshRunner(
     /// 5, review 2026-10-07 P2 7). An answer about the key rather than the title — refused, or the quota spent — leaves the title
     /// due as soon as fetching may resume; the blocker and the breaker hold everything until then.
     /// </summary>
-    private async Task<IReadOnlyList<DueTitle>> DueAsync(RatingsSettings settings, DateTime now, CancellationToken cancellationToken)
+    /// <param name="settings">The settings the window comes from.</param>
+    /// <param name="now">Now.</param>
+    /// <param name="onlyAgain">When set, only these titles may be due again; titles never attempted are always due.</param>
+    /// <param name="cancellationToken">Cancellation.</param>
+    private async Task<IReadOnlyList<DueTitle>> DueAsync(RatingsSettings settings, DateTime now, IReadOnlySet<(string MediaType, int TmdbId)>? onlyAgain,
+        CancellationToken cancellationToken)
     {
         var entries = await database.Entries.AsNoTracking().Where(entry => entry.TmdbId > 0)
             .Select(entry => new { entry.MediaType, entry.TmdbId, entry.AddedAt }).ToListAsync(cancellationToken).ConfigureAwait(false);
@@ -540,7 +624,7 @@ public sealed class RatingsRefreshRunner(
             {
                 Title = new DueTitle(group.Key.MediaType, group.Key.TmdbId),
                 Fresh = attempt is null,
-                Again = attempt is not null && Due(attempt),
+                Again = attempt is not null && (onlyAgain is null || onlyAgain.Contains(group.Key)) && Due(attempt),
                 Newest = group.Max(entry => entry.AddedAt)
             };
         }).ToList();
