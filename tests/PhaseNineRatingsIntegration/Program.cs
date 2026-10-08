@@ -1196,6 +1196,48 @@ static async Task AutomaticAsync(string root, CapturingLoggerProvider logs)
     await Settle();
     Assert(boundary.CallsFor("movie", 9304) == 1, "A file of a title fetched inside its window makes no call");
 
+    // ---- A new episode file of a series already in the catalog (review 2026-10-08, P2 1): the series binding is unchanged, the
+    // episode binding is new, and that is an arrival.
+    var seriesItem = Guid.NewGuid();
+    async Task<ReconciliationResult> BindSeries(params (int Season, int Number, Guid Item)[] files)
+    {
+        var episodes = new List<NativeEpisodeSnapshot>();
+        foreach (var (season, number, item) in files)
+        {
+            var path = Path.Combine(world.Tv.Location, $"s{season:00}e{number:00}.mkv");
+            await File.WriteAllTextAsync(path, "fixture");
+            episodes.Add(new NativeEpisodeSnapshot(item, seriesItem, 9800 + number, season, number, true, MediaPath: path));
+        }
+
+        using var scope = host.App.Services.CreateScope();
+        return await scope.ServiceProvider.GetRequiredService<ReconciliationService>().ReconcileAsync(new NativeTitleSnapshot("series", 9701,
+            world.Tv.Id, "JellyfinMod Ratings Series 9701", 2025, null, null, null, null,
+            [new NativeRepresentation(seriesItem, world.Tv.Id, true, MediaPath: world.Tv.Location)], episodes), CancellationToken.None);
+    }
+
+    var firstEpisode = (1, 1, Guid.NewGuid());
+    var seriesCreated = await BindSeries(firstEpisode);
+    await WaitFor(() => Task.FromResult(boundary.CallsFor("show", 9701) == 1), "the scanned series' first fetch");
+    Assert(seriesCreated.Outcome == ReconciliationOutcome.Created, "A series new to the catalog from a scan is fetched within seconds");
+    await using (var database = new ModDbContext(dbPath))
+    {
+        // Its ratings are past the refresh window, so the next arrival may fetch it again.
+        var attempt = await database.RatingsFetches.SingleAsync(row => row.MediaType == "series" && row.TmdbId == 9701);
+        attempt.AttemptedAt = time.GetUtcNow().UtcDateTime.AddDays(-20);
+        await database.SaveChangesAsync();
+    }
+
+    var unchanged = await BindSeries(firstEpisode);
+    await Settle();
+    Assert(unchanged.Outcome == ReconciliationOutcome.Unchanged && boundary.CallsFor("show", 9701) == 1,
+        "The same scan again (nothing new) is not an arrival, even with the series' ratings due", unchanged.Outcome);
+    var episodeArrived = Stopwatch.StartNew();
+    var newEpisode = await BindSeries(firstEpisode, (1, 2, Guid.NewGuid()));
+    await WaitFor(() => Task.FromResult(boundary.CallsFor("show", 9701) == 2), "the series after its new episode file");
+    Assert(newEpisode.Outcome == ReconciliationOutcome.Updated && episodeArrived.Elapsed < TimeSpan.FromSeconds(6),
+        "A new episode file of a known series (its series binding unchanged) fetches the series' due ratings within seconds (review 2026-10-08, P2 1)",
+        new { newEpisode.Outcome, episodeArrived.Elapsed.TotalSeconds });
+
     // ---- A burst: 50 titles added back to back become one pass, one call at a time, inside the budget.
     var used = (await Status()).GetProperty("budget").GetProperty("used").GetInt32();
     Assert((await Patch(new { revision = await Revision(), dailyBudget = used + 20 })).Status == HttpStatusCode.OK, "The budget leaves room for 20 calls today");
@@ -1257,7 +1299,7 @@ static async Task AutomaticAsync(string root, CapturingLoggerProvider logs)
     await Settle();
     var refreshCalls = boundary.Calls.Skip(callsBefore).Where(call => call != "movie:278").ToArray();
     Assert(boundary.MaxInFlight == 1 && refreshCalls.Distinct().Count() == refreshCalls.Length && refreshCalls[^1] == "movie:9500" &&
-        refreshCalls.Length == 57 + 1,
+        refreshCalls.Length == 58 + 1, // 57 movies and the scanned series, then the late arrival
         "A title arriving during the run is fetched by the next pass, after it: one call at a time, no title twice",
         new { refreshCalls.Length, boundary.MaxInFlight, last = refreshCalls[^1] });
 
