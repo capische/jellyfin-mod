@@ -154,6 +154,8 @@ public class HealthController : ControllerBase
         "acquisition.settings",
         "acquisition.releases",
         "acquisition.grabHold",
+        // Season and All Seasons searches, pack grabs that fill, add or replace, one queue row per pack (2026-10-08).
+        "acquisition.packs",
         "queue",
         "import",
         "seedRelease",

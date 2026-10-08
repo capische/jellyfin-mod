@@ -74,6 +74,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets the plugin's ownership of seeding copies after import (P5.I6).</summary>
     public DbSet<SeedReleaseOperation> SeedReleaseOperations => Set<SeedReleaseOperation>();
 
+    /// <summary>Gets the episodes each grab writes (season and series packs, 2026-10-08).</summary>
+    public DbSet<GrabClaim> GrabClaims => Set<GrabClaim>();
+
     /// <summary>Gets ordered client-to-local path mappings (P5.I2).</summary>
     public DbSet<DownloadClientPathMapping> DownloadClientPathMappings => Set<DownloadClientPathMapping>();
 
@@ -238,6 +241,17 @@ public class ModDbContext : DbContext
             // Grab operations are the audit of client handoffs; an entry removal detaches, never erases them.
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.SetNull);
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.SetNull);
+            // Releasing a grab's target clears its claims' keys (GrabClaimRelease trigger, migration SeasonPacks).
+            e.ToTable(table => table.HasTrigger("GrabClaimRelease"));
+        });
+        b.Entity<GrabClaim>(e =>
+        {
+            // One active claim per episode target key across every grab, single-episode and pack alike.
+            e.HasIndex(x => x.ActiveKey).IsUnique();
+            e.HasIndex(x => new { x.GrabId, x.EpisodeId }).IsUnique();
+            e.HasIndex(x => x.EpisodeId);
+            e.HasOne<GrabOperation>().WithMany().HasForeignKey(x => x.GrabId).OnDelete(DeleteBehavior.Cascade);
+            e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.Cascade);
         });
         b.Entity<ImportOperation>(e =>
         {

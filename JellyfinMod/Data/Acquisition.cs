@@ -488,8 +488,10 @@ public sealed class GrabOperation
     /// <summary>Gets or sets the target episode for series acquisition.</summary>
     public Guid? EpisodeId { get; set; }
 
-    /// <summary>Gets or sets the target while this operation owns it; null once released.</summary>
-    [MaxLength(40)]
+    /// <summary>
+    /// Gets or sets the target while this operation owns it; null once released. A pack owns <c>pack:&lt;entry&gt;:&lt;season|all&gt;</c>.
+    /// </summary>
+    [MaxLength(64)]
     public string? ActiveTarget { get; set; }
 
     /// <summary>Gets or sets the client/hash pair while this operation owns it; null once released.</summary>
@@ -599,4 +601,62 @@ public sealed class GrabOperation
 
     /// <summary>Gets or sets the upgrade this grab belongs to.</summary>
     public Guid? UpgradeOperationId { get; set; }
+
+    /// <summary>
+    /// Gets or sets what the grab covers: <c>title</c>, <c>episode</c>, <c>season</c> or <c>series</c> (season and series packs,
+    /// 2026-10-08). A pack carries no <see cref="EpisodeId"/>; its episodes are its <see cref="GrabClaim"/>s.
+    /// </summary>
+    [MaxLength(16)]
+    public string Scope { get; set; } = "episode";
+
+    /// <summary>Gets or sets the season of a season pack; null otherwise.</summary>
+    public int? SeasonNumber { get; set; }
+
+    /// <summary>
+    /// Gets or sets how the grab writes held episodes: <c>fill</c> only the ones without a file, <c>add</c> another version
+    /// beside what is held, <c>replace</c> another version that then replaces what is held (see <see cref="GrabModes"/>).
+    /// </summary>
+    [MaxLength(16)]
+    public string Mode { get; set; } = GrabModes.Fill;
+}
+
+/// <summary>How a grab writes the episodes it covers (season and series packs, 2026-10-08).</summary>
+public static class GrabModes
+{
+    /// <summary>Only episodes without a file; an episode that gained one meanwhile is skipped.</summary>
+    public const string Fill = "fill";
+
+    /// <summary>Another version beside what is held; episodes without a file are filled.</summary>
+    public const string Add = "add";
+
+    /// <summary>Another version that replaces what is held once it is in the library; episodes without a file are filled.</summary>
+    public const string Replace = "replace";
+}
+
+/// <summary>
+/// One episode a grab will write (season and series packs, 2026-10-08). While the grab is active its <see cref="ActiveKey"/>
+/// is the episode's target key (<c>episodeId</c>, or <c>episodeId+add</c> for another version), unique across grabs, so a
+/// single-episode grab and a pack can never take the same episode twice. Releasing the grab's <c>ActiveTarget</c> clears
+/// every key of its claims (a database trigger); the rows stay as the record of what the grab covered.
+/// </summary>
+public sealed class GrabClaim
+{
+    /// <summary>Gets or sets the claim identity.</summary>
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    /// <summary>Gets or sets the claiming grab.</summary>
+    public Guid GrabId { get; set; }
+
+    /// <summary>Gets or sets the claimed episode.</summary>
+    public Guid EpisodeId { get; set; }
+
+    /// <summary>Gets or sets the episode's target key while the grab is active; null once released.</summary>
+    [MaxLength(64)]
+    public string? ActiveKey { get; set; }
+
+    /// <summary>Gets or sets whether the episode held a file when it was claimed.</summary>
+    public bool Held { get; set; }
+
+    /// <summary>Gets or sets when the claim was made.</summary>
+    public DateTime CreatedAt { get; set; }
 }

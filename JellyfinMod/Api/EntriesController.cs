@@ -929,6 +929,7 @@ public sealed class EntriesController(
         "version_kept" => "Kept a version indefinitely",
         "version_unkept" => "Stopped keeping a version",
         "version_removed" => "Removed a version",
+        "version_replaced" => "Replaced a version",
         "imported" => "Imported a download",
         "blocklisted" => "Blocklisted a release",
         _ => "Updated this title"
@@ -966,8 +967,17 @@ public sealed class EntriesController(
         // The newest grab per target supplies the acquisition summary; file availability stays separate (P4.A6).
         var grabs = await database.GrabOperations.AsNoTracking().Where(operation => operation.EntryId == entry.Id)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
-        var latestGrab = grabs.GroupBy(operation => operation.EpisodeId)
-            .ToDictionary(group => group.Key ?? Guid.Empty, group => group.OrderByDescending(operation => operation.CreatedAt).First());
+        // A pack stands for each episode it claimed, never for the series (season and series packs, 2026-10-08).
+        var packIds = grabs.Where(operation => JellyfinMod.Services.Acquisition.ReleaseScopes.IsPack(operation.Scope))
+            .Select(operation => operation.Id).ToArray();
+        var packClaims = packIds.Length == 0 ? [] : await database.GrabClaims.AsNoTracking().Where(claim => packIds.Contains(claim.GrabId))
+            .Select(claim => new { claim.GrabId, claim.EpisodeId }).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var byId = grabs.ToDictionary(operation => operation.Id);
+        var latestGrab = grabs.Where(operation => !JellyfinMod.Services.Acquisition.ReleaseScopes.IsPack(operation.Scope))
+            .Select(operation => (Target: operation.EpisodeId ?? Guid.Empty, Operation: operation))
+            .Concat(packClaims.Select(claim => (Target: claim.EpisodeId, Operation: byId[claim.GrabId])))
+            .GroupBy(item => item.Target)
+            .ToDictionary(group => group.Key, group => group.Select(item => item.Operation).OrderByDescending(operation => operation.CreatedAt).First());
         AcquisitionSummaryDto? Summary(Guid? targetId) => latestGrab.TryGetValue(targetId ?? Guid.Empty, out var operation)
             ? AcquisitionSummaryDto.From(operation, isAdmin) : null;
         var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots, [entry.Id], cancellationToken)

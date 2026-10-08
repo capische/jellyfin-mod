@@ -47,7 +47,18 @@ public sealed record ParsedRelease(
     [property: JsonPropertyName("group"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Group,
     [property: JsonPropertyName("proper")] bool Proper,
     [property: JsonPropertyName("repack")] bool Repack,
-    [property: JsonPropertyName("quality"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Quality);
+    [property: JsonPropertyName("quality"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Quality,
+    [property: JsonPropertyName("seasonLast"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeasonLast = null,
+    [property: JsonPropertyName("seriesPack")] bool SeriesPack = false)
+{
+    /// <summary>
+    /// The seasons a pack names: a single season, a range <c>first..last</c>, or empty for a complete-series pack that names
+    /// none (season and series packs, 2026-10-08).
+    /// </summary>
+    public IReadOnlyList<int> PackSeasons() => !SeasonPack || SeasonNumber is not { } first
+        ? []
+        : Enumerable.Range(first, Math.Max(1, (SeasonLast ?? first) - first + 1)).ToArray();
+}
 
 /// <summary>
 /// An independently written release-title parser for movie and single-episode forms (P4.A4).
@@ -80,6 +91,8 @@ public static partial class ReleaseParser
         var absolute = false;
         var daily = false;
         var markerIndex = -1;
+        int? seasonLast = null;
+        var seriesPack = false;
 
         var episodeMatch = EpisodePattern().Match(title);
         if (episodeMatch.Success)
@@ -121,6 +134,16 @@ public static partial class ReleaseParser
 
             markerIndex = cross.Index;
         }
+        else if (SeasonRangePattern().Match(title) is { Success: true } range &&
+                 Int(range.Groups["last"].Value) is var lastSeason && lastSeason > Int(range.Groups["first"].Value))
+        {
+            // S01-S03, S01-03, Seasons 1-3: a multi-season pack keeps both ends (season and series packs, 2026-10-08).
+            season = Int(range.Groups["first"].Value);
+            seasonLast = lastSeason;
+            seasonPack = true;
+            seriesPack = true;
+            markerIndex = range.Index;
+        }
         else if (SeasonPattern().Match(title) is { Success: true } seasonOnly)
         {
             season = Int(seasonOnly.Groups["season"].Value);
@@ -138,7 +161,18 @@ public static partial class ReleaseParser
             markerIndex = absoluteMatch.Index;
         }
 
-        if (CompletePattern().IsMatch(title) && episodes.Count == 0) seasonPack = true;
+        // "Complete", "Complete Series" or "Complete Seasons" before any other marker ends the title; with no season named
+        // it is a complete-series pack. "S02 Complete" stays a pack of season 2 (season and series packs, 2026-10-08).
+        if (episodes.Count == 0 && !daily && CompleteMarker(title) is { } complete && (markerIndex < 0 || complete < markerIndex))
+        {
+            markerIndex = complete;
+            seasonPack = true;
+            if (season is null)
+            {
+                seriesPack = true;
+                absolute = false;
+            }
+        }
 
         var qualityIndex = FirstQualityIndex(title);
         int? year = null;
@@ -167,7 +201,26 @@ public static partial class ReleaseParser
         return new ParsedRelease(
             name.Length == 0 ? null : name, year, season, episodes, seasonPack, absolute, daily, resolution, source,
             Codec(tail), Audio(tail), Hdr(tail), group, ProperPattern().IsMatch(tail), RepackPattern().IsMatch(tail),
-            QualityCatalog.Identify(source, resolution));
+            QualityCatalog.Identify(source, resolution), seasonLast, seriesPack);
+    }
+
+    /// <summary>
+    /// The index of a "Complete" marker: <c>Complete Series</c>, <c>Complete Season(s)</c>, or a bare <c>Complete</c> followed
+    /// only by a year, a quality word, a bracket or the end, so a title such as "The Complete Works" is not read as a pack.
+    /// </summary>
+    private static int? CompleteMarker(string title)
+    {
+        foreach (Match match in CompletePattern().Matches(title))
+        {
+            if (match.Index == 0) continue;
+            if (match.Groups["kind"].Success) return match.Index;
+            var rest = title[(match.Index + match.Length)..].TrimStart(' ', '.', '_', '-');
+            if (rest.Length == 0 || rest[0] is '[' or '(' || YearPattern().Match(rest) is { Success: true, Index: 0 } ||
+                FirstQualityIndex(rest) == 0)
+                return match.Index;
+        }
+
+        return null;
     }
 
     /// <summary>Normalizes a title for identity comparison: case, accents, punctuation and a leading article.</summary>
@@ -283,8 +336,10 @@ public static partial class ReleaseParser
     private static partial Regex CrossPattern();
     [GeneratedRegex(B + @"(?:S(?<season>\d{1,3})|Season[ ._-]?(?<season>\d{1,3}))" + E, RegexOptions.IgnoreCase)]
     private static partial Regex SeasonPattern();
-    [GeneratedRegex(B + @"(?:complete[ ._-](?:series|season)s?|seasons?[ ._-]\d{1,2}[ ._-]?-[ ._-]?\d{1,2})" + E, RegexOptions.IgnoreCase)]
+    [GeneratedRegex(B + @"complete(?:[ ._-](?<kind>series|seasons?|collection))?" + E, RegexOptions.IgnoreCase)]
     private static partial Regex CompletePattern();
+    [GeneratedRegex(B + @"(?:S(?<first>\d{1,3})[ ._]?-[ ._]?S?(?<last>\d{1,3})|Seasons?[ ._-]?(?<first>\d{1,3})[ ._]?-[ ._]?(?<last>\d{1,3}))" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex SeasonRangePattern();
     [GeneratedRegex(B + @"(?:19|20)\d{2}[ ._-](?:0[1-9]|1[0-2])[ ._-](?:0[1-9]|[12]\d|3[01])" + E)]
     private static partial Regex DailyPattern();
     [GeneratedRegex(@"(?:[ ._]-[ ._]|[ ._]E[Pp]?)(?!(?:19|20)\d{2}(?!\d))(?<number>\d{2,4})(?:v\d)?(?=[ ._\[(]|$)")]

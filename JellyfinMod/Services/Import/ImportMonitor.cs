@@ -37,6 +37,9 @@ public sealed class ImportMonitor(
         // Upgrades follow their imports on the same cadence (P6.M5); a host without automation has none.
         if (scope.ServiceProvider.GetService<Automation.UpgradeService>() is { } upgrades)
             await upgrades.AdvanceAllAsync(cancellationToken).ConfigureAwait(false);
+        // Replace grabs remove what a pack's new files replace, once each is in the library (season and series packs).
+        if (scope.ServiceProvider.GetService<PackReplaceService>() is { } replacements)
+            await replacements.AdvanceAllAsync(cancellationToken).ConfigureAwait(false);
         var tick = Interlocked.Increment(ref _ticks);
         if (result.OpenImports + result.OpenSeedReleases > 0)
             logger.LogDebug("Import tick {Tick}: {Imports} imports, {Seeds} seed releases, {Reads} client reads, reachable {Reachable}",

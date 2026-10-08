@@ -14,7 +14,37 @@ public sealed record ReleaseTargetDto(
     [property: JsonPropertyName("title")] string Title,
     [property: JsonPropertyName("year"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? Year,
     [property: JsonPropertyName("seasonNumber"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeasonNumber,
-    [property: JsonPropertyName("episodeNumber"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? EpisodeNumber);
+    [property: JsonPropertyName("episodeNumber"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? EpisodeNumber,
+    [property: JsonPropertyName("scope")] string Scope = ReleaseScopes.Episode,
+    [property: JsonPropertyName("covered")] IReadOnlyList<CoveredEpisodeDto>? Covered = null);
+
+/// <summary>One episode a season or series search covers, and whether it already holds a file.</summary>
+public sealed record CoveredEpisodeDto(
+    [property: JsonPropertyName("episodeId")] Guid EpisodeId,
+    [property: JsonPropertyName("seasonNumber")] int SeasonNumber,
+    [property: JsonPropertyName("episodeNumber")] int EpisodeNumber,
+    [property: JsonPropertyName("held")] bool Held);
+
+/// <summary>
+/// What a pack row covers, for the picker (season and series packs, 2026-10-08): its seasons (empty for a complete pack that
+/// names none), whether it is complete, and how many of the searched episodes it covers are missing or already held.
+/// </summary>
+public sealed record PackCoverageDto(
+    [property: JsonPropertyName("seasons")] IReadOnlyList<int> Seasons,
+    [property: JsonPropertyName("complete")] bool Complete,
+    [property: JsonPropertyName("missing")] int Missing,
+    [property: JsonPropertyName("held")] int Held)
+{
+    /// <summary>The coverage of one parsed row against a pack target, or null for a row that is no pack.</summary>
+    public static PackCoverageDto? For(ReleaseTarget target, ParsedRelease parsed)
+    {
+        if (!ReleaseScopes.IsPack(target.Scope) || !parsed.SeasonPack) return null;
+        var seasons = parsed.PackSeasons();
+        var complete = parsed.SeriesPack && seasons.Count == 0;
+        var covered = target.Covered.Where(episode => complete || seasons.Contains(episode.SeasonNumber)).ToArray();
+        return new PackCoverageDto(seasons, complete, covered.Count(episode => !episode.Held), covered.Count(episode => episode.Held));
+    }
+}
 
 /// <summary>The profile a search was evaluated under.</summary>
 public sealed record ReleaseProfileDto(
@@ -24,11 +54,21 @@ public sealed record ReleaseProfileDto(
     [property: JsonPropertyName("inherited")] bool Inherited);
 
 /// <summary>Whether a grab can start from this search, and why not.</summary>
+/// <param name="Available">Whether a grab can start now.</param>
+/// <param name="Reason">Why not, or null.</param>
+/// <param name="HoldSeconds">How long a grab is held before it is sent.</param>
+/// <param name="ActiveOperationId">The grab that holds the target, or null.</param>
+/// <param name="Modes">
+/// The grab modes this search's rows may offer (user, 2026-10-09): <c>fill</c> for a title or episode without a file,
+/// <c>add</c> for another version beside what is held, and <c>replace</c> only while episode upgrades are on. A web client
+/// that finds no list offers what it did before.
+/// </param>
 public sealed record GrabAvailabilityDto(
     [property: JsonPropertyName("available")] bool Available,
     [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Reason,
     [property: JsonPropertyName("holdSeconds")] int HoldSeconds,
-    [property: JsonPropertyName("activeOperationId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? ActiveOperationId);
+    [property: JsonPropertyName("activeOperationId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? ActiveOperationId,
+    [property: JsonPropertyName("modes")] IReadOnlyList<string> Modes);
 
 /// <summary>One per-indexer search outcome.</summary>
 public sealed record IndexerOutcomeDto(
@@ -68,7 +108,8 @@ public sealed record ReleaseCandidateDto(
     [property: JsonPropertyName("rejections")] IReadOnlyList<ReleaseRejection> Rejections,
     [property: JsonPropertyName("seedRatio"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? SeedRatio,
     [property: JsonPropertyName("seedMinutes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeedMinutes,
-    [property: JsonPropertyName("heldQuality")] bool HeldQuality = false);
+    [property: JsonPropertyName("heldQuality")] bool HeldQuality = false,
+    [property: JsonPropertyName("coverage"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] PackCoverageDto? Coverage = null);
 
 /// <summary>The response of <c>GET /JellyfinMod/Releases</c>.</summary>
 public sealed record ReleaseSearchDto(
@@ -94,7 +135,9 @@ public sealed record ReleaseSearchDto(
         var target = snapshot.Target;
         return new ReleaseSearchDto(snapshot.SearchId, Utc(snapshot.CreatedAt), Utc(snapshot.ExpiresAt),
             new ReleaseTargetDto(target.EntryId, target.EpisodeId, target.MediaType, target.Title, target.Year, target.SeasonNumber,
-                target.EpisodeNumber),
+                target.EpisodeNumber, target.Scope,
+                target.Covered.Select(episode => new CoveredEpisodeDto(episode.Id, episode.SeasonNumber, episode.EpisodeNumber,
+                    episode.Held)).ToArray()),
             new ReleaseProfileDto(snapshot.Profile.Id, snapshot.Profile.Name, snapshot.Profile.Revision, snapshot.ProfileInherited),
             grab,
             snapshot.Candidates.Select(candidate => new ReleaseCandidateDto(candidate.ReleaseId, candidate.IndexerId,
@@ -105,7 +148,8 @@ public sealed record ReleaseSearchDto(
                 candidate.InfoHash is { } hash ? byHash[hash].Where(id => id != candidate.ReleaseId).ToArray() : [],
                 candidate.Evaluation.Score, candidate.Evaluation.Contributions, candidate.Evaluation.Eligible,
                 candidate.Evaluation.Rejections, candidate.SeedRatio, candidate.SeedMinutes,
-                candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality))).ToArray(),
+                candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality),
+                PackCoverageDto.For(target, candidate.Parsed))).ToArray(),
             snapshot.Candidates.Count(candidate => candidate.Evaluation.Eligible),
             snapshot.Candidates.Count(candidate => !candidate.Evaluation.Eligible),
             snapshot.Indexers.Select(outcome => new IndexerOutcomeDto(outcome.IndexerId, outcome.Name, outcome.Status,
@@ -132,6 +176,14 @@ public sealed class GrabReleaseRequest
     /// <summary>Gets or sets the client-generated idempotency key.</summary>
     [Required, MinLength(8), MaxLength(128), RegularExpression("^[A-Za-z0-9._:-]+$"), JsonPropertyName("idempotencyKey")]
     public string IdempotencyKey { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets how held episodes are written: <c>fill</c>, <c>add</c> or <c>replace</c> (season and series packs,
+    /// 2026-10-08). Optional: a pack fills where nothing is held and adds where something is; an episode's another-version
+    /// grab adds unless <c>replace</c> is asked.
+    /// </summary>
+    [MaxLength(16), JsonPropertyName("mode")]
+    public string? Mode { get; set; }
 }
 
 /// <summary>The canonical grab operation.</summary>
@@ -158,7 +210,10 @@ public sealed record GrabOperationDto(
     [property: JsonPropertyName("cancelledAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? CancelledAt,
     [property: JsonPropertyName("failureCode"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? FailureCode,
     [property: JsonPropertyName("message")] string Message,
-    [property: JsonPropertyName("openUrl"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? OpenUrl)
+    [property: JsonPropertyName("openUrl"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? OpenUrl,
+    [property: JsonPropertyName("scope")] string Scope = "episode",
+    [property: JsonPropertyName("seasonNumber"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeasonNumber = null,
+    [property: JsonPropertyName("mode")] string Mode = GrabModes.Fill)
 {
     /// <summary>Builds the public view of an operation.</summary>
     public static GrabOperationDto From(GrabOperation operation, string? openUrl)
@@ -171,7 +226,7 @@ public sealed record GrabOperationDto(
             parsed?.Quality, operation.Size, operation.InfoHash, operation.Score, operation.SeedRatio, operation.SeedMinutes,
             Utc(operation.HoldUntil), Utc(operation.CreatedAt), Utc(operation.UpdatedAt), UtcOrNull(operation.SubmittedAt),
             UtcOrNull(operation.AcceptedAt), UtcOrNull(operation.CancelledAt), operation.FailureCode, Describe(operation),
-            operation.State == GrabStates.Accepted ? openUrl : null);
+            operation.State == GrabStates.Accepted ? openUrl : null, operation.Scope, operation.SeasonNumber, operation.Mode);
     }
 
     private static string Describe(GrabOperation operation) => operation.State switch

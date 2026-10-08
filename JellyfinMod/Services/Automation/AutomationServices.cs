@@ -11,6 +11,7 @@ public static class AutomationServices
         services.AddSingleton<AutomationRunGate>();
         services.AddTransient<AutomationRunner>();
         services.AddTransient<UpgradeService>();
+        services.AddTransient<Import.PackReplaceService>();
         services.AddTransient<SeriesMetadataRefresher>();
         services.AddTransient<AutomationStatusService>();
     }

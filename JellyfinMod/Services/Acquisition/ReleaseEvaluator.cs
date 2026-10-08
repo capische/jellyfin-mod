@@ -2,7 +2,10 @@ using System.Text.Json.Serialization;
 
 namespace JellyfinMod.Services.Acquisition;
 
-/// <summary>What a search is for: one library-scoped movie entry or one stable episode.</summary>
+/// <summary>
+/// What a search is for: one library-scoped movie entry, one stable episode, or the episodes of a season or series pack.
+/// A pack target carries its season (season scope only), no episode, and the summed runtime of the episodes it covers.
+/// </summary>
 public sealed record ReleaseTarget(
     Guid EntryId,
     Guid? EpisodeId,
@@ -15,7 +18,17 @@ public sealed record ReleaseTarget(
     int? RuntimeMinutes,
     string? ImdbId,
     int TmdbId,
-    int? TvdbId);
+    int? TvdbId)
+{
+    /// <summary>Gets the scope: <c>title</c>, <c>episode</c>, <c>season</c> or <c>series</c> (see <see cref="ReleaseScopes"/>).</summary>
+    public string Scope { get; init; } = ReleaseScopes.Episode;
+
+    /// <summary>Gets the episodes a pack scope covers; empty for a title or an episode.</summary>
+    public IReadOnlyList<CoveredEpisode> Covered { get; init; } = [];
+
+    /// <summary>Gets the seasons the covered episodes belong to, in order.</summary>
+    public IReadOnlyList<int> CoveredSeasons() => Covered.Select(episode => episode.SeasonNumber).Distinct().Order().ToArray();
+}
 
 /// <summary>A profile as evaluated: ordered qualities and optional size-per-hour limits.</summary>
 public sealed record EvaluationProfile(
@@ -148,6 +161,10 @@ public static class ReleaseEvaluator
         {
             if (episodic) rejections.Add(new("media_type_mismatch", "The release is a TV episode or season."));
         }
+        else if (ReleaseScopes.IsPack(target.Scope))
+        {
+            PackRejections(target, facts, rejections);
+        }
         else
         {
             if (target.SeasonNumber == 0)
@@ -227,6 +244,55 @@ public static class ReleaseEvaluator
 
         return titleOnly ? "title" : "verified";
     }
+
+    /// <summary>
+    /// A season search takes only a pack of exactly that season; an All Seasons search takes a complete pack or a range covering
+    /// every season with covered episodes (season and series packs, 2026-10-08). An indexer's episode attribute on a pack row
+    /// is ignored; its season attribute must name the searched season.
+    /// </summary>
+    private static void PackRejections(ReleaseTarget target, ReleaseFacts facts, List<ReleaseRejection> rejections)
+    {
+        var parsed = facts.Parsed;
+        if (!parsed.SeasonPack)
+        {
+            rejections.Add(parsed.EpisodeNumbers.Count > 0 || parsed.DailyNumbering || parsed.AbsoluteNumbering
+                ? new("not_a_pack", "The release is one or a few episodes, not a pack.")
+                : new("ambiguous_numbering", "No season could be read from the release title."));
+            return;
+        }
+
+        var seasons = parsed.PackSeasons();
+        var complete = parsed.SeriesPack && seasons.Count == 0;
+        if (target.Scope == ReleaseScopes.Season)
+        {
+            var season = target.SeasonNumber!.Value;
+            if (parsed.SeriesPack && (complete || seasons.Contains(season)))
+                rejections.Add(new("pack_range", "The release covers several seasons; search All Seasons for it."));
+            else if (parsed.SeriesPack || parsed.SeasonNumber != season)
+                rejections.Add(new("season_mismatch", $"The release is a pack of {Seasons(seasons)}, not season {season}."));
+            if (facts.SeasonAttribute is { } attribute && attribute != season)
+                rejections.Add(new("season_mismatch", "The indexer reports a different season."));
+            return;
+        }
+
+        if (!parsed.SeriesPack)
+        {
+            rejections.Add(new("not_complete", $"The release is a pack of {Seasons(seasons)} only, not every season."));
+            return;
+        }
+
+        var missing = complete ? [] : target.CoveredSeasons().Except(seasons).ToArray();
+        if (missing.Length > 0)
+            rejections.Add(new("pack_incomplete", $"The release covers {Seasons(seasons)}, not {Seasons(missing)}."));
+    }
+
+    private static string Seasons(IReadOnlyList<int> seasons) => seasons.Count switch
+    {
+        0 => "no season",
+        1 => $"season {seasons[0]}",
+        _ when seasons.Zip(seasons.Skip(1)).All(pair => pair.Second == pair.First + 1) => $"seasons {seasons[0]}–{seasons[^1]}",
+        _ => "seasons " + string.Join(", ", seasons)
+    };
 
     private static bool TitleMatches(ReleaseTarget target, string? parsedTitle)
     {

@@ -56,6 +56,14 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
             .GroupBy(operation => operation.DestinationPath!, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.OrderByDescending(operation => operation.CompletedAt).First().VersionLabel!,
                 StringComparer.Ordinal);
+        // The completed imports' files by their content fingerprint when linked: a label says what a file is only while the file
+        // at that path still holds the bytes the import linked, not after a replacement or a rewrite in place (Codex review of
+        // the user fixes, finding 3 and re-review 5).
+        var imported = (await database.ImportOperations.AsNoTracking()
+                .Where(operation => operation.EntryId == entryId && operation.State == ImportStates.Completed &&
+                    operation.DestinationPath != null && operation.DestinationFingerprint != null && operation.VersionLabel != null)
+                .Select(operation => new { operation.DestinationPath, operation.DestinationFingerprint, operation.VersionLabel })
+                .ToListAsync(cancellationToken).ConfigureAwait(false));
         var seeds = await database.SeedReleaseOperations.AsNoTracking()
             .Where(seed => seed.EntryId == entryId && SeedReleaseStates.Open.Contains(seed.State))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
@@ -65,6 +73,7 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
         var result = new List<VersionDto>();
         foreach (var binding in bindings.OrderBy(binding => binding.IsDefault ? 0 : 1).ThenBy(binding => binding.Path, StringComparer.Ordinal))
         {
+            var label = binding.Path is null ? null : labels.GetValueOrDefault(binding.Path);
             var (quality, resolution) = VersionQuality.Parse(binding.Path);
             IReadOnlyList<MediaStream> streams = [];
             try
@@ -80,6 +89,13 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
             var audio = streams.Where(stream => stream.Type == MediaStreamType.Audio).OrderByDescending(stream => stream.IsDefault).FirstOrDefault();
             UnixFileSnapshot file = default;
             var inspected = binding.Path is not null && files.TryInspect(binding.Path, out file);
+            // A version that must not become Jellyfin's main one carries no resolution in its file name; the label of the
+            // completed import that linked this very file still names it (user, 2026-10-09). Anything else, a file replaced
+            // at that path or an import not finished, is read from the media itself below.
+            if (resolution is null && inspected && imported.FirstOrDefault(import =>
+                    (import.DestinationPath == binding.Path || import.DestinationPath == file.CanonicalPath) &&
+                    import.DestinationFingerprint == file.FileFingerprint) is { } linked)
+                (quality, resolution) = VersionQuality.ParseLabel(linked.VersionLabel);
             var seeding = inspected && seeds.Any(seed => seed.SeedingPhysicalIdentity == file.PhysicalIdentity && seed.GoalMetAt is null);
             var kept = keeps.Any(keep => keep.MediaPath == binding.Path ||
                 inspected && (keep.MediaPath == file.CanonicalPath || keep.PhysicalIdentity == file.PhysicalIdentity));
@@ -101,7 +117,7 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
             // 404 for it through LibraryAccess.CanSeeVersion.
             if (viewer is not null && (!read || !LibraryAccess.CanSeeVersion(viewer, native))) continue;
             result.Add(new VersionDto(binding.OwnerId, binding.ItemId.ToString("N", CultureInfo.InvariantCulture), binding.BindingId,
-                (binding.Path is null ? null : labels.GetValueOrDefault(binding.Path)) ?? Label(binding.Path),
+                label ?? Label(binding.Path),
                 quality, resolution ?? ResolutionOf(video),
                 video?.Width, video?.Height, video?.Codec, video?.VideoRange.ToString(), video?.BitDepth, audio?.Codec, audio?.Channels,
                 inspected ? (long)file.LogicalBytes : null, binding.IsDefault, retention)

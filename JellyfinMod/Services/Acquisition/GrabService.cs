@@ -75,8 +75,12 @@ public sealed class GrabLocks
 /// <param name="IdempotencyKey">The caller's idempotency key.</param>
 /// <param name="Automatic">Whether automation makes the grab (P6.M3).</param>
 /// <param name="UpgradeOperationId">The upgrade the grab belongs to (P6.M5).</param>
+/// <param name="Mode">
+/// <c>fill</c>, <c>add</c> or <c>replace</c> (season and series packs, 2026-10-08); null takes the default: fill where nothing is
+/// held, add where something is.
+/// </param>
 public sealed record GrabRequest(Guid SearchId, string ReleaseId, string IdempotencyKey, bool Automatic = false,
-    Guid? UpgradeOperationId = null);
+    Guid? UpgradeOperationId = null, string? Mode = null);
 
 /// <summary>
 /// The client-agnostic acquisition engine (P4.A5): persist intent, hold, submit once through the configured
@@ -131,6 +135,14 @@ public sealed class GrabService(
             throw new GrabException(409, "held_quality", "This quality is already in the library.");
 
         var target = snapshot.Target;
+        if (request.Mode is not (null or GrabModes.Fill or GrabModes.Add or GrabModes.Replace))
+            throw new GrabException(400, "invalid_mode", "The mode must be fill, add or replace.");
+        var pack = ReleaseScopes.IsPack(target.Scope);
+        if (!pack && request.Mode is { } asked && asked != (addVersion ? GrabModes.Add : GrabModes.Fill) &&
+            !(addVersion && asked == GrabModes.Replace && target.EpisodeId is not null))
+            throw new GrabException(400, "invalid_mode", addVersion
+                ? "Another version of an episode is added or replaces what is held; a movie's is added."
+                : "This grab fills a title without a file.");
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == target.EntryId, cancellationToken)
             .ConfigureAwait(false);
         var episode = target.EpisodeId is { } episodeId
@@ -142,6 +154,23 @@ public sealed class GrabService(
             throw new GrabException(404, "target_not_found", "The title is not available.");
 
         var state = await configuration.GetStateAsync(database, cancellationToken).ConfigureAwait(false);
+        // Adding another version by hand never needs episode upgrades; replacing what is held does (user, 2026-10-09).
+        if (request.Mode == GrabModes.Replace && !state.Settings.EpisodeUpgradesEnabled)
+            throw new GrabException(409, ReplaceDisabled, ReplaceDisabledMessage);
+        // A pack claims the episodes it will write: the missing ones to fill, every covered one to add or replace.
+        var mode = pack ? GrabModes.Fill : addVersion ? request.Mode ?? GrabModes.Add : GrabModes.Fill;
+        List<(Episode Episode, bool Held)> claimed = [];
+        if (pack)
+            (mode, claimed) = await PackClaimsAsync(entry, target, candidate, request.Mode, canAccess,
+                request.Automatic, cancellationToken).ConfigureAwait(false);
+        else if (episode is not null)
+        {
+            // Another version of an episode needs the file it was searched for; refused before the torrent is fetched, and
+            // again under the library lease right before the claim is saved (RefreshClaimsAsync).
+            if (addVersion && episode.State != FileState.OnDisk)
+                throw new GrabException(409, "search_stale", "The episode no longer has the file this version was searched for. Search again.");
+            claimed.Add((episode, episode.State == FileState.OnDisk));
+        }
         if (!state.Settings.Enabled) throw new GrabException(409, "acquisition_disabled", "Grabbing is turned off in the plugin settings.");
         if (!state.Ready)
             throw new GrabException(409, "acquisition_not_ready", "Acquisition is not ready: " + string.Join(", ", state.Blockers) + ".");
@@ -150,6 +179,10 @@ public sealed class GrabService(
         if (entry.TargetLibraryId is not { } libraryId || !destinations.Supports(client.LocalDirectory, libraryId))
             throw new GrabException(409, "destination_not_same_filesystem",
                 "The download folder does not share a filesystem with this title's library.");
+
+        var claimKeys = claimed.Select(item => ClaimKey(item.Episode.Id, ClaimsVersion(pack, addVersion, item.Held, mode))).ToArray();
+        if (await ClaimConflictAsync(claimKeys, cancellationToken).ConfigureAwait(false) is { } claimedElsewhere)
+            throw claimedElsewhere;
 
         TorrentLocator locator;
         using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
@@ -186,8 +219,12 @@ public sealed class GrabService(
         {
             RequestedBy = userId, IdempotencyKey = request.IdempotencyKey, RequestFingerprint = fingerprint,
             EntryId = entry.Id, EpisodeId = episode?.Id,
-            // An added version relaxes the one-active-grab rule for its own snapshot only: it owns a separate key.
-            ActiveTarget = TargetKey(entry.Id, episode?.Id) + (addVersion ? "+add" : string.Empty),
+            // An added version relaxes the one-active-grab rule for its own snapshot only: it owns a separate key. A pack owns
+            // one key per scope, so one pack per season (or per series) is active at a time.
+            ActiveTarget = pack
+                ? PackKey(entry.Id, target.Scope == ReleaseScopes.Season ? target.SeasonNumber : null)
+                : TargetKey(entry.Id, episode?.Id) + (addVersion ? "+add" : string.Empty),
+            Scope = target.Scope, SeasonNumber = pack ? target.SeasonNumber : null, Mode = mode,
             Intent = snapshot.Intent, Automatic = request.Automatic, UpgradeOperationId = request.UpgradeOperationId,
             ActiveHash = HashKey(client.Id, locator.InfoHash), SearchId = snapshot.SearchId, ReleaseId = candidate.ReleaseId,
             IndexerId = candidate.IndexerId, IndexerName = candidate.IndexerName, SourceGuid = candidate.SourceGuid,
@@ -216,7 +253,19 @@ public sealed class GrabService(
                     throw new GrabException(404, "target_not_found", "The title is not available.");
                 if (admit is not null && await admit(cancellationToken).ConfigureAwait(false) is { } refusal)
                     throw new GrabException(409, refusal, "The grab was not admitted: " + refusal + ".");
+                // Whether each claimed episode holds a file is read again here, under the library lease and the admission
+                // gate, right before the claims are saved: a file removed (or imported) while the torrent was fetched changes
+                // the episode's key and the import's intent, so a missing episode is claimed under its own key and no other
+                // grab can acquire it at the same time (Codex re-review of the pack plugin, finding 3).
+                claimed = await RefreshClaimsAsync(claimed, pack, addVersion, mode, cancellationToken).ConfigureAwait(false);
+                claimKeys = claimed.Select(item => ClaimKey(item.Episode.Id, ClaimsVersion(pack, addVersion, item.Held, mode))).ToArray();
                 database.GrabOperations.Add(operation);
+                foreach (var (claimedEpisode, held) in claimed)
+                    database.GrabClaims.Add(new GrabClaim
+                    {
+                        GrabId = operation.Id, EpisodeId = claimedEpisode.Id, Held = held, CreatedAt = now,
+                        ActiveKey = ClaimKey(claimedEpisode.Id, ClaimsVersion(pack, addVersion, held, mode))
+                    });
                 try
                 {
                     await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -233,6 +282,8 @@ public sealed class GrabService(
                         .FirstOrDefaultAsync(value => value.ActiveTarget == operation.ActiveTarget, cancellationToken).ConfigureAwait(false);
                     if (owner is not null)
                         throw new GrabException(409, "grab_active", "Another grab for this title is still active.", owner.Id);
+                    if (await ClaimConflictAsync(claimKeys, cancellationToken).ConfigureAwait(false) is { } conflict)
+                        throw conflict;
                     owner = await database.GrabOperations.AsNoTracking()
                         .FirstOrDefaultAsync(value => value.ActiveHash == operation.ActiveHash, cancellationToken).ConfigureAwait(false);
                     throw new GrabException(409, "duplicate_hash", "This torrent is already owned by another grab.", owner?.Id);
@@ -250,6 +301,85 @@ public sealed class GrabService(
     }
 
     /// <summary>
+    /// The claims as they stand when they are saved: each episode's file state read again. A pack keeps its episodes and takes
+    /// each one's key from what it holds now; a fill pack none of whose episodes is still without a file is refused. Another
+    /// version of one episode needs the file it was searched for: an episode without it is refused whatever an earlier read saw,
+    /// so the grab cannot add a version beside nothing while another grab acquires the episode.
+    /// </summary>
+    private async Task<List<(Episode Episode, bool Held)>> RefreshClaimsAsync(List<(Episode Episode, bool Held)> claimed, bool pack,
+        bool addVersion, string mode, CancellationToken cancellationToken)
+    {
+        if (claimed.Count == 0) return claimed;
+        var claimedIds = claimed.Select(item => item.Episode.Id).ToArray();
+        var states = await database.Episodes.AsNoTracking().Where(value => claimedIds.Contains(value.Id))
+            .ToDictionaryAsync(value => value.Id, value => value.State, cancellationToken).ConfigureAwait(false);
+        var refreshed = claimed.Where(item => states.ContainsKey(item.Episode.Id))
+            .Select(item => (Episode: item.Episode, Held: states[item.Episode.Id] == FileState.OnDisk)).ToList();
+        if (refreshed.Count != claimed.Count) throw new GrabException(404, "target_not_found", "The title is not available.");
+        if (pack && mode == GrabModes.Fill && refreshed.All(item => item.Held))
+            throw new GrabException(409, "nothing_to_fill", "Every episode this pack covers already has a file.");
+        // Whatever an earlier read saw (Codex pack re-review 2, P2 2): a cached search can predate the file's removal, so the
+        // grab's first read already sees the episode missing, and a "+add" claim beside nothing would let another grab acquire it.
+        if (!pack && addVersion && refreshed.Any(item => !item.Held))
+            throw new GrabException(409, "search_stale", "The episode no longer has the file this version was searched for. Search again.");
+        return refreshed;
+    }
+
+    /// <summary>
+    /// The mode and the claims of a pack grab, read again from the current episodes: <c>fill</c> claims the covered episodes
+    /// without a file, <c>add</c> and <c>replace</c> every covered episode. The default is fill where nothing is held, add where
+    /// something is. Adding beside a held episode's file never needs episode upgrades; replacing it does, and is refused before
+    /// this is reached (user, 2026-10-09).
+    /// </summary>
+    private async Task<(string Mode, List<(Episode Episode, bool Held)> Claims)> PackClaimsAsync(Entry entry, ReleaseTarget target,
+        ReleaseCandidate candidate, string? requested, Func<Entry, Episode?, bool> canAccess,
+        bool automatic, CancellationToken cancellationToken)
+    {
+        var seasons = candidate.Parsed.PackSeasons();
+        var complete = candidate.Parsed.SeriesPack && seasons.Count == 0;
+        var ids = target.Covered.Where(covered => complete || seasons.Contains(covered.SeasonNumber)).Select(covered => covered.Id)
+            .ToArray();
+        var episodes = await database.Episodes.AsNoTracking().Where(value => value.EntryId == entry.Id && ids.Contains(value.Id))
+            .OrderBy(value => value.SeasonNumber).ThenBy(value => value.EpisodeNumber).ToListAsync(cancellationToken).ConfigureAwait(false);
+        // Automation fills only what it wants (monitored, without a file); never adds or replaces.
+        if (automatic)
+        {
+            if (requested is not (null or GrabModes.Fill))
+                throw new GrabException(400, "invalid_mode", "Automation only fills episodes without a file.");
+            episodes = episodes.Where(value => value.State != FileState.OnDisk && canAccess(entry, value)).ToList();
+        }
+        else if (episodes.Any(value => !canAccess(entry, value)))
+        {
+            throw new GrabException(404, "target_not_found", "The title is not available.");
+        }
+
+        var anyHeld = episodes.Any(value => value.State == FileState.OnDisk);
+        var mode = requested ?? (anyHeld ? GrabModes.Add : GrabModes.Fill);
+        var claims = episodes.Where(value => mode != GrabModes.Fill || value.State != FileState.OnDisk)
+            .Select(value => (value, value.State == FileState.OnDisk)).ToList();
+        if (claims.Count == 0)
+            throw new GrabException(409, "nothing_to_fill", "Every episode this pack covers already has a file.");
+        return (mode, claims);
+    }
+
+    /// <summary>
+    /// The <c>grab_active</c> refusal naming the episodes another grab already claims under the same keys, or null when none
+    /// is claimed.
+    /// </summary>
+    private async Task<GrabException?> ClaimConflictAsync(IReadOnlyCollection<string> keys, CancellationToken cancellationToken)
+    {
+        if (keys.Count == 0) return null;
+        var taken = await database.GrabClaims.AsNoTracking().Where(claim => claim.ActiveKey != null && keys.Contains(claim.ActiveKey))
+            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, episode => episode.Id,
+                (claim, episode) => new { claim.GrabId, episode.SeasonNumber, episode.EpisodeNumber })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (taken.Count == 0) return null;
+        var names = string.Join(", ", taken.OrderBy(item => item.SeasonNumber).ThenBy(item => item.EpisodeNumber)
+            .Select(item => $"S{item.SeasonNumber:00}E{item.EpisodeNumber:00}"));
+        return new GrabException(409, "grab_active", "Another grab is still active for " + names + ".", taken[0].GrabId);
+    }
+
+    /// <summary>
     /// Why automation would no longer make this automatic grab, or null while it still would: automation on, the target
     /// monitored and still without a file (or still holding the one an upgrade replaces), and the switch for its kind of grab
     /// still on: episode upgrades for an episode upgrade or extra version, reacquisition for a reclaimed title (final review 2,
@@ -260,6 +390,17 @@ public sealed class GrabService(
     {
         if (!settings.AutomationEnabled) return "automation_disabled";
         if (!entry.Monitored) return "no_longer_wanted";
+        if (ReleaseScopes.IsPack(operation.Scope))
+        {
+            // A pack is still wanted while one of the episodes it claimed is monitored and still without a file.
+            var claimedIds = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == operation.Id)
+                .Select(claim => claim.EpisodeId).ToListAsync(cancellationToken).ConfigureAwait(false);
+            var wanted = await database.Episodes.AsNoTracking().Where(value => claimedIds.Contains(value.Id))
+                .Select(value => new { value.Monitored, value.State }).ToListAsync(cancellationToken).ConfigureAwait(false);
+            if (!wanted.Any(value => value.Monitored && value.State != FileState.OnDisk)) return "no_longer_wanted";
+            return wanted.Where(value => value.Monitored && value.State != FileState.OnDisk).All(value => value.State == FileState.Reclaimed) &&
+                !settings.ReacquireReclaimed ? "reacquire_disabled" : null;
+        }
         var episode = operation.EpisodeId is { } episodeId
             ? await database.Episodes.AsNoTracking().SingleOrDefaultAsync(value => value.Id == episodeId, cancellationToken).ConfigureAwait(false)
             : null;
@@ -536,9 +677,20 @@ public sealed class GrabService(
         operation.State = GrabStates.Accepted;
         operation.FailureCode = null;
         operation.AcceptedAt = operation.UpdatedAt = Now;
-        AddHistory(operation, operation.Automatic ? "auto_grabbed" : "grabbed",
-            (operation.Automatic ? "Automatically grabbed " : "Grabbed ") + Describe(operation) + " from " + operation.IndexerName +
-            (operation.Size is > 0 ? " · " + FormatSize(operation.Size.Value) : string.Empty));
+        var grabbedSummary = (operation.Automatic ? "Automatically grabbed " : "Grabbed ") + Describe(operation) + " from " +
+            operation.IndexerName + (operation.Size is > 0 ? " · " + FormatSize(operation.Size.Value) : string.Empty);
+        if (ReleaseScopes.IsPack(operation.Scope))
+        {
+            // One event per claimed episode, so each episode's (and later each file's) history starts with the pack.
+            var claimedIds = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == operation.Id)
+                .Select(claim => claim.EpisodeId).ToListAsync(CancellationToken.None).ConfigureAwait(false);
+            foreach (var claimedId in claimedIds)
+                AddHistory(operation, operation.Automatic ? "auto_grabbed" : "grabbed", grabbedSummary, claimedId);
+        }
+        else
+        {
+            AddHistory(operation, operation.Automatic ? "auto_grabbed" : "grabbed", grabbedSummary);
+        }
         // Phase 5 owns the download from acceptance on; its import operation is created in the same commit (P5.I3).
         if (!await database.ImportOperations.AnyAsync(value => value.GrabId == operation.Id, CancellationToken.None).ConfigureAwait(false))
             await Import.ImportService.CreateForGrabAsync(database, operation, Now, CancellationToken.None).ConfigureAwait(false);
@@ -568,17 +720,20 @@ public sealed class GrabService(
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
-    private void AddHistory(GrabOperation operation, string eventType, string summary)
+    private void AddHistory(GrabOperation operation, string eventType, string summary, Guid? episodeId = null)
     {
         if (operation.EntryId is not { } entryId) return;
+        var parsed = ReleaseScopes.IsPack(operation.Scope) ? JsonSerializer.Deserialize<ParsedRelease>(operation.ParsedJson) : null;
         database.History.Add(new HistoryRecord
         {
             EntryId = entryId, EventType = eventType, Summary = summary.Length > 1024 ? summary[..1024] : summary,
             CreatedAt = Now,
             Data = JsonSerializer.Serialize(new
             {
-                operationId = operation.Id, episodeId = operation.EpisodeId, infoHash = operation.InfoHash,
-                indexer = operation.IndexerName, state = operation.State, failureCode = operation.FailureCode
+                operationId = operation.Id, episodeId = episodeId ?? operation.EpisodeId, infoHash = operation.InfoHash,
+                indexer = operation.IndexerName, state = operation.State, failureCode = operation.FailureCode,
+                scope = operation.Scope, mode = operation.Mode,
+                coverage = parsed is null ? null : new { seasons = parsed.PackSeasons(), complete = parsed.SeriesPack && parsed.SeasonNumber is null }
             })
         });
     }
@@ -601,6 +756,15 @@ public sealed class GrabService(
             : null;
         if (entry is null || existing.EpisodeId.HasValue && episode is null || !canAccess(entry, episode))
             throw new GrabException(404, "target_not_found", "The title is not available.");
+        if (ReleaseScopes.IsPack(existing.Scope))
+        {
+            var claimedIds = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == existing.Id)
+                .Select(claim => claim.EpisodeId).ToListAsync(cancellationToken).ConfigureAwait(false);
+            var claimedEpisodes = await database.Episodes.AsNoTracking().Where(value => claimedIds.Contains(value.Id))
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            if (claimedEpisodes.Any(value => !canAccess(entry, value)))
+                throw new GrabException(404, "target_not_found", "The title is not available.");
+        }
     }
 
     /// <summary>Whether an administrator blocked this torrent or this indexer's release.</summary>
@@ -640,6 +804,7 @@ public sealed class GrabService(
     {
         var parsed = JsonSerializer.Deserialize<ParsedRelease>(operation.ParsedJson);
         var quality = parsed?.Quality ?? "unknown quality";
+        if (ReleaseScopes.IsPack(operation.Scope)) return PackLabel(parsed) + " " + quality;
         var episode = parsed is { SeasonNumber: { } season, EpisodeNumbers: [var number] } ? $"S{season:00}E{number:00} " : string.Empty;
         return episode + quality;
     }
@@ -662,6 +827,57 @@ public sealed class GrabService(
 
     /// <summary>The durable target ownership key.</summary>
     public static string TargetKey(Guid entryId, Guid? episodeId) => (episodeId ?? entryId).ToString("N");
+
+    /// <summary>The target key of a pack: one pack per season, or one per series for All Seasons (season and series packs).</summary>
+    public static string PackKey(Guid entryId, int? seasonNumber) =>
+        "pack:" + entryId.ToString("N") + ":" +
+        (seasonNumber is { } season ? season.ToString(System.Globalization.CultureInfo.InvariantCulture) : "all");
+
+    /// <summary>
+    /// The key an episode is claimed under: its target key to acquire it, <c>+add</c> to add or replace a version of a held
+    /// one, the same keys a single-episode grab owns, so the two can never take the same episode twice. A missing episode is
+    /// acquired whatever the pack's mode, so an add or replace pack and a single-episode grab cannot both fill it (Codex
+    /// review of the pack plugin, finding 4).
+    /// </summary>
+    public static string ClaimKey(Guid episodeId, bool version) => episodeId.ToString("N") + (version ? "+add" : string.Empty);
+
+    /// <summary>
+    /// Whether a claim takes the episode's version key: a single-episode grab of another version, or a pack that adds or
+    /// replaces an episode it holds.
+    /// </summary>
+    private static bool ClaimsVersion(bool pack, bool addVersion, bool held, string mode) =>
+        pack ? held && mode != GrabModes.Fill : addVersion;
+
+    /// <summary>A pack's name in history and the queue: "Season 2 pack", "Seasons 1–3 pack" or "Complete pack".</summary>
+    public static string PackLabel(ParsedRelease? parsed)
+    {
+        var seasons = parsed?.PackSeasons() ?? [];
+        return seasons.Count switch
+        {
+            0 => "Complete pack",
+            1 => $"Season {seasons[0]} pack",
+            _ => $"Seasons {seasons[0]}–{seasons[^1]} pack"
+        };
+    }
+
+    /// <summary>The refusal of a replace grab while episode upgrades are off (user, 2026-10-09).</summary>
+    public const string ReplaceDisabled = "episode_replace_disabled";
+
+    private const string ReplaceDisabledMessage =
+        "Replacing an episode's file needs episode upgrades turned on in the plugin settings. Add keeps both files.";
+
+    /// <summary>
+    /// The grab modes a search's rows may offer (user, 2026-10-09): a pack fills, adds and, while episode upgrades are on,
+    /// replaces; another version of an episode is added and, while episode upgrades are on, replaces; another version of a movie
+    /// is only added; everything else fills. Adding by hand never needs episode upgrades.
+    /// </summary>
+    public static IReadOnlyList<string> ModesFor(bool pack, bool addVersion, bool episode, bool episodeUpgradesEnabled)
+    {
+        if (pack)
+            return episodeUpgradesEnabled ? [GrabModes.Fill, GrabModes.Add, GrabModes.Replace] : [GrabModes.Fill, GrabModes.Add];
+        if (!addVersion) return [GrabModes.Fill];
+        return episode && episodeUpgradesEnabled ? [GrabModes.Add, GrabModes.Replace] : [GrabModes.Add];
+    }
 
     /// <summary>The system identity automatic grabs are made under; it is never a Jellyfin user.</summary>
     public static readonly Guid AutomationUserId = Guid.Parse("00000000-0000-4000-8000-00000000a07a");

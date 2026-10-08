@@ -104,6 +104,14 @@ public sealed class SeedReleaseService(
             return;
         }
 
+        if (torrent is null && seed.Pack && await PackDetachedManifestAsync(seed, cancellationToken).ConfigureAwait(false) is { } packFiles)
+        {
+            // Another file of the pack detached the torrent for all of them; this one is detached with the same files.
+            seed.CleanupManifest = packFiles;
+            await DetachAsync(seed).ConfigureAwait(false);
+            return;
+        }
+
         if (torrent is null)
         {
             // A release that recorded its files for a detach that did not finish (a retry sent it back to waiting or blocked)
@@ -170,7 +178,135 @@ public sealed class SeedReleaseService(
             return;
         }
 
+        if (seed.Pack)
+        {
+            await ReleasePackAsync(seed, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         await ReleaseAsync(seed, torrent, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Releases a pack's torrent once for all its files (season and series packs, 2026-10-08). Every imported file keeps its
+    /// own release, so seed protection stays per file; the pack's first open release (the leader) detaches the torrent only
+    /// when no import of the pack is still open and every release of the pack passes every safeguard, and then detaches all
+    /// of them together. One blocked file keeps the whole torrent.
+    /// </summary>
+    private async Task ReleasePackAsync(SeedReleaseOperation seed, CancellationToken cancellationToken)
+    {
+        if (await database.ImportOperations.AnyAsync(value => value.GrabId == seed.GrabId && ImportStates.Open.Contains(value.State),
+                cancellationToken).ConfigureAwait(false))
+        {
+            await WaitIfChangedAsync(seed, SeedReleaseReasons.PackImporting).ConfigureAwait(false);
+            return;
+        }
+
+        var siblings = await database.SeedReleaseOperations.Where(value => value.GrabId == seed.GrabId && value.Pack &&
+                SeedReleaseStates.Open.Contains(value.State))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var leader = siblings.OrderBy(value => value.PreparedAt).ThenBy(value => value.Id).First();
+        if (leader.Id != seed.Id)
+        {
+            // A blocked release keeps its reason in view; the leader's check of every release unblocks it once it passes.
+            if (seed.State != SeedReleaseStates.Blocked)
+                await WaitIfChangedAsync(seed, SeedReleaseReasons.PackWaiting).ConfigureAwait(false);
+            return;
+        }
+
+        await using var lease = await retentionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        var (read, torrent) = await ReadNowAsync(seed, cancellationToken).ConfigureAwait(false);
+        if (!read || torrent is null) return;
+        await DetachPackUnderGateAsync(seed, torrent, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Detaches a pack's torrent for every one of its releases, under the retention gate, on the torrent as the client shows it
+    /// now: only while no import of the pack is open and every open release of the pack passes every safeguard, read now. A
+    /// first detach and every retry of an interrupted one take the same path, so a retry never detaches the torrent on one
+    /// release's checks alone (Codex review of the pack plugin, finding 3). When one release fails a check, it is blocked or
+    /// waits, and every other release of the pack waits with it, out of <c>removing</c>.
+    /// </summary>
+    private async Task DetachPackUnderGateAsync(SeedReleaseOperation seed, ClientTorrentStatus torrent, CancellationToken cancellationToken)
+    {
+        var siblings = await database.SeedReleaseOperations.Where(value => value.GrabId == seed.GrabId && value.Pack &&
+                SeedReleaseStates.Open.Contains(value.State))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        async Task HoldAllAsync(string reason, Guid? except)
+        {
+            var now = Now;
+            var changed = false;
+            foreach (var sibling in siblings.Where(value => value.Id != except &&
+                         (value.State == SeedReleaseStates.Removing || value.Id == seed.Id) &&
+                         (value.State != SeedReleaseStates.Waiting || value.Reason != reason)))
+            {
+                sibling.State = SeedReleaseStates.Waiting;
+                sibling.Reason = reason;
+                sibling.UpdatedAt = now;
+                changed = true;
+            }
+
+            if (changed) await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+
+        if (await database.ImportOperations.AnyAsync(value => value.GrabId == seed.GrabId && ImportStates.Open.Contains(value.State),
+                cancellationToken).ConfigureAwait(false))
+        {
+            await HoldAllAsync(SeedReleaseReasons.PackImporting, null).ConfigureAwait(false);
+            return;
+        }
+
+        AcquisitionDownloadClient? client = null;
+        IReadOnlyList<VerifiedTorrentFile> verified = [];
+        var hardlinks = new Dictionary<Guid, long?>();
+        foreach (var sibling in siblings.OrderBy(value => value.Id == seed.Id ? 0 : 1).ToArray())
+        {
+            var (checkedClient, seeding, checkedFiles) = await CheckReleasableAsync(sibling, torrent, cancellationToken).ConfigureAwait(false);
+            // A release that failed a check was blocked or sent back to waiting; the pack's others wait with it.
+            if (checkedClient is null)
+            {
+                await HoldAllAsync(SeedReleaseReasons.PackWaiting, sibling.Id).ConfigureAwait(false);
+                return;
+            }
+
+            client ??= checkedClient;
+            verified = checkedFiles;
+            hardlinks[sibling.Id] = seeding.HardlinkCount;
+        }
+
+        var removingAt = Now;
+        var manifest = TorrentDataRemoval.Serialize(verified);
+        foreach (var sibling in siblings)
+        {
+            sibling.State = SeedReleaseStates.Removing;
+            sibling.Reason = null;
+            sibling.Error = null;
+            sibling.HardlinkCountBefore = hardlinks[sibling.Id];
+            sibling.RemovingAt = sibling.UpdatedAt = removingAt;
+            sibling.CleanupManifest = manifest;
+        }
+
+        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        logger.LogInformation("Pack seed releases of grab {Grab} detach torrent {Hash} after its goal; {Count} file(s) imported",
+            seed.GrabId, seed.InfoHash, siblings.Count);
+        if (!await RemoveFromClientAsync(seed, client!, cancellationToken).ConfigureAwait(false)) return;
+        foreach (var sibling in siblings) await DetachAsync(sibling).ConfigureAwait(false);
+    }
+
+    /// <summary>The files another release of the same pack recorded when it detached the torrent, or null.</summary>
+    private async Task<string?> PackDetachedManifestAsync(SeedReleaseOperation seed, CancellationToken cancellationToken) =>
+        await database.SeedReleaseOperations.AsNoTracking()
+            .Where(value => value.GrabId == seed.GrabId && value.Pack && value.Id != seed.Id &&
+                value.State == SeedReleaseStates.Detached && value.CleanupManifest != null)
+            .Select(value => value.CleanupManifest).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+
+    private async Task WaitIfChangedAsync(SeedReleaseOperation seed, string reason)
+    {
+        if (seed.State == SeedReleaseStates.Waiting && seed.Reason == reason) return;
+        seed.State = SeedReleaseStates.Waiting;
+        seed.Reason = reason;
+        seed.UpdatedAt = Now;
+        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>Checks every precondition, records the torrent's files, then has the client forget the torrent, deleting nothing.</summary>
@@ -348,6 +484,14 @@ public sealed class SeedReleaseService(
         // Read again under the gate, as before the first request (Codex re-review P1-a); the snapshot only says a detach is due.
         var (read, torrent) = snapshot is null ? (true, null) : await ReadNowAsync(seed, cancellationToken).ConfigureAwait(false);
         if (!read) return;
+        if (torrent is not null && seed.Pack)
+        {
+            // A pack's retry checks every release of the pack again, as its first detach did (Codex review of the pack plugin,
+            // finding 3).
+            await DetachPackUnderGateAsync(seed, torrent, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         if (torrent is not null)
         {
             // A retry is a new detach: every safeguard and the goal are read again first, and the files recorded afresh
@@ -389,10 +533,19 @@ public sealed class SeedReleaseService(
             grab.UpdatedAt = now;
         }
 
-        AddHistory(seed, "seeding_released", summary ?? (listed is null
-            ? "Stopped seeding after its goal. Nothing was deleted; its downloaded files need a manual cleanup."
-            : "Stopped seeding after its goal. Nothing was deleted; its downloaded files stay on disk."),
-            released: null, credited: null, now);
+        var kept = listed is null
+            ? "Nothing was deleted; its downloaded files need a manual cleanup."
+            : "Nothing was deleted; its downloaded files stay on disk.";
+        // A pack's files detach together: one line for the pack, never one identical line per file (user, 2026-10-09).
+        if (seed.Pack && grab is not null)
+        {
+            var pack = GrabService.PackLabel(JsonSerializer.Deserialize<ParsedRelease>(grab.ParsedJson));
+            await AddPackHistoryAsync(seed, grab, summary is null
+                ? "Stopped seeding the " + pack + " after its goal. " + kept
+                : pack + ": " + summary, now).ConfigureAwait(false);
+        }
+        else
+            AddHistory(seed, "seeding_released", summary ?? "Stopped seeding after its goal. " + kept, released: null, credited: null, now);
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         logger.LogInformation("Seed release {Seed} detached; {Count} file(s) kept on disk", seed.Id, listed?.Count ?? 0);
     }
@@ -464,6 +617,34 @@ public sealed class SeedReleaseService(
         AddHistory(seed, eventType, summary, released, credited, now);
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         logger.LogInformation("Seed release {Seed} finished: {Reason}", seed.Id, reason);
+    }
+
+    /// <summary>
+    /// Adds a pack's one <c>seeding_released</c> event for all its files (user, 2026-10-09): the pack's releases detach together,
+    /// so the event is keyed by the pack's first release and written by whichever release detaches first; the others find it.
+    /// </summary>
+    private async Task AddPackHistoryAsync(SeedReleaseOperation seed, GrabOperation grab, string summary, DateTime now)
+    {
+        if (seed.EntryId is not { } entryId || !await database.Entries.AnyAsync(entry => entry.Id == entryId).ConfigureAwait(false)) return;
+        var pack = await database.SeedReleaseOperations.AsNoTracking().Where(value => value.GrabId == seed.GrabId && value.Pack)
+            .OrderBy(value => value.PreparedAt).ThenBy(value => value.Id)
+            .Select(value => new { value.Id, value.EpisodeId, value.SourceLogicalBytes }).ToListAsync().ConfigureAwait(false);
+        var key = pack.Count == 0 ? seed.Id : pack[0].Id;
+        if (await database.History.AnyAsync(history => history.Id == key).ConfigureAwait(false) ||
+            database.History.Local.Any(history => history.Id == key))
+            return;
+        database.History.Add(new HistoryRecord
+        {
+            Id = key, EntryId = entryId, EventType = "seeding_released", CreatedAt = now, Summary = ImportService.Bound(summary),
+            Data = JsonSerializer.Serialize(new
+            {
+                grabId = grab.Id, pack = true, seedReleaseIds = pack.Select(value => value.Id),
+                episodeIds = pack.Select(value => value.EpisodeId).OfType<Guid>().Distinct(),
+                logicalBytes = pack.Sum(value => value.SourceLogicalBytes), observedRatio = seed.ObservedRatio,
+                observedSeedingSeconds = seed.ObservedSeedingSeconds, goalRatio = seed.GoalRatio, goalSeconds = seed.GoalSeconds,
+                filesKept = TorrentDataRemoval.Deserialize(seed.CleanupManifest)?.Count
+            })
+        });
     }
 
     /// <summary>Adds the release's one history event, keyed by the release, unless its entry is gone or it was written already.</summary>

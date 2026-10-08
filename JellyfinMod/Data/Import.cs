@@ -39,6 +39,19 @@ public static class ImportStates
     public static IReadOnlyList<string> Active { get; } = [Waiting, Identifying, Linking, Linked, Scanning];
 }
 
+/// <summary>Where a <c>replace</c> grab's removal of an episode's other files stands (season and series packs, 2026-10-08).</summary>
+public static class ReplaceStates
+{
+    /// <summary>The new file is bound; the episode's other files are still to be removed.</summary>
+    public const string Pending = "pending";
+
+    /// <summary>Every other file was removed.</summary>
+    public const string Done = "done";
+
+    /// <summary>A removal was refused (playing, kept, protected); both files stay.</summary>
+    public const string Refused = "refused";
+}
+
 /// <summary>Stable import reasons shared by the API and the web message table (P5.I1).</summary>
 public static class ImportReasons
 {
@@ -108,6 +121,12 @@ public static class ImportReasons
 
     /// <summary>The configured download client no longer exists.</summary>
     public const string ClientMissing = "client_missing";
+
+    /// <summary>A pack holds no file numbered as this claimed episode (season and series packs, 2026-10-08).</summary>
+    public const string PackEpisodeMissing = "pack_episode_missing";
+
+    /// <summary>No file of a pack mapped to any episode it claimed.</summary>
+    public const string PackNoFiles = "pack_no_files";
 }
 
 /// <summary>One durable import of one accepted grab (P5.I2).</summary>
@@ -123,9 +142,30 @@ public sealed class ImportOperation
     /// <summary>Gets or sets the Phase 4 grab this operation imports.</summary>
     public Guid GrabId { get; set; }
 
-    /// <summary>Gets or sets the grab while this operation is open; unique, so a grab has one open import.</summary>
-    [MaxLength(32)]
+    /// <summary>
+    /// Gets or sets the grab while this operation is open; unique, so a grab has one open import. A pack's imports add their
+    /// episode (<c>grab:episode</c>), so a pack owns one open import per episode (season and series packs, 2026-10-08).
+    /// </summary>
+    [MaxLength(80)]
     public string? OpenGrabKey { get; set; }
+
+    /// <summary>
+    /// Gets or sets where a <c>replace</c> grab's removal of the episode's other files stands once this import completed:
+    /// <c>pending</c>, <c>done</c> or <c>refused</c> (season and series packs, 2026-10-08). Null for every other import.
+    /// </summary>
+    [MaxLength(16)]
+    public string? ReplaceState { get; set; }
+
+    /// <summary>
+    /// Gets or sets the episode's other files a <c>replace</c> import may remove, fixed when the import completed: a JSON list of
+    /// each file's binding, path and content fingerprint (Codex re-review of the pack plugin, finding 2). Only these files are
+    /// ever removed, and each only while it is still that very file, so a version added after the replacement was decided stays.
+    /// </summary>
+    public string? ReplaceTargets { get; set; }
+
+    /// <summary>Gets or sets why a replacement removed nothing, or what it removed.</summary>
+    [MaxLength(1024)]
+    public string? ReplaceDetail { get; set; }
 
     /// <summary>Gets or sets the target entry. Detached, never cascaded, when an entry is removed.</summary>
     public Guid? EntryId { get; set; }
@@ -240,6 +280,14 @@ public sealed class ImportOperation
     [MaxLength(96)]
     public string? DestinationPhysicalIdentity { get; set; }
 
+    /// <summary>
+    /// Gets or sets the destination's content fingerprint when it was linked (identity, size and modification time): a version's
+    /// label speaks for the file at that path only while it is still these bytes, also after a rewrite in place (Codex review
+    /// of the user fixes, 2026-10-09).
+    /// </summary>
+    [MaxLength(256)]
+    public string? DestinationFingerprint { get; set; }
+
     /// <summary>Gets or sets the hardlink count observed after linking.</summary>
     public long? HardlinkCountAfter { get; set; }
 
@@ -323,6 +371,12 @@ public static class SeedReleaseReasons
     /// <summary>The effective goal is not met yet.</summary>
     public const string GoalUnmet = "seed_goal_unmet";
 
+    /// <summary>A pack's file waits until every file of the pack is imported (season and series packs, 2026-10-08).</summary>
+    public const string PackImporting = "pack_importing";
+
+    /// <summary>A pack's file is releasable and waits for the pack's other files, which release the torrent together.</summary>
+    public const string PackWaiting = "pack_waiting";
+
     /// <summary>The download is not complete in the client.</summary>
     public const string Incomplete = "seeding_incomplete";
 
@@ -380,6 +434,13 @@ public sealed class SeedReleaseOperation
 
     /// <summary>Gets or sets the grab that added the torrent.</summary>
     public Guid GrabId { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether this is one file of a pack (season and series packs, 2026-10-08): every imported file of the pack
+    /// keeps its own release, so seed protection stays per file, and the pack's releases detach the torrent once, together,
+    /// only when every one of them is releasable; one blocked file keeps the whole torrent.
+    /// </summary>
+    public bool Pack { get; set; }
 
     /// <summary>Gets or sets the entry.</summary>
     public Guid? EntryId { get; set; }
@@ -548,3 +609,4 @@ public sealed class ReleaseBlocklistEntry
     /// <summary>Gets or sets the administrator who created it.</summary>
     public Guid CreatedByUserId { get; set; }
 }
+

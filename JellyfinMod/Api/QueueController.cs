@@ -74,10 +74,46 @@ public sealed class QueueController(
         var episodes = await LoadEpisodesAsync(operations, cancellationToken);
         var clients = await database.AcquisitionDownloadClients.AsNoTracking().ToDictionaryAsync(client => client.Id, cancellationToken);
         var rows = new List<QueueRowDto>();
+        // A pack is one row (season and series packs, 2026-10-08): its first listed import stands for the torrent, and the row
+        // lists every claimed episode's own state. It is shown only to a user who may see every one of them.
+        var grabIds = operations.Select(operation => operation.GrabId).Distinct().ToArray();
+        var packs = await database.GrabOperations.AsNoTracking()
+            .Where(grab => grabIds.Contains(grab.Id) && (grab.Scope == "season" || grab.Scope == "series"))
+            .ToDictionaryAsync(grab => grab.Id, cancellationToken);
+        var packChildren = packs.Count == 0 ? [] : await database.ImportOperations.AsNoTracking()
+            .Where(operation => packs.Keys.Contains(operation.GrabId)).ToListAsync(cancellationToken);
+        var packClaims = packs.Count == 0 ? [] : await database.GrabClaims.AsNoTracking().Where(claim => packs.Keys.Contains(claim.GrabId))
+            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (claim, value) => new { claim.GrabId, Episode = value })
+            .ToListAsync(cancellationToken);
+        var packsShown = new HashSet<Guid>();
         foreach (var operation in operations)
         {
             var entry = operation.EntryId is { } id ? entries.GetValueOrDefault(id) : null;
             var episode = operation.EpisodeId is { } episodeId ? episodes.GetValueOrDefault(episodeId) : null;
+            if (packs.TryGetValue(operation.GrabId, out var pack))
+            {
+                if (!packsShown.Add(pack.Id)) continue;
+                var claimed = packClaims.Where(claim => claim.GrabId == pack.Id).Select(claim => claim.Episode)
+                    .OrderBy(value => value.SeasonNumber).ThenBy(value => value.EpisodeNumber).ToArray();
+                if (!CanSee(user, administrator, entry, null) || claimed.Any(value => !CanSee(user, administrator, entry, value))) continue;
+                // The row stands for the pack as a whole (Codex review of the pack plugin, finding 9): an episode still
+                // importing first, then a failed one, and only then a seeding one, so the row's state and its Retry match
+                // what the pack still needs.
+                var representative = operations.Where(value => value.GrabId == pack.Id)
+                    .OrderBy(value => value.State == ImportStates.Blocked ? 1 : ImportStates.Open.Contains(value.State) ? 0
+                        : value.State == ImportStates.Failed ? 2 : 3)
+                    .ThenBy(value => value.CreatedAt).First();
+                var packSeed = representative.State == ImportStates.Completed
+                    ? seeds.FirstOrDefault(value => value.ImportOperationId == representative.Id) ?? seeds.FirstOrDefault(value => value.GrabId == pack.Id)
+                    : null;
+                var packRow = QueueReadModel.Row(representative, packSeed, entry, null,
+                    clients.GetValueOrDefault(representative.DownloadClientId), clientSnapshots.GetValueOrDefault(representative.DownloadClientId),
+                    settings, administrator, packSeed is not null && LibraryLinkPresent(packSeed)) with { Episode = null };
+                if (states is { Length: > 0 } && !states.Contains(packRow.State, StringComparer.Ordinal)) continue;
+                rows.Add(packRow with { Pack = QueueReadModel.Pack(pack, claimed, packChildren) });
+                continue;
+            }
+
             if (!CanSee(user, administrator, entry, episode)) continue;
             var seed = seeds.FirstOrDefault(value => value.ImportOperationId == operation.Id);
             var row = QueueReadModel.Row(operation, seed, entry, episode, clients.GetValueOrDefault(operation.DownloadClientId),
@@ -127,6 +163,10 @@ public sealed class QueueController(
             var operation = await database.ImportOperations.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
             if (operation is null || !await CanSeeAsync(user, true, operation, cancellationToken)) return NotFound();
             var now = time.GetUtcNow().UtcDateTime;
+            var packGrab = await PackOfAsync(operation, cancellationToken);
+            // A pack is acted on only by someone who may read every episode it claimed (Codex review of the pack plugin,
+            // finding 10).
+            if (packGrab is not null && !await CanSeePackAsync(user, true, packGrab, cancellationToken)) return NotFound();
             if (operation.State == ImportStates.Blocked)
             {
                 // Everything is re-inspected from the start; nothing recorded is trusted blindly.
@@ -141,6 +181,39 @@ public sealed class QueueController(
                 operation.UpdatedAt = now;
                 await database.SaveChangesAsync(cancellationToken);
                 result = operation;
+            }
+            else if (packGrab is not null)
+            {
+                // A failed episode of a pack is retried alone, with its own intent and ancestry; a retry on the pack's row
+                // (any other episode of it) retries every failed episode of the pack (Codex review of the pack plugin,
+                // finding 5).
+                var failed = operation.State == ImportStates.Failed
+                    ? [operation]
+                    : await database.ImportOperations.Where(value => value.GrabId == packGrab.Id && value.State == ImportStates.Failed &&
+                            !database.ImportOperations.Any(retry => retry.RetryOfId == value.Id))
+                        .OrderBy(value => value.CreatedAt).ToListAsync(cancellationToken);
+                if (failed.Count == 0) return Refuse(409, "import_not_retryable", "Only blocked or failed imports can be retried.");
+                ImportOperation? first = null;
+                foreach (var child in failed)
+                {
+                    var (retried, refusal) = await ImportService.RetryPackEpisodeAsync(database, packGrab, child, now, cancellationToken);
+                    if (refusal is not null)
+                        return refusal == "import_open"
+                            ? Refuse(409, "import_open", "Another import of this episode is still open.")
+                            : Refuse(409, "grab_missing", "The grab of this import no longer exists.");
+                    first ??= retried;
+                }
+
+                try
+                {
+                    await database.SaveChangesAsync(cancellationToken);
+                }
+                catch (DbUpdateException error) when (error.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 19 })
+                {
+                    return Refuse(409, "grab_active", "Another grab now holds this episode or this pack's season; the pack is not imported again.");
+                }
+
+                result = first!;
             }
             else if (operation.State == ImportStates.Failed)
             {
@@ -182,13 +255,25 @@ public sealed class QueueController(
         database.ChangeTracker.Clear();
         var operation = await database.ImportOperations.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (operation is null || !await CanSeeAsync(user, true, operation, cancellationToken)) return NotFound();
-        var seed = await database.SeedReleaseOperations.SingleOrDefaultAsync(value => value.ImportOperationId == id, cancellationToken);
-        var importOpen = ImportStates.Open.Contains(operation.State) || operation.State == ImportStates.Failed;
-        var seedOpen = seed is not null && SeedReleaseStates.Open.Contains(seed.State);
-        if (!importOpen && !seedOpen) return Refuse(409, "not_in_queue", "This import is no longer in the queue.");
-        if (seed?.State == SeedReleaseStates.Removing)
-            return Refuse(409, "seed_release_in_progress", "The seeding copy is being released; try again shortly.");
         var grab = await database.GrabOperations.SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken);
+        var pack = grab is not null && ReleaseScopes.IsPack(grab.Scope);
+        // A pack is removed whole, so only by someone who may read every episode it claimed (Codex review of the pack plugin,
+        // finding 10); every import of it still in the queue, open or failed, and every seed release of it go with it
+        // (finding 9).
+        if (pack && !await CanSeePackAsync(user, true, grab!, cancellationToken)) return NotFound();
+        var removed = pack
+            ? await database.ImportOperations.Where(value => value.GrabId == grab!.Id && (ImportStates.Open.Contains(value.State) ||
+                value.State == ImportStates.Failed && !database.ImportOperations.Any(retry => retry.RetryOfId == value.Id)))
+                .ToListAsync(cancellationToken)
+            : ImportStates.Open.Contains(operation.State) || operation.State == ImportStates.Failed ? [operation] : [];
+        var removedSeeds = pack
+            ? await database.SeedReleaseOperations.Where(value => value.GrabId == grab!.Id && SeedReleaseStates.Open.Contains(value.State))
+                .ToListAsync(cancellationToken)
+            : await database.SeedReleaseOperations.Where(value => value.ImportOperationId == id && SeedReleaseStates.Open.Contains(value.State))
+                .ToListAsync(cancellationToken);
+        if (removed.Count == 0 && removedSeeds.Count == 0) return Refuse(409, "not_in_queue", "This import is no longer in the queue.");
+        if (removedSeeds.Any(value => value.State == SeedReleaseStates.Removing))
+            return Refuse(409, "seed_release_in_progress", "The seeding copy is being released; try again shortly.");
 
         var removedFromClient = false;
         if (request.RemoveFromClient)
@@ -234,20 +319,20 @@ public sealed class QueueController(
         }
 
         var now = time.GetUtcNow().UtcDateTime;
-        if (importOpen)
+        foreach (var child in removed)
         {
-            operation.State = ImportStates.Cancelled;
-            operation.Reason = ImportReasons.Cancelled;
-            operation.OpenGrabKey = null;
-            operation.CancelledBy = user.Id;
-            operation.CompletedAt = operation.UpdatedAt = now;
+            child.State = ImportStates.Cancelled;
+            child.Reason = ImportReasons.Cancelled;
+            child.OpenGrabKey = null;
+            child.CancelledBy = user.Id;
+            child.CompletedAt = child.UpdatedAt = now;
         }
 
-        if (seedOpen)
+        foreach (var removedSeed in removedSeeds)
         {
-            seed!.State = SeedReleaseStates.Cancelled;
-            seed.Reason = SeedReleaseReasons.Cancelled;
-            seed.CompletedAt = seed.UpdatedAt = now;
+            removedSeed.State = SeedReleaseStates.Cancelled;
+            removedSeed.Reason = SeedReleaseReasons.Cancelled;
+            removedSeed.CompletedAt = removedSeed.UpdatedAt = now;
         }
 
         if (grab is not null)
@@ -266,7 +351,8 @@ public sealed class QueueController(
                     operation.ReleaseTitle),
                 Data = JsonSerializer.Serialize(new
                 {
-                    operationId = operation.Id, operation.EpisodeId, removeFromClient = removedFromClient, request.Blocklist
+                    operationId = operation.Id, operation.EpisodeId, removeFromClient = removedFromClient, request.Blocklist,
+                    grabId = pack ? grab!.Id : (Guid?)null, removedImports = removed.Select(child => child.Id).ToArray()
                 })
             });
             if (request.Blocklist)
@@ -359,6 +445,26 @@ public sealed class QueueController(
             ? await database.Episodes.AsNoTracking().SingleOrDefaultAsync(value => value.Id == episodeId, cancellationToken)
             : null;
         return CanSee(user, administrator, entry, episode);
+    }
+
+    /// <summary>The pack grab an import belongs to, or null for a single-episode or movie import.</summary>
+    private async Task<GrabOperation?> PackOfAsync(ImportOperation operation, CancellationToken cancellationToken)
+    {
+        var grab = await database.GrabOperations.SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken);
+        return grab is not null && ReleaseScopes.IsPack(grab.Scope) ? grab : null;
+    }
+
+    /// <summary>Whether the user may see the pack's title and every episode it claimed, as the queue lists it.</summary>
+    private async Task<bool> CanSeePackAsync(User user, bool administrator, GrabOperation grab, CancellationToken cancellationToken)
+    {
+        var entry = grab.EntryId is { } entryId
+            ? await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken)
+            : null;
+        if (!CanSee(user, administrator, entry, null)) return false;
+        var claimed = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == grab.Id)
+            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (_, value) => value)
+            .ToListAsync(cancellationToken);
+        return claimed.All(value => CanSee(user, administrator, entry, value));
     }
 
     private async Task<Dictionary<Guid, Entry>> LoadEntriesAsync(IEnumerable<ImportOperation> operations, CancellationToken cancellationToken)

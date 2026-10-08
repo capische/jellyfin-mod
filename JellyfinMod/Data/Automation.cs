@@ -398,4 +398,10 @@ public static class RetentionProvenances
 
     /// <summary>An administrator removed exactly this version (V1 decision 3).</summary>
     public const string VersionRemoved = "version_removed";
+
+    /// <summary>
+    /// A pack's <c>replace</c> grab removed this version once the pack's file for the same episode was in the library (season
+    /// and series packs, 2026-10-08).
+    /// </summary>
+    public const string PackReplaced = "pack_replaced";
 }

@@ -121,7 +121,8 @@ public sealed class ImportService(
         await database.GrabOperations.AnyAsync(grab => grab.State == GrabStates.Accepted && grab.ActiveTarget != null &&
             !database.ImportOperations.Any(operation => operation.GrabId == grab.Id), cancellationToken).ConfigureAwait(false) ||
         await database.UpgradeOperations.AnyAsync(upgrade => UpgradeStates.Open.Contains(upgrade.State), cancellationToken)
-            .ConfigureAwait(false);
+            .ConfigureAwait(false) ||
+        await PackReplaceService.AnyPendingAsync(database, cancellationToken).ConfigureAwait(false);
 
     /// <summary>Reads one client for every hash the plugin tracks there, through the shared cache.</summary>
     public async Task<ClientSnapshot> SnapshotAsync(Guid clientId, TimeSpan maxAge, CancellationToken cancellationToken)
@@ -141,6 +142,35 @@ public sealed class ImportService(
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken)
             .ConfigureAwait(false);
         if (entry?.TargetLibraryId is not { } libraryId) return null;
+        if (ReleaseScopes.IsPack(grab.Scope))
+        {
+            // A pack owns one import per claimed episode (season and series packs, 2026-10-08), created when the grab is
+            // accepted; an episode that already has a completed or an open import of this grab gets none. A failed episode is
+            // retried on its own (RetryPackEpisodeAsync).
+            var claims = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == grab.Id)
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var taken = (await database.ImportOperations.AsNoTracking().Where(value => value.GrabId == grab.Id &&
+                    value.EpisodeId != null && (value.State == ImportStates.Completed || ImportStates.Open.Contains(value.State)))
+                .Select(value => value.EpisodeId!.Value).ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet();
+            ImportOperation? first = null;
+            foreach (var claim in claims.Where(claim => !taken.Contains(claim.EpisodeId)))
+            {
+                var child = new ImportOperation
+                {
+                    GrabId = grab.Id, OpenGrabKey = PackOpenKey(grab.Id, claim.EpisodeId), EntryId = entryId, EpisodeId = claim.EpisodeId,
+                    TargetLibraryId = libraryId, DownloadClientId = grab.DownloadClientId, InfoHash = grab.InfoHash,
+                    ReleaseTitle = grab.RawTitle,
+                    // A held episode takes the pack's file as another version, beside what it holds or replacing it.
+                    Intent = claim.Held && grab.Mode != GrabModes.Fill ? GrabIntents.AddVersion : GrabIntents.Acquire,
+                    State = ImportStates.Waiting, CreatedAt = now, UpdatedAt = now
+                };
+                database.ImportOperations.Add(child);
+                first ??= child;
+            }
+
+            return first;
+        }
+
         var operation = new ImportOperation
         {
             GrabId = grab.Id, OpenGrabKey = grab.Id.ToString("N"), EntryId = entryId, EpisodeId = grab.EpisodeId,
@@ -150,6 +180,67 @@ public sealed class ImportService(
         database.ImportOperations.Add(operation);
         return operation;
     }
+
+    /// <summary>The open key of a pack's import of one episode: one open import per grab and episode.</summary>
+    public static string PackOpenKey(Guid grabId, Guid episodeId) => grabId.ToString("N") + ":" + episodeId.ToString("N");
+
+    /// <summary>
+    /// Retries the failed import of one episode of a pack (Codex review of the pack plugin, finding 5): a new import of that
+    /// episode alone, with the failed one's intent and as its retry, while the pack holds no other open import of it. The pack's
+    /// ownership comes back with it: the pack's own target key and this episode's claim are taken again in the same save, and
+    /// both are unique, so a grab that took the episode or the season meanwhile makes the save fail instead of two grabs
+    /// importing the same episode. Returns the new import, or the refusal's code.
+    /// </summary>
+    public static async Task<(ImportOperation? Operation, string? Refusal)> RetryPackEpisodeAsync(ModDbContext database,
+        GrabOperation grab, ImportOperation failed, DateTime now, CancellationToken cancellationToken)
+    {
+        if (failed.EpisodeId is not { } episodeId || grab.EntryId is not { } entryId || grab.InfoHash is null)
+            return (null, "grab_missing");
+        var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken)
+            .ConfigureAwait(false);
+        if (entry?.TargetLibraryId is not { } libraryId) return (null, "grab_missing");
+        if (await database.ImportOperations.AnyAsync(value => value.GrabId == grab.Id && value.EpisodeId == episodeId &&
+                ImportStates.Open.Contains(value.State), cancellationToken).ConfigureAwait(false))
+            return (null, "import_open");
+        var claim = await database.GrabClaims.SingleOrDefaultAsync(value => value.GrabId == grab.Id && value.EpisodeId == episodeId,
+            cancellationToken).ConfigureAwait(false);
+        if (claim is null) return (null, "grab_missing");
+        grab.ActiveTarget ??= GrabService.PackKey(entryId, grab.Scope == ReleaseScopes.Season ? grab.SeasonNumber : null);
+        grab.UpdatedAt = now;
+        claim.ActiveKey ??= GrabService.ClaimKey(episodeId, claim.Held && grab.Mode != GrabModes.Fill);
+        var child = new ImportOperation
+        {
+            GrabId = grab.Id, OpenGrabKey = PackOpenKey(grab.Id, episodeId), EntryId = entryId, EpisodeId = episodeId,
+            TargetLibraryId = libraryId, DownloadClientId = grab.DownloadClientId, InfoHash = grab.InfoHash, ReleaseTitle = grab.RawTitle,
+            Intent = failed.Intent, RetryOfId = failed.Id, State = ImportStates.Waiting, CreatedAt = now, UpdatedAt = now
+        };
+        database.ImportOperations.Add(child);
+        return (child, null);
+    }
+
+    /// <summary>
+    /// Releases a pack's claim on one episode once its import needs nothing more of the pack: imported, skipped, or failed for
+    /// a reason no retry can change (the pack holds no file for it, or the episode left the catalog). A failure that can be
+    /// retried keeps the claim, as a failed single-episode import keeps its grab's target, until it is retried or removed.
+    /// Saved with the caller's changes.
+    /// </summary>
+    private async Task ReleasePackClaimAsync(ImportOperation operation, CancellationToken cancellationToken)
+    {
+        if (operation.EpisodeId is not { } episodeId) return;
+        var claim = await database.GrabClaims.SingleOrDefaultAsync(value => value.GrabId == operation.GrabId &&
+            value.EpisodeId == episodeId && value.ActiveKey != null, cancellationToken).ConfigureAwait(false);
+        if (claim is not null) claim.ActiveKey = null;
+    }
+
+    /// <summary>
+    /// Whether a pack holds nothing any more once this import is final: no other open import, and no claim still held but this
+    /// episode's.
+    /// </summary>
+    private async Task<bool> PackSettledAsync(Guid grabId, Guid operationId, Guid? episodeId, CancellationToken cancellationToken) =>
+        !await database.ImportOperations.AnyAsync(value => value.GrabId == grabId && value.Id != operationId &&
+            ImportStates.Open.Contains(value.State), cancellationToken).ConfigureAwait(false) &&
+        !await database.GrabClaims.AnyAsync(value => value.GrabId == grabId && value.EpisodeId != episodeId && value.ActiveKey != null,
+            cancellationToken).ConfigureAwait(false);
 
     private async Task EnsureOperationsAsync(CancellationToken cancellationToken)
     {
@@ -338,7 +429,39 @@ public sealed class ImportService(
             return;
         }
 
-        var choice = ImportFileSelector.Choose(torrent, settings.VideoExtensions, episode);
+        var grabScope = await database.GrabOperations.AsNoTracking().Where(value => value.Id == operation.GrabId)
+            .Select(value => value.Scope).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        ImportFileChoice choice;
+        if (ReleaseScopes.IsPack(grabScope) && episode is not null)
+        {
+            // A pack's files are mapped to the episodes it claimed by their names (season and series packs, 2026-10-08).
+            var claimed = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == operation.GrabId)
+                .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id,
+                    (claim, value) => new { value.SeasonNumber, value.EpisodeNumber })
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var mapping = ImportFileSelector.MapPack(torrent, settings.VideoExtensions,
+                claimed.Select(value => (value.SeasonNumber, value.EpisodeNumber)).ToHashSet());
+            await RecordPackSkipsAsync(operation, mapping, cancellationToken).ConfigureAwait(false);
+            if (mapping.Files.Count == 0 && mapping.Reason is { } packReason)
+            {
+                await BlockAsync(operation, packReason, mapping.Detail).ConfigureAwait(false);
+                return;
+            }
+
+            if (!mapping.Files.TryGetValue((episode.SeasonNumber, episode.EpisodeNumber), out var mapped))
+            {
+                await FailAsync(operation, ImportReasons.PackEpisodeMissing,
+                    $"The pack holds no file numbered S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00}.").ConfigureAwait(false);
+                return;
+            }
+
+            choice = new ImportFileChoice(mapped, null, null);
+        }
+        else
+        {
+            choice = ImportFileSelector.Choose(torrent, settings.VideoExtensions, episode);
+        }
+
         if (choice.File is not { } file)
         {
             await BlockAsync(operation, choice.Reason!, choice.Detail).ConfigureAwait(false);
@@ -450,6 +573,15 @@ public sealed class ImportService(
             else
             {
                 var plan = await PlanDestinationAsync(operation, entry, episode, source, cancellationToken).ConfigureAwait(false);
+                if (plan.Reason == ImportReasons.TargetExists && await IsPackAsync(operation.GrabId, cancellationToken).ConfigureAwait(false))
+                {
+                    // A pack fills only what is missing: an episode that gained a file meanwhile is skipped, not an error.
+                    await SkipAsync(operation, ImportReasons.TargetExists, "The episode gained a file before the pack finished.")
+                        .ConfigureAwait(false);
+                    await FinishPackGrabAsync(operation.GrabId, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
                 if (plan.Reason is { } reason)
                 {
                     await BlockAsync(operation, reason, plan.Detail).ConfigureAwait(false);
@@ -518,6 +650,7 @@ public sealed class ImportService(
         operation.State = ImportStates.Linked;
         operation.DestinationPath = linked.CanonicalPath;
         operation.DestinationPhysicalIdentity = linked.PhysicalIdentity;
+        operation.DestinationFingerprint = linked.FileFingerprint;
         operation.HardlinkCountAfter = linked.HardlinkCount;
         operation.LinkedAt ??= Now;
         operation.Reason = null;
@@ -732,13 +865,16 @@ public sealed class ImportService(
     /// file's own history starts with the grab that brought it (0.1.0.0 detail page design fix, 2026-10-07). Saved with the
     /// import's own changes.
     /// </summary>
-    private async Task StampGrabHistoryAsync(Guid entryId, Guid grabId, Guid bindingId, CancellationToken cancellationToken)
+    private async Task StampGrabHistoryAsync(Guid entryId, Guid grabId, Guid bindingId, CancellationToken cancellationToken,
+        Guid? packEpisodeId = null)
     {
         if (grabId == Guid.Empty || bindingId == Guid.Empty) return;
         var marker = "\"operationId\":\"" + grabId.ToString("D") + "\"";
+        // A pack wrote one grab event per episode; each file's history takes only its own episode's.
+        var episodeMarker = packEpisodeId is { } packEpisode ? "\"episodeId\":\"" + packEpisode.ToString("D") + "\"" : null;
         var grabs = await database.History.Where(history => history.EntryId == entryId && history.BindingId == null &&
                 (history.EventType == "grabbed" || history.EventType == "auto_grabbed") && history.Data != null &&
-                history.Data.Contains(marker))
+                history.Data.Contains(marker) && (episodeMarker == null || history.Data.Contains(episodeMarker)))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         foreach (var grab in grabs) grab.BindingId = bindingId;
     }
@@ -770,10 +906,25 @@ public sealed class ImportService(
         operation.OpenGrabKey = null;
         var grab = await database.GrabOperations.SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken)
             .ConfigureAwait(false);
-        if (grab is not null)
+        var pack = grab is not null && ReleaseScopes.IsPack(grab.Scope);
+        // A pack releases each episode's claim as its import completes, and its own target once it holds nothing more (season
+        // and series packs; Codex review of the pack plugin, finding 5).
+        if (pack) await ReleasePackClaimAsync(operation, cancellationToken).ConfigureAwait(false);
+        if (grab is not null && (!pack || await PackSettledAsync(grab.Id, operation.Id, operation.EpisodeId, cancellationToken)
+                .ConfigureAwait(false)))
         {
             grab.ActiveTarget = null;
             grab.UpdatedAt = now;
+        }
+
+        // A replace grab removes the episode's other files once this one is bound, through the version removal and its guards.
+        // The files it may remove are the ones the episode holds now, fixed here under the library lock: a version added later,
+        // while the replacement waits, is never one of them (Codex re-review of the pack plugin, finding 2).
+        if (grab?.Mode == GrabModes.Replace && operation.EpisodeId is { } replacedEpisode && operation.Intent == GrabIntents.AddVersion)
+        {
+            operation.ReplaceState = ReplaceStates.Pending;
+            operation.ReplaceTargets = await PackReplaceService.SnapshotTargetsAsync(database, replacedEpisode, bindingId,
+                operation.DestinationPath, cancellationToken).ConfigureAwait(false);
         }
 
         if (operation.EntryId is { } entryId)
@@ -800,14 +951,15 @@ public sealed class ImportService(
                 });
             }
 
-            await StampGrabHistoryAsync(entryId, operation.GrabId, bindingId, cancellationToken).ConfigureAwait(false);
+            await StampGrabHistoryAsync(entryId, operation.GrabId, bindingId, cancellationToken,
+                pack ? operation.EpisodeId : null).ConfigureAwait(false);
         }
 
         if (!await database.SeedReleaseOperations.AnyAsync(value => value.ImportOperationId == operation.Id, cancellationToken)
                 .ConfigureAwait(false))
             database.SeedReleaseOperations.Add(new SeedReleaseOperation
             {
-                ImportOperationId = operation.Id, GrabId = operation.GrabId, EntryId = operation.EntryId, EpisodeId = operation.EpisodeId,
+                ImportOperationId = operation.Id, GrabId = operation.GrabId, EntryId = operation.EntryId, EpisodeId = operation.EpisodeId, Pack = pack,
                 InfoHash = operation.InfoHash, DownloadClientId = operation.DownloadClientId, State = SeedReleaseStates.Waiting,
                 Reason = SeedReleaseReasons.GoalUnmet, IndexerRatio = grab?.SeedRatio,
                 IndexerSeconds = grab?.SeedMinutes is { } minutes ? minutes * 60L : null,
@@ -845,11 +997,17 @@ public sealed class ImportService(
         if (episode is not null)
         {
             var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken).ConfigureAwait(false);
-            var addEpisodeVersion = operation.Intent == GrabIntents.AddVersion && settings.EpisodeUpgradesEnabled;
+            var episodeGrab = await database.GrabOperations.AsNoTracking()
+                .SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken).ConfigureAwait(false);
+            // Another version added by hand never needs episode upgrades; an automatic one and a replacement still do, as when
+            // they were grabbed (user, 2026-10-09).
+            var manualAdd = episodeGrab is { Automatic: false } && episodeGrab.Mode != GrabModes.Replace;
+            var addEpisodeVersion = operation.Intent == GrabIntents.AddVersion && (settings.EpisodeUpgradesEnabled || manualAdd);
             if (await database.EpisodeBindings.AsNoTracking().AnyAsync(binding => binding.EpisodeId == episode.Id, cancellationToken)
                     .ConfigureAwait(false) && !addEpisodeVersion)
-                return DestinationPlan.Blocked(ImportReasons.TargetExists,
-                    "This episode already has a file; episode versions are imported only when episode upgrades are enabled.");
+                return DestinationPlan.Blocked(ImportReasons.TargetExists, operation.Intent == GrabIntents.AddVersion
+                    ? "This episode already has a file; automatic versions and replacements are imported only when episode upgrades are enabled."
+                    : "This episode already has a file.");
             var seriesFolder = await BoundSeriesFolderAsync(entry, roots, cancellationToken).ConfigureAwait(false);
             if (seriesFolder is not null && !SameMount(sourceMount, sourceIdentity, seriesFolder, source))
                 return DestinationPlan.Blocked(ImportReasons.CrossFilesystem,
@@ -879,18 +1037,63 @@ public sealed class ImportService(
                     .Where(binding => binding.EpisodeId == episode.Id && binding.MediaPath != null)
                     .OrderBy(binding => binding.OwnerItemId == null ? 0 : 1).Select(binding => binding.MediaPath!)
                     .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+                string? mainStem = null;
                 if (held is not null)
                 {
                     if (!ImportNaming.IsSingleEpisodeFile(held, episode.SeasonNumber, episode.EpisodeNumber))
                         return DestinationPlan.Blocked(ImportReasons.VersionsNotGrouped,
                             $"{Path.GetFileName(held)} does not read as S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00} alone, so Jellyfin would not group a new version with it.");
                     if (Path.GetDirectoryName(held) is { } heldFolder && MediaStorageIdentity.Contains(root, heldFolder))
+                    {
                         seasonFolder = heldFolder;
+                        mainStem = Path.GetFileNameWithoutExtension(held);
+                    }
                 }
 
-                var episodeGrab = await database.GrabOperations.AsNoTracking()
-                    .SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken).ConfigureAwait(false);
-                episodeLabel = ImportNaming.VersionLabel(episodeGrab is null ? null : JsonSerializer.Deserialize<ParsedRelease>(episodeGrab.ParsedJson));
+                var release = episodeGrab is null ? null : JsonSerializer.Deserialize<ParsedRelease>(episodeGrab.ParsedJson);
+                episodeLabel = ImportNaming.VersionLabel(release);
+                // Jellyfin 12 makes the file whose name carries a resolution (`720p`) the episode's main version, ahead of one
+                // without, whatever either really is, and among files without one the first by name (v12.0 VideoListResolver).
+                // The new file names its resolution only when it is higher than every version held, so a lower or equal one never
+                // becomes the default (user, 2026-10-09). Its version label still names the resolution in the plugin's rows and
+                // history; held files are never renamed. Every name is checked against Jellyfin's own grouping of the folder
+                // before anything is linked (Codex review of the user fixes, findings 1 and 2).
+                var ranked = await RanksAboveHeldAsync(entry.Id, episode.Id, release?.Resolution, cancellationToken).ConfigureAwait(false);
+                var fileLabel = ranked ? episodeLabel : ImportNaming.UnrankedVersionLabel(release);
+                IReadOnlyList<string> stems = ranked ? [] : ImportNaming.UnrankedStems(mainStem);
+                var seasonItem = mainStem is null ? null : NativeFolder(seasonFolder);
+                var colliding = false;
+                for (var attempt = 1; attempt <= 9; attempt++)
+                {
+                    var label = attempt == 1 ? fileLabel : fileLabel + " v" + attempt;
+                    var names = stems.Select(stem => ImportNaming.VersionBeside(stem, label, extension))
+                        .Append(ImportNaming.EpisodeFile(Path.GetFileName(seriesFolder), episode.SeasonNumber, episode.EpisodeNumber, extension, label));
+                    foreach (var name in names)
+                    {
+                        var candidate = Path.Combine(seasonFolder, name);
+                        if (!ImportNaming.FitsFileName(name) || !ImportNaming.IsSingleEpisodeFile(candidate, episode.SeasonNumber, episode.EpisodeNumber) ||
+                            !ranked && ImportNaming.NamesResolution(Path.GetFileNameWithoutExtension(name)))
+                            continue;
+                        if (files.Probe(candidate) != PathPresence.Absent)
+                        {
+                            colliding = true;
+                            continue;
+                        }
+
+                        // Beside the episode's main file: grouped with it, and, for a lower version, never ahead of it.
+                        var grouping = mainStem is null ? null
+                            : JellyfinGrouping.MainOf(seasonFolder, candidate, root, path => IgnoredByHost(path, seasonItem));
+                        if (mainStem is not null && (grouping is null || !grouping.Value.Members.Contains(held, StringComparer.Ordinal) ||
+                                !ranked && !string.Equals(grouping.Value.Main, held, StringComparison.Ordinal)))
+                            continue;
+                        return new(candidate, root, episodeLabel, Missing(seriesFolder, seasonFolder), null, null);
+                    }
+                }
+
+                return colliding
+                    ? DestinationPlan.Blocked(ImportReasons.DestinationCollision, "Every version label for this episode is already used.")
+                    : DestinationPlan.Blocked(ImportReasons.VersionsNotGrouped,
+                        "No name for the new version would keep the higher-resolution file the episode's default in Jellyfin; nothing was linked.");
             }
 
             var path = Path.Combine(seasonFolder, ImportNaming.EpisodeFile(Path.GetFileName(seriesFolder), episode.SeasonNumber,
@@ -945,6 +1148,71 @@ public sealed class ImportService(
 
         DestinationPlan CrossMount() => DestinationPlan.Blocked(ImportReasons.CrossFilesystem,
             "No folder of the target library is on the download's mount; nothing was copied.");
+    }
+
+    /// <summary>The library's own item for a folder, the parent its ignore rules are asked with; null when it has none.</summary>
+    private MediaBrowser.Controller.Entities.BaseItem? NativeFolder(string folder)
+    {
+        try
+        {
+            return library.FindByPath(folder, true);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Whether the host's scan leaves a file out, by its own ignore patterns and configured rules (ILibraryManager.IgnoreFile).
+    /// A rule that cannot answer counts as not ignoring, so the file still takes part in the grouping check.
+    /// </summary>
+    private bool IgnoredByHost(string path, MediaBrowser.Controller.Entities.BaseItem? parent)
+    {
+        try
+        {
+            return library.IgnoreFile(new MediaBrowser.Model.IO.FileSystemMetadata
+            {
+                FullName = path, Name = Path.GetFileName(path), Extension = Path.GetExtension(path), IsDirectory = false, Exists = true
+            }, parent!);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Whether a new version of <paramref name="resolution"/> is known to be higher than every version the episode holds: each
+    /// held version's resolution read from its name or the release it was imported from, else from the size Jellyfin probed,
+    /// classified like the versions row (<see cref="Automation.VersionQuality.NativeResolution"/>). A held version whose
+    /// resolution cannot be read is never assumed lower, so the new file does not displace it.
+    /// </summary>
+    private async Task<bool> RanksAboveHeldAsync(Guid entryId, Guid episodeId, string? resolution, CancellationToken cancellationToken)
+    {
+        var rank = Automation.VersionQuality.OrderOf(resolution);
+        if (rank == 0) return false;
+        var held = await Automation.VersionQuality.HeldAsync(database, entryId, episodeId, cancellationToken, library).ConfigureAwait(false);
+        foreach (var version in held)
+        {
+            var heldRank = Automation.VersionQuality.OrderOf(version.Resolution);
+            if (heldRank == 0)
+            {
+                try
+                {
+                    if (library.GetItemById(version.JellyfinItemId) is MediaBrowser.Controller.Entities.Video video)
+                        heldRank = Automation.VersionQuality.OrderOf(video.Width, video.Height);
+                }
+                catch (Exception error) when (error is not OutOfMemoryException)
+                {
+                    heldRank = 0;
+                }
+            }
+
+            if (heldRank == 0 || heldRank >= rank) return false;
+        }
+
+        return true;
     }
 
     private static bool SiblingUsesLabel(string folder, string folderName, string label)
@@ -1086,6 +1354,88 @@ public sealed class ImportService(
         return sourceMount is not null && table.Capture(canonical) == sourceMount && device == sourceDevice;
     }
 
+    private async Task<bool> IsPackAsync(Guid grabId, CancellationToken cancellationToken) =>
+        ReleaseScopes.IsPack(await database.GrabOperations.AsNoTracking().Where(value => value.Id == grabId)
+            .Select(value => value.Scope).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false));
+
+    /// <summary>Ends a pack's import of one episode without an error: the episode needs nothing from the pack.</summary>
+    private async Task SkipAsync(ImportOperation operation, string reason, string detail)
+    {
+        var now = Now;
+        operation.State = ImportStates.Cancelled;
+        operation.Reason = reason;
+        operation.Error = Bound(detail);
+        operation.CompletedAt = operation.UpdatedAt = now;
+        operation.OpenGrabKey = null;
+        await ReleasePackClaimAsync(operation, CancellationToken.None).ConfigureAwait(false);
+        if (operation.EntryId is { } entryId)
+            database.History.Add(new HistoryRecord
+            {
+                EntryId = entryId, EventType = "pack_episode_skipped", CreatedAt = now, Summary = Bound("Skipped in the pack: " + detail),
+                Data = JsonSerializer.Serialize(new { operationId = operation.Id, operation.GrabId, operation.EpisodeId, reason })
+            });
+        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Finishes a pack once every one of its imports is final (season and series packs, 2026-10-08): its target and claims are
+    /// released, and a pack where no file was imported fails with <c>pack_no_files</c>. Its hash stays owned while the client
+    /// holds the torrent, as for any import, until a seed release or a queue removal gives it back.
+    /// </summary>
+    private async Task FinishPackGrabAsync(Guid grabId, CancellationToken cancellationToken)
+    {
+        var grab = await database.GrabOperations.SingleOrDefaultAsync(value => value.Id == grabId, cancellationToken).ConfigureAwait(false);
+        if (grab is null || !ReleaseScopes.IsPack(grab.Scope) || grab.ActiveTarget is null) return;
+        var children = await database.ImportOperations.AsNoTracking().Where(value => value.GrabId == grabId)
+            .Select(value => new { value.State, value.Reason }).ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (children.Any(child => ImportStates.Open.Contains(child.State))) return;
+        // An episode whose failed import can still be retried keeps its claim, and the pack its target, until it is retried or
+        // removed from the queue.
+        if (await database.GrabClaims.AnyAsync(claim => claim.GrabId == grabId && claim.ActiveKey != null, cancellationToken)
+                .ConfigureAwait(false))
+            return;
+        var now = Now;
+        grab.ActiveTarget = null;
+        grab.UpdatedAt = now;
+        if (!children.Any(child => child.State == ImportStates.Completed) &&
+            children.All(child => child.Reason == ImportReasons.PackEpisodeMissing))
+        {
+            grab.State = GrabStates.Failed;
+            grab.FailureCode = ImportReasons.PackNoFiles;
+            if (grab.EntryId is { } entryId)
+                database.History.Add(new HistoryRecord
+                {
+                    EntryId = entryId, EventType = "import_failed", CreatedAt = now,
+                    Summary = Bound("Import failed: " + ImportMessages.For(ImportReasons.PackNoFiles)),
+                    Data = JsonSerializer.Serialize(new { grabId, reason = ImportReasons.PackNoFiles })
+                });
+        }
+
+        await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        logger.LogInformation("Pack grab {Grab} finished: every import is final", grabId);
+    }
+
+    /// <summary>
+    /// Names, once per pack, the files it holds that no claimed episode takes: specials, other seasons, multi-episode files
+    /// and files without numbering (season and series packs, 2026-10-08).
+    /// </summary>
+    private async Task RecordPackSkipsAsync(ImportOperation operation, PackMapping mapping, CancellationToken cancellationToken)
+    {
+        if (mapping.Skipped.Count == 0 || operation.EntryId is not { } entryId) return;
+        var marker = "\"grabId\":\"" + operation.GrabId.ToString("D") + "\"";
+        if (await database.History.AnyAsync(history => history.EntryId == entryId && history.EventType == "pack_file_skipped" &&
+                history.Data != null && history.Data.Contains(marker), cancellationToken).ConfigureAwait(false))
+            return;
+        var now = Now;
+        foreach (var (name, reason) in mapping.Skipped)
+            database.History.Add(new HistoryRecord
+            {
+                EntryId = entryId, EventType = "pack_file_skipped", CreatedAt = now,
+                Summary = Bound("Skipped " + Path.GetFileName(name) + " in the pack: " + PackMapping.Describe(reason)),
+                Data = JsonSerializer.Serialize(new { grabId = operation.GrabId, file = name, reason })
+            });
+    }
+
     private async Task BlockAsync(ImportOperation operation, string reason, string? detail)
     {
         var now = Now;
@@ -1118,6 +1468,9 @@ public sealed class ImportService(
         operation.UpdatedAt = now;
         operation.CompletedAt = now;
         operation.OpenGrabKey = null;
+        if (reason is ImportReasons.PackEpisodeMissing or ImportReasons.TargetMissing &&
+            await IsPackAsync(operation.GrabId, CancellationToken.None).ConfigureAwait(false))
+            await ReleasePackClaimAsync(operation, CancellationToken.None).ConfigureAwait(false);
         if (operation.EntryId is { } entryId && await database.Entries.AnyAsync(entry => entry.Id == entryId).ConfigureAwait(false))
             database.History.Add(new HistoryRecord
             {
@@ -1125,6 +1478,7 @@ public sealed class ImportService(
                 Data = JsonSerializer.Serialize(new { operationId = operation.Id, operation.EpisodeId, reason })
             });
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        await FinishPackGrabAsync(operation.GrabId, CancellationToken.None).ConfigureAwait(false);
     }
 
     internal static string Bound(string value) => value.Length <= 1024 ? value : value[..1024];
@@ -1157,6 +1511,8 @@ public static class ImportMessages
         ImportReasons.Cancelled => "it was removed from the queue.",
         ImportReasons.TargetMissing => "the title was removed from the catalog.",
         ImportReasons.ClientMissing => "the download client is no longer configured.",
+        ImportReasons.PackEpisodeMissing => "the pack holds no file for this episode.",
+        ImportReasons.PackNoFiles => "no file of the pack matched an episode it was grabbed for.",
         _ => "an unexpected problem occurred."
     };
 }

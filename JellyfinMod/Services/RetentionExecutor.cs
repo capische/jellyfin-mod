@@ -251,6 +251,101 @@ public sealed class RetentionExecutor(
     }
 
     /// <summary>
+    /// Replaces one version of an episode with the file a pack's <c>replace</c> grab imported for that same episode (season and
+    /// series packs; Codex review of the pack plugin, findings 1 and 2). It is the administrator's explicit Replace, confirmed in
+    /// the picker, so, as with Remove this version, neither retention being off nor its schedule stops it. Everything that
+    /// protects this one file still does: a per-file Keep, the file playing, a multi-part file, unwritable media, changed
+    /// storage or contents, a file another binding shares, a library path that is a download JellyfinMod keeps on disk, and a
+    /// file bound to its episode by its number only, which may be another episode (RET2-R3). Nothing is removed unless the
+    /// successor is, under the same locks and right before the unlink, still bound to the same episode, still the very file the
+    /// import linked and the file Jellyfin plays for its item, so the old file is never the last valid copy. An operation
+    /// interrupted before its unlink is never resumed: the next attempt checks everything again.
+    /// Codex re-review of the pack plugin: Keep on the title or the episode is read again under the locks, after every other
+    /// check and right before the unlink, as retention reads it (finding 1); and the binding must still be the very file the
+    /// replacement fixed when it was decided, at <paramref name="expectedPath"/> with <paramref name="expectedFingerprint"/>,
+    /// so a version added since then is never removed (finding 2).
+    /// </summary>
+    public async Task<RetentionExecutionResult> ReplaceVersionAsync(Guid entryId, Guid bindingId, Guid successorImportId,
+        string expectedPath, string? expectedFingerprint, CancellationToken cancellationToken)
+    {
+        await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        var target = await LoadVersionAsync(entryId, bindingId, cancellationToken).ConfigureAwait(false);
+        if (target?.EpisodeId is null) return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
+        if (await database.RetentionOperations.AsNoTracking().AnyAsync(operation => operation.BindingId == bindingId &&
+                (operation.State == RetentionOperationStates.Prepared || operation.State == RetentionOperationStates.Unlinked),
+                cancellationToken).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.OperationOpen);
+        var successorPath = await database.ImportOperations.AsNoTracking().Where(value => value.Id == successorImportId)
+            .Select(value => value.DestinationPath).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        // Both files' libraries are locked: the successor is read under the same locks as the file it replaces.
+        var libraries = LibrariesContaining(target.Path).Concat(LibrariesContaining(successorPath)).Append(target.LibraryId).ToHashSet();
+        await using var libraryLease = await AcquireLibrariesAsync(libraries, cancellationToken).ConfigureAwait(false);
+        target = await LoadVersionAsync(entryId, bindingId, cancellationToken).ConfigureAwait(false);
+        if (target?.EpisodeId is not { } episodeId)
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
+        // Only a file the replacement chose when it was decided, and only while it is still that file.
+        if (!string.Equals(target.Path, expectedPath, StringComparison.Ordinal) || string.IsNullOrEmpty(expectedFingerprint) ||
+            !string.Equals(target.Fingerprint, expectedFingerprint, StringComparison.Ordinal))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.MediaIdentityChanged);
+        if (await IdentityUnverifiedAsync(bindingId, cancellationToken).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.IdentityUnverified);
+        var (reason, observed) = await CheckRemovableAsync(target, cancellationToken).ConfigureAwait(false);
+        if (reason is not null) return RetentionExecutionResult.NotStarted(bindingId, reason);
+        if (!await ImportedFilePresentAsync(successorImportId, entryId, episodeId, cancellationToken).ConfigureAwait(false) ||
+            await SuccessorIsTargetAsync(successorImportId, bindingId, observed, cancellationToken).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.SuccessorUnavailable);
+        if (await Import.RetainedDownloads.ProtectionAsync(database, files, observed.CanonicalPath, cancellationToken)
+                .ConfigureAwait(false) is not null)
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.RetainedDownload);
+        // Keep on the title or the episode, read last: Keep is set under these same locks, so a Keep that returned before
+        // this point is seen here and nothing it protects is unlinked (Codex re-review of the pack plugin, finding 1).
+        if (await database.Entries.AsNoTracking().AnyAsync(entry => entry.Id == entryId && entry.RetentionPolicy == RetentionPolicy.Never,
+                cancellationToken).ConfigureAwait(false) ||
+            await database.Episodes.AsNoTracking().AnyAsync(episode => episode.Id == episodeId &&
+                episode.RetentionPolicy == RetentionPolicy.Never, cancellationToken).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionLiveReasons.Kept);
+        var policy = await database.RetentionPolicySnapshots.AsNoTracking()
+            .SingleOrDefaultAsync(snapshot => snapshot.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
+        var operation = new RetentionOperation
+        {
+            ActionId = Guid.NewGuid(), BindingId = bindingId, EntryId = target.EntryId, EpisodeId = target.EpisodeId,
+            JellyfinItemId = target.ItemId, TargetLibraryId = target.LibraryId, PolicyVersion = policy?.Version ?? 0,
+            MediaPath = observed.CanonicalPath, StorageIdentity = target.StorageIdentity!, PhysicalIdentity = observed.PhysicalIdentity,
+            LogicalBytes = checked((long)observed.LogicalBytes), HardlinkCountBefore = observed.HardlinkCount,
+            Reason = RetentionProvenances.PackReplaced, PreparedAt = clock.GetUtcNow().UtcDateTime,
+            Provenance = RetentionProvenances.PackReplaced
+        };
+        database.RetentionOperations.Add(operation);
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+        // The last point at which cancellation is honoured; everything after the unlink must finish.
+        cancellationToken.ThrowIfCancellationRequested();
+        var unlink = files.UnlinkPinned(operation.MediaPath, operation.PhysicalIdentity);
+        if (!unlink.Removed)
+            return await FinishAsync([operation], bindingId,
+                unlink.IsReplacement ? RetentionOperationStates.Blocked : RetentionOperationStates.Failed,
+                unlink.IsReplacement ? RetentionPreviewReasons.MediaIdentityChanged : RetentionExecutionReasons.UnlinkFailed,
+                new IOException(unlink.Detail), cancellationToken).ConfigureAwait(false);
+        operation.State = RetentionOperationStates.Unlinked;
+        operation.Reason = RetentionExecutionReasons.Unlinked;
+        operation.UnlinkedAt = clock.GetUtcNow().UtcDateTime;
+        operation.PhysicalBytesReleased = operation.HardlinkCountBefore > 1 ? 0 : null;
+        await SaveAfterUnlinkAsync([operation]).ConfigureAwait(false);
+        await TryRemoveNativeAsync(operation).ConfigureAwait(false);
+        return await CompleteUnderLeaseAsync([operation], bindingId, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>Whether the successor is the very file to be removed: its binding, or the same path.</summary>
+    private async Task<bool> SuccessorIsTargetAsync(Guid successorImportId, Guid bindingId, UnixFileSnapshot observed,
+        CancellationToken cancellationToken)
+    {
+        var import = await database.ImportOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == successorImportId,
+            cancellationToken).ConfigureAwait(false);
+        return import is null || import.BindingId == bindingId || import.DestinationPath is not { } destination ||
+            !files.TryCanonicalize(destination, out var canonical) || string.Equals(canonical, observed.CanonicalPath, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Whether an upgrade's new version is still there: bound to the same target, on disk, playable (review P1-3), and still
     /// the very file the import linked (review P1-9). A file put at its path since then, or the same file rewritten in place,
     /// is not the successor, and the old version may be the last valid copy.
@@ -259,20 +354,31 @@ public sealed class RetentionExecutor(
     {
         var upgrade = await database.UpgradeOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == upgradeOperationId,
             cancellationToken).ConfigureAwait(false);
-        if (upgrade?.NewImportOperationId is not { } importId) return false;
+        return upgrade?.NewImportOperationId is { } importId &&
+            await ImportedFilePresentAsync(importId, upgrade.EntryId, upgrade.EpisodeId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether the file an import completed with is still there: its binding still on the import's own movie or episode and
+    /// still the item it bound, the file at that path the inode the import linked with the size it linked and the content
+    /// reconciliation recorded, and the file Jellyfin plays for that item.
+    /// </summary>
+    private async Task<bool> ImportedFilePresentAsync(Guid importId, Guid entryId, Guid? episodeId, CancellationToken cancellationToken)
+    {
         var import = await database.ImportOperations.AsNoTracking().SingleOrDefaultAsync(value => value.Id == importId, cancellationToken)
             .ConfigureAwait(false);
-        if (import?.BindingId is not { } bindingId || import.NativeItemId is not { } nativeId ||
+        if (import?.BindingId is not { } bindingId || import.NativeItemId is not { } nativeId || import.State != ImportStates.Completed ||
+            import.EntryId != entryId || import.EpisodeId != episodeId ||
             string.IsNullOrEmpty(import.DestinationPath) || string.IsNullOrEmpty(import.DestinationPhysicalIdentity))
             return false;
-        var binding = upgrade.EpisodeId is { } episodeId
-            ? await database.EpisodeBindings.AsNoTracking().Where(value => value.Id == bindingId && value.EpisodeId == episodeId)
+        var binding = episodeId is { } boundEpisode
+            ? await database.EpisodeBindings.AsNoTracking().Where(value => value.Id == bindingId && value.EpisodeId == boundEpisode)
                 .Select(value => new { value.JellyfinItemId, value.MediaPath, value.FileFingerprint })
                 .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false)
-            : await database.EntryBindings.AsNoTracking().Where(value => value.Id == bindingId && value.EntryId == upgrade.EntryId)
+            : await database.EntryBindings.AsNoTracking().Where(value => value.Id == bindingId && value.EntryId == entryId)
                 .Select(value => new { value.JellyfinItemId, value.MediaPath, value.FileFingerprint })
                 .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
-        // The binding the import completed with, still on the upgrade's own movie or episode and still the item it bound.
+        // The binding the import completed with, still on the import's own movie or episode and still the item it bound.
         if (binding is null || binding.JellyfinItemId != nativeId || string.IsNullOrEmpty(binding.MediaPath) ||
             string.IsNullOrEmpty(binding.FileFingerprint))
             return false;
@@ -478,6 +584,12 @@ public sealed class RetentionExecutor(
             operations.Any(operation => !SameFile(operation, observed)))
             return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Failed,
                 RetentionPreviewReasons.MediaIdentityChanged, null, cancellationToken).ConfigureAwait(false);
+        // A pack replacement stopped before its unlink is not resumed on checks made before the stop: its successor may have
+        // gone since. It ends here, and the replacement prepares a new one with every check made again (Codex review of the
+        // pack plugin, finding 1).
+        if (operations.Any(operation => operation.Provenance == RetentionProvenances.PackReplaced))
+            return await FinishAsync(operations, selected.BindingId, RetentionOperationStates.Blocked,
+                RetentionExecutionReasons.ReplacementInterrupted, null, cancellationToken).ConfigureAwait(false);
         return await ExecutePreparedUnderLeaseAsync(operations, selected.BindingId, cancellationToken).ConfigureAwait(false);
     }
 
@@ -709,6 +821,7 @@ public sealed class RetentionExecutor(
                 .ConfigureAwait(false))
         {
             var replaced = operation.Provenance == RetentionProvenances.UpgradeReplaced;
+            var packReplaced = operation.Provenance == RetentionProvenances.PackReplaced;
             var versionRemoved = operation.Provenance == RetentionProvenances.VersionRemoved;
             var lastRemoved = versionRemoved && !(operation.EpisodeId.HasValue
                 ? await database.EpisodeBindings.AnyAsync(candidate => candidate.EpisodeId == operation.EpisodeId &&
@@ -719,9 +832,11 @@ public sealed class RetentionExecutor(
             {
                 Id = operation.Id,
                 EntryId = entryId,
-                EventType = replaced ? "upgrade_replaced" : versionRemoved ? "version_removed" : "reclaimed",
+                EventType = replaced ? "upgrade_replaced" : packReplaced ? "version_replaced" : versionRemoved ? "version_removed" : "reclaimed",
                 BindingId = operation.BindingId == Guid.Empty ? null : operation.BindingId,
-                Summary = versionRemoved
+                Summary = packReplaced
+                    ? $"Replaced the version {Path.GetFileName(operation.MediaPath)} with the file from the pack"
+                    : versionRemoved
                     ? $"Removed the version {Path.GetFileName(operation.MediaPath)}; the folder and its other files stay" +
                         (lastRemoved ? ". It was the last copy, so this is no longer monitored" : string.Empty)
                     : replaced
@@ -1129,4 +1244,7 @@ internal static class RetentionExecutionReasons
     public const string OperationOpen = "operation_open";
     public const string MediaIdentityUnverified = "media_identity_unverified";
     public const string SuccessorUnavailable = "successor_unavailable";
+
+    /// <summary>A pack replacement was stopped before its unlink; it is prepared again with every check.</summary>
+    public const string ReplacementInterrupted = "replacement_interrupted";
 }

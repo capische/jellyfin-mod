@@ -15,6 +15,7 @@ internal static class HistoricalSchemaRepair
     private const string BindingProvenance = "20260914125924_PhaseTwoBindingProvenance";
     private const string EmptyGuid = "00000000-0000-0000-0000-000000000000";
     private const string RetentionOperations = "20260916120000_PhaseThreeRetentionOperations";
+    private const string SeasonPacks = "20261008043448_SeasonPacks";
     /// <summary>
     /// Migrations of the manual download cleanup, withdrawn before release (user decision 2026-10-02: 0.1.0.0 never deletes
     /// downloads; the cleanup tool comes in a later version). Only test instances ran them.
@@ -34,6 +35,7 @@ internal static class HistoricalSchemaRepair
             await RepairBindingProvenanceAsync(connection, applied, cancellationToken).ConfigureAwait(false);
             await RepairRetentionOperationsAsync(connection, applied, cancellationToken).ConfigureAwait(false);
             await RemoveWithdrawnCleanupRunsAsync(connection, applied, cancellationToken).ConfigureAwait(false);
+            await RepairReplaceTargetsAsync(connection, applied, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -170,6 +172,31 @@ internal static class HistoricalSchemaRepair
             await fail.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <c>ImportOperations.ReplaceTargets</c> was added by editing the already-applied <c>SeasonPacks</c> migration (Codex pack
+    /// re-review 2, P1 1), so a database that applied its earlier form lacks the column and every import read fails. The column
+    /// is added empty: a replace import without recorded targets removes nothing and finishes done, so recovery never invents
+    /// a file to delete. <c>ImportOperations.DestinationFingerprint</c> joined the same migration later (Codex review of the
+    /// user fixes, 2026-10-09) and is added empty the same way: an import without it never lends its label's resolution to a
+    /// file. A no-op on a database that already has them, or that has not applied <c>SeasonPacks</c> yet (the migration itself
+    /// then creates them).
+    /// </summary>
+    private static async Task RepairReplaceTargetsAsync(SqliteConnection connection, IReadOnlySet<string> applied,
+        CancellationToken cancellationToken)
+    {
+        if (!applied.Contains(SeasonPacks)) return;
+        var columns = await ColumnsAsync(connection, "ImportOperations", cancellationToken).ConfigureAwait(false);
+        if (columns.Count == 0 || columns.Contains("ReplaceTargets") && columns.Contains("DestinationFingerprint")) return;
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        if (!columns.Contains("ReplaceTargets"))
+            await ExecuteAsync(connection, transaction, "ALTER TABLE \"ImportOperations\" ADD COLUMN \"ReplaceTargets\" TEXT NULL;",
+                cancellationToken).ConfigureAwait(false);
+        if (!columns.Contains("DestinationFingerprint"))
+            await ExecuteAsync(connection, transaction, "ALTER TABLE \"ImportOperations\" ADD COLUMN \"DestinationFingerprint\" TEXT NULL;",
+                cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 

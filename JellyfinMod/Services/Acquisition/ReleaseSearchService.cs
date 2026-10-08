@@ -308,6 +308,10 @@ public sealed class ReleaseSearchService(
         var limit = Math.Min(caps.LimitMax ?? MaxLimit, MaxLimit);
         var allowedHosts = AcquisitionConfiguration.AllowedHosts(indexer);
         var items = new List<TorznabItem>();
+        // The rows of each query already answered, with the identity and method they were found by: a pack search can go on to
+        // its next query when the ones before found no eligible pack (Codex review of the pack plugin, finding 7).
+        var answered = new List<(List<TorznabItem> Items, SearchIdentity Identity, string Method)>();
+        var pack = ReleaseScopes.IsPack(target.Scope);
         var truncated = false;
         var budgetStopped = false;
         var pages = 0;
@@ -370,6 +374,16 @@ public sealed class ReleaseSearchService(
             further = false;
         }
 
+        // Every query's rows evaluated with the identity they were found by; a release listed by two queries counts once.
+        List<ReleaseCandidate> EvaluateAll()
+        {
+            var all = new List<ReleaseCandidate>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var (rows, rowsIdentity, rowsMethod) in answered.Append((items, identity, method)))
+                all.AddRange(Evaluate(indexer, rows.Where(row => seen.Add(row.Guid)), target, profile, rowsIdentity, rowsMethod, allowedHosts));
+            return all;
+        }
+
         try
         {
             // Real indexers answer nothing for a query their own engine cannot match — 1337x returns zero
@@ -378,6 +392,8 @@ public sealed class ReleaseSearchService(
             // cannot grab the wrong title (P4.A3).
             foreach (var attempt in attempts)
             {
+                if (items.Count > 0) answered.Add((items, identity, method));
+                items = [];
                 identity = attempt.Identity;
                 method = attempt.Method;
                 var parameters = attempt.Parameters;
@@ -414,7 +430,12 @@ public sealed class ReleaseSearchService(
                     }
                 }
 
-                if (items.Count > 0 || budgetStopped) break;
+                // An episode or a title stops at the first query that found rows. A pack stops at the first that found an eligible
+                // pack: a season id search can answer with single episodes only while "Season 2" lists the pack, and every
+                // further query still takes a unit of the indexer's budget and its pacing.
+                if (budgetStopped || items.Count > 0 && (!pack || Evaluate(indexer, items, target, profile, identity, method, allowedHosts)
+                        .Any(candidate => candidate.Evaluation.Eligible)))
+                    break;
             }
         }
         catch (TorznabException error)
@@ -422,21 +443,22 @@ public sealed class ReleaseSearchService(
             if (error.Code == "rate_limited") cache.BackOff(indexer.Id, error.RetryAfter ?? TimeSpan.FromMinutes(1));
             logger.LogInformation("Torznab search on {Indexer} failed: {Code}", indexer.Name, error.Code);
             // Rows from pages already read are kept, but the source is reported as failed, never as complete.
-            return (Evaluate(indexer, items, target, profile, identity, method, allowedHosts),
-                Outcome(error.Code, error.Message, items.Count, items.Count > 0,
+            var partial = EvaluateAll();
+            return (partial,
+                Outcome(error.Code, error.Message, partial.Count, partial.Count > 0,
                     error.RetryAfter is { } retryAfter ? (int)Math.Ceiling(retryAfter.TotalSeconds) : null), sent);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return (Evaluate(indexer, items, target, profile, identity, method, allowedHosts),
-                Outcome("timeout", "The indexer did not answer in time.", items.Count, items.Count > 0), sent);
+            var partial = EvaluateAll();
+            return (partial, Outcome("timeout", "The indexer did not answer in time.", partial.Count, partial.Count > 0), sent);
         }
         finally
         {
             Unsent();
         }
 
-        var candidates = Evaluate(indexer, items, target, profile, identity, method, allowedHosts);
+        var candidates = EvaluateAll();
         if (budgetStopped && candidates.Count == 0)
             return (candidates, Outcome("budget_exhausted", "The indexer's daily query budget ran out during this search."), sent);
         return (candidates, Outcome(candidates.Count == 0 ? "no_results" : "ok", null, candidates.Count, truncated || budgetStopped), sent);
@@ -463,6 +485,22 @@ public sealed class ReleaseSearchService(
                 attempts.Add(new([("t", "movie"), ("tmdbid", target.TmdbId.ToString(CultureInfo.InvariantCulture))],
                     SearchIdentity.ProviderId, "tmdbid"));
         }
+        else if (target.Scope == ReleaseScopes.Season)
+        {
+            // A season pack: tvsearch by season with no episode, by the series' id when the indexer lists it (season and
+            // series packs, 2026-10-08).
+            var season = target.SeasonNumber!.Value.ToString(CultureInfo.InvariantCulture);
+            if (caps.TvSearch.Contains("tvdbid") && caps.TvSearch.Contains("season") && target.TvdbId is { } seasonTvdb)
+                attempts.Add(new([("t", "tvsearch"), ("tvdbid", seasonTvdb.ToString(CultureInfo.InvariantCulture)), ("season", season)],
+                    SearchIdentity.ProviderId, "tvdbid"));
+        }
+        else if (target.Scope == ReleaseScopes.Series)
+        {
+            // A complete-series pack: tvsearch by the series' id alone.
+            if (caps.TvSearch.Contains("tvdbid") && target.TvdbId is { } seriesTvdb)
+                attempts.Add(new([("t", "tvsearch"), ("tvdbid", seriesTvdb.ToString(CultureInfo.InvariantCulture))],
+                    SearchIdentity.ProviderId, "tvdbid"));
+        }
         else if (caps.TvSearch.Contains("tvdbid") && caps.TvSearch.Contains("season") && caps.TvSearch.Contains("ep") &&
                  target.TvdbId is { } tvdb)
         {
@@ -485,16 +523,23 @@ public sealed class ReleaseSearchService(
 
     private static List<(string Text, string Method)> TextQueries(ReleaseTarget target)
     {
-        var suffix = target.MediaType == "movie"
-            ? null
-            : $"S{target.SeasonNumber:00}E{target.EpisodeNumber:00}";
+        // Season packs are asked for as "<title> S02" and "<title> Season 2"; series packs as "<title> Complete" and the bare
+        // title, which the evaluator filters (season and series packs, 2026-10-08). Each attempt is tried only while the ones
+        // before it returned nothing, and each takes a unit of the indexer's query budget.
+        string[] suffixes = target.MediaType == "movie" ? [string.Empty]
+            : target.Scope == ReleaseScopes.Season ? [$" S{target.SeasonNumber:00}", $" Season {target.SeasonNumber}"]
+            : target.Scope == ReleaseScopes.Series ? [" Complete", string.Empty]
+            : [$" S{target.SeasonNumber:00}E{target.EpisodeNumber:00}"];
         var queries = new List<(string, string)>();
         void Add(string text, string method)
         {
-            var value = suffix is null ? text : text + " " + suffix;
-            if (!string.IsNullOrWhiteSpace(text) && queries.TrueForAll(existing =>
-                    !string.Equals(existing.Item1, value, StringComparison.OrdinalIgnoreCase)))
-                queries.Add((value, method));
+            foreach (var suffix in suffixes)
+            {
+                var value = text + suffix;
+                if (!string.IsNullOrWhiteSpace(text) && queries.TrueForAll(existing =>
+                        !string.Equals(existing.Item1, value, StringComparison.OrdinalIgnoreCase)))
+                    queries.Add((value, method));
+            }
         }
 
         if (target.MediaType == "movie" && target.Year is { } year) Add($"{target.Title} {year}", "q");

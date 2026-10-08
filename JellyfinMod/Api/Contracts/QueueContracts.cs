@@ -75,7 +75,31 @@ public sealed record QueueRowDto(
     [property: JsonPropertyName("updatedAt")] DateTime UpdatedAt,
     [property: JsonPropertyName("client"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] QueueClientDto? Client,
     [property: JsonPropertyName("seeding"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] QueueSeedingDto? Seeding,
-    [property: JsonPropertyName("admin"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] QueueAdminDetailDto? Admin);
+    [property: JsonPropertyName("admin"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] QueueAdminDetailDto? Admin)
+{
+    /// <summary>
+    /// Gets the pack this row stands for (season and series packs, 2026-10-08): one row per pack grab, its whole-torrent
+    /// progress, and each claimed episode's own import state. Null for a single-episode or movie row.
+    /// </summary>
+    [JsonPropertyName("pack"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public QueuePackDto? Pack { get; init; }
+}
+
+/// <summary>A pack's queue row detail: "Season 2 pack · 8 episodes", "Complete pack · S01–S05".</summary>
+public sealed record QueuePackDto(
+    [property: JsonPropertyName("scope")] string Scope,
+    [property: JsonPropertyName("label")] string Label,
+    [property: JsonPropertyName("mode")] string Mode,
+    [property: JsonPropertyName("episodes")] IReadOnlyList<QueuePackEpisodeDto> Episodes);
+
+/// <summary>One claimed episode of a pack and where its import stands.</summary>
+public sealed record QueuePackEpisodeDto(
+    [property: JsonPropertyName("episodeId")] Guid EpisodeId,
+    [property: JsonPropertyName("seasonNumber")] int SeasonNumber,
+    [property: JsonPropertyName("episodeNumber")] int EpisodeNumber,
+    [property: JsonPropertyName("importId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? ImportId,
+    [property: JsonPropertyName("importState"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ImportState,
+    [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Reason);
 
 /// <summary>Whether the download client answered the latest read.</summary>
 public sealed record QueueClientStatusDto(

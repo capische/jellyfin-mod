@@ -110,6 +110,7 @@ public sealed class AutomationRunner(
                 return null;
         }
 
+        packsTried.Clear();
         var run = new AutomationRun { Trigger = trigger, StartedAt = now };
         database.AutomationRuns.Add(run);
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -239,14 +240,20 @@ public sealed class AutomationRunner(
     /// </summary>
     /// <summary>
     /// Open imports and the grabs that will become one, counted in one statement over one snapshot: a grab whose import is
-    /// created meanwhile is counted once, as either, never neither (Codex delta review 2).
+    /// created meanwhile is counted once, as either, never neither (Codex delta review 2). A pack that has no imports yet counts
+    /// as the episodes it claimed, each of which becomes an import (Codex review of the pack plugin, finding 8).
     /// </summary>
     private async Task<int> OpenImportsAsync(CancellationToken cancellationToken) =>
         await database.ImportOperations.Where(operation => ImportStates.Open.Contains(operation.State)).Select(operation => operation.Id)
-            .Concat(database.GrabOperations.Where(grab => grab.State == GrabStates.Pending || grab.State == GrabStates.Submitting ||
-                grab.State == GrabStates.Unknown ||
-                grab.State == GrabStates.Accepted && grab.ActiveTarget != null &&
-                !database.ImportOperations.Any(operation => operation.GrabId == grab.Id)).Select(grab => grab.Id))
+            .Concat(database.GrabOperations.Where(grab => grab.Scope != ReleaseScopes.Season && grab.Scope != ReleaseScopes.Series &&
+                (grab.State == GrabStates.Pending || grab.State == GrabStates.Submitting || grab.State == GrabStates.Unknown ||
+                 grab.State == GrabStates.Accepted && grab.ActiveTarget != null &&
+                 !database.ImportOperations.Any(operation => operation.GrabId == grab.Id))).Select(grab => grab.Id))
+            .Concat(database.GrabClaims.Where(claim => claim.ActiveKey != null && database.GrabOperations.Any(grab => grab.Id == claim.GrabId &&
+                (grab.Scope == ReleaseScopes.Season || grab.Scope == ReleaseScopes.Series) &&
+                (grab.State == GrabStates.Pending || grab.State == GrabStates.Submitting || grab.State == GrabStates.Unknown ||
+                 grab.State == GrabStates.Accepted && grab.ActiveTarget != null &&
+                 !database.ImportOperations.Any(operation => operation.GrabId == grab.Id)))).Select(claim => claim.Id))
             .CountAsync(cancellationToken).ConfigureAwait(false);
 
     /// <summary>
@@ -274,13 +281,19 @@ public sealed class AutomationRunner(
     /// <summary>The grab the current target's step created, scheduled by the run once the step is saved.</summary>
     private GrabOperation? createdGrab;
 
+    /// <summary>The seasons this run already searched a pack for, so one season is asked for once per run.</summary>
+    private readonly HashSet<(Guid EntryId, int Season)> packsTried = [];
+
     private async Task<string> ProcessCoreAsync(AutomationRun run, AutomationTarget target, AutomationTargetState row,
         AcquisitionSettings settings, int grabsToday, Dictionary<Guid, int> queries, CancellationToken cancellationToken)
     {
         var now = Now;
         var targetKey = GrabService.TargetKey(target.Entry.Id, target.Episode?.Id);
         row.SearchNowRequestedAt = null;
+        // A pack that claimed the episode holds it as a single-episode grab would (season and series packs, 2026-10-08).
         if (await database.GrabOperations.AnyAsync(grab => grab.ActiveTarget == targetKey || grab.ActiveTarget == targetKey + "+add",
+                cancellationToken).ConfigureAwait(false) ||
+            await database.GrabClaims.AnyAsync(claim => claim.ActiveKey == targetKey || claim.ActiveKey == targetKey + "+add",
                 cancellationToken).ConfigureAwait(false) ||
             await database.UpgradeOperations.AnyAsync(upgrade => upgrade.OpenTargetKey == targetKey, cancellationToken).ConfigureAwait(false))
             return Skip(run, target, row, AutomationReasons.ActiveGrabExists, null, retryIn: TimeSpan.FromHours(1));
@@ -310,6 +323,12 @@ public sealed class AutomationRunner(
                 retryIn: allBroken ? ReleaseSearchService.BreakerDuration : now.Date.AddDays(1) - now,
                 kind: allBroken ? AutomationDecisionKinds.Skipped : AutomationDecisionKinds.BudgetExhausted);
         }
+
+        // Automation prefers packs: a missing episode of a fully aired season with at least two monitored episodes missing
+        // searches that season's pack first, once per run; with no eligible pack, the episode is searched alone as before.
+        if (!target.IsUpgrade && target.Episode is { } wanted && packsTried.Add((target.Entry.Id, wanted.SeasonNumber)) &&
+            await TryPackAsync(run, target, row, settings, wanted.SeasonNumber, queries, cancellationToken).ConfigureAwait(false) is { } packOutcome)
+            return packOutcome;
 
         ReleaseSearchSnapshot snapshot;
         using (var scope = scopes.CreateScope())
@@ -439,6 +458,122 @@ public sealed class AutomationRunner(
         row.LastOutcome = AutomationReasons.Grabbed;
         Record(run, target, AutomationDecisionKinds.Grabbed, AutomationReasons.Grabbed, best.RawTitle, grabId: grab.Id,
             indexerId: best.IndexerId);
+        return AutomationReasons.Grabbed;
+    }
+
+    /// <summary>
+    /// The minimum number of monitored missing episodes for which a fully aired season is searched as a pack first (season and
+    /// series packs, 2026-10-08, proposed default).
+    /// </summary>
+    public const int PackMinimumMissing = 2;
+
+    /// <summary>
+    /// Searches and grabs a season pack in <c>fill</c> mode for a season that qualifies: every episode of it has aired and at
+    /// least <see cref="PackMinimumMissing"/> monitored episodes are missing. Returns the outcome when the pack was grabbed or
+    /// the grab refused, or null to search the episode alone. The same profile, identity, score and seeder rules apply; one
+    /// pack counts as one grab against the daily budget and as its claimed episodes against the open-import limit.
+    /// </summary>
+    private async Task<string?> TryPackAsync(AutomationRun run, AutomationTarget target, AutomationTargetState row,
+        AcquisitionSettings settings, int season, Dictionary<Guid, int> queries, CancellationToken cancellationToken)
+    {
+        var now = Now;
+        var entry = target.Entry;
+        var episodes = await database.Episodes.AsNoTracking().Where(value => value.EntryId == entry.Id).ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var seasonEpisodes = episodes.Where(value => value.SeasonNumber == season).ToArray();
+        // An episode another grab already holds (its own or a pack's) is not missing for this purpose.
+        var keys = seasonEpisodes.Select(value => GrabService.TargetKey(entry.Id, value.Id)).ToArray();
+        var taken = (await database.GrabOperations.AsNoTracking().Where(grab => grab.ActiveTarget != null && keys.Contains(grab.ActiveTarget))
+                .Select(grab => grab.ActiveTarget!).ToListAsync(cancellationToken).ConfigureAwait(false))
+            .Concat(await database.GrabClaims.AsNoTracking().Where(claim => claim.ActiveKey != null && keys.Contains(claim.ActiveKey))
+                .Select(claim => claim.ActiveKey!).ToListAsync(cancellationToken).ConfigureAwait(false))
+            .ToHashSet(StringComparer.Ordinal);
+        bool Wanted(Episode value) => value.Monitored && value.State != FileState.OnDisk &&
+            (value.State != FileState.Reclaimed || settings.ReacquireReclaimed) &&
+            !taken.Contains(GrabService.TargetKey(entry.Id, value.Id));
+        if (season <= 0 || seasonEpisodes.Length == 0 ||
+            seasonEpisodes.Any(value => value.AirDate is not { } aired || aired.AddMinutes(Math.Max(0, settings.NewEpisodeDelayMinutes)) > now) ||
+            seasonEpisodes.Count(Wanted) < PackMinimumMissing)
+            return null;
+        if (await database.GrabOperations.AnyAsync(grab => grab.ActiveTarget == GrabService.PackKey(entry.Id, season), cancellationToken)
+                .ConfigureAwait(false))
+            return null;
+
+        var covered = ReleaseTargets.Covered(episodes, ReleaseScopes.Season, season, now);
+        ReleaseSearchSnapshot snapshot;
+        using (var scope = scopes.CreateScope())
+        {
+            try
+            {
+                snapshot = await scope.ServiceProvider.GetRequiredService<ReleaseSearchService>().SearchAsync(GrabService.AutomationUserId,
+                    ReleaseTargets.ForPack(entry, ReleaseScopes.Season, season, covered, episodes),
+                    new EvaluationProfile(target.Profile.Id, target.Profile.Name, target.Profile.Revision,
+                        AcquisitionConfiguration.Qualities(target.Profile), target.Profile.MinimumBytesPerHour,
+                        target.Profile.MaximumBytesPerHour),
+                    target.Inherited, settings.Revision, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is TorznabException or HttpRequestException or DbUpdateException)
+            {
+                return null;
+            }
+        }
+
+        foreach (var (indexerId, count) in snapshot.QueriesByIndexer) queries[indexerId] = queries.GetValueOrDefault(indexerId) + count;
+        foreach (var opened in snapshot.BreakersOpened)
+            Record(run, target, AutomationDecisionKinds.BreakerOpened, AutomationReasons.BreakerOpen,
+                "The indexer failed five times in a row and is paused for an hour.", indexerId: opened);
+        run.Searched++;
+        var titleMatchIndexers = await database.AcquisitionIndexers.AsNoTracking()
+            .Where(indexer => indexer.AutomateTitleMatches).Select(indexer => indexer.Id)
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        var best = snapshot.Candidates.FirstOrDefault(candidate => candidate.Evaluation.Eligible &&
+            (candidate.Evaluation.Identity == "verified" ||
+             candidate.Evaluation.Identity == "title" && titleMatchIndexers.Contains(candidate.IndexerId)) &&
+            (target.Profile.MinimumAutoScore is not { } score || candidate.Evaluation.Score >= score) &&
+            (target.Profile.MinimumSeeders is not { } seeders || (candidate.Seeders ?? 0) >= seeders));
+        if (best is null)
+        {
+            // The episode's own search follows and records the step's one decision.
+            logger.LogInformation("No eligible season {Season} pack for {Entry} among {Count} candidates; searching episodes one at a time",
+                season, entry.Id, snapshot.Candidates.Count);
+            return null;
+        }
+
+        var wantedCount = seasonEpisodes.Count(Wanted);
+        GrabOperation grab;
+        using (var scope = scopes.CreateScope())
+        {
+            try
+            {
+                var (operation, created) = await scope.ServiceProvider.GetRequiredService<GrabService>().CreateAsync(
+                    GrabService.AutomationUserId,
+                    new GrabRequest(snapshot.SearchId, best.ReleaseId, $"auto-{run.Id:N}-pack-{entry.Id:N}-{season}", true, null, GrabModes.Fill),
+                    (current, episode) => current.Monitored && (episode is null || Wanted(episode)), cancellationToken,
+                    async token => await OpenImportsAsync(token).ConfigureAwait(false) + wantedCount > Math.Max(0, settings.MaxConcurrentImports)
+                        ? "too_many_open_imports" : null).ConfigureAwait(false);
+                grab = operation;
+                if (created) createdGrab = operation;
+            }
+            catch (GrabException error)
+            {
+                if (error.Code is "too_many_open_imports")
+                    return Skip(run, target, row, AutomationReasons.TooManyOpenImports, "Season " + season + " pack", retryIn: TimeSpan.FromHours(1));
+                // Any other refusal (an episode claimed meanwhile, nothing left to fill) leaves the episode to its own search.
+                logger.LogInformation("Season {Season} pack for {Entry} was not grabbed ({Code}); searching episodes one at a time",
+                    season, entry.Id, error.Code);
+                return null;
+            }
+        }
+
+        row.LastGrabId = grab.Id;
+        row.LastAutoGrabAt = now;
+        row.LastSearchedAt = now;
+        row.ConsecutiveEmpty = 0;
+        row.NextSearchAt = now + FirstBackoff;
+        run.Grabbed++;
+        row.LastOutcome = AutomationReasons.Grabbed;
+        Record(run, target, AutomationDecisionKinds.Grabbed, AutomationReasons.Grabbed, $"Season {season} pack: {best.RawTitle}",
+            grabId: grab.Id, indexerId: best.IndexerId);
         return AutomationReasons.Grabbed;
     }
 

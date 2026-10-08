@@ -29,7 +29,14 @@ public static class QueueReadModel
             .Where(grab => grab.EntryId != null && entryIds.Contains(grab.EntryId.Value) && grab.ActiveTarget != null)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         var result = new Dictionary<Guid, ProjectedAcquisition>();
-        foreach (var grab in grabs) result[grab.EpisodeId ?? grab.EntryId!.Value] = new("grabbed", null);
+        // A pack shows as grabbed on each episode it claimed, through its claims (season and series packs, 2026-10-08).
+        var packIds = grabs.Where(grab => ReleaseScopes.IsPack(grab.Scope)).Select(grab => grab.Id).ToArray();
+        if (packIds.Length > 0)
+            foreach (var episodeId in await database.GrabClaims.AsNoTracking()
+                         .Where(claim => packIds.Contains(claim.GrabId) && claim.ActiveKey != null).Select(claim => claim.EpisodeId)
+                         .ToListAsync(cancellationToken).ConfigureAwait(false))
+                result[episodeId] = new("grabbed", null);
+        foreach (var grab in grabs.Where(grab => !ReleaseScopes.IsPack(grab.Scope))) result[grab.EpisodeId ?? grab.EntryId!.Value] = new("grabbed", null);
         foreach (var operation in operations.OrderBy(operation => operation.CreatedAt))
         {
             var target = operation.EpisodeId ?? operation.EntryId!.Value;
@@ -80,6 +87,23 @@ public static class QueueReadModel
             administrator && client is not null ? new QueueClientDto(client.Id, client.Name, client.OpenUrl) : null,
             seed is null ? null : Seeding(seed, torrent, settings, libraryLinkPresent),
             administrator ? Admin(operation) : null);
+    }
+
+    /// <summary>The pack detail of a pack's single queue row: its label and each claimed episode's newest import.</summary>
+    public static QueuePackDto Pack(GrabOperation grab, IReadOnlyList<Episode> claimed, IReadOnlyList<ImportOperation> children)
+    {
+        var parsed = System.Text.Json.JsonSerializer.Deserialize<ParsedRelease>(grab.ParsedJson);
+        var seasons = parsed?.PackSeasons() ?? [];
+        var label = seasons.Count == 1
+            ? $"Season {seasons[0]} pack · {claimed.Count} episode{(claimed.Count == 1 ? string.Empty : "s")}"
+            : claimed.Count == 0 ? GrabService.PackLabel(parsed)
+            : $"{GrabService.PackLabel(parsed)} · S{claimed.Min(value => value.SeasonNumber):00}–S{claimed.Max(value => value.SeasonNumber):00}";
+        return new QueuePackDto(grab.Scope, label, grab.Mode, claimed.Select(episode =>
+        {
+            var import = children.Where(child => child.GrabId == grab.Id && child.EpisodeId == episode.Id)
+                .OrderByDescending(child => child.CreatedAt).FirstOrDefault();
+            return new QueuePackEpisodeDto(episode.Id, episode.SeasonNumber, episode.EpisodeNumber, import?.Id, import?.State, import?.Reason);
+        }).ToArray());
     }
 
     /// <summary>The row state shown to users (P5 API contract).</summary>

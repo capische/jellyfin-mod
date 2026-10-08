@@ -111,6 +111,26 @@ public enum PathMapOutcome
 /// <summary>The file chosen from a completed torrent, or why none could be chosen.</summary>
 public sealed record ImportFileChoice(ClientTorrentFile? File, string? Reason, string? Detail);
 
+/// <summary>
+/// A pack's files mapped to the episodes it claimed (season and series packs, 2026-10-08), the files no claimed episode takes
+/// with why, or why nothing could be mapped at all.
+/// </summary>
+public sealed record PackMapping(IReadOnlyDictionary<(int Season, int Episode), ClientTorrentFile> Files,
+    IReadOnlyList<(string Name, string Reason)> Skipped, string? Reason, string? Detail)
+{
+    /// <summary>The sentence for a skip reason.</summary>
+    public static string Describe(string reason) => reason switch
+    {
+        "special" => "specials are never imported from a pack.",
+        "other_season" => "it belongs to a season the pack was not grabbed for.",
+        "not_claimed" => "its episode was not grabbed from this pack.",
+        "multi_episode" => "it holds several episodes in one file.",
+        "unnumbered" => "no season and episode number could be read from its name.",
+        "duplicate" => "another file of the pack is the same episode.",
+        _ => "it could not be matched to an episode."
+    };
+}
+
 /// <summary>Chooses the one file of a torrent that is the title (P5.I1 defaults table).</summary>
 public static partial class ImportFileSelector
 {
@@ -140,6 +160,82 @@ public static partial class ImportFileSelector
             return new(null, ImportReasons.EpisodeMismatch,
                 $"The file is not numbered S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00}.");
         return new(chosen, null, null);
+    }
+
+    /// <summary>
+    /// Maps a completed pack's video files to the episodes it claimed by their names, and a season folder when the file name
+    /// carries only an episode number. Samples, trailers and extras, and files under a tenth of the largest video, are
+    /// ignored silently; specials, other seasons, unclaimed episodes, multi-episode and unnumbered files are skipped and
+    /// named. Two files of one episode keep the larger and skip the other.
+    /// </summary>
+    public static PackMapping MapPack(ClientTorrentStatus torrent, string videoExtensions, IReadOnlySet<(int Season, int Episode)> claimed)
+    {
+        var allowed = videoExtensions.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(extension => extension.TrimStart('.').ToLowerInvariant()).ToHashSet(StringComparer.Ordinal);
+        var wanted = torrent.Files.Where(file => file.Wanted).ToArray();
+        var videos = wanted.Where(file => allowed.Contains(Extension(file.Name)) && !IsExtra(file.Name, torrent.Name)).ToArray();
+        if (videos.Length == 0)
+        {
+            var archive = wanted.Any(file => ImportDefaults.ArchiveExtensions.Contains(Extension(file.Name)) || RarPartPattern().IsMatch(file.Name));
+            return new(new Dictionary<(int, int), ClientTorrentFile>(), [],
+                archive ? ImportReasons.ArchiveUnsupported : ImportReasons.NoVideoFile,
+                archive ? "The release is packed in an archive; archives are never extracted." : "The torrent holds no allow-listed video file.");
+        }
+
+        var floor = videos.Max(file => file.Length) / 10;
+        var claimedSeasons = claimed.Select(item => item.Season).ToHashSet();
+        var files = new Dictionary<(int, int), ClientTorrentFile>();
+        var skipped = new List<(string, string)>();
+        foreach (var file in videos.Where(file => file.Length >= floor).OrderByDescending(file => file.Length))
+        {
+            var (season, episodes) = Numbering(file.Name);
+            string? reason = season is null || episodes.Count == 0 ? "unnumbered"
+                : season == 0 ? "special"
+                : episodes.Count > 1 ? "multi_episode"
+                : !claimedSeasons.Contains(season.Value) ? "other_season"
+                : !claimed.Contains((season.Value, episodes[0])) ? "not_claimed"
+                : files.ContainsKey((season.Value, episodes[0])) ? "duplicate"
+                : null;
+            if (reason is null) files[(season!.Value, episodes[0])] = file;
+            else skipped.Add((file.Name, reason));
+        }
+
+        return new(files, skipped, null, null);
+    }
+
+    /// <summary>
+    /// A file's season and episodes: from its own name, else from a folder's; a name with only an episode number
+    /// (<c>E03</c>, <c>Episode 3</c>, <c>03 - Title</c>) takes its season from the nearest season folder.
+    /// </summary>
+    private static (int? Season, IReadOnlyList<int> Episodes) Numbering(string name)
+    {
+        var segments = name.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var own = ReleaseParser.Parse(Path.GetFileNameWithoutExtension(segments[^1]));
+        if (own.SeasonNumber is not null && own.EpisodeNumbers.Count > 0) return (own.SeasonNumber, own.EpisodeNumbers);
+        int? folderSeason = null;
+        for (var index = segments.Length - 2; index >= 0 && folderSeason is null; index--)
+        {
+            var folder = ReleaseParser.Parse(segments[index]);
+            if (folder.SeasonNumber is not null && folder.SeasonLast is null) folderSeason = folder.SeasonNumber;
+        }
+
+        if (folderSeason is null) return (null, []);
+        var stem = Path.GetFileNameWithoutExtension(segments[^1]);
+        var bare = BareEpisodePattern().Match(stem);
+        if (!bare.Success) return (null, []);
+        List<int> episodes = [int.Parse(bare.Groups["episode"].Value, System.Globalization.CultureInfo.InvariantCulture)];
+        // Every number right after the first (E01E02, E01E02E03, E01-E02-E03, E01-02, 01-02, 01 & 02) makes a multi-episode
+        // file, never the first episode alone: it is skipped as several episodes, like S01E01E02 (Codex review of the pack
+        // plugin, finding 6; re-review, finding 4: three or more). A quality or a title after the number ("E01 - 720p",
+        // "03 - Title") is not another episode.
+        var rest = stem[(bare.Index + bare.Length)..];
+        for (var more = BareEpisodeContinuation().Match(rest); more.Success; more = BareEpisodeContinuation().Match(rest))
+        {
+            episodes.Add(int.Parse(more.Groups["episode"].Value, System.Globalization.CultureInfo.InvariantCulture));
+            rest = rest[more.Length..];
+        }
+
+        return (folderSeason, episodes);
     }
 
     /// <summary>Returns the lower-case extension without its dot.</summary>
@@ -186,6 +282,12 @@ public static partial class ImportFileSelector
 
     [GeneratedRegex(@"\.r\d{2}$", RegexOptions.IgnoreCase)]
     private static partial Regex RarPartPattern();
+
+    [GeneratedRegex(@"^(?:.*?[\s._\-])??(?:E|Ep|Episode)[\s._\-]?(?<episode>\d{1,3})(?![0-9])|^(?<episode>\d{1,3})(?=[\s._\-]|$)", RegexOptions.IgnoreCase)]
+    private static partial Regex BareEpisodePattern();
+
+    [GeneratedRegex(@"^(?:[\s._]*[-&+~][\s._]*(?:E|Ep|Episode)?[\s._]?|[\s._]*(?:E|Ep|Episode)[\s._]?)(?<episode>\d{1,3})(?=[\s._\-\[(]|$|(?:E|Ep|Episode)[\s._]?\d)", RegexOptions.IgnoreCase)]
+    private static partial Regex BareEpisodeContinuation();
 }
 
 /// <summary>Jellyfin-compatible names for imported files (P5.I1 defaults table).</summary>
@@ -283,6 +385,55 @@ public static partial class ImportNaming
         return "v1";
     }
 
+    /// <summary>
+    /// A version label that names no resolution, for another version that must not become Jellyfin's main one: Jellyfin 12 puts
+    /// a file whose name matches <c>[0-9]{3,}[ip]</c> ahead of one without (v12.0 <c>VideoListResolver</c>). The source, else
+    /// the release group, else <c>Version</c> (user, 2026-10-09).
+    /// </summary>
+    public static string UnrankedVersionLabel(ParsedRelease? parsed)
+    {
+        var label = VersionLabel(parsed);
+        if (parsed?.Resolution is { } resolution && label.StartsWith(resolution, StringComparison.Ordinal))
+            label = label[resolution.Length..].Trim();
+        if (label.Length == 0 || label == "v1" || ResolutionTokenPattern().IsMatch(label))
+            label = !string.IsNullOrWhiteSpace(parsed?.Group) && Sanitize(parsed.Group) is { Length: > 0 } group &&
+                !ResolutionTokenPattern().IsMatch(group) ? group : "Version";
+        return label;
+    }
+
+    /// <summary>
+    /// The stems a lower version may be named after, so that it sorts right after the main file it goes beside: the main file's
+    /// own name when it names no resolution. Otherwise that name with Jellyfin's resolution tokens (<c>720p</c>) and the
+    /// plugin's own aliases (<c>4K</c>, <c>UHD</c>) taken out, then with each alias kept but ended by a letter (<c>4Kx</c>),
+    /// which neither reads as a resolution nor sorts ahead of the main file. A resolution the main file names is never carried
+    /// into the new file's name (Codex review of the user fixes, finding 1); each name is still checked against Jellyfin's own
+    /// grouping before it is used.
+    /// </summary>
+    public static IReadOnlyList<string> UnrankedStems(string? mainStem)
+    {
+        if (string.IsNullOrWhiteSpace(mainStem)) return [];
+        if (!NamesResolution(mainStem)) return [mainStem];
+        var bare = ResolutionTokenPattern().Replace(mainStem, string.Empty);
+        string Tidy(string value) => SpacesPattern().Replace(value, " ").Trim(' ', '-', '.', '_');
+        return new[] { Tidy(AliasPattern().Replace(bare, string.Empty)), Tidy(AliasPattern().Replace(bare, match => match.Value + "x")) }
+            .Where(stem => stem.Length > 0 && !NamesResolution(stem)).Distinct(StringComparer.Ordinal).ToArray();
+    }
+
+    /// <summary>
+    /// Whether a name says a resolution to Jellyfin (its version ordering token) or to the plugin's own readers
+    /// (<see cref="Automation.VersionQuality.Parse"/>, which also reads <c>4K</c> and <c>UHD</c>).
+    /// </summary>
+    public static bool NamesResolution(string stem) =>
+        ResolutionTokenPattern().IsMatch(stem) || AliasPattern().IsMatch(stem) ||
+        Automation.VersionQuality.Parse("/" + stem + ".mkv").Resolution is not null;
+
+    /// <summary>Another version named after the file it goes beside: <c>Show - S01E01 - Pilot - WEB-DL.mkv</c>, never cut short.</summary>
+    public static string VersionBeside(string mainStem, string label, string extension) =>
+        mainStem + " - " + Sanitize(label) + "." + extension;
+
+    /// <summary>Whether a file name fits the filesystem's 255-byte limit; a longer one is never cut, it is not used.</summary>
+    public static bool FitsFileName(string name) => name.Length > 0 && Encoding.UTF8.GetByteCount(name) <= 255;
+
     /// <summary>Removes path separators, control and reserved characters, and trailing dots and spaces.</summary>
     public static string Sanitize(string value)
     {
@@ -313,6 +464,14 @@ public static partial class ImportNaming
 
     [GeneratedRegex(@"\s{2,}")]
     private static partial Regex SpacesPattern();
+
+    /// <summary>The resolutions the plugin's release parser reads, aliases included (<c>ReleaseParser.ResolutionPattern</c>).</summary>
+    [GeneratedRegex(@"(?<![A-Za-z0-9])(?:2160p|1080p|1080i|720p|576p|480p|4k|uhd)(?![A-Za-z0-9])", RegexOptions.IgnoreCase)]
+    private static partial Regex AliasPattern();
+
+    /// <summary>Jellyfin 12's resolution pattern for version ordering (v12.0 <c>VideoListResolver.ResolutionRegex</c>).</summary>
+    [GeneratedRegex(@"[0-9]{2}[0-9]+[ip]", RegexOptions.IgnoreCase)]
+    private static partial Regex ResolutionTokenPattern();
 
     [GeneratedRegex(@"\s*\[(tmdbid|imdbid|tvdbid)-[^\]]*\]", RegexOptions.IgnoreCase)]
     private static partial Regex ProviderTagPattern();

@@ -36,7 +36,10 @@ public static class VersionQuality
     }
 
     /// <summary>Ranks a resolution: 2160p highest, unknown 0.</summary>
-    public static int ResolutionRank(string? path) => Parse(path).Resolution switch
+    public static int ResolutionRank(string? path) => RankOf(Parse(path).Resolution);
+
+    /// <summary>Ranks a parsed resolution (<c>1080p</c>): 2160p highest, unknown 0.</summary>
+    public static int RankOf(string? resolution) => resolution switch
     {
         "2160p" => 4,
         "1080p" => 3,
@@ -61,14 +64,40 @@ public static class VersionQuality
     }
 
     /// <summary>Ranks a native video size the same way as a parsed resolution.</summary>
-    public static int NativeRank(int? width, int? height) => NativeResolution(width, height) switch
+    public static int NativeRank(int? width, int? height) => RankOf(NativeResolution(width, height));
+
+    /// <summary>
+    /// Orders known resolutions finely, 576p above 480p, for deciding which of an episode's versions Jellyfin should take as
+    /// its default (Codex review of the user fixes, finding 4); unknown 0. Retention keeps its coarser <see cref="RankOf"/>.
+    /// </summary>
+    public static int OrderOf(string? resolution) => resolution switch
     {
-        "2160p" => 4,
-        "1080p" => 3,
-        "720p" => 2,
+        "2160p" => 5,
+        "1080p" => 4,
+        "720p" => 3,
+        "576p" => 2,
         "480p" => 1,
         _ => 0
     };
+
+    /// <summary>
+    /// The same order from the size Jellyfin probed, classified by <see cref="NativeResolution"/>. Its lowest tier holds both
+    /// 576p and 480p; inside it a picture at least 540 lines tall (PAL 720×576, 1024×576, 960×540) is ordered as 576p, above
+    /// NTSC 480 lines, so a 576p file is never taken for the lower one. Unknown 0.
+    /// </summary>
+    public static int OrderOf(int? width, int? height)
+    {
+        var resolution = NativeResolution(width, height);
+        return OrderOf(resolution == "480p" && height >= 540 ? "576p" : resolution);
+    }
+
+    /// <summary>The quality and resolution a version label names (<c>720p WEB-DL</c>), for a file whose own name does not.</summary>
+    public static (string? Quality, string? Resolution) ParseLabel(string? label)
+    {
+        if (string.IsNullOrWhiteSpace(label)) return (null, null);
+        var parsed = ReleaseParser.Parse("Version." + label.Trim().Replace(' ', '.'));
+        return (parsed.Quality, parsed.Resolution);
+    }
 
     /// <summary>Returns a quality's position in a profile, best first; qualities outside the profile rank last.</summary>
     public static int ProfileIndex(IReadOnlyList<string> profile, string? quality)
