@@ -538,7 +538,11 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         states[(firstUser.Id, movie.Id)] = State(true, 0, null);
         Raise(firstUser.Id, movie, UserDataSaveReason.Import);
         workerGate.Set();
-        await WaitForObservationAsync(path, firstUser.Id, movie.Id,
+        // The listener is first in, first out: a later episode event proves the coalesced movie read was handled. The movie
+        // row cannot be waited on, because the revocation written before that read carries the same clock time.
+        states[(firstUser.Id, nativeEpisode.Id)] = State(true, 0, clock.GetUtcNow().UtcDateTime);
+        Raise(firstUser.Id, nativeEpisode, UserDataSaveReason.TogglePlayed);
+        await WaitForObservationAsync(path, firstUser.Id, nativeEpisode.Id,
             observation => observation.ObservedAt == clock.GetUtcNow().UtcDateTime);
         await using (var after = new ModDbContext(path))
         {
