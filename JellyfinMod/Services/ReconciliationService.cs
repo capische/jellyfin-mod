@@ -14,7 +14,8 @@ public sealed class ReconciliationService(
     MediaStorageIdentity? mediaStorage = null,
     TimeProvider? clock = null,
     ILibraryManager? library = null,
-    UnixFileInspector? files = null)
+    UnixFileInspector? files = null,
+    Ratings.RatingsAutoFetch? ratingsFetch = null)
 {
     private readonly MediaStorageIdentity _mediaStorage = mediaStorage ?? new();
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
@@ -772,6 +773,9 @@ public sealed class ReconciliationService(
         }
 
         if (!created) await DetachOrphanVersionKeepsAsync([entry.Id], cancellationToken).ConfigureAwait(false);
+        // A title new to the catalog, or a file of it newly bound (a scan, an import): its ratings are fetched within seconds
+        // when they are due (user decision 8). This only wakes the background fetcher.
+        if (created || addedEntryBindings > 0) ratingsFetch?.Arrived(entry.Id);
 
         return new(created ? ReconciliationOutcome.Created : entryChanged || entryBindingChanges > 0 || episodeChanges > 0
             ? ReconciliationOutcome.Updated : ReconciliationOutcome.Unchanged, entry.Id, episodeChanges, null)

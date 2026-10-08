@@ -83,7 +83,14 @@ public sealed record RatingsStatusDto(
     [property: JsonPropertyName("lastRun"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] RatingsRunDto? LastRun,
     [property: JsonPropertyName("entries")] int Entries,
     [property: JsonPropertyName("entriesWithoutRatings")] int EntriesWithoutRatings,
-    [property: JsonPropertyName("queued")] int Queued);
+    [property: JsonPropertyName("queued")] int Queued,
+    [property: JsonPropertyName("running"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] RatingsActivityDto? Running);
+
+/// <summary>A pass in progress (user decision 8): what started it, when, and how many titles it still has before it.</summary>
+public sealed record RatingsActivityDto(
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("startedAt")] DateTime StartedAt,
+    [property: JsonPropertyName("remaining")] int Remaining);
 
 /// <summary>The breaker.</summary>
 public sealed record RatingsBreakerDto(

@@ -71,6 +71,14 @@ internal sealed class Boundary : IAsyncDisposable
 
     public int CallsFor(string kind, int id) => Calls.Count(call => call == $"{kind}:{id}");
 
+    /// <summary>How long every MDBList call takes before it is answered (a pass in progress is visible this way).</summary>
+    public TimeSpan Delay { get; set; }
+
+    private int _inFlight;
+
+    /// <summary>The most MDBList calls ever open at once: one fetcher means one.</summary>
+    public int MaxInFlight;
+
     public static async Task<Boundary> StartAsync()
     {
         var builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions());
@@ -79,6 +87,28 @@ internal sealed class Boundary : IAsyncDisposable
         builder.Logging.ClearProviders();
         var app = builder.Build();
         Boundary? self = null;
+        app.Use(async (context, next) =>
+        {
+            if (!context.Request.Path.StartsWithSegments("/tmdb"))
+            {
+                await next();
+                return;
+            }
+
+            var boundary = self!;
+            var open = Interlocked.Increment(ref boundary._inFlight);
+            for (var seen = Volatile.Read(ref boundary.MaxInFlight); open > seen; seen = Volatile.Read(ref boundary.MaxInFlight))
+                if (Interlocked.CompareExchange(ref boundary.MaxInFlight, open, seen) == seen) break;
+            try
+            {
+                if (boundary.Delay > TimeSpan.Zero) await Task.Delay(boundary.Delay);
+                await next();
+            }
+            finally
+            {
+                Interlocked.Decrement(ref boundary._inFlight);
+            }
+        });
         app.MapGet("/tmdb/{kind}/{id:int}", async (HttpContext context, string kind, int id) =>
         {
             var boundary = self!;

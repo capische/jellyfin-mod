@@ -31,6 +31,8 @@ public sealed class RatingsController(
     RatingsCredentialGate credential,
     RatingsRefreshQueue queue,
     MdbListClient client,
+    RatingsRunGate runGate,
+    RatingsAutoFetch automatic,
     TimeProvider clock) : ControllerBase
 {
     /// <summary>Gets the ratings settings.</summary>
@@ -66,6 +68,7 @@ public sealed class RatingsController(
             Status = 409, Type = "revision_conflict", Title = "This configuration changed since it was loaded. Reload and try again."
         });
         var previous = settings.ApiKeyRef;
+        var wasEnabled = settings.Enabled;
         if (request.Enabled is { } enabled) settings.Enabled = enabled;
         if (request.RefreshDays is { } days) settings.RefreshDays = days;
         if (request.DailyBudget is { } budget) settings.DailyBudget = budget;
@@ -91,7 +94,11 @@ public sealed class RatingsController(
         });
         await database.SaveChangesAsync(cancellationToken);
         if (previous != settings.ApiKeyRef) await secrets.RemoveAsync(previous, CancellationToken.None);
-        return await DtoAsync(settings, cancellationToken);
+        var dto = await DtoAsync(settings, cancellationToken);
+        // Switched on with a key saved: fetch everything due now rather than at 04:00 (user decision 8). This only wakes the
+        // background fetcher; the save does not wait for it.
+        if (!wasEnabled && settings.Enabled && dto.ApiKeyConfigured) automatic.RunAll(RatingsPassKinds.Setup);
+        return dto;
     }
 
     /// <summary>Makes one real MDBList call for a fixed well-known title and answers a code and a sentence.</summary>
@@ -100,6 +107,8 @@ public sealed class RatingsController(
     {
         if (!readiness.IsReady) return StatusCode(503);
         var result = await runner.TestAsync(cancellationToken);
+        // A key Test has just verified starts a full run in the background at once (user decision 8).
+        if (result.Outcome == RatingsOutcomes.Ok) automatic.RunAll(RatingsPassKinds.Setup);
         var sources = result.Ratings.Select(rating => rating.Source).Where(RatingSources.IsKnown).ToArray();
         return new RatingsTestDto(result.Outcome == RatingsOutcomes.Ok, result.Outcome, result.Outcome switch
         {
@@ -136,7 +145,8 @@ public sealed class RatingsController(
             state.LastRunStartedAt is { } started
                 ? new RatingsRunDto(Utc(started)!.Value, Utc(state.LastRunFinishedAt), state.LastRunFetched, state.LastRunFailed, state.LastRunStopReason)
                 : null,
-            total, total - rated, queue.Count);
+            total, total - rated, queue.Count,
+            runGate.Activity is { } activity ? new RatingsActivityDto(activity.Kind, Utc(activity.StartedAt)!.Value, activity.Remaining) : null);
     }
 
     /// <summary>Whether ratings are on and the administrator's default order, for every signed-in user.</summary>

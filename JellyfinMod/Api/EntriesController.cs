@@ -30,7 +30,8 @@ public sealed class EntriesController(
     TimeProvider? clock = null,
     MediaBrowser.Controller.Library.ILibraryManager? library = null,
     MediaBrowser.Controller.Library.IUserDataManager? userData = null,
-    JellyfinMod.Services.Ratings.RatingsStore? ratings = null) : ControllerBase
+    JellyfinMod.Services.Ratings.RatingsStore? ratings = null,
+    JellyfinMod.Services.Ratings.RatingsAutoFetch? ratingsFetch = null) : ControllerBase
 {
     /// <summary>The main item of a native version, or null when the item is its own main item or cannot be read (V1).</summary>
     private Guid? MainVersionOf(Guid itemId)
@@ -154,6 +155,8 @@ public sealed class EntriesController(
                 return await CompleteConcurrentAdd(existing, episodes, user, cancellationToken);
             }
 
+            // Its ratings are fetched within seconds in the background, not at 04:00 (user decision 8).
+            ratingsFetch?.Arrived(entry.Id);
             return new CreateEntryResult(new EntryDto(entry), true);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
