@@ -8,8 +8,14 @@ public class RatingsSettings
     /// <summary>The singleton row's id.</summary>
     public static Guid SingletonId { get; } = Guid.Parse("4c1f7a3e-9b2d-4e60-8a15-2f9d0c7b6e31");
 
-    /// <summary>The default per-user source order (user decision 6, 2026-10-07).</summary>
-    public const string DefaultSourcesJson = "[\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"tmdb\",\"trakt\"]";
+    /// <summary>
+    /// The default sources shown, in order (user decision 9, 2026-10-08: IMDb, Rotten Tomatoes critics and audience, Trakt; every
+    /// other source off). It replaced decision 6's list, which also had TMDB.
+    /// </summary>
+    public const string DefaultSourcesJson = "[\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"trakt\"]";
+
+    /// <summary>Decision 6's default (2026-10-07), which migration <c>PhaseNineRatingsDisplayDefaults</c> replaces where it was never changed.</summary>
+    public const string FirstDefaultSourcesJson = "[\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"tmdb\",\"trakt\"]";
 
     /// <summary>Gets or sets the primary key.</summary>
     public Guid Id { get; set; } = SingletonId;
