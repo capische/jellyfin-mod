@@ -68,8 +68,8 @@ public static partial class RatingSources
     public static IReadOnlyList<string> Known { get; } =
         [Imdb, TomatoesCritic, TomatoesAudience, Tmdb, Trakt, Metacritic, MetacriticUser, Letterboxd, RogerEbert];
 
-    /// <summary>The default sources, in order (user decision 6, 2026-10-07).</summary>
-    public static IReadOnlyList<string> Defaults { get; } = [Imdb, TomatoesCritic, TomatoesAudience, Tmdb, Trakt];
+    /// <summary>The default sources, in order (user decision 9, 2026-10-08; decision 6 also had TMDB).</summary>
+    public static IReadOnlyList<string> Defaults { get; } = [Imdb, TomatoesCritic, TomatoesAudience, Trakt];
 
     /// <summary>Gets a value indicating whether a source is one this release shows.</summary>
     public static bool IsKnown(string? source) => source is not null && Known.Contains(source, StringComparer.Ordinal);
