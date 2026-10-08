@@ -202,12 +202,5 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
         return separator < 0 ? null : name[(separator + 3)..];
     }
 
-    private static string? ResolutionOf(MediaStream? video) => video?.Height switch
-    {
-        >= 2000 => "2160p",
-        >= 1000 => "1080p",
-        >= 700 => "720p",
-        > 0 => "480p",
-        _ => null
-    };
+    private static string? ResolutionOf(MediaStream? video) => VersionQuality.NativeResolution(video?.Width, video?.Height);
 }

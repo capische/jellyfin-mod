@@ -102,6 +102,8 @@ internal static class Phase6
             // RET2-R8: a title whose older file an administrator kept by itself (PHASE10 Q3) while an upgrade replaces (Q10).
             AddMovie(database, ids, movies.Id, "filekept", 465, "File Kept Movie", 2020, "tt0900465", monitored: true);
             AddMovie(database, ids, movies.Id, "order", 462, "Order Movie", 2020, "tt0900462", monitored: false);
+            // A title whose versions carry no resolution in their names, so their tier is read from the probed video size.
+            AddMovie(database, ids, movies.Id, "scope", 467, "Scope Movie", 2020, "tt0900467", monitored: false);
             // Two titles whose only releases live on a tracker that advertises nothing but a text search.
             AddMovie(database, ids, movies.Id, "textauto", 463, "Text Only Movie", 2021, "tt0900463", monitored: true);
             AddMovie(database, ids, movies.Id, "textmanual", 464, "Text Manual Movie", 2019, "tt0900464", monitored: true);
@@ -896,6 +898,62 @@ internal static class Phase6
             Assert(operations.Count == 2 && operations[0].MediaPath.Contains("720p", StringComparison.Ordinal) &&
                 operations[1].MediaPath.Contains("1080p", StringComparison.Ordinal) && operations.All(value => value.Provenance == "retention"),
                 "The executor processes the 720p before the 1080p of the same due title");
+        }
+
+        // A version's tier is the larger of its width and height tiers, as Jellyfin's own media info reads it: a scope-ratio
+        // 3840x1600 file is 2160p, not the 1080p its height alone gives. The versions API reads the probed streams, and
+        // retention ranks the same sizes from the native items, so a 4:3 1440x1080 file is 1080p, not 720p by its width.
+        var scopeFolder = Path.Combine(world.Movies.Location, "Scope Movie (2020) [tmdbid-467]");
+        Directory.CreateDirectory(scopeFolder);
+        var scopeSizes = new (string Label, int Width, int Height, string Resolution)[]
+        {
+            ("Wide", 3840, 1600, "2160p"), ("Cinema", 1920, 800, "1080p"), ("Flat", 1280, 536, "720p"), ("Academy", 1440, 1080, "1080p")
+        };
+        foreach (var size in scopeSizes)
+        {
+            var file = Path.Combine(scopeFolder, $"Scope Movie (2020) [tmdbid-467] - {size.Label}.mkv");
+            await File.WriteAllBytesAsync(file, new byte[1000]);
+            world.Native.AddMovie(world.Movies, file, 467);
+            var item = (Video)world.Native.Items.Single(value => value.Path == file);
+            item.Width = size.Width;
+            item.Height = size.Height;
+            world.Native.Streams[item.Id] =
+            [
+                new MediaBrowser.Model.Entities.MediaStream
+                {
+                    Type = MediaBrowser.Model.Entities.MediaStreamType.Video, Index = 0, Codec = "hevc", Width = size.Width, Height = size.Height
+                }
+            ];
+        }
+
+        await WaitAsync(async () =>
+        {
+            await using var database = new ModDbContext(dbPath);
+            return await database.EntryBindings.CountAsync(value => value.EntryId == ids["scope"]) == scopeSizes.Length ? true : null;
+        }, "Every scope-ratio version is bound");
+        var scopeRows = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["scope"]}")).GetProperty("versions")
+            .EnumerateArray().ToArray();
+        Assert(scopeRows.Length == scopeSizes.Length && scopeSizes.All(size => scopeRows.Any(row =>
+                row.GetProperty("label").GetString() == size.Label && row.GetProperty("width").GetInt32() == size.Width &&
+                row.GetProperty("height").GetInt32() == size.Height && row.GetProperty("resolution").GetString() == size.Resolution)),
+            "Each version's resolution is its width or height tier, whichever is larger: " +
+            string.Join("; ", scopeRows.Select(row => $"{row.GetProperty("label")} {row.GetProperty("width")}x{row.GetProperty("height")} " +
+                $"{row.GetProperty("resolution")}")));
+        time.Offset += TimeSpan.FromMinutes(1);
+        _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
+        _ = await admin.GetStringAsync("/JellyfinMod/Retention/Preview");
+        time.Offset += TimeSpan.FromDays(3);
+        await using (var scope = host.App.Services.CreateAsyncScope())
+            await scope.ServiceProvider.GetRequiredService<RetentionRunner>().RunAsync(new Progress<double>(), CancellationToken.None);
+        await using (var database = new ModDbContext(dbPath))
+        {
+            // 720p, then the two 1080p files by path, then 2160p; a width-only rank put the 1440x1080 file first.
+            var order = (await database.RetentionOperations.AsNoTracking().Where(value => value.EntryId == ids["scope"])
+                    .OrderBy(value => value.PreparedAt).ToListAsync())
+                .Select(value => Path.GetFileNameWithoutExtension(value.MediaPath))
+                .Select(name => name[(name.LastIndexOf(" - ", StringComparison.Ordinal) + 3)..]).ToArray();
+            Assert(order.SequenceEqual(["Flat", "Academy", "Cinema", "Wide"]),
+                "Retention processes the scope-ratio versions lowest tier first: " + string.Join(", ", order));
         }
 
         // ---- M3 title matches: a release a public tracker could only match by title and year is grabbable by hand,

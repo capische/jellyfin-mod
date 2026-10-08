@@ -45,8 +45,30 @@ public static class VersionQuality
         _ => 0
     };
 
-    /// <summary>Ranks a native video width the same way.</summary>
-    public static int WidthRank(int width) => width >= 3200 ? 4 : width >= 1800 ? 3 : width >= 1200 ? 2 : width > 0 ? 1 : 0;
+    /// <summary>
+    /// Classifies a native video size as the larger of its width tier and its height tier, on the boundaries Jellyfin 12's own
+    /// media info uses, so a scope-ratio 3840×1600 file is 2160p and 1920×800 is 1080p like the stock row says, not the
+    /// tier its height alone would give. Sizes above 4K stay 2160p, the highest tier; null when neither side is known.
+    /// </summary>
+    public static string? NativeResolution(int? width, int? height)
+    {
+        int w = width ?? 0, h = height ?? 0;
+        if (w <= 0 && h <= 0) return null;
+        if (w > 2560 || h > 1440) return "2160p";
+        if (w > 1280 || h > 962) return "1080p";
+        if (w > 1024 || h > 576) return "720p";
+        return "480p";
+    }
+
+    /// <summary>Ranks a native video size the same way as a parsed resolution.</summary>
+    public static int NativeRank(int? width, int? height) => NativeResolution(width, height) switch
+    {
+        "2160p" => 4,
+        "1080p" => 3,
+        "720p" => 2,
+        "480p" => 1,
+        _ => 0
+    };
 
     /// <summary>Returns a quality's position in a profile, best first; qualities outside the profile rank last.</summary>
     public static int ProfileIndex(IReadOnlyList<string> profile, string? quality)

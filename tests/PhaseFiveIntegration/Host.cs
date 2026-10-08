@@ -96,6 +96,16 @@ internal sealed partial class NativeWorld
     private ILibraryMonitor? _monitor;
 
     public ILibraryManager Library => _library ??= Stub<ILibraryManager>.Create(LibraryCall);
+
+    /// <summary>The media streams Jellyfin's probe recorded for an item; an item without any reads as unprobed.</summary>
+    public ConcurrentDictionary<Guid, MediaStream[]> Streams { get; } = new();
+
+    private IMediaSourceManager? _mediaSources;
+
+    public IMediaSourceManager MediaSources => _mediaSources ??= Stub<IMediaSourceManager>.Create((method, arguments) =>
+        method.Name == "GetMediaStreams" && arguments is [Guid itemId]
+            ? Streams.TryGetValue(itemId, out var streams) ? streams.ToList() : new List<MediaStream>()
+            : null);
     public ILibraryMonitor Monitor => _monitor ??= Stub<ILibraryMonitor>.Create((method, arguments) =>
     {
         if (method.Name == "ReportFileSystemChanged")
@@ -449,6 +459,7 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Services.AddSingleton(users);
         builder.Services.AddSingleton(world.Native.Library);
         builder.Services.AddSingleton(world.Native.Monitor);
+        builder.Services.AddSingleton(world.Native.MediaSources);
         builder.Services.AddSingleton(userData);
         builder.Services.AddSingleton(sessions);
         builder.Services.AddSingleton(localization);

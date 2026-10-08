@@ -191,8 +191,8 @@ public sealed class RetentionRunner(
         {
             cancellationToken.ThrowIfCancellationRequested();
             var rank = Automation.VersionQuality.ResolutionRank(item.CanonicalPath ?? item.Path);
-            if (rank == 0 && library?.GetItemById(item.JellyfinItemId) is MediaBrowser.Controller.Entities.Video { Width: > 0 } video)
-                rank = Automation.VersionQuality.WidthRank(video.Width);
+            if (rank == 0 && library?.GetItemById(item.JellyfinItemId) is MediaBrowser.Controller.Entities.Video video)
+                rank = Automation.VersionQuality.NativeRank(video.Width, video.Height);
             result[item.BindingId] = rank;
         }
 
