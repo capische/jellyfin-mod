@@ -481,6 +481,9 @@ static async Task VerifyEventAndPolicyPersistenceAsync(string folder)
         states[(firstUser.Id, movie.Id)] = State(true, 500, clock.GetUtcNow().UtcDateTime);
         Raise(firstUser.Id, movie, UserDataSaveReason.PlaybackProgress);
         await WaitForObservationAsync(path, firstUser.Id, movie.Id, observation => observation.PlaybackPositionTicks == 500);
+        // The same read then re-evaluates the movie; the evaluation is read below only once that write has landed.
+        await WaitForEvaluationAsync(path, movieEntryId, evaluation => evaluation.State == "blocked" && evaluation.Reason == "active_resume",
+            "A resume update did not block the movie as active_resume");
         DateTime observedAt;
         DateTime evaluatedAt;
         await using (var before = new ModDbContext(path))
