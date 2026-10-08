@@ -134,6 +134,10 @@
 .jfmod-iconbtn-red:hover{background:#8a1c1c;background:var(--jf-palette-error-dark,#8a1c1c)}
 .jfmod-iconbtn:focus{outline:.16em solid #fff;outline:.16em solid var(--jf-palette-text-primary,#fff);outline-offset:.12em;background:#00a4dc;background:var(--jf-palette-secondary-main,#00a4dc);color:rgba(0,0,0,.87)}
 .jfmod-iconbtn[aria-disabled="true"]{opacity:.45}
+/* A refused row icon (Move Up on the first row) drops its fill and keeps its glyph in the secondary text colour, 8:1:
+   dimming it took it under 4.5:1, and to 2.3:1 focused. Focused, it takes the focus fill as every icon does. */
+.jfmod-settings .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy),.jfmod-sheet .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy){opacity:1;filter:none}
+.jfmod-settings .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy):not(:focus),.jfmod-sheet .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy):not(:focus){color:rgba(255,255,255,.7);color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));background:transparent}
 .jfmod-mapfoot>.jfmod-rowactions{margin-left:auto;margin-right:0}
 .jfmod-secret-below{margin:.5em 0 1.4em}
 .jfmod-secret-below .jfmod-notice{margin-top:.5em}
@@ -945,8 +949,12 @@
             note.className = 'jfmod-visually-hidden';
             element.parentNode.insertBefore(note, element.nextSibling);
           }
-          var target = document.getElementById(describedBy);
+          // The note is found beside the element, so a row refused before it is mounted still says why (Codex review
+          // rows-case 1, P3 6).
+          var target = element.nextSibling && element.nextSibling.id === describedBy ? element.nextSibling : document.getElementById(describedBy);
           if (target) target.textContent = reason;
+          // An icon button's tooltip is its name; the reason follows it.
+          if (element.classList.contains('jfmod-iconbtn')) element.setAttribute('title', element.getAttribute('aria-label') + ' — ' + reason);
           element.setAttribute('aria-describedby', describedBy);
         } else {
           element.removeAttribute('aria-disabled');
