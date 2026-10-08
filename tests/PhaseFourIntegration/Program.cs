@@ -230,6 +230,26 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
     for (var index = 0; index < 20; index++)
         big.MovieItems.Add(new($"Example.Movie.2024.1080p.WEB-DL-BIG{index}", $"big-{index}", dl("missing"), 4_000_000_000, 1, []));
     torznab.Indexers["big"] = big;
+    // Season and series packs (2026-10-08): an indexer that lists season id search without an episode parameter.
+    var seasonPackTorrent = TorrentFixture.Create("Example.Show.S01.1080p.WEB-DL-PACK.mkv", 6_000_000_000, announce);
+    torznab.Torrents["s1pack"] = seasonPackTorrent.Bytes;
+    transmission.MetainfoHashes[Convert.ToBase64String(seasonPackTorrent.Bytes)] = seasonPackTorrent.InfoHash;
+    var packs = new IndexerScript { ApiKey = "packs-key", Caps = TorznabBoundary.Caps("q", "q,tvdbid,season") };
+    packs.TvItems.AddRange([
+        new("Example.Show.S01.1080p.WEB-DL-PACK", "pack-1", dl("s1pack"), 6_000_000_000, 40, Attributes(("tvdbid", "300"))),
+        new("Example.Show.S01-S02.1080p.WEB-DL-RANGE", "pack-2", dl("missing"), 6_000_000_000, 30, []),
+        new("Example.Show.Complete.Series.1080p.WEB-DL-CMPL", "pack-3", dl("missing"), 6_000_000_000, 30, []),
+        new("Example.Show.S02.1080p.WEB-DL-OTHER", "pack-4", dl("missing"), 6_000_000_000, 30, []),
+        new("Example.Show.S02-S03.1080p.WEB-DL-NARROW", "pack-5", dl("missing"), 6_000_000_000, 30, []),
+        new("Example.Show.S01E02.1080p.WEB-DL-SINGLE", "pack-6", dl("missing"), 1_500_000_000, 30, []),
+        new("Example.Show.Season.1.1080p.WEB-DL-WORDS", "pack-7", dl("missing"), 6_000_000_000, 20, [])
+    ]);
+    torznab.Indexers["packs"] = packs;
+    // A season id search on this indexer answers with single episodes only; its text search lists the season pack.
+    var fallback = new IndexerScript { ApiKey = "fallback-key", Caps = TorznabBoundary.Caps("q", "tvdbid,season") };
+    fallback.TvItems.Add(new("Example.Show.S01E01.1080p.WEB-DL-FALLBACK", "fallback-1", dl("missing"), 1_500_000_000, 30, Attributes(("tvdbid", "300"))));
+    fallback.MovieItems.Add(new("Example.Show.Season.1.1080p.WEB-DL-FALLBACK", "fallback-2", dl("missing"), 6_000_000_000, 30, []));
+    torznab.Indexers["fallback"] = fallback;
 
     var time = new ShiftedTimeProvider();
     var configuration = new PluginConfiguration();
@@ -1268,6 +1288,300 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         var inherited = await ReadAsync(await restarted.PatchAsJsonAsync($"/JellyfinMod/Entries/{movieId}", new { qualityProfileId = (Guid?)null }), 200,
             "Restore inheritance");
         Assert(inherited.GetProperty("qualityProfileId").ValueKind == JsonValueKind.Null, "An explicit null restores inheritance");
+
+        // ---- Season and series packs (2026-10-08): scope validation, coverage, exact-season and covering-range rules, claims and
+        // modes. Nothing has aired yet, so a season search covers nothing.
+        var packsId = (await ReadAsync(await restarted.PostAsJsonAsync("/JellyfinMod/Settings/Indexers", new
+        {
+            name = "packs", baseUrl = new Uri(torznab.Address, "/packs/api").ToString(), enabled = true, categories = new[] { 2000, 5000 },
+            priority = 5, minIntervalSeconds = 0, dailyQueryBudget = 200, apiKey = new { action = "replace", value = packs.ApiKey }
+        }), 201, "Indexer packs created")).GetProperty("id").AsGuid();
+        await ExpectAsync(restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1"), 409,
+            "no_covered_episodes", "A season without aired episodes covers nothing");
+        await using (var database = new ModDbContext(dbPath))
+            await database.Database.ExecuteSqlRawAsync("UPDATE Episodes SET AirDate = '2023-03-01 00:00:00' WHERE SeasonNumber = 1");
+        await ExpectAsync(restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=bogus"), 400, "invalid_scope", "An unknown scope is refused");
+        await ExpectAsync(restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season"), 400, "season_required",
+            "A season search needs a season");
+        await ExpectAsync(restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=0"), 400, "season_required",
+            "Specials are never searched as a pack");
+        await ExpectAsync(restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1&episodeId={episodeIds[0]}"),
+            400, "invalid_scope", "A season search takes no episode");
+        await ExpectAsync(restarted.GetAsync($"/JellyfinMod/Releases?entryId={movieId}&scope=season&seasonNumber=1"), 400, "scope_not_applicable",
+            "A movie has no seasons");
+        await ExpectAsync(restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=series&seasonNumber=1"), 400, "season_required",
+            "An All Seasons search takes no season number");
+        await ExpectAsync(restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}"), 400, "episode_required",
+            "A series search with neither an episode nor a scope still needs an episode");
+        Assert((await viewer.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1")).StatusCode ==
+            HttpStatusCode.Forbidden, "Ordinary users cannot search packs");
+
+        var packQueriesBefore = packs.Queries.Count;
+        var seasonSearch = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1"), 200,
+            "Season search");
+        var seasonQueries = packs.Queries.Skip(packQueriesBefore).Where(query => !query.Contains("t=caps", StringComparison.Ordinal)).ToArray();
+        Assert(seasonQueries.Length > 0 && seasonQueries[0].Contains("t=tvsearch", StringComparison.Ordinal) &&
+            seasonQueries[0].Contains("tvdbid=300", StringComparison.Ordinal) && seasonQueries[0].Contains("season=1", StringComparison.Ordinal) &&
+            !seasonQueries[0].Contains("ep=", StringComparison.Ordinal),
+            "A season search sends tvsearch by the series' id and season, without an episode: " + string.Join(" | ", seasonQueries));
+        var seasonTarget = seasonSearch.GetProperty("target");
+        Assert(seasonTarget.GetProperty("scope").GetString() == "season" && seasonTarget.GetProperty("seasonNumber").GetInt32() == 1 &&
+            seasonTarget.GetProperty("episodeId").ValueKind == JsonValueKind.Null &&
+            seasonTarget.GetProperty("covered").EnumerateArray().Select(value => value.GetProperty("episodeId").AsGuid()).ToHashSet()
+                .SetEquals(episodeIds.Take(3)),
+            "A season search covers the season's aired episodes, never the special: " + seasonTarget.GetRawText());
+        byTitle = seasonSearch.GetProperty("candidates").EnumerateArray().ToDictionary(row => row.GetProperty("rawTitle").GetString()!);
+        var packRow = byTitle["Example.Show.S01.1080p.WEB-DL-PACK"];
+        Assert(packRow.GetProperty("eligible").GetBoolean() && packRow.GetProperty("parsed").GetProperty("seasonPack").GetBoolean() &&
+            packRow.GetProperty("coverage").GetProperty("seasons").EnumerateArray().Select(value => value.GetInt32()).SequenceEqual([1]) &&
+            !packRow.GetProperty("coverage").GetProperty("complete").GetBoolean() &&
+            packRow.GetProperty("coverage").GetProperty("missing").GetInt32() == 3 && packRow.GetProperty("coverage").GetProperty("held").GetInt32() == 0,
+            "A pack of exactly that season is eligible and carries its coverage: " + packRow.GetRawText());
+        Assert(byTitle["Example.Show.Season.1.1080p.WEB-DL-WORDS"].GetProperty("eligible").GetBoolean(), "\"Season 1\" names a season pack too");
+        Rejected("Example.Show.S01E02.1080p.WEB-DL-SINGLE", "not_a_pack");
+        Rejected("Example.Show.S01-S02.1080p.WEB-DL-RANGE", "pack_range");
+        Rejected("Example.Show.Complete.Series.1080p.WEB-DL-CMPL", "pack_range");
+        Rejected("Example.Show.S02.1080p.WEB-DL-OTHER", "season_mismatch");
+        Assert(byTitle["Example.Show.S01-S02.1080p.WEB-DL-RANGE"].GetProperty("parsed").GetProperty("seasonLast").GetInt32() == 2 &&
+            byTitle["Example.Show.S01-S02.1080p.WEB-DL-RANGE"].GetProperty("parsed").GetProperty("seriesPack").GetBoolean() &&
+            byTitle["Example.Show.Complete.Series.1080p.WEB-DL-CMPL"].GetProperty("parsed").GetProperty("title").GetString() == "Example Show",
+            "A season range keeps both ends, and a complete pack's title stops before \"Complete\"");
+
+        packQueriesBefore = packs.Queries.Count;
+        var seriesSearch = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=series"), 200, "All Seasons search");
+        var seriesQueries = packs.Queries.Skip(packQueriesBefore).Where(query => !query.Contains("t=caps", StringComparison.Ordinal)).ToArray();
+        Assert(seriesQueries.Length > 0 && seriesQueries[0].Contains("tvdbid=300", StringComparison.Ordinal) &&
+            !seriesQueries[0].Contains("season=", StringComparison.Ordinal) && !seriesQueries[0].Contains("ep=", StringComparison.Ordinal),
+            "An All Seasons search sends tvsearch by the series' id alone: " + string.Join(" | ", seriesQueries));
+        byTitle = seriesSearch.GetProperty("candidates").EnumerateArray().ToDictionary(row => row.GetProperty("rawTitle").GetString()!);
+        Assert(byTitle["Example.Show.Complete.Series.1080p.WEB-DL-CMPL"].GetProperty("eligible").GetBoolean() &&
+            byTitle["Example.Show.Complete.Series.1080p.WEB-DL-CMPL"].GetProperty("coverage").GetProperty("complete").GetBoolean() &&
+            byTitle["Example.Show.S01-S02.1080p.WEB-DL-RANGE"].GetProperty("eligible").GetBoolean(),
+            "All Seasons takes a complete pack and a range covering every season with episodes");
+        Rejected("Example.Show.S01.1080p.WEB-DL-PACK", "not_complete");
+        Rejected("Example.Show.S02-S03.1080p.WEB-DL-NARROW", "pack_incomplete");
+        Rejected("Example.Show.S01E02.1080p.WEB-DL-SINGLE", "not_a_pack");
+
+        // Claims: the season pack would fill S01E01, which the accepted single-episode grab still holds.
+        var packRelease = Release(seasonSearch, "Example.Show.S01.1080p.WEB-DL-PACK");
+        var episodeGrabId = episodeGrab.GetProperty("id").AsGuid();
+        var claimedFirst = await restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab",
+            Grab(seasonSearch.GetProperty("searchId").AsGuid(), packRelease, "pack-0001"));
+        var claimedBody = await claimedFirst.Content.ReadAsStringAsync();
+        Assert(claimedFirst.StatusCode == HttpStatusCode.Conflict && claimedBody.Contains("grab_active") && claimedBody.Contains("S01E01") &&
+            claimedBody.Contains(episodeGrabId.ToString("N")), "A pack cannot claim an episode a single-episode grab holds: " + claimedBody);
+        // Free S01E01: the administrator removes its torrent and a recheck releases the grab; its claim goes with it.
+        transmission.Torrents.TryRemove(episodeTorrent.InfoHash, out _);
+        await ReadAsync(await restarted.PostAsync($"/JellyfinMod/Grabs/{episodeGrabId}/Recheck", null), 200, "Recheck the episode grab");
+        await using (var database = new ModDbContext(dbPath))
+            Assert(await database.GrabClaims.CountAsync(claim => claim.GrabId == episodeGrabId) == 1 &&
+                await database.GrabClaims.AllAsync(claim => claim.GrabId != episodeGrabId || claim.ActiveKey == null),
+                "Releasing a grab clears its claim's key and keeps the claim as a record");
+
+        // Modes: with S01E01 held, the default would add; an unknown mode is refused; replace claims every covered episode
+        // under the version key and cancels cleanly during its hold.
+        await using (var database = new ModDbContext(dbPath))
+            await database.Database.ExecuteSqlInterpolatedAsync($"UPDATE Episodes SET State = 4 WHERE Id = {episodeIds[0]}");
+
+        // Modes by the episode upgrades switch (user, 2026-10-09): adding a version by hand never needs it; replacing does. Every
+        // search says which modes its rows may offer, and a replace grab with the switch off is refused, single episode or pack.
+        // The Phase 4 host serves no automation settings page; the switch is the stored setting every search and grab reads
+        // (Phase 5 turns it through the settings API).
+        async Task SetEpisodeUpgradesAsync(bool on)
+        {
+            await using var database = new ModDbContext(dbPath);
+            var settings = await database.AcquisitionSettings.SingleAsync();
+            settings.EpisodeUpgradesEnabled = on;
+            await database.SaveChangesAsync();
+        }
+
+        string[] Modes(JsonElement search) => Strings(search.GetProperty("grab").GetProperty("modes"));
+        const string e1Release = "Example.Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP";
+        var e1VersionOn = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&episodeId={episodeIds[0]}&intent=addVersion"),
+            200, "Another version of S01E01 with episode upgrades on");
+        var e2Acquire = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&episodeId={episodeIds[1]}"), 200,
+            "S01E02 acquire search");
+        var movieAcquire = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "Movie acquire search");
+        Assert(Modes(e1VersionOn).SequenceEqual(["add", "replace"]) && Modes(e2Acquire).SequenceEqual(["fill"]) &&
+            Modes(movieAcquire).SequenceEqual(["fill"]),
+            $"With episode upgrades on, another version of an episode offers add and replace, an acquire search fills: " +
+            $"{string.Join(",", Modes(e1VersionOn))} / {string.Join(",", Modes(e2Acquire))} / {string.Join(",", Modes(movieAcquire))}");
+
+        await SetEpisodeUpgradesAsync(false);
+        try
+        {
+            var offSeason = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1"), 200,
+                "Season search with one episode held and episode upgrades off");
+            Assert(Modes(offSeason).SequenceEqual(["fill", "add"]),
+                "With episode upgrades off a pack offers fill and add, never replace: " + string.Join(",", Modes(offSeason)));
+            var offPack = Release(offSeason, "Example.Show.S01.1080p.WEB-DL-PACK");
+            await ExpectAsync(restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+            {
+                searchId = offSeason.GetProperty("searchId").AsGuid(), releaseId = offPack, idempotencyKey = "pack-off-replace", mode = "replace"
+            }), 409, "episode_replace_disabled", "A replace pack is refused while episode upgrades are off");
+            var offAdd = await ReadAsync(await restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+            {
+                searchId = offSeason.GetProperty("searchId").AsGuid(), releaseId = offPack, idempotencyKey = "pack-off-add-01", mode = "add"
+            }), 202, "An add pack while episode upgrades are off");
+            var offAddId = offAdd.GetProperty("id").AsGuid();
+            await using (var database = new ModDbContext(dbPath))
+            {
+                var claims = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == offAddId).ToListAsync();
+                Assert(offAdd.GetProperty("mode").GetString() == "add" && claims.Count == 3 &&
+                    claims.Single(claim => claim.EpisodeId == episodeIds[0]).ActiveKey == episodeIds[0].ToString("N") + "+add",
+                    "With episode upgrades off an add pack is held and claims the held episode under its version key: " + offAdd.GetRawText());
+            }
+
+            await ReadAsync(await restarted.PostAsync($"/JellyfinMod/Grabs/{offAddId}/Cancel", null), 200, "Cancel the add pack");
+
+            var offVersion = await ReadAsync(await restarted.GetAsync(
+                $"/JellyfinMod/Releases?entryId={seriesId}&episodeId={episodeIds[0]}&intent=addVersion"), 200,
+                "Another version of S01E01 while episode upgrades are off is searched, no longer refused");
+            Assert(Modes(offVersion).SequenceEqual(["add"]) && offVersion.GetProperty("grab").GetProperty("available").GetBoolean(),
+                "With episode upgrades off another version of an episode offers add alone: " + offVersion.GetProperty("grab").GetRawText());
+            await ExpectAsync(restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+            {
+                searchId = offVersion.GetProperty("searchId").AsGuid(), releaseId = Release(offVersion, e1Release), idempotencyKey = "e1-off-replace",
+                mode = "replace"
+            }), 409, "episode_replace_disabled", "Replacing one episode's file is refused while episode upgrades are off");
+            var offVersionAdd = await ReadAsync(await restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab",
+                Grab(offVersion.GetProperty("searchId").AsGuid(), Release(offVersion, e1Release), "e1-off-add-0001")), 202,
+                "Adding another version of S01E01 while episode upgrades are off");
+            Assert(offVersionAdd.GetProperty("mode").GetString() == "add",
+                "Another version of an episode is added while episode upgrades are off: " + offVersionAdd.GetRawText());
+            await ReadAsync(await restarted.PostAsync($"/JellyfinMod/Grabs/{offVersionAdd.GetProperty("id").AsGuid()}/Cancel", null), 200,
+                "Cancel the added version");
+        }
+        finally
+        {
+            await SetEpisodeUpgradesAsync(true);
+        }
+
+        seasonSearch = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1"), 200,
+            "Season search with one episode held");
+        Assert(Modes(seasonSearch).SequenceEqual(["fill", "add", "replace"]),
+            "With episode upgrades on a pack offers fill, add and replace: " + string.Join(",", Modes(seasonSearch)));
+        var heldCoverage = seasonSearch.GetProperty("candidates").EnumerateArray()
+            .Single(row => row.GetProperty("rawTitle").GetString() == "Example.Show.S01.1080p.WEB-DL-PACK").GetProperty("coverage");
+        Assert(heldCoverage.GetProperty("missing").GetInt32() == 2 && heldCoverage.GetProperty("held").GetInt32() == 1,
+            "Coverage counts the held and the missing episodes: " + heldCoverage.GetRawText());
+        packRelease = Release(seasonSearch, "Example.Show.S01.1080p.WEB-DL-PACK");
+        var seasonSearchId = seasonSearch.GetProperty("searchId").AsGuid();
+        await ExpectAsync(restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab",
+            new { searchId = seasonSearchId, releaseId = packRelease, idempotencyKey = "pack-bogus-01", mode = "bogus" }), 400, "invalid_mode",
+            "An unknown mode is refused");
+        // Searched before the replace grab, so its grab attempt below fits inside the replace pack's hold.
+        var e2WhileReplace = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&episodeId={episodeIds[1]}"), 200,
+            "S01E02 search before the replace pack");
+        var replaceGrab = await ReadAsync(await restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab",
+            new { searchId = seasonSearchId, releaseId = packRelease, idempotencyKey = "pack-replace-01", mode = "replace" }), 202, "Replace pack grab");
+        var replaceId = replaceGrab.GetProperty("id").AsGuid();
+        Assert(replaceGrab.GetProperty("scope").GetString() == "season" && replaceGrab.GetProperty("seasonNumber").GetInt32() == 1 &&
+            replaceGrab.GetProperty("mode").GetString() == "replace" && replaceGrab.GetProperty("episodeId").ValueKind == JsonValueKind.Null,
+            "A pack grab carries its scope, season and mode: " + replaceGrab.GetRawText());
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var claims = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == replaceId).ToListAsync();
+            var grabRow = await database.GrabOperations.AsNoTracking().SingleAsync(value => value.Id == replaceId);
+            Assert(claims.Count == 3 && claims.Single(claim => claim.EpisodeId == episodeIds[0]).Held &&
+                claims.Single(claim => claim.EpisodeId == episodeIds[0]).ActiveKey == episodeIds[0].ToString("N") + "+add" &&
+                claims.Where(claim => claim.EpisodeId != episodeIds[0]).All(claim => !claim.Held && claim.ActiveKey == claim.EpisodeId.ToString("N")) &&
+                grabRow.ActiveTarget == $"pack:{seriesId:N}:1",
+                "Replace claims every covered episode: the held one under its version key, the missing ones under their own keys " +
+                "(Codex review of the pack plugin, finding 4); the pack owns its season's key");
+        }
+
+        // A missing episode a replace pack fills cannot be acquired again by a single-episode grab (finding 4).
+        var e2Duplicate = await restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab", Grab(e2WhileReplace.GetProperty("searchId").AsGuid(),
+            Release(e2WhileReplace, "Example.Show.S01E02.1080p.WEB-DL.DDP5.1.H.264-GRP"), "e2-during-replace"));
+        var e2DuplicateBody = await e2Duplicate.Content.ReadAsStringAsync();
+        Assert(e2Duplicate.StatusCode == HttpStatusCode.Conflict && e2DuplicateBody.Contains("grab_active", StringComparison.Ordinal) &&
+            e2DuplicateBody.Contains(replaceId.ToString("N"), StringComparison.Ordinal),
+            "A single-episode grab of an episode a replace pack fills is refused: " + e2DuplicateBody);
+
+        await ReadAsync(await restarted.PostAsync($"/JellyfinMod/Grabs/{replaceId}/Cancel", null), 200, "Cancel the replace pack");
+        await using (var database = new ModDbContext(dbPath))
+            Assert(await database.GrabClaims.Where(claim => claim.GrabId == replaceId).AllAsync(claim => claim.ActiveKey == null),
+                "Cancelling a pack releases every claim");
+
+        var fillGrab = await ReadAsync(await restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab",
+            new { searchId = seasonSearchId, releaseId = packRelease, idempotencyKey = "pack-fill-0001", mode = "fill" }), 202, "Fill pack grab");
+        var fillId = fillGrab.GetProperty("id").AsGuid();
+        var fillAccepted = await WaitForStateAsync(restarted, fillId, "accepted");
+        Assert(fillAccepted.GetProperty("mode").GetString() == "fill" && transmission.Torrents.ContainsKey(seasonPackTorrent.InfoHash),
+            "The fill pack reaches the client");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var claims = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == fillId).ToListAsync();
+            Assert(claims.Count == 2 && claims.Select(claim => claim.EpisodeId).ToHashSet().SetEquals(episodeIds.Skip(1).Take(2)) &&
+                claims.All(claim => claim.ActiveKey == claim.EpisodeId.ToString("N") && !claim.Held),
+                "Fill claims only the missing episodes, under their own keys");
+            var imports = await database.ImportOperations.AsNoTracking().Where(value => value.GrabId == fillId).ToListAsync();
+            Assert(imports.Count == 2 && imports.All(value => value.OpenGrabKey == $"{fillId:N}:{value.EpisodeId:N}") &&
+                imports.Select(value => value.EpisodeId!.Value).ToHashSet().SetEquals(episodeIds.Skip(1).Take(2)),
+                "An accepted pack owns one open import per claimed episode");
+            var grabbed = await database.History.AsNoTracking().Where(history => history.EntryId == seriesId && history.EventType == "grabbed" &&
+                history.Data!.Contains(fillId.ToString())).ToListAsync();
+            Assert(grabbed.Count == 2 && grabbed.All(history => history.Summary.StartsWith("Grabbed Season 1 pack webdl-1080p from packs",
+                    StringComparison.Ordinal)) &&
+                episodeIds.Skip(1).Take(2).All(id => grabbed.Any(history => history.Data!.Contains(id.ToString()))),
+                "One grabbed event per claimed episode names the pack: " + string.Join(" | ", grabbed.Select(history => history.Summary)));
+        }
+
+        var e2Search = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&episodeId={episodeIds[1]}"), 200,
+            "S01E02 search while the pack holds it");
+        Assert(e2Search.GetProperty("grab").GetProperty("reason").GetString() == "grab_active" &&
+            e2Search.GetProperty("grab").GetProperty("activeOperationId").AsGuid() == fillId, "An episode search learns a pack holds the episode");
+        var single = await restarted.PostAsJsonAsync("/JellyfinMod/Releases/Grab",
+            Grab(e2Search.GetProperty("searchId").AsGuid(), Release(e2Search, "Example.Show.S01E02.1080p.WEB-DL.DDP5.1.H.264-GRP"), "e2-after-pack"));
+        var singleBody = await single.Content.ReadAsStringAsync();
+        Assert(single.StatusCode == HttpStatusCode.Conflict && singleBody.Contains("grab_active") && singleBody.Contains("S01E02") &&
+            singleBody.Contains(fillId.ToString("N")), "A single-episode grab of a pack-claimed episode is refused: " + singleBody);
+        var seasonAgain = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1"), 200,
+            "Season search while its pack is active");
+        Assert(seasonAgain.GetProperty("grab").GetProperty("reason").GetString() == "grab_active" &&
+            seasonAgain.GetProperty("grab").GetProperty("activeOperationId").AsGuid() == fillId, "One pack per season at a time");
+        var seriesAfterPack = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Entries/{seriesId}"), 200, "Series detail with a pack");
+        JsonElement EpisodeRow(Guid id) => seriesAfterPack.GetProperty("episodes").EnumerateArray().Single(e => e.GetProperty("id").AsGuid() == id);
+        Assert(EpisodeRow(episodeIds[1]).GetProperty("acquisition").GetProperty("operationId").AsGuid() == fillId &&
+            EpisodeRow(episodeIds[2]).GetProperty("acquisition").GetProperty("operationId").AsGuid() == fillId &&
+            EpisodeRow(episodeIds[0]).GetProperty("acquisition").GetProperty("operationId").AsGuid() != fillId,
+            "Each claimed episode shows the pack as its acquisition; the held one does not");
+        var health = await ReadAsync(await restarted.GetAsync("/JellyfinMod/Health"), 200, "Health");
+        Assert(health.GetProperty("Capabilities").EnumerateArray().Any(value => value.GetString() == "acquisition.packs"),
+            "The plugin advertises pack acquisition");
+        var packsRow = Json.Parse(await restarted.GetStringAsync("/JellyfinMod/Settings/Indexers")).EnumerateArray()
+            .Single(value => value.GetProperty("id").AsGuid() == packsId);
+        await ReadAsync(await restarted.PatchAsJsonAsync($"/JellyfinMod/Settings/Indexers/{packsId}", new
+        {
+            name = "packs", baseUrl = packsRow.GetProperty("baseUrl").GetString(), enabled = false, categories = new[] { 2000, 5000 },
+            priority = 5, revision = packsRow.GetProperty("revision").GetInt32()
+        }), 200, "The packs indexer is disabled again");
+
+        // A season id search that answers with single episodes only does not end a pack search: its "Example Show S01" text query
+        // still runs and finds the pack, and the search stops there (Codex review of the pack plugin, finding 7).
+        var fallbackId = (await ReadAsync(await restarted.PostAsJsonAsync("/JellyfinMod/Settings/Indexers", new
+        {
+            name = "fallback", baseUrl = new Uri(torznab.Address, "/fallback/api").ToString(), enabled = true, categories = new[] { 2000, 5000 },
+            priority = 5, minIntervalSeconds = 0, dailyQueryBudget = 200, apiKey = new { action = "replace", value = fallback.ApiKey }
+        }), 201, "Indexer fallback created")).GetProperty("id").AsGuid();
+        var fallbackSearch = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1"), 200,
+            "Season search through the fallback indexer");
+        var fallbackQueries = fallback.Queries.Where(query => !query.Contains("t=caps", StringComparison.Ordinal)).ToArray();
+        var fallbackPack = fallbackSearch.GetProperty("candidates").EnumerateArray()
+            .Single(row => row.GetProperty("rawTitle").GetString() == "Example.Show.Season.1.1080p.WEB-DL-FALLBACK");
+        Assert(fallbackQueries.Length == 2 && fallbackQueries[0].Contains("t=tvsearch", StringComparison.Ordinal) &&
+            fallbackQueries[0].Contains("season=1", StringComparison.Ordinal) && fallbackQueries[1].Contains("t=search", StringComparison.Ordinal) &&
+            fallbackPack.GetProperty("eligible").GetBoolean(),
+            "A pack search goes on past a query without an eligible pack and stops at the one that found it: " + string.Join(" | ", fallbackQueries) +
+            " " + fallbackPack.GetRawText());
+        var fallbackRow = Json.Parse(await restarted.GetStringAsync("/JellyfinMod/Settings/Indexers")).EnumerateArray()
+            .Single(value => value.GetProperty("id").AsGuid() == fallbackId);
+        await ReadAsync(await restarted.PatchAsJsonAsync($"/JellyfinMod/Settings/Indexers/{fallbackId}", new
+        {
+            name = "fallback", baseUrl = fallbackRow.GetProperty("baseUrl").GetString(), enabled = false, categories = new[] { 2000, 5000 },
+            priority = 5, revision = fallbackRow.GetProperty("revision").GetInt32()
+        }), 200, "The fallback indexer is disabled again");
 
         // Nothing durable carries a credential or passkey.
         var dbBytes = await File.ReadAllBytesAsync(dbPath);

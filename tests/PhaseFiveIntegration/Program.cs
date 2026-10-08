@@ -1789,6 +1789,165 @@ internal static partial class Phase5
             transmission.Torrents.ContainsKey(hashM) && transmission.RemoveCalls == removeCallsBeforeM,
             "Retention reclaims only the library link, reports 0 bytes and leaves the seeding torrent alone");
 
+        // ================= Season packs (2026-10-08): one torrent with N episode files, a sample, a special and a double episode
+        // imports each claimed episode it holds, names what it skipped, finishes the grab only when every import is final,
+        // shows as one queue row, and detaches its torrent once for all its files.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            AddEntry(database, ids, "pack", "series", 210, "Pack Show", 2022, null, 310, world.Tv.Id);
+            for (var number = 0; number <= 4; number++)
+            {
+                var episode = new Episode { EntryId = ids["pack"], TmdbId = 2100 + number, SeasonNumber = number == 0 ? 0 : 1,
+                    EpisodeNumber = number == 0 ? 1 : number, Title = "Pack Episode " + number, RuntimeMinutes = 45,
+                    AirDate = new DateTime(2022, 2, 1 + number, 0, 0, 0, DateTimeKind.Utc) };
+                database.Episodes.Add(episode);
+                ids["pack" + number] = episode.Id;
+            }
+
+            await database.SaveChangesAsync();
+        }
+
+        var packFixture = TorrentFixture.Multi("Pack.Show.S01.1080p.WEB-DL-GRP",
+            ("Pack.Show.S01E01.1080p.WEB-DL-GRP.mkv", Size), ("Pack.Show.S01E02.1080p.WEB-DL-GRP.mkv", Size),
+            ("Pack.Show.S01E03.1080p.WEB-DL-GRP.mkv", Size), ("Sample/Pack.Show.S01E01.sample.mkv", 20_000),
+            ("Pack.Show.S00E01.Special.1080p.WEB-DL-GRP.mkv", Size), ("Pack.Show.S01E04E05.1080p.WEB-DL-GRP.mkv", Size),
+            ("Pack.Show.S01.nfo", 100));
+        torznab.Torrents["pack"] = packFixture.Bytes;
+        transmission.Register(packFixture);
+        lock (torznab.MovieItems)
+            torznab.TvItems.Add(new("Pack.Show.S01.1080p.WEB-DL-GRP", "guid-pack", torznab.Download("pack"), Size * 3, 25,
+                new() { ["tvdbid"] = "310" }));
+        var packSearch = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Releases?entryId={ids["pack"]}&scope=season&seasonNumber=1"));
+        var packCandidate = packSearch.GetProperty("candidates").EnumerateArray()
+            .Single(item => item.GetProperty("rawTitle").GetString() == "Pack.Show.S01.1080p.WEB-DL-GRP");
+        Assert(packCandidate.GetProperty("eligible").GetBoolean() && packCandidate.GetProperty("coverage").GetProperty("missing").GetInt32() == 4,
+            "The season pack is eligible and covers the season's four aired episodes: " + packCandidate.GetRawText());
+        var packGrab = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+        {
+            searchId = packSearch.GetProperty("searchId").AsGuid(), releaseId = packCandidate.GetProperty("releaseId").GetString(),
+            idempotencyKey = "p5-pack-" + Guid.NewGuid().ToString("N")
+        }), 202, "Administrator grabs the season pack");
+        var packGrabId = packGrab.GetProperty("id").AsGuid();
+        Assert(packGrab.GetProperty("mode").GetString() == "fill", "With nothing held, a pack fills");
+        await WaitAsync(async () => Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Grabs/{packGrabId}")).GetProperty("state").GetString() ==
+            "accepted" ? true : (bool?)null, "The pack grab is accepted");
+        transmission.Progress(packFixture.InfoHash, 0.5);
+        await Tick();
+        var packQueue = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Queue?entryId={ids["pack"]}"));
+        var packRows = packQueue.GetProperty("items").EnumerateArray().Where(item => item.GetProperty("grabId").AsGuid() == packGrabId).ToArray();
+        Assert(packRows.Length == 1 && packRows[0].GetProperty("pack").GetProperty("label").GetString() == "Season 1 pack · 4 episodes" &&
+            packRows[0].GetProperty("pack").GetProperty("episodes").GetArrayLength() == 4 && packRows[0].GetProperty("state").GetString() == "downloading" &&
+            packRows[0].GetProperty("episode").ValueKind == JsonValueKind.Null,
+            "A pack is one queue row with its whole-torrent progress and every claimed episode: " + packQueue.GetRawText());
+        var packDetail = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["pack"]}"));
+        Assert(Enumerable.Range(1, 4).All(number => packDetail.GetProperty("episodes").EnumerateArray()
+                .Single(item => item.GetProperty("id").AsGuid() == ids["pack" + number]).GetProperty("state").GetString() == "downloading"),
+            "Each claimed episode shows the pack's download on its own page");
+
+        transmission.Progress(packFixture.InfoHash, 1.0);
+        await WaitAsync(async () =>
+        {
+            await Tick();
+            await using var database = new ModDbContext(dbPath);
+            var children = await database.ImportOperations.AsNoTracking().Where(value => value.GrabId == packGrabId).ToListAsync();
+            return children.Count == 4 && children.All(child => !ImportStates.Open.Contains(child.State)) ? true : (bool?)null;
+        }, "Every import of the pack is final", 60);
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var children = await database.ImportOperations.AsNoTracking().Where(value => value.GrabId == packGrabId).ToListAsync();
+            var byEpisode = children.ToDictionary(child => child.EpisodeId!.Value);
+            Assert(Enumerable.Range(1, 3).All(number => byEpisode[ids["pack" + number]].State == ImportStates.Completed &&
+                    byEpisode[ids["pack" + number]].DestinationPath == Path.Combine(world.Tv.Location, "Pack Show (2022) [tmdbid-210]", "Season 01",
+                        $"Pack Show (2022) S01E0{number}.mkv")) &&
+                byEpisode[ids["pack4"]].State == ImportStates.Failed && byEpisode[ids["pack4"]].Reason == ImportReasons.PackEpisodeMissing,
+                "Each episode file of the pack is imported as its own episode; the episode the pack lacks fails as pack_episode_missing: " +
+                string.Join(" | ", children.Select(child => $"{child.State} {child.Reason} {child.DestinationPath}")));
+            var grab = await database.GrabOperations.AsNoTracking().SingleAsync(value => value.Id == packGrabId);
+            Assert(grab.ActiveTarget is null && grab.State == GrabStates.Accepted &&
+                await database.GrabClaims.Where(claim => claim.GrabId == packGrabId).AllAsync(claim => claim.ActiveKey == null),
+                "The pack's target and claims are released once every import is final");
+            var skipped = await database.History.AsNoTracking().Where(history => history.EntryId == ids["pack"] &&
+                history.EventType == "pack_file_skipped").Select(history => history.Summary).ToListAsync();
+            Assert(skipped.Count == 2 && skipped.Any(summary => summary.Contains("Pack.Show.S00E01.Special", StringComparison.Ordinal) &&
+                    summary.Contains("specials", StringComparison.Ordinal)) &&
+                skipped.Any(summary => summary.Contains("Pack.Show.S01E04E05", StringComparison.Ordinal) &&
+                    summary.Contains("several episodes", StringComparison.Ordinal)),
+                "The special and the double episode are skipped and named once; the sample and the nfo are ignored: " + string.Join(" | ", skipped));
+            var grabbedEvents = await database.History.AsNoTracking().Where(history => history.EntryId == ids["pack"] &&
+                history.EventType == "grabbed").ToListAsync();
+            Assert(grabbedEvents.Count == 4 && Enumerable.Range(1, 3).All(number => grabbedEvents.Count(history => history.BindingId ==
+                    byEpisode[ids["pack" + number]].BindingId && history.Data!.Contains(ids["pack" + number].ToString())) == 1),
+                "Each imported file's history starts with its own episode's grab event");
+            var seeds = await database.SeedReleaseOperations.AsNoTracking().Where(value => value.GrabId == packGrabId).ToListAsync();
+            Assert(seeds.Count == 3 && seeds.All(seed => seed.Pack), "Each imported file of the pack keeps its own seed release");
+        }
+
+        var removesBeforePack = transmission.RemoveCalls;
+        transmission.Torrents[packFixture.InfoHash].UploadRatio = 1.5;
+        await WaitAsync(async () =>
+        {
+            await Tick();
+            await using var database = new ModDbContext(dbPath);
+            return await database.SeedReleaseOperations.Where(value => value.GrabId == packGrabId)
+                .AllAsync(seed => seed.State == SeedReleaseStates.Detached) ? true : (bool?)null;
+        }, "The pack's seed releases detach together once the goal is met");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seeds = await database.SeedReleaseOperations.AsNoTracking().Where(value => value.GrabId == packGrabId).ToListAsync();
+            var grab = await database.GrabOperations.AsNoTracking().SingleAsync(value => value.Id == packGrabId);
+            Assert(transmission.RemoveCalls == removesBeforePack + 1 && !transmission.Torrents.ContainsKey(packFixture.InfoHash) &&
+                grab.ActiveHash is null && seeds.All(seed => seed.CleanupManifest is not null) &&
+                Enumerable.Range(1, 3).All(number => File.Exists(Path.Combine(world.Tv.Location, "Pack Show (2022) [tmdbid-210]", "Season 01",
+                    $"Pack Show (2022) S01E0{number}.mkv"))),
+                $"The torrent is detached once for the whole pack and every library file stays ({transmission.RemoveCalls - removesBeforePack} removals)");
+            // One history line for the pack, naming it, never one identical line per file (user, 2026-10-09).
+            var released = await database.History.AsNoTracking().Where(history => history.EntryId == ids["pack"] &&
+                history.EventType == "seeding_released").ToListAsync();
+            Assert(released.Count == 1 && released[0].Summary ==
+                    "Stopped seeding the Season 1 pack after its goal. Nothing was deleted; its downloaded files stay on disk." &&
+                seeds.Any(seed => seed.Id == released[0].Id) && released[0].Data!.Contains(packGrabId.ToString(), StringComparison.Ordinal) &&
+                Enumerable.Range(1, 3).All(number => released[0].Data!.Contains(ids["pack" + number].ToString(), StringComparison.Ordinal)),
+                "A pack of three files writes one seeding_released line that names the pack: " +
+                string.Join(" | ", released.Select(history => history.Summary + " " + history.Data)));
+        }
+
+        // A single episode's seed release keeps its own line, worded as before: Pack Show's S01E04, which the pack lacked, is
+        // grabbed on its own and detached once its goal is met.
+        var e4Fixture = TorrentFixture.Single("Pack.Show.S01E04.1080p.WEB-DL-GRP.mkv", Size);
+        torznab.Torrents["packe4"] = e4Fixture.Bytes;
+        transmission.Register(e4Fixture);
+        lock (torznab.MovieItems)
+            torznab.TvItems.Add(new("Pack.Show.S01E04.1080p.WEB-DL-GRP", "guid-packe4", torznab.Download("packe4"), Size, 25,
+                new() { ["tvdbid"] = "310" }));
+        var (e4Grab, e4Hash) = await GrabAsync(admin, ids["pack"], ids["pack4"], e4Fixture);
+        transmission.Progress(e4Hash, 1.0);
+        var e4Import = await CompleteAsync(dbPath, e4Grab, Tick);
+        transmission.Torrents[e4Hash].UploadRatio = 1.5;
+        await WaitAsync(async () =>
+        {
+            await Tick();
+            await using var database = new ModDbContext(dbPath);
+            return (await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == e4Import.Id)).State ==
+                SeedReleaseStates.Detached ? true : (bool?)null;
+        }, "The single-episode seed release detaches once its goal is met");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.AsNoTracking().SingleAsync(value => value.ImportOperationId == e4Import.Id);
+            var lines = await database.History.AsNoTracking().Where(history => history.EntryId == ids["pack"] &&
+                history.EventType == "seeding_released").ToListAsync();
+            Assert(!seed.Pack && lines.Count == 2 && lines.Any(history => history.Id == seed.Id &&
+                    history.Summary == "Stopped seeding after its goal. Nothing was deleted; its downloaded files stay on disk." &&
+                    history.Data!.Contains(ids["pack4"].ToString(), StringComparison.Ordinal)),
+                "A single episode's seed release writes its own line, worded as before: " +
+                string.Join(" | ", lines.Select(history => history.Summary)));
+        }
+
+        // Season packs after the Codex review of the pack plugin (2026-10-08): Add and Replace end to end, All Seasons across seasons,
+        // Retry, Remove and access to every claimed episode.
+        await PackReviewScenarios.RunAsync(Tick, admin, host.Client(world.RestrictedAdmin, true), world, dbPath, ids, torznab, transmission);
+        // Episode upgrades off and the default version (user, 2026-10-09).
+        await UpgradesOffScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission);
+
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))
         {

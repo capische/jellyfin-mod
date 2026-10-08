@@ -1694,6 +1694,90 @@ internal static class Phase6
             Json.Parse(await admin.GetStringAsync("/JellyfinMod/Settings/Automation")).GetProperty("revision").GetInt32(), enabled: true, batch: 3,
             grabs: 20)), 200, "Automation settings back to the run's values");
 
+        // ---- Automation prefers packs (season and series packs, 2026-10-08): a fully aired season with at least two monitored
+        // episodes missing is grabbed as one season pack in fill mode; a season with one missing episode is searched episode by
+        // episode as before.
+        var packNow = time.GetUtcNow().UtcDateTime;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            foreach (var row in await database.AutomationTargets.ToListAsync()) row.NextSearchAt = packNow.AddDays(30);
+            var tvLibraryId = (await database.Entries.AsNoTracking().SingleAsync(value => value.Id == ids["series"])).TargetLibraryId;
+            foreach (var (key, tmdb, title, tvdb) in new[] { ("packAuto", 510, "Pack Auto Show", 710), ("oneAuto", 511, "One Auto Show", 711) })
+            {
+                var entry = new Entry
+                {
+                    MediaType = "series", TmdbId = tmdb, Title = title, Year = 2022, TargetLibraryId = tvLibraryId, Monitored = true, MetadataJson = Metadata("series", tmdb, title, 2022, null, tvdb)
+                };
+                database.Entries.Add(entry);
+                ids[key] = entry.Id;
+                for (var number = 1; number <= 3; number++)
+                {
+                    var episode = new Episode
+                    {
+                        EntryId = entry.Id, TmdbId = tmdb * 10 + number, SeasonNumber = 1, EpisodeNumber = number, Title = key + number,
+                        AirDate = packNow.AddDays(-20 + number), RuntimeMinutes = 45, Monitored = true,
+                        // One Auto Show holds two of its three episodes, so only one is missing.
+                        State = key == "oneAuto" && number > 1 ? FileState.OnDisk : FileState.None
+                    };
+                    database.Episodes.Add(episode);
+                    ids[key + number] = episode.Id;
+                }
+            }
+
+            await database.SaveChangesAsync();
+        }
+
+        release(torznab, "packAutoS1", "Pack.Auto.Show.S01.1080p.WEB-DL-GRP", null, "710");
+        release(torznab, "oneAutoS1", "One.Auto.Show.S01.1080p.WEB-DL-GRP", null, "711");
+        release(torznab, "oneAutoE1", "One.Auto.Show.S01E01.1080p.WEB-DL-GRP", null, "711");
+        var packRun = await Run();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var packGrabs = await database.GrabOperations.AsNoTracking().Where(grab => grab.EntryId == ids["packAuto"]).ToListAsync();
+            Assert(packGrabs.Count == 1 && packGrabs[0].Scope == "season" && packGrabs[0].SeasonNumber == 1 && packGrabs[0].Mode == "fill" &&
+                packGrabs[0].Automatic && packGrabs[0].RawTitle == "Pack.Auto.Show.S01.1080p.WEB-DL-GRP",
+                "A fully aired season with every episode missing is grabbed as one season pack: " +
+                string.Join(" | ", packGrabs.Select(grab => $"{grab.Scope} {grab.Mode} {grab.RawTitle}")));
+            var packClaims = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == packGrabs[0].Id).ToListAsync();
+            Assert(packClaims.Count == 3 && packClaims.All(claim => claim.ActiveKey == claim.EpisodeId.ToString("N")),
+                "The automatic pack claims the season's three missing episodes");
+            var packDecisions = await database.AutomationDecisions.AsNoTracking()
+                .Where(decision => decision.RunId == packRun.Id && decision.EntryId == ids["packAuto"]).ToListAsync();
+            // At least one sibling is decided in this run, so the check cannot pass with none; the next run decides the rest
+            // (Codex review of the pack plugin).
+            Assert(packDecisions.Count(decision => decision.Kind == "grabbed") == 1 &&
+                packDecisions.Count(decision => decision.Kind != "grabbed") >= 1 &&
+                packDecisions.Where(decision => decision.Kind != "grabbed").All(decision => decision.Reason == AutomationReasons.ActiveGrabExists),
+                "One pack is one automatic grab; the season's other episodes are skipped because the pack holds them: " +
+                string.Join(" | ", packDecisions.Select(decision => $"{decision.Kind} {decision.Reason} {decision.Detail}")));
+        }
+
+        // A later run never searches the pack's episodes one by one while the pack holds them; the batch's remaining target runs.
+        var packRunTwo = await Run();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            // Over both runs every episode of the season is decided exactly once: the pack's grab, and a skip for each other
+            // episode because the pack holds it.
+            var bothRuns = await database.AutomationDecisions.AsNoTracking().Where(decision => (decision.RunId == packRun.Id ||
+                decision.RunId == packRunTwo.Id) && decision.EntryId == ids["packAuto"]).ToListAsync();
+            Assert(bothRuns.Count == 3 && bothRuns.Count(decision => decision.Kind == "grabbed") == 1 &&
+                bothRuns.Select(decision => decision.TargetId).ToHashSet().SetEquals([ids["packAuto1"], ids["packAuto2"], ids["packAuto3"]]) &&
+                bothRuns.Where(decision => decision.Kind != "grabbed").All(decision => decision.Reason == AutomationReasons.ActiveGrabExists),
+                "Each episode of the season is decided once over two runs: one pack grab and two skips for the pack's hold: " +
+                string.Join(" | ", bothRuns.Select(decision => $"{decision.Kind} {decision.Reason} {decision.Detail}")));
+            Assert(await database.GrabOperations.CountAsync(grab => grab.EntryId == ids["packAuto"]) == 1,
+                "No single-episode grab takes an episode the pack is downloading");
+            var oneGrabs = await database.GrabOperations.AsNoTracking().Where(grab => grab.EntryId == ids["oneAuto"]).ToListAsync();
+            Assert(oneGrabs.Count == 1 && oneGrabs[0].Scope == "episode" && oneGrabs[0].EpisodeId == ids["oneAuto1"] &&
+                oneGrabs[0].RawTitle == "One.Auto.Show.S01E01.1080p.WEB-DL-GRP",
+                "A season with only one missing episode is searched episode by episode: " +
+                string.Join(" | ", oneGrabs.Select(grab => $"{grab.Scope} {grab.RawTitle}")));
+            Assert(torznab.Queries.Any(query => query.Contains("tvdbid=710", StringComparison.Ordinal) &&
+                    query.Contains("season=1", StringComparison.Ordinal) && !query.Contains("ep=", StringComparison.Ordinal)) &&
+                !torznab.Queries.Any(query => query.Contains("tvdbid=711", StringComparison.Ordinal) && !query.Contains("ep=", StringComparison.Ordinal)),
+                "Only the qualifying season is searched as a pack");
+        }
+
         // ---- Settings survive a restart; the whole run wrote no media_missing.
         await host.DisposeAsync();
         host = await PluginHost.StartAsync(world, dbPath, time, logs, configuration, taskManager);

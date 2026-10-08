@@ -86,6 +86,18 @@ internal sealed partial class NativeWorld
     public ConcurrentQueue<string> ScanRequests { get; } = new();
     public bool AutoScan { get; set; } = true;
 
+    /// <summary>
+    /// The TMDB id Jellyfin's metadata gives a scanned episode file, or null for one it only numbers (season and series packs:
+    /// a file bound by its number alone is not verified as that episode).
+    /// </summary>
+    public Func<string, int?>? EpisodeTmdbId { get; set; }
+
+    /// <summary>The native items a session is playing now, by item id.</summary>
+    public ConcurrentDictionary<Guid, bool> Playing { get; } = new();
+
+    /// <summary>Runs whenever the plugin reads the sessions, before they are returned; a run uses it to act at that moment.</summary>
+    public Action? SessionsRead { get; set; }
+
     /// <summary>Items whose read fails while this says so, as an unreadable database row would (V1 re-review P-3).</summary>
     public Func<Guid, bool>? FailingRead { get; set; }
     public int Scans;
@@ -239,6 +251,7 @@ internal sealed partial class NativeWorld
             IndexNumber = numbering.Success ? int.Parse(numbering.Groups[2].Value, CultureInfo.InvariantCulture) : null,
             DateCreated = DateTime.UtcNow
         };
+        if (EpisodeTmdbId?.Invoke(file) is { } tmdb) episode.ProviderIds["Tmdb"] = tmdb.ToString(CultureInfo.InvariantCulture);
         lock (series.Items) series.Items.Add(episode);
         _items[episode.Id] = episode;
         _added?.Invoke(this, new ItemChangeEventArgs { Item = episode });
@@ -348,6 +361,9 @@ internal sealed partial class NativeWorld
                 return video.LocalAlternateVersions.Select(path => NewItemId(path, video.GetType()))
                     .Where(versionId => _items.ContainsKey(versionId)).ToArray();
             case "GetLinkedAlternateVersions": return Array.Empty<Video>();
+            // The host's scan exclusions as far as these fixtures use them: Jellyfin's IgnorePatterns leave out every dot file
+            // ("**/.*"), macOS "._" sidecars included.
+            case "IgnoreFile": return ((MediaBrowser.Model.IO.FileSystemMetadata)arguments![0]!).Name.StartsWith('.');
             case "GetItemById":
             // The stored item: these fixtures keep one instance per item, so it is the same one (Q16 review P2-2).
             case "RetrieveItem":
@@ -427,7 +443,19 @@ internal sealed class PluginHost : IAsyncDisposable
         var userData = Stub<IUserDataManager>.Create((method, args) => method.Name == "GetUserData" && args?[1] is BaseItem item
             ? new UserItemData { Key = item.Id.ToString("N"), Played = true, LastPlayedDate = time.GetUtcNow().UtcDateTime }
             : null);
-        var sessions = Stub<ISessionManager>.Create((method, _) => method.Name == "get_Sessions" ? Array.Empty<SessionInfo>() : null);
+        // A session plays an item while the run says so: its media source names the item, as a client's play state does.
+        ISessionManager? sessionManager = null;
+        var sessions = sessionManager = Stub<ISessionManager>.Create((method, _) => method.Name == "get_Sessions"
+            ? ReadSessions()
+            : null);
+        SessionInfo[] ReadSessions()
+        {
+            world.Native.SessionsRead?.Invoke();
+            return world.Native.Playing.Keys.Select(id => new SessionInfo(sessionManager!, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance)
+            {
+                PlayState = new MediaBrowser.Model.Session.PlayerStateInfo { MediaSourceId = id.ToString("N") }
+            }).ToArray();
+        }
 
         var builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions
         {
