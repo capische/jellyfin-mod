@@ -126,8 +126,8 @@ Jellyfin 12.0.0) and as `latest`. A version tag is never overwritten: a broken r
 publishing the next version (`0.1.0.1`) and moving `latest` to it. Pin a version tag in production.
 The one exception, by the user's decision: `0.1.0.0` has been republished in place, on 2026-09-27
 with the Trakt indicator and the import fixes (see the changelog in `build.yaml`), and on 2026-10-03,
-2026-10-07 and 2026-10-08 with the review and settings fixes. The current index is
-`sha256:5c81e4839c15…a5927`, built from this repository's `f7c274c` (without the Phase 9 ratings below)
+2026-10-07 and 2026-10-08 with the review and settings fixes, and on 2026-10-09 with the resolution fix. The current
+index is `sha256:9c3525549ed6…1a3970`, built from this repository's `cb5c6f9` (without the Phase 9 ratings below)
 and the web fork's `3364b4da43`; each index is recorded in the web fork's `docs/jellyfinmod/PHASE7.md`.
 A volume that already ran an earlier `0.1.0.0` build picks the new one up on the next start (see
 *Plugin install* below).
