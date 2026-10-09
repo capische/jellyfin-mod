@@ -9,6 +9,17 @@
 - `jellyfin-web` stays a fork of upstream Jellyfin Web and keeps merging upstream releases; keep changes additive and the upstream patch surface listed.
 - Delete merged and stale branches, locally and on the remote, rather than accumulating them.
 
+## Do not over-engineer
+
+User rule, 2026-10-09: **do not over-engineer.** Most of any product is used rarely, and about 20% of it carries 80% of the use, so build for that 20%. Hold this in design, implementation, tests and reports alike.
+
+- Build the simplest thing that covers the common path the user actually uses. Add an option, a setting, an abstraction, a fallback or an edge-case branch only when a real, current case needs it, not for a case that could happen.
+- Prefer a small change to the existing code over a new component, layer, hook or file. Extend what is there before adding something new, and delete what the change makes unused.
+- Do not tune past "good enough to judge". Offer one setting, or at most two, not a grid of variants. Stop when the user can see it works; they will say if it needs more.
+- Do not widen a task. A fix fixes the reported problem; related polish, refactors and "while I am here" changes are listed for the user and left alone.
+- Size the work to the use: a rarely used path gets a plain, correct implementation and its normal checks, not special infrastructure. The test gates, the lease rules and the safety of destructive paths (retention delete, data restore) are not scaled down by this rule; it limits what gets built, not how carefully it is verified.
+- If a simpler design exists and it loses something, say what it loses in one sentence and choose the simple one unless the user objects.
+
 ## Agents and pacing
 
 - Pause all work at 80% of the 5-hour usage limit.
@@ -41,6 +52,7 @@
 
 ### Code review (Codex GPT-6.1 Sol, high)
 
+- **When a review runs** (user, 2026-10-09): run the Codex review **once, at the end**: only after every test and matrix for the change has passed, the user has approved the tested change, and it is ready to push or merge to its target branch (plugin `master`, web `jellyfin-mod`). Do not run it on a first look, between fix rounds, after each small change or to check a hunch. Codex usage is limited and a review per round costs both that and time. When the review finds P1/P2 issues, fix them and re-review only that fix delta, once; if the fix changes what the user sees, it goes back through the first-look rule instead. The user can still ask for a review earlier, and a design that sits on a destructive path (the retention delete path) may be adversarially reviewed before it is built on, when the brief says so.
 - Every code review runs on Codex with model `gpt-6.1-sol` at high reasoning effort (user rule, 2026-10-01; it needs Codex CLI 0.159.3 or later — older CLIs reject it with "not supported when using Codex with a ChatGPT account"): phase and slice reviews, re-reviews of fix deltas, adversarial verification of critical findings — especially the retention delete path.
 - Run it read-only from the worktree that holds the branch, never the main checkout, and save the output as the review record:
   `codex exec -m gpt-6.1-sol -c model_reasoning_effort='"high"' -s read-only "<review brief naming the diff, e.g. git diff <base>..<tip>>" > <scratchpad>/review-<slice>.md`
@@ -56,6 +68,11 @@
 ### Design (Opus 5.5 high)
 
 - Opus 5.5 at high effort takes design work: the upstream patch surface, whose decisions bind every future merge; phase plans; UI and UX design proposals.
+- **Show the design before implementing it** (user, 2026-10-09): when a new feature, a bug fix or a change needs a design decision that changes how something looks or is laid out, first make a simple static proposal: a plain HTML/CSS page or an image mockup, no build, no deploy, no app code. Show the user how it is going to look (screenshots, or the file to open) and stop. Implement only after the user approves the design. Offer one proposal, or at most two when the choice is genuinely open, not a grid of variants.
+  - **Skip it only when the user says so explicitly**, for example "go implement without showing the design" or "implement it directly". A vague go-ahead ("do it", "fix it") is not that: if the change needs a design decision, propose it first. A change with no visual decision in it (backend, data, a bug whose fix looks the same as before) needs no proposal.
+  - **A small style tweak to something already built** (a colour, a spacing, a blur value) takes the live-styles route in Testing instead of a mockup: inject the values into the deployed page and screenshot it.
+  - After approval the work follows the gates in Testing: first look on one instance, the rest, re-verify, then review. The approved mockup is the reference the first look is compared against, and the report says where it differs.
+  - A brief to another session for a change like this asks for the proposal first and says to wait for the approval, which comes through the session that started it.
 
 ## Testing
 
@@ -63,6 +80,14 @@
 - Browser work iterates on Playwright's own bundled Chromium, headless. Final acceptance always runs the same checks on real Google Chrome, and nothing is finished without that pass.
 - Iterate with fast test settings (for example a minute-scale retention window), then confirm the behaviour with the real settings.
 - **Re-run only what a fix touches** (user, 2026-10-08): during review-fix rounds, re-run the Chromium checks and the live steps the change affects, and say which steps were skipped and why. Run the full live list and the real-Chrome pass once, on the final reviewed code, before acceptance. A full live run plus Chrome after every round cost Phase 9 about an hour per round.
+- **Show first, then the rest, then review** (user, 2026-10-09): a change the user can see goes through four gates, in this order. Never skip one, and never start a later gate before the user has approved the earlier one.
+  1. **First look:** implement only a representative first part of the change (the user names it, for example the computer and TV layouts; if not named, pick the one the change is mainly about) and verify it on **one** instance, the one the user will look at (18096 by default, or a single local environment), in Playwright Chromium. Then stop and show: screenshots, the key numbers, the URL to open and what to look for. Only cheap, low-risk checks come before approval: typecheck, lint, a smoke run and the screenshots.
+  2. **The rest:** after the user approves the first look, implement the remaining parts (for example phone and the other themes), copy the same build to the remaining instances and environments (no rebuild unless the code changed), and run the full matrix: all browsers, layouts and themes, and the real-Chrome pass. Then report the results and stop again.
+  3. **Re-verify:** the user checks the finished change. A change they ask for here that alters what they see goes back to gate 1 for that part; one that does not (a fix to a test, a comment, a doc) does not.
+  4. **Review:** only after the user approves the tested change, run the one Codex code review (see Code review above) and then push.
+  - **The first-look instance stays leased** while the user looks (renew it, release it when told). Each report says which gate it is, and says what has not been run. Record the slice in `PLAN.md` as built (not accepted) until the full matrix has passed and the user has approved it.
+  - **A brief to another session** that is a user-visible change states this rule and names the first part, so the session stops after each gate and waits for the user's approval, which comes through the session that started it. The rule does not apply to changes with nothing to look at (backend, migrations, refactors, tooling), which follow the normal flow, nor when the user asks for the full run.
+- **Style changes are tested simply** (user, 2026-10-09): a change to styles, markup or copy needs no test run, runner or user-data step. Find the values live: load the page that is already deployed in a browser, inject the candidate CSS into it (a style tag or setting the properties on the element), screenshot the page, and repeat until it looks right, with no rebuild or redeploy per try. Put the chosen values into the source once, build once, deploy by copying the build, and take the page screenshot (Home, scrolled where the change shows) as the first look. Read computed styles from the page when a number is needed. Run the hero, playback or full matrix only at the later gates, and only for behaviour, not for how something looks.
 - **Suites on the Mac first** (user, 2026-10-08): run the plugin suites that pass on macOS on the Mac (currently Phase 0 and 1 smoke, Phase 2, Phase 3, Q16 Trakt, Phase 9 and Phase 10), in parallel where they share no ports or folders. Send only the Linux-specific suites to the Pi (hardlinks, Transmission seed protection, the root-only Phase 4 run, Phase 5 with its bind-mount aliases, and any suite that fails on macOS for platform reasons). The full Pi run of all 14 suites in sequence took 29 minutes.
 - **Batch service restarts** (user, 2026-10-08): live runners that must stop the instance to change its database group those changes into as few stop/start cycles as the checks allow, because each Jellyfin restart on the Pi costs a minute or more. Never trade a check's meaning for speed: a step that must prove behaviour across a restart keeps its own restart.
 - Leave no test fixtures behind: no `JellyfinMod …` titles or files in any library or catalog once a run ends, and no test libraries. Remove a test library only through `DELETE /Library/VirtualFolders` (never by deleting its folder on disk, which leaves an orphan view), then prove cleanup with `GET /UserViews` for `oleksii`: only the instance's own libraries (Movies, Shows) may remain. Leftover "JellyfinMod V1 …", "Movies Alt" and "Movies B" views reached the user on 2026-09-28.
@@ -115,6 +140,12 @@ Every session shows its current state as a prefix on its session title (user, 20
 
 The prefix is only for display. The lease `--owner` and anything else that identifies the session always use the bare session name without the prefix, so the owner never changes with the status. Peers message a session by its `local_…` id, which stays the same when the title changes.
 
+### Session names
+
+- Rename every new session as soon as its task is clear (usually after the first message), with `mcp__ccd_session_mgmt__set_session_title`, to a short, memorable name of two to four words that says what the session fixes or builds, for example "Scope-Ratio 4K Fix" or "Settings Rows and Title Case". Name the thing, not the activity.
+- Never reuse a title another session has. Keep the name for the life of the session; rename only when its scope clearly changes. The status prefixes above go in front of it, and the name is the `<name>` part (and the lease `--owner`).
+- When you start another session, give it a name of the same kind.
+
 ## Credentials
 
 - Load `TMDB_READ_ACCESS_TOKEN` from ignored `plugin/.env` for mod E2E. Keep file permissions `0600`.
@@ -141,6 +172,7 @@ The prefix is only for display. The lease `--owner` and anything else that ident
 
 ## Pi deployment
 
+- **Deploying for the user's verification is pre-approved** (user, 2026-10-09): when the user needs a build running on a mod test instance to verify it, deploy it without asking first. It covers `18096`, `28096` and `48096`, under your lease, with `jellyfin-sync` configured explicitly for that instance, a backup of what is there first, and a stated restore command. For a web-only change that means copying the build into the instance's web folder with no restart. Where the instance serves its web from the plugin's zip (28096), replacing the zip and restarting only that one container is part of the same approval. The plugin assembly and database are not covered: a plugin or migration change follows the normal gates. It never covers production `8096`, another instance's lease, or deleting data. Say what was deployed, the live build marker and the restore command in the report. This is the user's decision recorded here; if the harness's own permission check still blocks the command, do not retry it another way: report it to the user and ask them to allow or run it.
 - Connect with `ssh pi`. Jellyfin runs in Docker; inspect Compose services and mounts before deployment.
 - Build the plugin against its pinned versions. Copy the assembly and required runtime dependencies into the target's persistent `plugins/JellyfinMod/` directory.
 - Match native dependencies to the Pi architecture. Preserve other plugins, configuration and data; do not rebuild the Jellyfin image just to install the plugin.
