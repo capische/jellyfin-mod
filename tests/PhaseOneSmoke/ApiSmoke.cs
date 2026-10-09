@@ -1175,6 +1175,10 @@ internal static class ApiSmoke
         using var listedJson = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
         Assert(listed.StatusCode == HttpStatusCode.OK && listedJson.RootElement.GetArrayLength() == 2,
             "The admin conflict view lists every open episode conflict");
+        // Each entry says when it was found, as a UTC stamp (settings polish, 2026-10-09).
+        Assert(listedJson.RootElement.EnumerateArray().All(row => row.TryGetProperty("detectedAt", out var detected) &&
+                detected.GetString()!.EndsWith('Z') && DateTime.Parse(detected.GetString()!).ToUniversalTime() > DateTime.UtcNow.AddHours(-1)),
+            "Every listed episode conflict carries when it was detected, in UTC");
         Assert((await client.PostAsync($"/JellyfinMod/Reconciliation/Conflicts/{rebind.Id}/Rebind", null)).StatusCode ==
                 HttpStatusCode.NoContent &&
             (await client.PostAsync($"/JellyfinMod/Reconciliation/Conflicts/{keep.Id}/Keep", null)).StatusCode ==
@@ -1243,6 +1247,9 @@ internal static class ApiSmoke
         Assert(orphans.StatusCode == HttpStatusCode.OK &&
             orphansJson.RootElement.EnumerateArray().Select(row => Guid.Parse(row.GetProperty("id").GetString()!)).SequenceEqual([orphan.Id]),
             "Administrator diagnostics list exactly the entries whose library is no longer live");
+        Assert(orphansJson.RootElement.EnumerateArray().All(row => row.TryGetProperty("addedAt", out var added) &&
+                added.GetString()!.EndsWith('Z') && DateTime.Parse(added.GetString()!).ToUniversalTime() > DateTime.UtcNow.AddHours(-1)),
+            "Every listed orphan carries when it was added, in UTC");
         Assert((await client.DeleteAsync($"/JellyfinMod/Entries/{stale.Id}")).StatusCode == HttpStatusCode.NoContent &&
             (await client.DeleteAsync($"/JellyfinMod/Entries/{orphan.Id}")).StatusCode == HttpStatusCode.NoContent,
             "An administrator can remove stale-bound and orphaned entries instead of receiving 404");

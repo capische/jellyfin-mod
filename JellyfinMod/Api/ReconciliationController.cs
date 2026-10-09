@@ -44,7 +44,7 @@ public sealed class ReconciliationController(
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         return Ok(entries.Where(entry => !access.IsLiveLibrary(entry.TargetLibraryId))
             .Select(entry => new OrphanedEntryDto(entry.Id, entry.Title, entry.MediaType, entry.TmdbId,
-                entry.TargetLibraryId, FileStates.ToWire(entry.State)))
+                entry.TargetLibraryId, FileStates.ToWire(entry.State), DateTime.SpecifyKind(entry.AddedAt, DateTimeKind.Utc)))
             .ToArray());
     }
 
@@ -76,9 +76,11 @@ public sealed class ReconciliationController(
                 orderby entry.Title, episode.SeasonNumber, episode.EpisodeNumber
                 select new EpisodeConflictDto(conflict.Id, entry.Id, entry.Title, conflict.JellyfinItemId,
                     episode.TmdbId, episode.SeasonNumber, episode.EpisodeNumber, conflict.ObservedTmdbId,
-                    conflict.ObservedSeasonNumber, conflict.ObservedEpisodeNumber))
+                    conflict.ObservedSeasonNumber, conflict.ObservedEpisodeNumber, conflict.DetectedAt))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
-        return Ok(rows.Where(row => readable.Contains(row.Id)).ToList());
+        // The stored time has no kind; the wire says UTC, as every other stamp of this API does.
+        return Ok(rows.Where(row => readable.Contains(row.Id))
+            .Select(row => row with { DetectedAt = DateTime.SpecifyKind(row.DetectedAt, DateTimeKind.Utc) }).ToList());
     }
 
     /// <summary>Moves the native episode to the identity Jellyfin now reports, writing one history event.</summary>

@@ -40,7 +40,8 @@ public sealed record OrphanedEntryDto(
     [property: JsonPropertyName("mediaType")] string MediaType,
     [property: JsonPropertyName("tmdbId")] int TmdbId,
     [property: JsonPropertyName("targetLibraryId")] Guid? TargetLibraryId,
-    [property: JsonPropertyName("state")] string State);
+    [property: JsonPropertyName("state")] string State,
+    [property: JsonPropertyName("addedAt")] DateTime AddedAt);
 
 /// <summary>An open episode identity conflict shown to administrators (P2.R9).</summary>
 public sealed record EpisodeConflictDto(
@@ -53,4 +54,5 @@ public sealed record EpisodeConflictDto(
     [property: JsonPropertyName("trackedEpisodeNumber")] int TrackedEpisodeNumber,
     [property: JsonPropertyName("observedTmdbId")] int ObservedTmdbId,
     [property: JsonPropertyName("observedSeasonNumber")] int ObservedSeasonNumber,
-    [property: JsonPropertyName("observedEpisodeNumber")] int ObservedEpisodeNumber);
+    [property: JsonPropertyName("observedEpisodeNumber")] int ObservedEpisodeNumber,
+    [property: JsonPropertyName("detectedAt")] DateTime DetectedAt);
