@@ -38,6 +38,9 @@
 .jfmod-three{grid-template-columns:1fr 1fr 1fr}
 @media (max-width:44em){.jfmod-two,.jfmod-three{grid-template-columns:1fr}}
 .layout-mobile .jfmod-two,.layout-mobile .jfmod-three{grid-template-columns:1fr}
+/* Fields side by side start their inputs on one line (user, 2026-10-09): a label that wrapped to a second line pushed its
+   own input down. The page gives every label of a row of columns the height of the tallest (alignFieldRows), so a short
+   label costs nothing when none of them wraps. */
 
 .jfmod-state{display:inline-flex;align-items:center;color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));font-size:.95em}
 .jfmod-state i{flex:none;width:.62em;height:.62em;border-radius:50%;border:.12em solid currentColor;margin-right:.45em}
@@ -115,14 +118,29 @@
 .jfmod-settings .jfmod-busy{opacity:.75;cursor:progress}
 
 /* Secrets: a component, never a password field with a placeholder. */
-.jfmod-secret .jfmod-secret-label{display:block;color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));margin-bottom:.35em;font-size:.95em}
+/* The caption has an input label's own metrics (size and the gap under it), so a secret beside a text field starts level with it. */
+.jfmod-secret .jfmod-secret-label{display:block;color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));margin-bottom:.25em;font-size:1em}
 .jfmod-secret-row{display:flex;align-items:center;flex-wrap:wrap;min-height:2.6em;padding:.25em .3em .25em .7em;background:var(--jf-palette-FilledInput-bg,rgba(255,255,255,.09));border-radius:.2em}
 .jfmod-secret-state{display:inline-flex;align-items:center;margin-right:auto;color:var(--jf-palette-text-primary,#fff);min-width:0}
 .jfmod-secret-pending .jfmod-secret-state{color:var(--jf-palette-starIcon-main,#f2b01e)}
 .jfmod-lock{width:.75em;height:.6em;border:.12em solid var(--jf-palette-primary-main,#00a4dc);border-radius:.15em;position:relative;margin-right:.55em;margin-left:.1em;flex:none}
 .jfmod-lock::before{content:"";position:absolute;left:.12em;right:.12em;top:-.5em;height:.45em;border:.12em solid var(--jf-palette-primary-main,#00a4dc);border-bottom:0;border-radius:.4em .4em 0 0}
 .jfmod-secret-edit{margin-top:.5em}
+.jfmod-secret-label+.jfmod-secret-edit{margin-top:0}
+.jfmod-secret-row+.jfmod-secret-edit{margin-top:0}
+/* The secret's input is named by its caption; its own (empty) label would only push it down. */
+.jfmod-secret-edit .inputLabel{display:none}
 .jfmod-secret-edit .inputContainer{margin-bottom:.4em}
+/* A secret's Save sits at the end of its input, centred on it (user, 2026-10-09). */
+.jfmod-secret-inputrow{display:flex;align-items:center;min-height:2.6em;padding:.25em .3em .25em .3em;background:rgba(255,255,255,.09);background:var(--jf-palette-FilledInput-bg,rgba(255,255,255,.09));border-radius:.2em}
+.jfmod-secret-inputrow:focus-within{box-shadow:0 0 0 .12em #00a4dc;box-shadow:0 0 0 .12em var(--jf-palette-primary-main,#00a4dc)}
+.jfmod-secret-inputrow .inputContainer{flex:1;min-width:0;margin-bottom:0}
+/* One field (user, 2026-10-09): the input is the field's text, not a box of its own; its Save and Keep sit inside, at the right. */
+.jfmod-secret-edit .jfmod-secret-inputrow input.emby-input{background:transparent;border-color:transparent;box-shadow:none}
+/* The edit field is the Configured box in another state (user, 2026-10-10): the same left edge, width, height and text size, with the text
+   starting where "Configured" starts. Measured against the stock input, which sat 0.4em in from the left and drew its text at 110%. */
+.jfmod-secret .jfmod-secret-edit .jfmod-secret-inputrow{margin:0;padding:.25em .3em .25em .7em}
+.jfmod-secret .jfmod-secret-edit .jfmod-secret-inputrow input.emby-input{border-width:0;padding:.4em 0;font-size:inherit}
 /* Test, Replace and Clear are round icon buttons in the box (user, 2026-10-07), and so is every action of a list row (user,
    2026-10-08): at least 40 px, centred, grey or red as the labelled buttons are; focus takes the cyan fill with dark
    glyphs, as upstream's .raised does. */
@@ -130,14 +148,43 @@
 .jfmod-iconbtn:first-of-type{margin-left:.86em}
 .jfmod-iconbtn .material-icons{font-size:1.4em}
 .jfmod-iconbtn-red{color:#fff;color:var(--jf-palette-error-contrastText,#fff);background:#c62828;background:var(--jf-palette-error-main,#c62828)}
-.jfmod-iconbtn-grey:hover{background:linear-gradient(rgba(255,255,255,.12),rgba(255,255,255,.12)) #424242;background:linear-gradient(rgba(var(--jf-palette-text-primaryChannel)/.12),rgba(var(--jf-palette-text-primaryChannel)/.12)) var(--jf-palette-Button-inheritContainedBg,#424242)}
+/* Hover (user, 2026-10-09): the icon grows a little and a veil of its own text colour lightens it, both over 140 ms. The veil
+   is a pseudo-element whose opacity moves, since a gradient fill cannot be animated; transform and opacity are all that
+   move, so an older webOS pays nothing for it. The focused icon keeps its ring and its fill unchanged. */
+.jfmod-iconbtn{position:relative;transition:transform .14s ease-out,background-color .14s ease-out}
+.jfmod-iconbtn::before{content:"";position:absolute;top:0;right:0;bottom:0;left:0;border-radius:50%;background:currentColor;opacity:0;transition:opacity .14s ease-out;pointer-events:none}
+.jfmod-iconbtn:hover:not([aria-disabled="true"]):not(:focus){transform:scale(1.08)}
+.jfmod-iconbtn-grey:hover:not([aria-disabled="true"]):not(:focus)::before{opacity:.12}
+@media (prefers-reduced-motion:reduce){.jfmod-iconbtn,.jfmod-iconbtn::before{transition:none}.jfmod-iconbtn:hover:not([aria-disabled="true"]):not(:focus){transform:none}}
+/* A Test icon (user, 2026-10-09, design C2 "Gauge"): the signal arcs with a needle across them are the indicator, with no mark on
+   the corner. Idle it is the text colour; while the test runs the needle sweeps across the arcs; a pass turns the whole glyph
+   green; a failure turns it red and drops the needle to zero. Only transform moves, on one group, and the shapes differ as well
+   as the colours. The needle's cut (a wider stroke in the button's fill) clears the arcs it crosses. */
+.jfmod-iconbtn .jfmod-testglyph{display:inline-flex;align-items:center;justify-content:center}
+.jfmod-testsig{display:block;width:1.4em;height:1.4em}
+.jfmod-testsig-cut{stroke:#424242;stroke:var(--jf-palette-Button-inheritContainedBg,#424242)}
+.jfmod-iconbtn:focus .jfmod-testsig-cut{stroke:#00a4dc;stroke:var(--jf-palette-secondary-main,#00a4dc)}
+.jfmod-testsig-needle{transform-origin:12px 19.2px}
+.jfmod-testing .jfmod-testsig-needle{animation:jfmod-testsweep 1.4s ease-in-out infinite alternate}
+@keyframes jfmod-testsweep{from{transform:rotate(-58deg)}to{transform:rotate(14deg)}}
+.jfmod-test-ok .jfmod-testsig{color:#81c784}
+.jfmod-test-fail .jfmod-testsig{color:#ff7b72}
+.jfmod-test-fail .jfmod-testsig-needle{transform:rotate(-70deg)}
+/* The focus fill is a light cyan: the coloured glyphs take their dark shades there. */
+.jfmod-iconbtn:focus.jfmod-test-ok .jfmod-testsig{color:#1b5e20}
+.jfmod-iconbtn:focus.jfmod-test-fail .jfmod-testsig{color:#b71c1c}
+.jfmod-teststatus{margin-right:.2em;color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));font-size:.9em}
+/* The number fields' spin arrows are the browser's own, drawn for a light field unless the field says it is dark, which made
+   them nearly invisible (user, 2026-10-09); the light scheme is the one light field. */
+.jfmod-settings input[type="number"],.jfmod-sheet input[type="number"]{color-scheme:dark}
+:root[data-theme="light"] .jfmod-settings input[type="number"],:root[data-theme="light"] .jfmod-sheet input[type="number"]{color-scheme:light}
 .jfmod-iconbtn-red:hover{background:#8a1c1c;background:var(--jf-palette-error-dark,#8a1c1c)}
 .jfmod-iconbtn:focus{outline:.16em solid #fff;outline:.16em solid var(--jf-palette-text-primary,#fff);outline-offset:.12em;background:#00a4dc;background:var(--jf-palette-secondary-main,#00a4dc);color:rgba(0,0,0,.87)}
 .jfmod-iconbtn[aria-disabled="true"]{opacity:.45}
 /* A refused row icon (Move Up on the first row) drops its fill and keeps its glyph in the secondary text colour, 8:1:
    dimming it took it under 4.5:1, and to 2.3:1 focused. Focused, it takes the focus fill as every icon does. */
-.jfmod-settings .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy),.jfmod-sheet .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy){opacity:1;filter:none}
-.jfmod-settings .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy):not(:focus),.jfmod-sheet .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy):not(:focus){color:rgba(255,255,255,.7);color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));background:transparent}
+.jfmod-settings .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy),.jfmod-sheet .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy),.jfmod-secret-inputrow .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy){opacity:1;filter:none}
+.jfmod-settings .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy):not(:focus),.jfmod-sheet .jfmod-rowactions .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy):not(:focus),.jfmod-secret-inputrow .jfmod-iconbtn[aria-disabled="true"]:not(.jfmod-busy):not(:focus){color:rgba(255,255,255,.7);color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));background:transparent}
 .jfmod-mapfoot>.jfmod-rowactions{margin-left:auto;margin-right:0}
 .jfmod-secret-below{margin:.5em 0 1.4em}
 .jfmod-secret-below .jfmod-notice{margin-top:.5em}
@@ -172,6 +219,12 @@
 .layout-mobile .jfmod-brow{grid-template-columns:1fr}
 .layout-mobile .jfmod-brow .jfmod-rowactions{justify-content:flex-end;margin-top:.4em}
 .jfmod-empty{color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));padding:.8em 0}
+/* Diagnostics entries scroll in an area of their own (user, 2026-10-09), so a long list does not push the page: it is a tab
+   stop, takes the arrow keys while it can still scroll (a remote has no wheel), and shows a ring while focused. Every entry
+   carries when it happened, small and dim. */
+.jfmod-scrolllist{max-height:17em;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.jfmod-scrolllist:focus{outline:.16em solid #00a4dc;outline:.16em solid var(--jf-palette-primary-main,#00a4dc);outline-offset:.12em}
+.jfmod-when{display:block;margin-top:.2em;font-size:.78em;color:var(--jf-palette-text-secondary,rgba(255,255,255,.7))}
 .jfmod-loglist{margin-bottom:1.2em}
 .jfmod-logrow{padding:.4em 0;border-bottom:.07em solid var(--jf-palette-divider,rgba(255,255,255,.12));font-size:.9em}
 
@@ -745,16 +798,16 @@
             <dt>Changes</dt><dd id="ReconciliationChanges"></dd>
             <dt>Attention</dt><dd id="ReconciliationAttention"></dd>
           </dl>
-          <ul class="fieldDescription" id="ReconciliationLibraryReasons"></ul>
+          <div class="jfmod-blist jfmod-scrolllist" id="ReconciliationLibraryReasons" role="region" aria-label="Library reasons from the latest run" tabindex="0"></div>
           <div class="fieldDescription">Run <strong>Reconcile JellyfinMod catalog</strong> from Dashboard → Scheduled Tasks to backfill or repair bindings.</div>
         </div>
         <div class="jfmod-group">
           <h3 class="jfmod-grouptitle">Episode Conflicts</h3>
-          <div class="jfmod-blist" id="EpisodeConflicts"></div>
+          <div class="jfmod-blist jfmod-scrolllist" id="EpisodeConflicts" role="region" aria-label="Episode conflicts, newest first" tabindex="0"></div>
         </div>
         <div class="jfmod-group">
           <h3 class="jfmod-grouptitle">Entries in Removed Libraries</h3>
-          <div class="jfmod-blist" id="OrphanedEntries"></div>
+          <div class="jfmod-blist jfmod-scrolllist" id="OrphanedEntries" role="region" aria-label="Entries in removed libraries, newest first" tabindex="0"></div>
         </div>
       </div>
       <footer class="jfmod-check-secfoot">
@@ -765,6 +818,7 @@
   </main>
 </div>
 
+<div id="JfmodLive" class="jfmod-visually-hidden" role="status" aria-live="polite"></div>
 <div class="jfmod-sheet-scrim" id="JfmodSheetScrim" hidden></div>
 <div class="jfmod-sheet" id="JfmodSheet" role="dialog" aria-modal="true" aria-labelledby="JfmodSheetTitle" hidden>
   <div class="jfmod-sheet-head">
@@ -935,6 +989,8 @@
       // look and the sentence beside it say no (UX §13, T19). The reason is announced through
       // aria-describedby as well as the tooltip, so it is never a hover-only affordance.
       var refusalIds = 0;
+      // An icon's tooltip is its name, and for a Test icon also when it was last checked or why it failed.
+      function tipOf(element) { return element.getAttribute('data-jfmod-tip') || element.getAttribute('aria-label'); }
       function refuse(element, reason) {
         if (!element) return;
         var describedBy = element.getAttribute('data-jfmod-reason');
@@ -954,12 +1010,12 @@
           var target = element.nextSibling && element.nextSibling.id === describedBy ? element.nextSibling : document.getElementById(describedBy);
           if (target) target.textContent = reason;
           // An icon button's tooltip is its name; the reason follows it.
-          if (element.classList.contains('jfmod-iconbtn')) element.setAttribute('title', element.getAttribute('aria-label') + ' — ' + reason);
+          if (element.classList.contains('jfmod-iconbtn')) element.setAttribute('title', tipOf(element) + ' — ' + reason);
           element.setAttribute('aria-describedby', describedBy);
         } else {
           element.removeAttribute('aria-disabled');
           // An icon button's title is its tooltip, its name; any other control's title was only the reason.
-          if (element.classList.contains('jfmod-iconbtn')) element.title = element.getAttribute('aria-label');
+          if (element.classList.contains('jfmod-iconbtn')) element.title = tipOf(element);
           else element.removeAttribute('title');
           element.removeAttribute('aria-describedby');
           var stale = describedBy && document.getElementById(describedBy);
@@ -1041,16 +1097,89 @@
           help: 'Asks TMDB whether it accepts the saved token. Save a new token first.',
           // The revision a result belongs to: a later save (replace or clear) leaves it stale (Codex review 1, P2 2).
           revision: function () { return state.discovery ? String(state.discovery.revision) : ''; },
-          run: function (control) {
+          testing: false,
+          // Each run takes a number; only the latest one reports, so a test superseded by a newer token never repaints over it.
+          runId: 0,
+          // What the icon shows: running, or what the last answer was, or what the server remembers of the last pass.
+          stateOf: function () {
+            var discovery = state.discovery || {};
+            if (this.testing) return { kind: 'testing' };
+            var outcome = testOutcomes.discovery;
+            if (outcome && outcome.revision === String(discovery.revision)) {
+              return { kind: outcome.ok ? 'ok' : 'fail', reason: outcome.reason, checkedAt: outcome.at };
+            }
+            return discovery.verified ? { kind: 'ok', checkedAt: discovery.verifiedAt } : { kind: 'idle' };
+          },
+          run: function (control, supersede) {
             var test = this;
+            // A Save while an older test is out starts the test of the new token: it supersedes the old one.
+            if ((test.testing && !supersede) || refused(control)) return;
+            var runId = ++test.runId;
             var tested = test.revision();
             var slot = $('[data-notice="discovery-test"]');
             if (slot) slot.setAttribute('data-for-revision', tested);
+            test.testing = true;
+            paintTest(control, test.stateOf());
+            var status = $('.jfmod-teststatus', control.parentNode);
+            if (status) status.textContent = 'Testing…';
+            say('Testing the TMDB token…');
             // The answer is shown only if the token it tested is still the saved one and no clear is pending: a save or a
             // Clear made while the request was out leaves it unshown (Codex re-review 2, P2).
-            connectionTest(control, 'Discovery/Test', 'discovery-test', function () {
+            var stillSaved = function () {
               return test.revision() === tested && state.clearSecrets.TmdbReadAccessToken !== true;
+            };
+            connectionTest(control, 'Discovery/Test', 'discovery-test', stillSaved, function (ok, reason) {
+              if (runId !== test.runId) return;
+              test.testing = false;
+              if (ok !== null) {
+                testOutcomes.discovery = { revision: tested, ok: ok, reason: reason, at: new Date().toISOString() };
+                say(ok ? 'The TMDB token test passed.' : 'The TMDB token test failed.');
+              }
+              // A dropped answer reloads nothing, and a reload replaces the control: repaint whichever one is mounted now.
+              var mounted = $('#' + test.id);
+              if (mounted) {
+                paintTest(mounted, test.stateOf());
+                var words = $('.jfmod-teststatus', mounted.parentNode);
+                if (words) words.textContent = '';
+              }
             });
+          }
+        }
+      };
+      // A Save at the end of a secret's input (user, 2026-10-09): it writes just that field through the typed endpoint, then
+      // starts the field's Test. Only the TMDB token has one: the other secrets are saved with the record they belong to.
+      var secretSaves = {
+        TmdbReadAccessToken: {
+          label: 'Save TMDB Token', empty: 'Type a token first.',
+          saving: false,
+          run: function (control) {
+            var key = 'TmdbReadAccessToken';
+            var token = secretChange(key);
+            // One save at a time, whatever the refusal attributes say; the input holds still while it is out, so what was
+            // sent is what is forgotten.
+            if (this.saving || token.action !== 'replace' || refused(control)) return;
+            var self = this;
+            var input = $('#' + key);
+            self.saving = true;
+            if (input) input.readOnly = true;
+            busy(control, true, null);
+            Dashboard.showLoadingMsg();
+            return settingsRequest('PATCH', 'Discovery', { token: token, revision: state.discovery ? state.discovery.revision : null })
+              .then(function () {
+                forgetSecrets([key]);
+                clearNotice('discovery');
+                return loadAll();
+              }).then(function () {
+                // The box was drawn again: the focus that was on the Save or the input goes to the Test that follows.
+                var tester = $('#TestDiscovery');
+                var active = document.activeElement;
+                if (tester && (!active || active === document.body || !active.isConnected)) tester.focus();
+                if (tester && !refused(tester)) secretTests[key].run(tester, true);
+              }).catch(function (error) {
+                busy(control, false);
+                if (input) input.readOnly = false;
+                return fail('discovery', error);
+              }).then(function () { self.saving = false; });
           }
         }
       };
@@ -1076,6 +1205,55 @@
         element.setAttribute('data-row-action', action);
         return element;
       }
+      // A Test icon (user, 2026-10-09): `idle` is the plain wifi glyph, `testing` a spinner, `ok` a green tick and `fail` a red
+      // cross on the glyph's corner. The name stays "Test <row>"; the tooltip adds when it was last checked, or why it failed;
+      // the words are said once through the page's polite live region, not repeated on the icon.
+      var SIGNAL = '<svg class="jfmod-testsig" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round" aria-hidden="true">' +
+        '<path d="M8.46 16.46A5 5 0 0 1 15.54 16.46"/><path d="M5.64 13.64A9 9 0 0 1 18.36 13.64"/><path d="M2.81 10.81A13 13 0 0 1 21.19 10.81"/>' +
+        '<circle cx="12" cy="19.2" r="1.7" fill="currentColor" stroke="none"/>' +
+        '<g class="jfmod-testsig-needle"><path class="jfmod-testsig-cut" d="M12 19.2L16.2 7.2" stroke-width="5.4"/><path d="M12 19.2L16.2 7.2"/></g></svg>';
+      function paintTest(button, test) {
+        var kind = test.kind;
+        var glyph = button.querySelector('.jfmod-testglyph');
+        if (!glyph) {
+          glyph = document.createElement('span');
+          glyph.className = 'jfmod-testglyph';
+          glyph.setAttribute('aria-hidden', 'true');
+          glyph.innerHTML = SIGNAL;
+          button.insertBefore(glyph, button.firstChild);
+        }
+        // The glyph is built once; the state is only classes on the button.
+        button.classList.toggle('jfmod-testing', kind === 'testing');
+        button.classList.toggle('jfmod-test-ok', kind === 'ok');
+        button.classList.toggle('jfmod-test-fail', kind === 'fail');
+        var name = button.getAttribute('aria-label');
+        var tip = name;
+        if (kind === 'testing') tip = name + ' — testing…';
+        else if (kind === 'fail') tip = name + ' — failed' + (test.reason ? ': ' + test.reason : '') + (test.checkedAt ? ' · last checked ' + when(test.checkedAt) : '');
+        else if (kind === 'ok') tip = name + ' — passed' + (test.checkedAt ? ' · last checked ' + when(test.checkedAt) : '');
+        else tip = name + ' — not tested yet';
+        button.setAttribute('data-jfmod-tip', tip);
+        if (!refused(button)) button.title = tip;
+        button.setAttribute('data-test-state', kind);
+      }
+      // A Test icon is made like any other icon, then painted. The glyph class passed to iconButton is a stand-in.
+      function testIcon(label, action, row, test, handler) {
+        var make = row ? rowIcon : iconButton;
+        var element = make(label, 'wifi', false, action, handler);
+        element.removeChild(element.firstChild);
+        element.classList.add('jfmod-iconbtn-test');
+        paintTest(element, test);
+        return element;
+      }
+      // Said aloud once, politely: "Testing Prowlarr 1337x…", then the answer.
+      function say(words) {
+        var live = $('#JfmodLive');
+        if (!live) return;
+        live.textContent = '';
+        window.setTimeout(function () { live.textContent = words; }, 30);
+      }
+      // The latest answer of a test whose result the server does not keep (the TMDB token): shown only beside the revision it tested.
+      var testOutcomes = {};
       function renderSecret(key, label, configured) {
         var slot = $('[data-secret-slot="' + key + '"]');
         if (!slot) return;
@@ -1108,10 +1286,38 @@
         input.setAttribute('aria-labelledby', key + '-label');
         input.placeholder = configured ? 'New value — replaces the stored one on save' : 'Paste to store — never shown again';
         field.appendChild(input);
-        edit.appendChild(field);
+        var save = secretSaves[key];
+        // One field that is either the box (Configured, with its icons) or the input: Replace swaps the box for the input, whose
+        // Save (when the secret has one) and Keep sit at its end; Keep swaps the box back (user, 2026-10-09).
+        var inputRow = document.createElement('div');
+        inputRow.className = 'jfmod-secret-inputrow';
+        inputRow.appendChild(field);
+        var row = null;
+        if (save) {
+          // Save waits for something to save, and says so (refused, not disabled).
+          var saver = iconButton(save.label, 'save', false, 'save', function () { save.run(saver); });
+          inputRow.appendChild(saver);
+          refuse(saver, save.empty);
+          input.addEventListener('input', function () { refuse(saver, input.value ? null : save.empty); });
+          input.addEventListener('keydown', function (event) {
+            if (event.key === 'Enter' && input.value) { event.preventDefault(); save.run(saver); }
+          });
+        }
+        if (configured) {
+          var keep = iconButton('Keep the Saved One', 'close', false, 'keep', function () {
+            input.value = '';
+            if (saver) refuse(saver, save.empty);
+            edit.hidden = true;
+            row.style.display = '';
+            var again = $('[data-secret-action="replace"]', slot);
+            if (again) again.focus();
+          });
+          inputRow.appendChild(keep);
+        }
+        edit.appendChild(inputRow);
 
         if (configured) {
-          var row = document.createElement('div');
+          row = document.createElement('div');
           row.className = 'jfmod-secret-row' + (pending ? ' jfmod-secret-pending' : '');
           var status = document.createElement('span');
           status.className = 'jfmod-secret-state';
@@ -1132,11 +1338,17 @@
             }));
           } else {
             if (test) {
-              var tester = iconButton(test.label, 'network_check', false, 'test', function (event) { test.run(event.currentTarget); });
+              var testWords = document.createElement('span');
+              testWords.className = 'jfmod-teststatus';
+              testWords.setAttribute('aria-hidden', 'true');
+              testWords.textContent = test.testing ? 'Testing…' : '';
+              row.appendChild(testWords);
+              var tester = testIcon(test.label, 'test', false, test.stateOf(), function (event) { test.run(event.currentTarget); });
               tester.id = test.id;
               row.appendChild(tester);
             }
             row.appendChild(iconButton('Replace', 'edit', false, 'replace', function () {
+              row.style.display = 'none';
               edit.hidden = false;
               input.focus();
             }));
@@ -1377,6 +1589,37 @@
         }
       }
 
+      // Every label of a row of columns takes the height of the tallest, so the inputs start on one line however the labels wrap
+      // at this width; a stacked row (one column) is left alone. Run when a section is shown, after a render and on resize.
+      function alignFieldRows() {
+        $$('.jfmod-two, .jfmod-three').forEach(function (group) {
+          var cells = Array.prototype.slice.call(group.children);
+          var labels = [];
+          cells.forEach(function (cell) {
+            for (var i = 0; i < cell.children.length; i++) {
+              if (/(^|\s)(inputLabel|selectLabel|jfmod-secret-label)(\s|$)/.test(cell.children[i].className)) { labels.push(cell.children[i]); break; }
+            }
+          });
+          labels.forEach(function (label) { label.style.minHeight = ''; });
+          if (labels.length < 2 || !group.offsetWidth || cells[0].offsetTop !== cells[cells.length - 1].offsetTop) return;
+          var tallest = 0;
+          labels.forEach(function (label) { tallest = Math.max(tallest, label.offsetHeight); });
+          labels.forEach(function (label) { label.style.minHeight = tallest + 'px'; });
+        });
+      }
+      var alignQueued = false;
+      function queueAlign() {
+        if (alignQueued) return;
+        alignQueued = true;
+        window.requestAnimationFrame(function () { alignQueued = false; alignFieldRows(); });
+      }
+      // The window outlives the view: the listener lets go once the page has left the document.
+      function onResize() {
+        if (!page.isConnected) window.removeEventListener('resize', onResize);
+        else queueAlign();
+      }
+      window.addEventListener('resize', onResize);
+
       function show(id, focusHeading) {
         if (!SECTIONS.some(function (section) { return section.id === id; })) id = 'discovery';
         current = id;
@@ -1389,6 +1632,7 @@
         var picker = $('#JfmodSectionPicker');
         if (picker) picker.value = id;
         try { window.sessionStorage.setItem('jfmod-settings-section', id); } catch (error) { /* private mode */ }
+        alignFieldRows();
         if (focusHeading) {
           var heading = $('.jfmod-check-section[data-section="' + id + '"] h2');
           if (heading) heading.focus();
@@ -1566,7 +1810,7 @@
         refuse($('#TestDiscovery'), discovery.tokenConfigured || discovery.apiKeyConfigured ? null : 'Save a token before testing it.');
         var summary = summarise('discovery');
         setState($('[data-secstate="discovery"]'), summary.kind, summary.words);
-        text($('[data-savemeta="discovery"]'), state.discovery ? 'Revision ' + state.discovery.revision + '.' : '');
+        text($('[data-savemeta="discovery"]'), '');
       }
 
       function saveDiscovery() {
@@ -1632,7 +1876,7 @@
           notice('client', client.lastError ? 'err' : 'warn',
             client.lastError
               ? 'The last test failed: ' + client.lastError + '. Grabs are blocked until a test passes.'
-              : 'This client changed since its last successful test (revision ' + client.revision + '). Grabs are blocked until a test passes.');
+              : 'This client changed since its last successful test. Grabs are blocked until a test passes.');
         } else if (client) {
           clearNotice('client');
         } else {
@@ -1643,7 +1887,7 @@
         var summary = summarise('client');
         setState($('[data-secstate="client"]'), summary.kind, summary.words);
         text($('[data-savemeta="client"]'), client
-          ? 'Saved · revision ' + client.revision + (client.verifiedAt ? ' · verified ' + when(client.verifiedAt) : ' · never verified')
+          ? 'Saved' + (client.verifiedAt ? ' · verified ' + when(client.verifiedAt) : ' · never verified')
           : 'Not saved yet.');
       }
 
@@ -1686,8 +1930,9 @@
           dot.setAttribute('aria-hidden', 'true');
           status.appendChild(dot);
           var words = document.createElement('span');
-          words.textContent = mapping.verifiedAt ? 'verified ' + when(mapping.verifiedAt)
+          words.textContent = mapping.verifiedAt ? 'verified'
             : mapping.verificationReason ? 'not verified · ' + mapping.verificationReason : 'not saved yet';
+          if (mapping.verifiedAt) status.title = 'Last checked ' + when(mapping.verifiedAt);
           status.appendChild(words);
           foot.appendChild(status);
           var actions = document.createElement('span');
@@ -1816,20 +2061,21 @@
           row.appendChild(main);
 
           var status = document.createElement('span');
-          var kind = indexer.lastError ? 'err' : indexer.verified ? 'ok' : 'warn';
-          status.className = 'jfmod-state jfmod-state-' + kind;
+          var shown = indexerStatus(indexer);
+          status.className = 'jfmod-state jfmod-state-' + shown.kind;
           var dot = document.createElement('i');
           dot.setAttribute('aria-hidden', 'true');
           status.appendChild(dot);
+          // The date of the last check is the Test icon's tooltip, not a line of the row (user, 2026-10-09). The reason of a
+          // failure is the row's own line below.
           var words = document.createElement('span');
-          words.textContent = indexer.lastError ? 'last test: ' + indexer.lastError
-            : indexer.verified ? 'verified ' + when(indexer.capabilitiesFetchedAt) : 'not verified';
+          words.textContent = shown.words;
           status.appendChild(words);
           row.appendChild(status);
 
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
-          var test = rowIcon('Test ' + indexer.name, 'network_check', false, 'test', function () { testIndexer(indexer, test); });
+          var test = testIcon('Test ' + indexer.name, 'test', true, indexerTestState(indexer), function () { testIndexer(indexer, test, status); });
           actions.appendChild(test);
           actions.appendChild(rowIcon('Edit ' + indexer.name, 'edit', false, 'edit', function () { openIndexerSheet(indexer); }));
           row.appendChild(actions);
@@ -1857,18 +2103,47 @@
         setState($('[data-secstate="indexers"]'), summary.kind, summary.words);
       }
 
-      function testIndexer(indexer, control) {
+      function indexerStatus(indexer) {
+        if (indexer.lastError) return { kind: 'err', words: 'last test failed' };
+        return indexer.verified ? { kind: 'ok', words: 'verified' } : { kind: 'warn', words: 'not verified' };
+      }
+      // What the server remembers of an indexer's last test: a failure first, then a pass, else it was never tested.
+      function indexerTestState(indexer) {
+        if (indexer.lastError) return { kind: 'fail', reason: indexer.lastError };
+        if (indexer.verified) return { kind: 'ok', checkedAt: indexer.capabilitiesFetchedAt };
+        return { kind: 'idle' };
+      }
+
+      function testIndexer(indexer, control, status) {
         if (refused(control)) return;
-        // An icon keeps its glyph while it tests; its busy look and aria-disabled say so.
+        // The icon spins and the row's status says "Testing…" until the answer is in; aria-disabled keeps the focus on it.
         busy(control, true, null);
+        paintTest(control, { kind: 'testing' });
+        if (status) {
+          status.className = 'jfmod-state jfmod-state-busy';
+          text(status.querySelector('span'), 'Testing…');
+        }
+        say('Testing ' + indexer.name + '…');
+        // However the test ends, a row that was not drawn again goes back to what the server says (a failed request or reload).
+        var settle = function () {
+          if (!control.isConnected) return;
+          paintTest(control, indexerTestState(indexer));
+          if (status) {
+            var shown = indexerStatus(indexer);
+            status.className = 'jfmod-state jfmod-state-' + shown.kind;
+            text(status.querySelector('span'), shown.words);
+          }
+        };
         settingsRequest('POST', 'Indexers/' + indexer.id + '/Test').then(function (result) {
           busy(control, false);
+          say(indexer.name + ': the test ' + (result.ok ? 'passed.' : 'failed.'));
           notice('indexers', result.ok ? 'ok' : 'err', indexer.name + ': ' + result.message + ' (' + result.code + ')');
           return loadAll();
         }, function (error) {
           busy(control, false);
+          say(indexer.name + ': the test could not run.');
           return fail('indexers', error);
-        });
+        }).then(settle, settle);
       }
 
       function openIndexerSheet(indexer) {
@@ -1920,7 +2195,7 @@
           opener: opener,
           title: indexer ? 'Indexer · ' + indexer.name : 'New Indexer',
           content: content,
-          meta: indexer ? 'Saved · revision ' + indexer.revision : 'Not saved yet.',
+          meta: indexer ? 'Saved' : 'Not saved yet.',
           onSave: function () { saveIndexer(indexer); },
           onDelete: indexer ? function () { deleteIndexer(indexer); } : null
         });
@@ -2100,7 +2375,7 @@
           opener: opener,
           title: profile ? 'Quality Profile · ' + profile.name : 'New Quality Profile',
           content: content,
-          meta: profile ? 'Saved · revision ' + profile.revision : 'Not saved yet.',
+          meta: profile ? 'Saved' : 'Not saved yet.',
           onSave: function () { saveProfile(profile); },
           onDelete: profile ? function () { deleteProfile(profile); } : null,
           // The server keeps a default profile; saying so beats a control that silently fails.
@@ -2281,7 +2556,7 @@
 
         var summary = summarise('grabbing');
         setState($('[data-secstate="grabbing"]'), summary.kind, summary.words);
-        text($('[data-savemeta="grabbing"]'), 'Saved · revision ' + acquisition.revision);
+        text($('[data-savemeta="grabbing"]'), '');
       }
 
       // A refused checkbox is still focusable and still clickable; the click is what explains it.
@@ -2331,7 +2606,7 @@
         $('#ScanTimeoutMinutes').value = settings.scanTimeoutMinutes;
         var summary = summarise('import');
         setState($('[data-secstate="import"]'), summary.kind, summary.words);
-        text($('[data-savemeta="import"]'), 'Loaded revision ' + settings.revision);
+        text($('[data-savemeta="import"]'), '');
       }
 
       function saveImport() {
@@ -2435,7 +2710,7 @@
 
         var summary = summarise('retention');
         setState($('[data-secstate="retention"]'), summary.kind, summary.words);
-        text($('[data-savemeta="retention"]'), 'Retention revision ' + retention.revision + ' · seed protection revision ' + seed.revision + '.');
+        text($('[data-savemeta="retention"]'), '');
       }
 
       // A disabled or deleted Selected user stays stored until an administrator picks another; the
@@ -2564,7 +2839,7 @@
 
         var summary = summarise('automation');
         setState($('[data-secstate="automation"]'), summary.kind, summary.words);
-        text($('[data-savemeta="automation"]'), 'Saved · revision ' + settings.revision);
+        text($('[data-savemeta="automation"]'), '');
       }
 
       function saveAutomation() {
@@ -2694,8 +2969,37 @@
       // ---------------------------------------------------------------------
       // Section 10 — Diagnostics.
       // ---------------------------------------------------------------------
+      // One line saying when something happened, in the viewer's locale; `iso` is kept machine-readable for the <time> element.
+      function whenLine(words, iso) {
+        var line = document.createElement('time');
+        line.className = 'jfmod-when';
+        if (iso) line.setAttribute('datetime', iso);
+        line.textContent = words + ' ' + when(iso);
+        return line;
+      }
+      function newestFirst(items, field) {
+        return items.slice().sort(function (a, b) { return String(b[field] || '').localeCompare(String(a[field] || '')); });
+      }
+      // Arrows scroll a focused scroll area while it has room to go, then let go so the focus moves on (a TV remote has no wheel).
+      function arrowsScroll(area) {
+        if (area.getAttribute('data-arrows')) return;
+        area.setAttribute('data-arrows', '1');
+        area.classList.add('focusable');
+        area.addEventListener('keydown', function (event) {
+          var down = event.key === 'ArrowDown';
+          // Only from the region itself: an action inside a row (Rebind, Keep) keeps the arrows for moving between rows.
+          if (event.target !== area || (!down && event.key !== 'ArrowUp')) return;
+          var room = down ? area.scrollHeight - area.clientHeight - area.scrollTop > 1 : area.scrollTop > 0;
+          if (!room) return;
+          event.preventDefault();
+          event.stopPropagation();
+          var step = parseFloat(window.getComputedStyle(area).fontSize) * 3;
+          area.scrollTop += down ? step : -step;
+        });
+      }
       function renderDiagnostics() {
         var run = state.reconciliation;
+        $$('.jfmod-scrolllist').forEach(arrowsScroll);
         text($('#ReconciliationRun'), run
           ? run.status + ' · ' + when(run.completedAt || run.startedAt) + ' · scanned ' + run.scannedItems + '/' + run.totalItems
           : 'No reconciliation run has been recorded.');
@@ -2709,12 +3013,25 @@
 
         var reasons = $('#ReconciliationLibraryReasons');
         reasons.innerHTML = '';
-        // Library-level reasons carry an empty native item id (P2.R6).
-        ((run && run.diagnostics) || []).filter(function (diagnostic) {
+        // Library-level reasons carry an empty native item id (P2.R6); they were found by the latest run, which is their time.
+        var found = ((run && run.diagnostics) || []).filter(function (diagnostic) {
           return /^0{8}-?0{4}-?0{4}-?0{4}-?0{12}$/.test(diagnostic.nativeItemId);
-        }).forEach(function (diagnostic) {
-          var item = document.createElement('li');
-          item.textContent = diagnostic.title + ': ' + diagnostic.detail;
+        });
+        reasons.hidden = !found.length;
+        found.forEach(function (diagnostic) {
+          var item = document.createElement('div');
+          item.className = 'jfmod-brow';
+          var main = document.createElement('div');
+          main.className = 'jfmod-brow-main';
+          var name = document.createElement('strong');
+          name.textContent = diagnostic.title;
+          main.appendChild(name);
+          var sub = document.createElement('span');
+          sub.className = 'jfmod-sub';
+          sub.textContent = diagnostic.detail;
+          main.appendChild(sub);
+          main.appendChild(whenLine('Found', run.completedAt || run.startedAt));
+          item.appendChild(main);
           reasons.appendChild(item);
         });
 
@@ -2726,7 +3043,7 @@
           noConflicts.textContent = 'No episode conflicts.';
           conflicts.appendChild(noConflicts);
         }
-        state.conflicts.forEach(function (conflict) {
+        newestFirst(state.conflicts, 'detectedAt').forEach(function (conflict) {
           var pad = function (value) { return (value < 10 ? '0' : '') + value; };
           var row = document.createElement('div');
           row.className = 'jfmod-brow';
@@ -2740,6 +3057,7 @@
           sub.textContent = 'tracked S' + pad(conflict.trackedSeasonNumber) + 'E' + pad(conflict.trackedEpisodeNumber) +
             ', Jellyfin now reports S' + pad(conflict.observedSeasonNumber) + 'E' + pad(conflict.observedEpisodeNumber);
           main.appendChild(sub);
+          main.appendChild(whenLine('Detected', conflict.detectedAt));
           row.appendChild(main);
           var actions = document.createElement('span');
           actions.className = 'jfmod-rowactions';
@@ -2763,7 +3081,7 @@
           noOrphans.textContent = 'No entries are waiting for a removed library.';
           orphans.appendChild(noOrphans);
         }
-        state.orphans.forEach(function (orphan) {
+        newestFirst(state.orphans, 'addedAt').forEach(function (orphan) {
           var row = document.createElement('div');
           row.className = 'jfmod-brow';
           var main = document.createElement('div');
@@ -2775,6 +3093,7 @@
           sub.className = 'jfmod-sub';
           sub.textContent = '(' + orphan.mediaType + ') — its library was removed; hidden from users until its media reappears';
           main.appendChild(sub);
+          main.appendChild(whenLine('Added', orphan.addedAt));
           row.appendChild(main);
           orphans.appendChild(row);
         });
@@ -2861,6 +3180,7 @@
           renderInterface();
           renderDiagnostics();
           renderRail();
+          queueAlign();
           Dashboard.hideLoadingMsg();
         }, function (error) {
           Dashboard.hideLoadingMsg();
@@ -2915,7 +3235,8 @@
         });
       });
       // `current`, when given, says whether the answer still belongs where it would be shown.
-      function connectionTest(control, path, section, current) {
+      // `report(ok, reason)`, when given, hears the outcome once (`ok` null when the answer was dropped).
+      function connectionTest(control, path, section, current, report) {
         if (refused(control)) return;
         // An icon button keeps its glyph; only a labelled one says "Testing…".
         busy(control, true, control.classList.contains('jfmod-iconbtn') ? null : 'Testing…');
@@ -2923,13 +3244,15 @@
           busy(control, false);
           // An answer that no longer belongs is dropped whole: no notice and no reload, which would also replace any
           // edits made since (Codex re-review 3).
-          if (current && !current()) return;
+          if (current && !current()) { if (report) report(null); return; }
+          if (report) report(!!result.ok, result.ok ? '' : result.message);
           notice(section, result.ok ? 'ok' : 'err', result.message + ' (' + result.code + ')' +
             (result.version ? ' · Transmission ' + result.version : ''));
           return loadAll();
         }, function (error) {
           busy(control, false);
-          if (current && !current()) return;
+          if (current && !current()) { if (report) report(null); return; }
+          if (report) report(false, 'the request failed');
           return fail(section, error, current);
         });
       }
