@@ -76,6 +76,21 @@ public sealed class ReleaseSearchService(
         bool profileInherited, int settingsRevision, CancellationToken cancellationToken, ReleaseSearchOptions? searchOptions = null)
     {
         searchOptions ??= ReleaseSearchOptions.Default;
+        try
+        {
+            return await SearchCoreAsync(userId, target, profile, profileInherited, settingsRevision, cancellationToken, searchOptions)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            if (searchOptions.ProgressKey is { } key) cache.Progress.Finish(key);
+        }
+    }
+
+    private async Task<ReleaseSearchSnapshot> SearchCoreAsync(Guid userId, ReleaseTarget target, EvaluationProfile profile,
+        bool profileInherited, int settingsRevision, CancellationToken cancellationToken, ReleaseSearchOptions searchOptions)
+    {
+        var progressKey = searchOptions.ProgressKey;
         var indexers = await database.AcquisitionIndexers.Where(indexer => indexer.Enabled)
             .OrderBy(indexer => indexer.Priority).ThenBy(indexer => indexer.Name).ToListAsync(cancellationToken).ConfigureAwait(false);
         // Per-indexer budgets and breakers apply to every search, manual ones included (P6.M3).
@@ -91,6 +106,10 @@ public sealed class ReleaseSearchService(
                     "The indexer failed repeatedly; it is paused until " + open.ToString("u", CultureInfo.InvariantCulture) + ".", 0, false,
                     (int)Math.Ceiling((open - now).TotalSeconds));
         }
+        if (progressKey is not null)
+            cache.Progress.Start(progressKey, userId, indexers.Select(indexer => blocked.TryGetValue(indexer.Id, out var refused)
+                ? new IndexerProgress(indexer.Id, indexer.Name, refused.Status, null, 0, refused.RetryAfterSeconds)
+                : new IndexerProgress(indexer.Id, indexer.Name, "queued", null, 0, null)));
         // Capabilities first: anything unverified at its current revision is checked before it is searched.
         var capabilities = new Dictionary<Guid, (TorznabCapabilities? Value, string? Error)>();
         foreach (var indexer in indexers)
@@ -101,6 +120,8 @@ public sealed class ReleaseSearchService(
                 continue;
             }
 
+            if (progressKey is not null && !blocked.ContainsKey(indexer.Id))
+                cache.Progress.Set(progressKey, new IndexerProgress(indexer.Id, indexer.Name, "verifying", null, 0, null));
             try
             {
                 capabilities[indexer.Id] = (await VerifyAsync(indexer, cancellationToken).ConfigureAwait(false), null);
@@ -133,13 +154,20 @@ public sealed class ReleaseSearchService(
             {
                 if (blocked.TryGetValue(indexer.Id, out var refused)) return (Candidates: (IReadOnlyList<ReleaseCandidate>)[], Outcome: refused, Queries: 0);
                 if (!IndexerQueryLedger.HasBudget(indexer.Id, cache.UtcNow, indexer.DailyQueryBudget))
-                    return (Candidates: (IReadOnlyList<ReleaseCandidate>)[], Outcome: new IndexerOutcome(indexer.Id, indexer.Name, "budget_exhausted",
-                        "The indexer's daily query budget is used up.", 0, false, null), Queries: 0);
+                {
+                    var exhausted = new IndexerOutcome(indexer.Id, indexer.Name, "budget_exhausted",
+                        "The indexer's daily query budget is used up.", 0, false, null);
+                    ReportOutcome(progressKey, exhausted);
+                    return (Candidates: (IReadOnlyList<ReleaseCandidate>)[], Outcome: exhausted, Queries: 0);
+                }
+
                 await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    return await SearchIndexerAsync(indexer, capabilities[indexer.Id], endpoints[indexer.Id], target, profile,
-                        cancellationToken).ConfigureAwait(false);
+                    var searched = await SearchIndexerAsync(indexer, capabilities[indexer.Id], endpoints[indexer.Id], target, profile,
+                        cancellationToken, progressKey).ConfigureAwait(false);
+                    ReportOutcome(progressKey, searched.Outcome);
+                    return searched;
                 }
                 finally
                 {
@@ -284,9 +312,20 @@ public sealed class ReleaseSearchService(
             .ConfigureAwait(false) > 0;
     }
 
+    /// <summary>Reads the progress a search with this key has written, for the user who started it.</summary>
+    public SearchProgress? Progress(string key, Guid userId) => cache.Progress.Find(key, userId);
+
+    /// <summary>Records an indexer's final outcome in the search's progress, when the caller asked to follow it.</summary>
+    private void ReportOutcome(string? progressKey, IndexerOutcome outcome)
+    {
+        if (progressKey is not null)
+            cache.Progress.Set(progressKey, new IndexerProgress(outcome.IndexerId, outcome.Name, outcome.Status, null, outcome.ResultCount,
+                outcome.RetryAfterSeconds));
+    }
+
     private async Task<(IReadOnlyList<ReleaseCandidate> Candidates, IndexerOutcome Outcome, int Queries)> SearchIndexerAsync(
         AcquisitionIndexer indexer, (TorznabCapabilities? Value, string? Error) capabilities, TorznabEndpoint? endpoint,
-        ReleaseTarget target, EvaluationProfile profile, CancellationToken cancellationToken)
+        ReleaseTarget target, EvaluationProfile profile, CancellationToken cancellationToken, string? progressKey = null)
     {
         IndexerOutcome Outcome(string status, string? message, int count = 0, bool truncated = false, int? retry = null) =>
             new(indexer.Id, indexer.Name, status, message, count, truncated, retry);
@@ -355,6 +394,8 @@ public sealed class ReleaseSearchService(
                 while (!IndexerQueryLedger.TryCommit(first, cache.UtcNow))
                     await IndexerQueryLedger.WaitAsync(first, token).ConfigureAwait(false);
                 timeout.CancelAfter(options.Timeout);
+                if (progressKey is not null)
+                    cache.Progress.Set(progressKey, new IndexerProgress(indexer.Id, indexer.Name, "asking", cache.UtcNow, 0, null));
             }
             else if (further)
             {
@@ -581,7 +622,7 @@ public sealed class ReleaseSearchService(
 
             var hostAllowed = item.DownloadUrl is null || Uri.TryCreate(item.DownloadUrl, UriKind.Absolute, out var link) &&
                 link.Scheme is "http" or "https" && allowedHosts.Contains(link.IdnHost.ToLowerInvariant());
-            var parsed = ReleaseParser.Parse(item.Title);
+            var parsed = ReleaseParser.WithIndexerLanguages(ReleaseParser.Parse(item.Title), item.Language, item.Subs);
             var freeleech = item.DownloadVolumeFactor is { } factor ? factor == 0 : (bool?)null;
             var facts = new ReleaseFacts(parsed, identity, item.Size, item.Seeders, freeleech, item.ImdbId, item.TmdbId,
                 item.TvdbId, item.Season, item.Episode, item.DownloadUrl is not null || item.MagnetUrl is not null, hostAllowed,

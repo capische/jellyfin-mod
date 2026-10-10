@@ -142,7 +142,8 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
     secrets.Add(good.ApiKey);
     Dictionary<string, string> Attributes(params (string, string)[] values) => values.ToDictionary(value => value.Item1, value => value.Item2);
     good.MovieItems.AddRange([
-        new("Example.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP", "good-a", dl("movie"), 4_000_000_000, 50, Attributes(("imdbid", "0000100"))),
+        new("Example.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP", "good-a", dl("movie"), 4_000_000_000, 50,
+            Attributes(("imdbid", "0000100"), ("language", "English, French"), ("subs", "German"))),
         new("Example.Movie.2024.2160p.BluRay.REMUX.HEVC.TrueHD.Atmos-GRP", "good-b", dl("missing"), 60_000_000_000, 20, []),
         new("Example.Movie.2024.720p.WEBRip.x264-GRP", "good-c", dl("webrip"), 1_200_000_000, 5, Attributes(("downloadvolumefactor", "0"))),
         new("Example.Movie.2024.HDCAM.x264-BAD", "good-d", dl("missing"), 1_000_000_000, 900, []),
@@ -171,6 +172,8 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
     queryOnly.MovieItems.Add(new("Example.Movie.2024.1080p.WEB-DL-QONLY", "q-a", dl("movie"), 4_000_000_000, 60, []));
     // Same title, wrong year: a text-only match must still be refused on the year (user decision 2026-09-20).
     queryOnly.MovieItems.Add(new("Example.Movie.1998.1080p.WEB-DL-QOLD", "q-b", dl("movie"), 4_000_000_000, 60, []));
+    // Languages and subtitles read from the title when the indexer sends no attributes (release picker, 2026-10-10).
+    queryOnly.MovieItems.Add(new("Example.Movie.2024.1080p.WEB-DL.DDP5.1.MULTi.GERMAN.VOSTFR-QLANG", "q-c", dl("movie"), 4_000_000_000, 7, []));
     torznab.Indexers["qonly"] = queryOnly;
     // Whole-review chunk 2a, P2 6: text-only episode matches. The series is from 2023; another series shares its name.
     var queryTv = new IndexerScript { ApiKey = "qtv-key", Caps = TorznabBoundary.Caps("q", "q") };
@@ -531,6 +534,51 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
                 .Select(row => row.GetProperty("releaseId").GetString())
                 .SequenceEqual(rows.Where(row => row.GetProperty("indexerName").GetString() == "Good").Select(row => row.GetProperty("releaseId").GetString())),
             "Scoring and ordering are deterministic across searches");
+
+        // Release picker (2026-10-10): languages and subtitles from attributes and from title tokens, additive in `parsed`.
+        var attributed = best.GetProperty("parsed");
+        string[] Codes(JsonElement parsed, string name) => parsed.GetProperty(name).EnumerateArray().Select(value => value.GetString()!).ToArray();
+        Assert(Codes(attributed, "languages").SequenceEqual(["EN", "FR"]) && Codes(attributed, "subtitles").SequenceEqual(["DE"]) &&
+            attributed.GetProperty("audioChannels").GetString() == "5.1",
+            "Indexer language and subs attributes become ISO codes, and the title's channel count is read: " + attributed.GetRawText());
+        var tokenParsed = byTitle["Example.Movie.2024.1080p.WEB-DL.DDP5.1.MULTi.GERMAN.VOSTFR-QLANG"].GetProperty("parsed");
+        Assert(Codes(tokenParsed, "languages").SequenceEqual(["MULTI", "DE"]) && Codes(tokenParsed, "subtitles").SequenceEqual(["FR"]),
+            "Title tokens give languages and subtitles when the indexer sends none: " + tokenParsed.GetRawText());
+        Assert(Codes(proper.GetProperty("parsed"), "languages").Length == 0 && Codes(proper.GetProperty("parsed"), "subtitles").Length == 0 &&
+            proper.GetProperty("parsed").GetProperty("audioChannels").ValueKind == JsonValueKind.Null,
+            "A title that names no language or channels leaves the lists empty");
+
+        // Release picker (2026-10-10): the progress side channel shows each indexer's state while the search runs.
+        var progressKey = "progress-" + Guid.NewGuid().ToString("N");
+        var running = admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}&progressKey={progressKey}");
+        var seenStates = new HashSet<string>();
+        var progressSeen = 0;
+        while (!running.IsCompleted)
+        {
+            var poll = await admin.GetAsync($"/JellyfinMod/Releases/Progress/{progressKey}");
+            if (poll.StatusCode == System.Net.HttpStatusCode.OK)
+            {
+                progressSeen++;
+                foreach (var line in Json.Parse(await poll.Content.ReadAsStringAsync()).GetProperty("indexers").EnumerateArray())
+                    seenStates.Add(line.GetProperty("state").GetString()!);
+            }
+
+            await Task.Delay(100);
+        }
+
+        var progressed = await ReadAsync(await running, 200, "Search with a progress key answers");
+        var finalProgress = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Releases/Progress/{progressKey}"));
+        var finalLines = finalProgress.GetProperty("indexers").EnumerateArray().ToDictionary(line => line.GetProperty("name").GetString()!);
+        Assert(progressSeen > 3 && seenStates.Contains("asking") && finalProgress.GetProperty("finished").GetBoolean() &&
+            finalLines.Count == progressed.GetProperty("indexers").GetArrayLength() &&
+            finalLines["Good"].GetProperty("state").GetString() == "ok" && finalLines["Good"].GetProperty("resultCount").GetInt32() == 10 &&
+            finalLines["slow"].GetProperty("state").GetString() == "timeout",
+            "The progress follows each indexer from waiting to its outcome and ends finished: " + string.Join(",", seenStates));
+        Assert((await admin2.GetAsync($"/JellyfinMod/Releases/Progress/{progressKey}")).StatusCode == System.Net.HttpStatusCode.NotFound &&
+            (await admin.GetAsync("/JellyfinMod/Releases/Progress/unknown-key")).StatusCode == System.Net.HttpStatusCode.NotFound &&
+            (await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}&progressKey=bad%20key!")).StatusCode == System.Net.HttpStatusCode.BadRequest &&
+            (await anonymous.GetAsync($"/JellyfinMod/Releases/Progress/{progressKey}")).StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden,
+            "Another user and an unknown key get 404, a malformed key is refused, and a request without sign-in is refused");
 
         // Picker profile changes rescore one search without touching the entry's saved profile.
         var small = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}&profileId={sdId}"), 200, "Rescored search");

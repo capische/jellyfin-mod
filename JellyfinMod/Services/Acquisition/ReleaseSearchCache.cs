@@ -66,7 +66,8 @@ public sealed record ReleaseSearchSnapshot(
 /// <summary>Options of one search beyond its target and profile.</summary>
 /// <param name="Intent"><c>acquire</c> or <c>addVersion</c>.</param>
 /// <param name="HeldQualities">Qualities already held, marked on candidates of an <c>addVersion</c> search.</param>
-public sealed record ReleaseSearchOptions(string Intent = "acquire", IReadOnlySet<string>? HeldQualities = null)
+/// <param name="ProgressKey">A key the caller polls <c>Releases/Progress</c> with while the search runs, or null.</param>
+public sealed record ReleaseSearchOptions(string Intent = "acquire", IReadOnlySet<string>? HeldQualities = null, string? ProgressKey = null)
 {
     /// <summary>A plain acquisition search.</summary>
     public static ReleaseSearchOptions Default { get; } = new();
@@ -84,6 +85,9 @@ public sealed class ReleaseSearchCache(TimeProvider time)
     private const int Capacity = 64;
     private readonly ConcurrentDictionary<Guid, ReleaseSearchSnapshot> _snapshots = new();
     private readonly ConcurrentDictionary<string, DateTimeOffset> _backoff = new();
+
+    /// <summary>Gets the progress of running searches, for the picker's live view.</summary>
+    public ReleaseProgressTable Progress { get; } = new(time);
 
     /// <summary>Gets the current time used for expiry.</summary>
     public DateTime UtcNow => time.GetUtcNow().UtcDateTime;

@@ -80,6 +80,29 @@ public sealed record IndexerOutcomeDto(
     [property: JsonPropertyName("truncated")] bool Truncated,
     [property: JsonPropertyName("retryAfterSeconds"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? RetryAfterSeconds);
 
+/// <summary>One indexer's line of a running search.</summary>
+public sealed record ReleaseProgressIndexerDto(
+    [property: JsonPropertyName("indexerId")] Guid IndexerId,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("state")] string State,
+    [property: JsonPropertyName("startedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? StartedAt,
+    [property: JsonPropertyName("resultCount")] int ResultCount,
+    [property: JsonPropertyName("retryAfterSeconds"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? RetryAfterSeconds);
+
+/// <summary>The response of <c>GET /JellyfinMod/Releases/Progress/{key}</c>.</summary>
+public sealed record ReleaseProgressDto(
+    [property: JsonPropertyName("indexers")] IReadOnlyList<ReleaseProgressIndexerDto> Indexers,
+    [property: JsonPropertyName("finished")] bool Finished)
+{
+    /// <summary>Builds the public view of a search's progress.</summary>
+    public static ReleaseProgressDto From(SearchProgress progress) => new(
+        progress.Indexers.Select(line => new ReleaseProgressIndexerDto(line.IndexerId, line.Name, line.State,
+            line.StartedAt is { } started ? Utc(started) : null, line.ResultCount, line.RetryAfterSeconds)).ToArray(),
+        progress.Finished);
+
+    private static DateTime Utc(DateTime value) => DateTime.SpecifyKind(value, DateTimeKind.Utc);
+}
+
 /// <summary>How the row matched the target.</summary>
 public sealed record ReleaseMatchDto(
     [property: JsonPropertyName("identity")] string Identity,

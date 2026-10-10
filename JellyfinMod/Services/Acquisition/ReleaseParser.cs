@@ -49,7 +49,10 @@ public sealed record ParsedRelease(
     [property: JsonPropertyName("repack")] bool Repack,
     [property: JsonPropertyName("quality"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Quality,
     [property: JsonPropertyName("seasonLast"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeasonLast = null,
-    [property: JsonPropertyName("seriesPack")] bool SeriesPack = false)
+    [property: JsonPropertyName("seriesPack")] bool SeriesPack = false,
+    [property: JsonPropertyName("languages")] IReadOnlyList<string>? Languages = null,
+    [property: JsonPropertyName("subtitles")] IReadOnlyList<string>? Subtitles = null,
+    [property: JsonPropertyName("audioChannels"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? AudioChannels = null)
 {
     /// <summary>
     /// The seasons a pack names: a single season, a range <c>first..last</c>, or empty for a complete-series pack that names
@@ -201,7 +204,79 @@ public static partial class ReleaseParser
         return new ParsedRelease(
             name.Length == 0 ? null : name, year, season, episodes, seasonPack, absolute, daily, resolution, source,
             Codec(tail), Audio(tail), Hdr(tail), group, ProperPattern().IsMatch(tail), RepackPattern().IsMatch(tail),
-            QualityCatalog.Identify(source, resolution), seasonLast, seriesPack);
+            QualityCatalog.Identify(source, resolution), seasonLast, seriesPack, TitleLanguages(tail), TitleSubtitles(tail),
+            ChannelsPattern().Match(tail) is { Success: true } channels ? channels.Groups["count"].Value : null);
+    }
+
+    /// <summary>
+    /// The languages and subtitles of a row for the picker (2026-10-10): what the indexer's <c>language</c> and <c>subs</c>
+    /// attributes say, else what the title says. Codes are upper-case ISO 639-1; <c>MULTI</c> and <c>DUAL</c> stay words.
+    /// </summary>
+    public static ParsedRelease WithIndexerLanguages(ParsedRelease parsed, string? language, string? subs)
+    {
+        var languages = AttributeCodes(language);
+        var subtitles = AttributeCodes(subs);
+        return parsed with
+        {
+            Languages = languages.Count > 0 ? languages : parsed.Languages ?? [],
+            Subtitles = subtitles.Count > 0 ? subtitles : parsed.Subtitles ?? []
+        };
+    }
+
+    private static readonly Dictionary<string, string> LanguageCodes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["english"] = "EN", ["eng"] = "EN", ["en"] = "EN", ["french"] = "FR", ["fre"] = "FR", ["fra"] = "FR", ["fr"] = "FR",
+        ["german"] = "DE", ["ger"] = "DE", ["deu"] = "DE", ["de"] = "DE", ["spanish"] = "ES", ["spa"] = "ES", ["es"] = "ES",
+        ["italian"] = "IT", ["ita"] = "IT", ["it"] = "IT", ["portuguese"] = "PT", ["por"] = "PT", ["pt"] = "PT",
+        ["russian"] = "RU", ["rus"] = "RU", ["ru"] = "RU", ["japanese"] = "JA", ["jpn"] = "JA", ["ja"] = "JA",
+        ["korean"] = "KO", ["kor"] = "KO", ["ko"] = "KO", ["chinese"] = "ZH", ["chi"] = "ZH", ["zho"] = "ZH", ["zh"] = "ZH",
+        ["dutch"] = "NL", ["dut"] = "NL", ["nld"] = "NL", ["nl"] = "NL", ["polish"] = "PL", ["pol"] = "PL", ["pl"] = "PL",
+        ["swedish"] = "SV", ["swe"] = "SV", ["sv"] = "SV", ["turkish"] = "TR", ["tur"] = "TR", ["tr"] = "TR",
+        ["hindi"] = "HI", ["hin"] = "HI", ["hi"] = "HI", ["arabic"] = "AR", ["ara"] = "AR", ["ar"] = "AR",
+        ["multi"] = "MULTI", ["dual"] = "DUAL"
+    };
+
+    /// <summary>Codes from a comma or slash separated attribute such as <c>English, French</c> or <c>en/fr</c>; unknown words are dropped.</summary>
+    private static List<string> AttributeCodes(string? value)
+    {
+        var codes = new List<string>();
+        foreach (var word in (value ?? string.Empty).Split([',', '/', ';', '|', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            if (LanguageCodes.TryGetValue(word, out var code) && !codes.Contains(code)) codes.Add(code);
+        return codes.Take(12).ToList();
+    }
+
+    private static IReadOnlyList<string> TitleLanguages(string tail)
+    {
+        var codes = new List<string>();
+        void Add(Regex pattern, string code)
+        {
+            if (pattern.IsMatch(tail) && !codes.Contains(code)) codes.Add(code);
+        }
+
+        Add(MultiPattern(), "MULTI");
+        Add(DualPattern(), "DUAL");
+        Add(GermanPattern(), "DE");
+        Add(FrenchPattern(), "FR");
+        Add(ItalianPattern(), "IT");
+        Add(SpanishPattern(), "ES");
+        Add(RussianPattern(), "RU");
+        Add(JapanesePattern(), "JA");
+        Add(KoreanPattern(), "KO");
+        return codes;
+    }
+
+    private static IReadOnlyList<string> TitleSubtitles(string tail)
+    {
+        var codes = new List<string>();
+        if (VostfrPattern().IsMatch(tail)) codes.Add("FR");
+        if (SubsPattern().Match(tail) is { Success: true } subs)
+        {
+            var code = subs.Groups["lang"].Success && LanguageCodes.TryGetValue(subs.Groups["lang"].Value, out var named) ? named
+                : subs.Groups["multi"].Success ? "MULTI" : "SUB";
+            if (!codes.Contains(code)) codes.Add(code);
+        }
+
+        return codes;
     }
 
     /// <summary>
@@ -404,6 +479,30 @@ public static partial class ReleaseParser
     private static partial Regex ProperPattern();
     [GeneratedRegex(B + @"(?:repack|rerip)\d?" + E, RegexOptions.IgnoreCase)]
     private static partial Regex RepackPattern();
+    [GeneratedRegex(@"(?<![0-9])(?<count>1\.0|2\.0|2\.1|5\.1|7\.1)(?![0-9])")]
+    private static partial Regex ChannelsPattern();
+    [GeneratedRegex(B + @"multi" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex MultiPattern();
+    [GeneratedRegex(B + @"dual(?:[ .-]?audio)?" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex DualPattern();
+    [GeneratedRegex(B + @"(?:german|deutsch|ger)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex GermanPattern();
+    [GeneratedRegex(B + @"(?:french|truefrench|vff|vfq|vf2?|vfi)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex FrenchPattern();
+    [GeneratedRegex(B + @"(?:italian|ita)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex ItalianPattern();
+    [GeneratedRegex(B + @"(?:spanish|castellano|latino|spa)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex SpanishPattern();
+    [GeneratedRegex(B + @"(?:russian|rus)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex RussianPattern();
+    [GeneratedRegex(B + @"(?:japanese|jap|jpn)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex JapanesePattern();
+    [GeneratedRegex(B + @"(?:korean|kor)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex KoreanPattern();
+    [GeneratedRegex(B + @"vostfr" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex VostfrPattern();
+    [GeneratedRegex(B + @"(?:(?<multi>multi)[ .-]?subs?|(?<lang>eng(?:lish)?|fre(?:nch)?|ger(?:man)?|spa(?:nish)?|ita(?:lian)?)[ .-]?(?:sub|subs|subbed)|subbed|subs)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex SubsPattern();
     [GeneratedRegex(@"-(?<group>[A-Za-z0-9]{2,32})(?:\[[^\]]*\])?$")]
     private static partial Regex GroupPattern();
 }

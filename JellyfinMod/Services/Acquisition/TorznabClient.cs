@@ -44,7 +44,9 @@ public sealed record TorznabItem(
     int? TmdbId,
     int? TvdbId,
     int? Season,
-    int? Episode);
+    int? Episode,
+    string? Language = null,
+    string? Subs = null);
 
 /// <summary>One fetched feed page.</summary>
 public sealed record TorznabPage(IReadOnlyList<TorznabItem> Items, int? Offset, int? Total);
@@ -145,7 +147,9 @@ public sealed class TorznabClient(IHttpClientFactory clients, ILogger<TorznabCli
                 Int(Attribute("tmdbid")),
                 Int(Attribute("tvdbid")),
                 Int(Attribute("season")),
-                Int(Attribute("episode"))));
+                Int(Attribute("episode")),
+                Attribute("language") ?? Attribute("languages"),
+                Attribute("subs") ?? Attribute("subtitles")));
         }
 
         return new TorznabPage(items, Int((string?)response?.Attribute("offset")), Int((string?)response?.Attribute("total")));

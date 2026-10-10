@@ -31,9 +31,11 @@ public sealed class ReleasesController(
     [HttpGet("Releases")]
     public async Task<ActionResult<ReleaseSearchDto>> Search([FromQuery] Guid entryId, [FromQuery] Guid? episodeId,
         [FromQuery] Guid? profileId, [FromQuery] string? intent, CancellationToken cancellationToken,
-        [FromQuery] string? scope = null, [FromQuery] int? seasonNumber = null)
+        [FromQuery] string? scope = null, [FromQuery] int? seasonNumber = null, [FromQuery] string? progressKey = null)
     {
         intent ??= GrabIntents.Acquire;
+        if (progressKey is not null && !ReleaseProgressTable.IsValidKey(progressKey))
+            return Error(400, "invalid_progress_key", "The progress key must be 1 to 64 letters, digits, dashes or underscores.");
         if (intent is not (GrabIntents.Acquire or GrabIntents.AddVersion))
             return Error(400, "invalid_intent", "The intent must be acquire or addVersion.");
         if (scope is not (null or ReleaseScopes.Episode or ReleaseScopes.Season or ReleaseScopes.Series))
@@ -44,7 +46,7 @@ public sealed class ReleasesController(
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken);
         if (entry is null || !access.CanRead(user, entry)) return NotFound();
         if (ReleaseScopes.IsPack(scope))
-            return await SearchPackAsync(user, entry, scope!, seasonNumber, episodeId, profileId, intent, cancellationToken);
+            return await SearchPackAsync(user, entry, scope!, seasonNumber, episodeId, profileId, intent, progressKey, cancellationToken);
         if (seasonNumber is not null) return Error(400, "invalid_scope", "A season number belongs to a season search.");
         Episode? episode = null;
         if (entry.MediaType == "series")
@@ -79,7 +81,7 @@ public sealed class ReleasesController(
         var snapshot = await search.SearchAsync(user.Id, ReleaseTargets.For(entry, episode),
             new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
                 profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
-            inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(intent, held));
+            inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(intent, held, progressKey));
         var targetKey = GrabService.TargetKey(entry.Id, episode?.Id) + (intent == GrabIntents.AddVersion ? "+add" : string.Empty);
         var active = await database.GrabOperations.AsNoTracking()
             .FirstOrDefaultAsync(value => value.ActiveTarget == targetKey, cancellationToken);
@@ -101,7 +103,7 @@ public sealed class ReleasesController(
     /// tracked episodes of that season, or of every season but specials, and the requester must be able to read each one.
     /// </summary>
     private async Task<ActionResult<ReleaseSearchDto>> SearchPackAsync(User user, Entry entry, string scope, int? seasonNumber,
-        Guid? episodeId, Guid? profileId, string intent, CancellationToken cancellationToken)
+        Guid? episodeId, Guid? profileId, string intent, string? progressKey, CancellationToken cancellationToken)
     {
         if (entry.MediaType != "series") return Error(400, "scope_not_applicable", "Only a series has seasons.");
         if (episodeId is not null) return Error(400, "invalid_scope", "A season or All Seasons search takes no episode.");
@@ -129,7 +131,7 @@ public sealed class ReleasesController(
         var snapshot = await search.SearchAsync(user.Id, ReleaseTargets.ForPack(entry, scope, seasonNumber, covered, episodes),
             new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
                 profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
-            inherited, state.Settings.Revision, cancellationToken);
+            inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(ProgressKey: progressKey));
         var packKey = GrabService.PackKey(entry.Id, scope == ReleaseScopes.Season ? seasonNumber : null);
         var active = await database.GrabOperations.AsNoTracking()
             .FirstOrDefaultAsync(value => value.ActiveTarget == packKey, cancellationToken);
@@ -140,6 +142,20 @@ public sealed class ReleasesController(
         return ReleaseSearchDto.From(snapshot,
             new GrabAvailabilityDto(reason is null, reason, (int)Math.Ceiling(hold.Hold.TotalSeconds), active?.Id,
                 GrabService.ModesFor(true, false, true, state.Settings.EpisodeUpgradesEnabled)));
+    }
+
+    /// <summary>
+    /// What a running search has done so far, for the release picker's live view: one line per enabled indexer and whether the
+    /// search is over. 404 for an unknown key, one that is not the caller's, or one that finished more than a minute ago.
+    /// </summary>
+    [HttpGet("Releases/Progress/{progressKey}")]
+    public ActionResult<ReleaseProgressDto> Progress(string progressKey)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
+        if (!ReleaseProgressTable.IsValidKey(progressKey) || search.Progress(progressKey, user.Id) is not { } progress) return NotFound();
+        return ReleaseProgressDto.From(progress);
     }
 
     /// <summary>
