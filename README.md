@@ -127,8 +127,9 @@ publishing the next version (`0.1.0.1`) and moving `latest` to it. Pin a version
 The one exception, by the user's decision: `0.1.0.0` has been republished in place, on 2026-09-27
 with the Trakt indicator and the import fixes (see the changelog in `build.yaml`), and on 2026-10-03,
 2026-10-07 and 2026-10-08 with the review and settings fixes, and on 2026-10-09 with the resolution fix and again with
-the Home hero and frosted top bar. The current index is `sha256:73e5fb87ec5e…934d00`, built from this repository's
-`7290d31` (without the Phase 9 ratings below) and the web fork's `aa88dbd42d`; each index is recorded in the web fork's `docs/jellyfinmod/PHASE7.md`.
+the Home hero and frosted top bar, and on 2026-10-10 with the top bar on every page and fading in. The current index is
+`sha256:041c81fa3432…dcfef`, built from this repository's `9459ce5` (without the Phase 9 ratings below) and the web
+fork's `2c83810caf`; each index is recorded in the web fork's `docs/jellyfinmod/PHASE7.md`.
 A volume that already ran an earlier `0.1.0.0` build picks the new one up on the next start (see
 *Plugin install* below).
 
