@@ -1085,6 +1085,19 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
                 "A second grab for an active target is refused and names the owner");
         }
 
+        // A rejection is soft (user, 2026-10-10): a person who chooses to grab a rejected release passes the rejection check and meets
+        // the next gate, the torrent fetch (this release has no torrent in the stand-in) or the active grab on this target; without
+        // the choice the same request stops at the rejection.
+        var rejectedRelease = Release(search, "Example.Movie.2024.2160p.BluRay.REMUX.HEVC.TrueHD.Atmos-GRP");
+        var chosen = await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab",
+            new { searchId, releaseId = rejectedRelease, idempotencyKey = "soft-0001", acceptRejected = true });
+        var chosenBody = await chosen.Content.ReadAsStringAsync();
+        Assert(!chosenBody.Contains("release_rejected") && (chosenBody.Contains("download_failed") || chosenBody.Contains("grab_active")),
+            "A rejected release passes the rejection check when the person chooses it: " + chosen.StatusCode + " " + chosenBody);
+        var notChosen = await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", Grab(searchId, rejectedRelease, "soft-0002"));
+        Assert(notChosen.StatusCode == HttpStatusCode.Conflict && (await notChosen.Content.ReadAsStringAsync()).Contains("release_rejected"),
+            "Without the choice the same release stops at the rejection");
+
         var accepted = await WaitForStateAsync(admin, movieGrabId, "accepted");
         Assert(transmission.AddCalls == 1 && transmission.Torrents.TryGetValue(movieTorrent.InfoHash, out var added) &&
             added.DownloadDir == "/downloads/jellyfinmod" &&

@@ -184,6 +184,13 @@ public sealed class GrabReleaseRequest
     /// </summary>
     [MaxLength(16), JsonPropertyName("mode")]
     public string? Mode { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether the person chose to grab a release the profile or the identity checks rejected (user,
+    /// 2026-10-10: a rejection is soft, the choice is the person's). Never honoured for automation.
+    /// </summary>
+    [JsonPropertyName("acceptRejected")]
+    public bool AcceptRejected { get; set; }
 }
 
 /// <summary>The canonical grab operation.</summary>

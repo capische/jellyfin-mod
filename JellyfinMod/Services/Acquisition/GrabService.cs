@@ -79,8 +79,12 @@ public sealed class GrabLocks
 /// <c>fill</c>, <c>add</c> or <c>replace</c> (season and series packs, 2026-10-08); null takes the default: fill where nothing is
 /// held, add where something is.
 /// </param>
+/// <param name="AcceptRejected">
+/// The person chose to grab a rejected release (user, 2026-10-10). Honoured for a person's grab only, never for automation,
+/// and never for a release with no download link.
+/// </param>
 public sealed record GrabRequest(Guid SearchId, string ReleaseId, string IdempotencyKey, bool Automatic = false,
-    Guid? UpgradeOperationId = null, string? Mode = null);
+    Guid? UpgradeOperationId = null, string? Mode = null, bool AcceptRejected = false);
 
 /// <summary>
 /// The client-agnostic acquisition engine (P4.A5): persist intent, hold, submit once through the configured
@@ -128,7 +132,16 @@ public sealed class GrabService(
         var candidate = snapshot.Candidates.SingleOrDefault(value => value.ReleaseId == request.ReleaseId)
             ?? throw new GrabException(404, "release_not_found", "This release is not part of the search.");
         if (!candidate.Evaluation.Eligible)
-            throw new GrabException(409, "release_rejected", "Rejected releases cannot be grabbed.");
+        {
+            // A rejection is soft (user, 2026-10-10): a person may still grab the release, and automation never does. A release
+            // with no download link has nothing to grab, so that rejection stays hard.
+            if (candidate.Evaluation.Rejections.Any(rejection => rejection.Code == "no_download_locator"))
+                throw new GrabException(409, "release_rejected", "This release has no torrent or magnet link, so it cannot be grabbed.");
+            if (!request.AcceptRejected || request.Automatic)
+                throw new GrabException(409, "release_rejected", "This release was rejected; choose to add it anyway to grab it.");
+            logger.LogInformation("Grab of {Release} accepted by choice despite rejections {Rejections}", request.ReleaseId,
+                string.Join(", ", candidate.Evaluation.Rejections.Select(rejection => rejection.Code)));
+        }
         var addVersion = snapshot.Intent == GrabIntents.AddVersion;
         // Another quality must be another quality: a held one is refused (P6.M6).
         if (addVersion && candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality))

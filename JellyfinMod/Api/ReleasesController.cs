@@ -155,7 +155,8 @@ public sealed class ReleasesController(
         try
         {
             var (operation, created) = await grabs.CreateAsync(user.Id,
-                new GrabRequest(request.SearchId, request.ReleaseId, request.IdempotencyKey, Mode: request.Mode),
+                new GrabRequest(request.SearchId, request.ReleaseId, request.IdempotencyKey, Mode: request.Mode,
+                    AcceptRejected: request.AcceptRejected),
                 (entry, episode) => CanAccess(user, entry, episode), cancellationToken);
             if (created) dispatcher.Schedule(operation.Id, operation.HoldUntil);
             var openUrl = await OpenUrlAsync(operation, cancellationToken);
