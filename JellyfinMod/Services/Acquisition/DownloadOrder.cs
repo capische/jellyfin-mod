@@ -129,7 +129,8 @@ public sealed class DownloadOrderService(
             var target = downloads.Any(Target);
             var priority = target ? 1 : 0;
             if (torrent.BandwidthPriority != priority) bandwidth = priority;
-            moveTop = target && torrent.Status == "download_wait";
+            // Only a torrent that is not already first: the client keeps the position, so asking again every tick changes nothing.
+            moveTop = target && torrent.Status == "download_wait" && torrent.QueuePosition is not 0;
         }
 
         if (high.Count == 0 && normal.Count == 0 && bandwidth is null && !moveTop) return;

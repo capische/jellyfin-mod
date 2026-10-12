@@ -371,6 +371,12 @@ internal static class NextUpScenarios
             transmission.OrderWrites(e2).All(write => write.Arguments.ToJsonString() == Body(e2, bandwidth: 0)) &&
             transmission.OrderWrites(e3).Count == e3Writes && transmission.Torrents[e3].BandwidthPriority == 1,
             "S01E01 goes first and to the top of the queue, S01E02 back to normal, the relabelled S01E03 is left alone");
+        // At the top of the queue it stays there: queue-move-top is not sent again while it waits in the queue.
+        for (var index = 0; index < 3; index++) await tick();
+        Assert(transmission.Torrents[e1].QueuePosition == 0 &&
+            transmission.OrderWrites(e1).Count(write => write.Method == "queue-move-top") == 1,
+            "A queued torrent already first is moved to the top once: " +
+            transmission.OrderWrites(e1).Count(write => write.Method == "queue-move-top"));
 
         transmission.Torrents[e1].Queued = false;
         transmission.Progress(e1, 1.0);

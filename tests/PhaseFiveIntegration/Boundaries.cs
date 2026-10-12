@@ -200,6 +200,8 @@ internal sealed class HeldTorrent
     public int BandwidthPriority { get; set; }
     /// <summary>Waiting in the client's download queue (status 3, download_wait) while incomplete.</summary>
     public bool Queued { get; set; }
+    /// <summary>The place in the client's queue, 0 first; queue-move-top makes it 0 and moves the ones before it down.</summary>
+    public int QueuePosition { get; set; }
     /// <summary>
     /// A local folder that holds the files until the whole torrent completes, as Transmission's incomplete folder does; the
     /// files move to the download folder then. Null writes straight into the download folder.
@@ -393,6 +395,7 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
                 Torrents[fixture.InfoHash] = new HeldTorrent
                 {
                     Hash = fixture.InfoHash, Name = fixture.Name, DownloadDir = arguments["download-dir"]!.GetValue<string>(),
+                    QueuePosition = Torrents.Count,
                     Labels = arguments["labels"]!.AsArray().Select(label => label!.GetValue<string>()).ToList(),
                     Files = fixture.Files.Select(file => new HeldFile { Name = file.Path, Length = file.Length }).ToList()
                 };
@@ -418,6 +421,13 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
                 break;
             case "queue-move-top":
                 Writes.Enqueue((method, (JsonObject)arguments.DeepClone()));
+                foreach (var id in arguments["ids"]!.AsArray().Select(value => value!.GetValue<string>()))
+                    if (Torrents.TryGetValue(id.ToLowerInvariant(), out var moved))
+                    {
+                        foreach (var other in Torrents.Values.Where(value => value.QueuePosition < moved.QueuePosition)) other.QueuePosition++;
+                        moved.QueuePosition = 0;
+                    }
+
                 result = [];
                 break;
             case "torrent-remove":
@@ -481,7 +491,7 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
             ["labels"] = new JsonArray(torrent.Labels.Select(label => (JsonNode)label).ToArray()),
             ["percentDone"] = size == 0 ? 0 : (double)(size - left) / size, ["sizeWhenDone"] = size, ["leftUntilDone"] = left,
             ["rateDownload"] = torrent.RateDownload, ["eta"] = complete ? -1 : 600, ["status"] = complete ? 6 : torrent.Queued ? 3 : 4,
-            ["bandwidthPriority"] = torrent.BandwidthPriority,
+            ["bandwidthPriority"] = torrent.BandwidthPriority, ["queuePosition"] = torrent.QueuePosition,
             ["isFinished"] = false, ["uploadRatio"] = torrent.UploadRatio, ["secondsSeeding"] = torrent.SecondsSeeding,
             ["seedRatioMode"] = torrent.SeedRatioMode, ["seedRatioLimit"] = torrent.SeedRatioLimit, ["seedIdleMode"] = torrent.SeedIdleMode,
             ["seedIdleLimit"] = 30, ["etaIdle"] = -1, ["error"] = 0,

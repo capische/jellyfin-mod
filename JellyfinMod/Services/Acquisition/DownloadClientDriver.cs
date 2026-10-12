@@ -55,7 +55,8 @@ public sealed record ClientTorrentStatus(
     long? IdleLimitSeconds,
     bool HasClientError,
     IReadOnlyList<ClientTorrentFile> Files,
-    int BandwidthPriority = 0)
+    int BandwidthPriority = 0,
+    int? QueuePosition = null)
 {
     /// <summary>Gets a value indicating whether every wanted byte is downloaded.</summary>
     public bool Complete => LeftUntilDone == 0 && PercentDone >= 1 && Files.Where(file => file.Wanted)

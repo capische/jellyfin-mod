@@ -126,7 +126,7 @@ public sealed class TransmissionDriver(IHttpClientFactory clients, ILogger<Trans
     [
         "hashString", "name", "downloadDir", "labels", "percentDone", "sizeWhenDone", "leftUntilDone", "rateDownload", "eta",
         "status", "isFinished", "uploadRatio", "secondsSeeding", "seedRatioMode", "seedRatioLimit", "seedIdleMode",
-        "seedIdleLimit", "error", "files", "fileStats", "bandwidthPriority"
+        "seedIdleLimit", "error", "files", "fileStats", "bandwidthPriority", "queuePosition"
     ];
 
     /// <inheritdoc />
@@ -197,7 +197,8 @@ public sealed class TransmissionDriver(IHttpClientFactory clients, ILogger<Trans
             Math.Max(0, ReadDouble(torrent, "uploadRatio") ?? 0), ReadLong(torrent, "secondsSeeding") ?? 0,
             ratioMode == 1 ? ReadDouble(torrent, "seedRatioLimit") : null,
             idleMode == 1 && ReadLong(torrent, "seedIdleLimit") is { } idle ? idle * 60 : null,
-            ReadLong(torrent, "error") is > 0, parsedFiles, (int)Math.Clamp(ReadLong(torrent, "bandwidthPriority") ?? 0, -1, 1));
+            ReadLong(torrent, "error") is > 0, parsedFiles, (int)Math.Clamp(ReadLong(torrent, "bandwidthPriority") ?? 0, -1, 1),
+            ReadLong(torrent, "queuePosition") is { } position ? (int)Math.Clamp(position, 0, int.MaxValue) : null);
     }
 
     private static string StatusName(long? status) => status switch
