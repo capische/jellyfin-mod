@@ -56,9 +56,12 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
             provider.GetRequiredService<UnixFileInspector>(), provider.GetRequiredService<ILogger<TransmissionSeedClient>>(),
             provider.GetRequiredService<AcquisitionSecretStore>()));
         services.AddSingleton(TimeProvider.System);
+        // Jellyfin's own TMDb connection, used when no TMDB token is saved (P1.FU13); bound once, at first use.
+        services.AddSingleton<JellyfinTmdb>();
         services.AddTransient(provider => new TmdbClient(provider.GetRequiredService<IHttpClientFactory>(),
             () => Plugin.Instance!.Configuration, provider.GetRequiredService<ILogger<TmdbClient>>(),
-            provider.GetRequiredService<AcquisitionSecretStore>(), () => provider.GetRequiredService<ModDbContext>()));
+            provider.GetRequiredService<AcquisitionSecretStore>(), () => provider.GetRequiredService<ModDbContext>(),
+            jellyfin: provider.GetRequiredService<JellyfinTmdb>()));
         AcquisitionServices.Add(services, () => Plugin.Instance!.DataPath);
         ImportServices.Add(services);
         AutomationServices.Add(services);

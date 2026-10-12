@@ -26,6 +26,16 @@
     </PackageReference>
   </ItemGroup>
 
+  <!-- Jellyfin's own TMDb connection (P1.FU13): the host's TmdbClientManager returns TMDbLib types, and the host
+       ships TMDbLib 3.0.0 (the Jellyfin 12.0.0 image). Compile against the same version; the host's copy binds at
+       runtime, so nothing of it is packaged or copied. The suites carry their own copy (Directory.Build.props). -->
+  <ItemGroup>
+    <PackageReference Include="TMDbLib" Version="3.0.0">
+      <ExcludeAssets>runtime</ExcludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
   <ItemGroup>
     <EmbeddedResource Include="Configuration\configPage.html" />
   </ItemGroup>

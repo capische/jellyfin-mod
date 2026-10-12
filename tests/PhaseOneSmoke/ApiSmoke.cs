@@ -898,6 +898,13 @@ internal static class ApiSmoke
         (pluginConfiguration.TmdbReadAccessToken, pluginConfiguration.TmdbApiKey) = (token, apiKey);
         Assert(notConfigured.Status == HttpStatusCode.ServiceUnavailable && OpenedRequests().Length == 0 && !await OpenedLoadedAsync(),
             "Without a TMDB credential the load answers 503 and the list stays unloaded (P1.FU9): " + notConfigured.Status);
+        (pluginConfiguration.TmdbReadAccessToken, pluginConfiguration.TmdbApiKey) = (string.Empty, string.Empty);
+        http.Requests.Clear();
+        using var unconfiguredSearch = await ordinary.GetAsync("/JellyfinMod/Discover/Search?q=title&type=movie");
+        (pluginConfiguration.TmdbReadAccessToken, pluginConfiguration.TmdbApiKey) = (token, apiKey);
+        Assert(unconfiguredSearch.StatusCode == HttpStatusCode.ServiceUnavailable && http.Requests.IsEmpty,
+            "Without a TMDB credential and with no Jellyfin TMDb connection in the host, discovery still answers 503 and asks no TMDB (P1.FU13): " +
+            unconfiguredSearch.StatusCode);
         http.Response = _ => new HttpResponseMessage(HttpStatusCode.NotFound);
         var unknown = await OpenAsync(ordinary, opened.Id);
         Assert(unknown.Status == HttpStatusCode.NotFound && OpenedRequests().Length == 1 && !await OpenedLoadedAsync(),

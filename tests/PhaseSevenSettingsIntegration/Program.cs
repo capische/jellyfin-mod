@@ -191,6 +191,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         var test = await Read(admin.PostAsync("/JellyfinMod/Settings/Discovery/Test", null), 200, "Discovery test answers");
         Assert(test.GetProperty("ok").GetBoolean() && test.GetProperty("code").GetString() == "ok" && tmdb.LastAuthorization == "Bearer " + tmdb.Token,
             "Discovery still works after the import without re-entering the token: TMDB receives it as a bearer credential");
+        Assert(test.GetProperty("source").GetString() == "token" && discovery.GetProperty("source").GetString() == "token",
+            "With a saved token, the test and the settings name the token as the source (P1.FU13)");
         Assert((await Read(admin.GetAsync("/JellyfinMod/Settings/Discovery"), 200, "Discovery re-reads")).GetProperty("verified").GetBoolean(),
             "A passing test verifies the current discovery revision");
 
@@ -226,8 +228,21 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         discovery = await Read(admin.PatchAsJsonAsync("/JellyfinMod/Settings/Discovery", new { token = new { action = "clear" }, revision = 3 }), 200,
             "Administrator clears the token");
         Assert(!discovery.GetProperty("tokenConfigured").GetBoolean(), "Clear flips the indicator");
+        Assert(discovery.GetProperty("source").GetString() == "none",
+            "With no token and no Jellyfin TMDb connection in this host, the settings name no source (P1.FU13)");
         test = await Read(admin.PostAsync("/JellyfinMod/Settings/Discovery/Test", null), 200, "Unconfigured test answers");
         Assert(test.GetProperty("code").GetString() == "not_configured", "A test without a token says so");
+        var setupWithoutSource = await Read(admin.GetAsync("/JellyfinMod/Setup/State"), 200, "Setup state reads without a source");
+        Assert(setupWithoutSource.GetProperty("steps").EnumerateArray().Single(step => step.GetProperty("id").GetString() == "discovery")
+                .GetProperty("reasons").EnumerateArray().Select(reason => reason.GetString()).SequenceEqual(["discovery_token_missing"]),
+            "With no token and no Jellyfin TMDb connection, the setup's discovery step still says the token is missing (P1.FU13)");
+        var requestsBefore = tmdb.Requests;
+        test = await Read(admin.PostAsync("/JellyfinMod/Settings/Discovery/Test?source=jellyfin", null), 200, "Jellyfin-source test answers");
+        Assert(!test.GetProperty("ok").GetBoolean() && test.GetProperty("code").GetString() == "not_available" &&
+            test.GetProperty("source").GetString() == "jellyfin" && tmdb.Requests == requestsBefore,
+            "The Jellyfin-source diagnostic reports an unavailable connection in a host without one, and calls no TMDB (P1.FU13)");
+        await Expect(admin.PostAsync("/JellyfinMod/Settings/Discovery/Test?source=other", null), 400, "invalid_source",
+            "A test for an unknown source is refused");
         discovery = await Read(admin.PatchAsJsonAsync("/JellyfinMod/Settings/Discovery",
             new { token = new { action = "replace", value = newToken }, revision = 4 }), 200, "Administrator saves the token again");
         Assert((await Read(admin.PostAsync("/JellyfinMod/Settings/Discovery/Test", null), 200, "Discovery test")).GetProperty("ok").GetBoolean(),
@@ -682,6 +697,7 @@ internal sealed class TmdbBoundary : IAsyncDisposable
     private WebApplication _app = null!;
     public string Token { get; set; } = string.Empty;
     public string? LastAuthorization { get; private set; }
+    public int Requests { get; private set; }
     public TimeSpan Delay { get; set; }
     public bool Abort { get; set; }
     public Uri Address { get; private set; } = null!;
@@ -696,6 +712,7 @@ internal sealed class TmdbBoundary : IAsyncDisposable
         _app.MapGet("/3/configuration", async context =>
         {
             LastAuthorization = context.Request.Headers.Authorization;
+            Requests++;
             if (Abort) { context.Abort(); return; }
             if (Delay > TimeSpan.Zero)
             {

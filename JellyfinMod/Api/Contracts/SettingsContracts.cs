@@ -3,12 +3,17 @@ using System.Text.Json.Serialization;
 namespace JellyfinMod.Api.Contracts;
 
 /// <summary>Discovery (TMDB) settings; the token is write-only (P7.S7).</summary>
+/// <remarks>
+/// <c>source</c> says what TMDB calls use (P1.FU13): <c>token</c> (the saved token or v3 key), <c>jellyfin</c> (no token is
+/// saved, so Jellyfin's built-in TMDb connection) or <c>none</c> (neither, so discovery is unavailable).
+/// </remarks>
 public sealed record DiscoverySettingsDto(
     [property: JsonPropertyName("tokenConfigured")] bool TokenConfigured,
     [property: JsonPropertyName("apiKeyConfigured")] bool ApiKeyConfigured,
     [property: JsonPropertyName("verified")] bool Verified,
     [property: JsonPropertyName("verifiedAt")] DateTime? VerifiedAt,
-    [property: JsonPropertyName("revision")] int Revision);
+    [property: JsonPropertyName("revision")] int Revision,
+    [property: JsonPropertyName("source")] string Source);
 
 /// <summary>A change to the discovery settings.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]

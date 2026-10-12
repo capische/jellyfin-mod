@@ -15,31 +15,72 @@ namespace JellyfinMod.Services;
 /// <remarks>
 /// The Read Access Token lives in the SQLite settings row since P7.S7. A value or reference still on the XML
 /// configuration wins, because it is newer: the one-time import moves it at the next startup.
+/// The token is optional (P1.FU13): with none saved, every call goes through Jellyfin's own TMDb connection
+/// (<see cref="JellyfinTmdb"/>), and only when that is unavailable too does a call fail as not configured.
 /// </remarks>
 public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfiguration> configuration, ILogger<TmdbClient> logger,
-    AcquisitionSecretStore? secrets = null, Func<ModDbContext>? database = null, TmdbEndpoint? endpoint = null)
+    AcquisitionSecretStore? secrets = null, Func<ModDbContext>? database = null, TmdbEndpoint? endpoint = null,
+    JellyfinTmdb? jellyfin = null)
 {
+    /// <summary>The source a call used: the saved token (or v3 key).</summary>
+    public const string TokenSource = "token";
+
+    /// <summary>The source a call used: Jellyfin's own TMDb connection.</summary>
+    public const string JellyfinSource = "jellyfin";
+
     /// <summary>
-    /// Checks the configured credential against TMDB without reading any title (P7.S7 Discovery Test).
+    /// Checks the configured credential against TMDB without reading any title (P7.S7 Discovery Test). With no token saved,
+    /// it checks Jellyfin's TMDb connection instead, with one read of a well-known series (P1.FU13).
     /// </summary>
-    /// <returns>A stable code and a sentence; never the credential or a raw exception.</returns>
-    public async Task<(string Code, string Message)> TestAsync(CancellationToken cancellationToken)
+    /// <returns>A stable code, a sentence and the source tested; never the credential or a raw exception.</returns>
+    public async Task<(string Code, string Message, string? Source)> TestAsync(CancellationToken cancellationToken)
     {
+        string? source = null;
         try
         {
-            using var _ = await GetAsync("configuration", cancellationToken).ConfigureAwait(false);
-            return ("ok", "TMDB accepted the token.");
+            var (credential, viaJellyfin) = await SourceAsync(cancellationToken).ConfigureAwait(false);
+            if (viaJellyfin is not null)
+            {
+                source = JellyfinSource;
+                await viaJellyfin.GetDetailsAsync("series", JellyfinTmdb.ProbeSeriesId, cancellationToken).ConfigureAwait(false);
+                return ("ok", "TMDB answered through Jellyfin's built-in TMDb connection.", source);
+            }
+
+            source = TokenSource;
+            using var _ = await GetAsync("configuration", credential!, cancellationToken).ConfigureAwait(false);
+            return ("ok", "TMDB accepted the token.", source);
         }
         catch (TmdbException failure)
         {
             return (failure.Code, failure.Code switch
             {
-                "not_configured" => "No TMDB Read Access Token is saved yet.",
+                "not_configured" => "No TMDB token is saved, and Jellyfin's built-in TMDb connection is unavailable.",
                 "unauthorized" => "TMDB rejected the token. Check it was copied completely.",
                 "timeout" => "TMDB did not answer in time.",
                 "unreachable" => "TMDB could not be reached from this server.",
+                "not_found" when source == JellyfinSource => "Jellyfin's TMDb connection returned nothing. TMDB may be refusing its key or unreachable.",
                 _ => "TMDB answered with an error."
-            });
+            }, source);
+        }
+    }
+
+    /// <summary>
+    /// Checks Jellyfin's TMDb connection whatever token is saved: one well-known series and its first season, read only
+    /// (P1.FU13 live diagnostic). Nothing is recorded.
+    /// </summary>
+    /// <returns>A stable code and a sentence with the counts read.</returns>
+    public async Task<(string Code, string Message)> TestJellyfinAsync(CancellationToken cancellationToken)
+    {
+        if (jellyfin is not { Available: true })
+            return ("not_available", "Jellyfin's built-in TMDb connection is unavailable on this server.");
+        try
+        {
+            var (seasons, episodes) = await jellyfin.ProbeAsync(cancellationToken).ConfigureAwait(false);
+            return ("ok", $"Jellyfin's TMDb connection answered: {seasons} seasons, {episodes} episodes in season 1.");
+        }
+        catch (TmdbException failure)
+        {
+            return (failure.Code, $"Jellyfin's TMDb connection failed: {failure.Message}");
         }
     }
 
@@ -48,16 +89,9 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
     {
         var path = MediaPath(mediaType);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(id);
-        using var json = await GetAsync($"{path}/{id}?append_to_response=external_ids,{(mediaType == "movie" ? "release_dates" : "content_ratings")}", cancellationToken);
-        if (mediaType == "series")
-        {
-            if (!json.RootElement.TryGetProperty("seasons", out var seasons) || seasons.ValueKind != JsonValueKind.Array)
-                throw new TmdbException("TMDB returned incomplete series metadata.", HttpStatusCode.BadGateway);
-            var numbers = seasons.EnumerateArray().Select(season => Number(season, "season_number")).ToArray();
-            if (numbers.Any(number => number is null or < 0) || numbers.Distinct().Count() != numbers.Length)
-                throw new TmdbException("TMDB returned conflicting season identities.", HttpStatusCode.BadGateway);
-        }
-        var result = Parse(json.RootElement, mediaType);
+        var (credential, viaJellyfin) = await SourceAsync(cancellationToken);
+        var result = viaJellyfin is not null ? await viaJellyfin.GetDetailsAsync(mediaType, id, cancellationToken)
+            : await DetailsOverHttpAsync(path, mediaType, id, credential!, cancellationToken);
         if (result.TmdbId != id || string.IsNullOrWhiteSpace(result.Title))
         {
             throw new TmdbException("TMDB returned incomplete metadata.", HttpStatusCode.BadGateway);
@@ -66,13 +100,33 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         return result;
     }
 
+    private async Task<TmdbMetadata> DetailsOverHttpAsync(string path, string mediaType, int id, Credential credential,
+        CancellationToken cancellationToken)
+    {
+        using var json = await GetAsync($"{path}/{id}?append_to_response=external_ids,{(mediaType == "movie" ? "release_dates" : "content_ratings")}",
+            credential, cancellationToken);
+        if (mediaType == "series")
+        {
+            if (!json.RootElement.TryGetProperty("seasons", out var seasons) || seasons.ValueKind != JsonValueKind.Array)
+                throw new TmdbException("TMDB returned incomplete series metadata.", HttpStatusCode.BadGateway);
+            var numbers = seasons.EnumerateArray().Select(season => Number(season, "season_number")).ToArray();
+            if (numbers.Any(number => number is null or < 0) || numbers.Distinct().Count() != numbers.Length)
+                throw new TmdbException("TMDB returned conflicting season identities.", HttpStatusCode.BadGateway);
+        }
+
+        return Parse(json.RootElement, mediaType);
+    }
+
     /// <summary>Fetches one remote search page. Permission checks and exclusions happen before exposing it.</summary>
     public async Task<TmdbPage> SearchAsync(string query, string mediaType, int page, CancellationToken cancellationToken)
     {
         var path = MediaPath(mediaType);
         if (string.IsNullOrWhiteSpace(query) || query.Length > 200) throw new ArgumentException("A search query of 1–200 characters is required.", nameof(query));
         if (page is < 1 or > 500) throw new ArgumentOutOfRangeException(nameof(page));
-        using var json = await GetAsync($"search/{path}?query={Uri.EscapeDataString(query.Trim())}&include_adult=false&page={page}", cancellationToken);
+        var (credential, viaJellyfin) = await SourceAsync(cancellationToken);
+        if (viaJellyfin is not null) return await viaJellyfin.SearchAsync(query.Trim(), mediaType, page, cancellationToken);
+        using var json = await GetAsync($"search/{path}?query={Uri.EscapeDataString(query.Trim())}&include_adult=false&page={page}",
+            credential!, cancellationToken);
         var root = json.RootElement;
         if (!root.TryGetProperty("results", out var searchResults) || searchResults.ValueKind != JsonValueKind.Array)
             throw new TmdbException("TMDB returned incomplete search metadata.", HttpStatusCode.BadGateway);
@@ -87,6 +141,7 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
     /// <remarks>
     /// One request reads up to twenty seasons, appended to the series (P1.FU4), instead of one request per season. A season
     /// TMDB leaves out of an appended response is read on its own, so an occasional omission never fails the series.
+    /// Through Jellyfin's TMDb connection each season is one request (P1.FU13), four at a time.
     /// </remarks>
     public async Task<IReadOnlyList<Episode>> GetEpisodesAsync(TmdbMetadata series, CancellationToken cancellationToken)
     {
@@ -94,11 +149,19 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         var episodes = new ConcurrentBag<Episode>();
         var omitted = new ConcurrentBag<int>();
         var parallel = new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken };
+        var (credential, viaJellyfin) = await SourceAsync(cancellationToken);
+        if (viaJellyfin is not null)
+        {
+            await Parallel.ForEachAsync(series.Seasons.Select(season => season.Number), parallel,
+                async (number, token) => await viaJellyfin.ReadSeasonAsync(series.TmdbId, number, episodes, token));
+            return Checked(episodes);
+        }
+
         await Parallel.ForEachAsync(series.Seasons.Select(season => season.Number).Chunk(MaxAppendedSeasons), parallel,
             async (numbers, token) =>
             {
                 using var json = await GetAsync($"tv/{series.TmdbId}?append_to_response=" +
-                    string.Join(",", numbers.Select(number => $"season/{number}")), token);
+                    string.Join(",", numbers.Select(number => $"season/{number}")), credential!, token);
                 foreach (var number in numbers)
                 {
                     if (json.RootElement.TryGetProperty($"season/{number}", out var season) && season.ValueKind != JsonValueKind.Null)
@@ -109,10 +172,16 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             });
         await Parallel.ForEachAsync(omitted, parallel, async (number, token) =>
         {
-            using var json = await GetAsync($"tv/{series.TmdbId}/season/{number}", token);
+            using var json = await GetAsync($"tv/{series.TmdbId}/season/{number}", credential!, token);
             ReadSeason(json.RootElement, number, episodes);
         });
 
+        return Checked(episodes);
+    }
+
+    /// <summary>A series' episodes in order, once no two share an id or a position.</summary>
+    private static Episode[] Checked(ConcurrentBag<Episode> episodes)
+    {
         if (episodes.DistinctBy(e => e.TmdbId).Count() != episodes.Count || episodes.DistinctBy(e => (e.SeasonNumber, e.EpisodeNumber)).Count() != episodes.Count)
             throw new TmdbException("TMDB returned conflicting episode identities.", HttpStatusCode.BadGateway);
         return episodes.OrderBy(episode => episode.SeasonNumber).ThenBy(episode => episode.EpisodeNumber).ToArray();
@@ -153,7 +222,13 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
     private async Task<string> ReadSecretAsync(string? reference, CancellationToken cancellationToken) =>
         secrets is null ? string.Empty : await secrets.GetAsync(reference, cancellationToken).ConfigureAwait(false) ?? string.Empty;
 
-    private async Task<JsonDocument> GetAsync(string path, CancellationToken cancellationToken)
+    /// <summary>The saved TMDB credential: the Read Access Token, the v3 key, or both.</summary>
+    private sealed record Credential(string Token, string Key);
+
+    /// <summary>
+    /// Where a call goes: the saved token or key when there is one, else Jellyfin's TMDb connection (P1.FU13), else nowhere.
+    /// </summary>
+    private async Task<(Credential? Credential, JellyfinTmdb? Jellyfin)> SourceAsync(CancellationToken cancellationToken)
     {
         var config = configuration();
         // Saved credentials live in the secret store; a value on the configuration object is used as given.
@@ -162,9 +237,15 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
                 cancellationToken).ConfigureAwait(false)).Trim();
         var key = (config.TmdbApiKey.Length > 0 ? config.TmdbApiKey
             : await ReadSecretAsync(config.TmdbApiKeyRef, cancellationToken).ConfigureAwait(false)).Trim();
-        if (token.Length == 0 && key.Length == 0)
-            throw new TmdbException("An administrator must configure a TMDB API Read Access Token or API key.", HttpStatusCode.ServiceUnavailable,
-                "not_configured");
+        if (token.Length > 0 || key.Length > 0) return (new Credential(token, key), null);
+        if (jellyfin is { Available: true }) return (null, jellyfin);
+        throw new TmdbException("TMDB is not set up: save a TMDB token, or make Jellyfin's built-in TMDb connection available.",
+            HttpStatusCode.ServiceUnavailable, "not_configured");
+    }
+
+    private async Task<JsonDocument> GetAsync(string path, Credential saved, CancellationToken cancellationToken)
+    {
+        var (token, key) = saved;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(15));
         try

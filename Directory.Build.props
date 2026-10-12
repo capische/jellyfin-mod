@@ -9,4 +9,15 @@
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <!-- The Jellyfin host supplies TMDbLib to the plugin at runtime (P1.FU13), so the plugin compiles against it without
+       copying it. The suites host the plugin themselves, so they carry it, as they carry the other host assemblies. -->
+  <ItemGroup Condition="'$(MSBuildProjectName)' != 'JellyfinMod'">
+    <PackageReference Include="TMDbLib" Version="3.0.0" />
+  </ItemGroup>
+  <!-- TMDbLib depends on a multithreading analyzer; it must not join this build's analysers (the suites' own locks trip it). -->
+  <Target Name="JellyfinModDropTmdbLibAnalyzer" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <Analyzer Remove="@(Analyzer)" Condition="'%(Filename)' == 'SmartAnalyzers.MultithreadingAnalyzer'" />
+    </ItemGroup>
+  </Target>
 </Project>

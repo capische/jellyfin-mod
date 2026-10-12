@@ -74,14 +74,25 @@ public sealed class SettingsController(
         return await DiscoveryDtoAsync(settings, cancellationToken);
     }
 
-    /// <summary>Checks the saved TMDB token against TMDB and records a pass against the current revision.</summary>
+    /// <summary>
+    /// Checks the saved TMDB token against TMDB, or Jellyfin's TMDb connection when none is saved, and records a pass against
+    /// the current revision. With <c>source=jellyfin</c> it checks Jellyfin's connection whatever is saved and records nothing
+    /// (P1.FU13 live diagnostic).
+    /// </summary>
     [HttpPost("Settings/Discovery/Test")]
-    public async Task<ActionResult<ConnectionTestDto>> TestDiscovery(CancellationToken cancellationToken)
+    public async Task<ActionResult<ConnectionTestDto>> TestDiscovery([FromQuery] string? source, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
+        if (source is not (null or TmdbClient.JellyfinSource)) return Invalid("invalid_source");
+        if (source == TmdbClient.JellyfinSource)
+        {
+            var (probeCode, probeMessage) = await tmdb.TestJellyfinAsync(cancellationToken);
+            return new ConnectionTestDto(probeCode == "ok", probeCode, probeMessage, null, null, TmdbClient.JellyfinSource);
+        }
+
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
         var revision = settings.DiscoveryRevision;
-        var (code, message) = await tmdb.TestAsync(cancellationToken);
+        var (code, message, tested) = await tmdb.TestAsync(cancellationToken);
         if (code == "ok")
         {
             settings.DiscoveryVerifiedRevision = revision;
@@ -93,7 +104,7 @@ public sealed class SettingsController(
         }
 
         await database.SaveChangesAsync(cancellationToken);
-        return new ConnectionTestDto(code == "ok", code, message, null, null);
+        return new ConnectionTestDto(code == "ok", code, message, null, null, tested);
     }
 
     /// <summary>Gets where seed protection reads Transmission from.</summary>
@@ -241,8 +252,8 @@ public sealed class SettingsController(
         var bundles = services.GetService<WebBundleStore>();
         var areas = new List<SettingsAreaDto>
         {
-            new("discovery", discovery.TokenConfigured || discovery.ApiKeyConfigured, null,
-                discovery.TokenConfigured || discovery.ApiKeyConfigured ? [] : ["discovery_token_missing"], discovery.Revision),
+            new("discovery", discovery.Source != NoSource, null,
+                discovery.Source != NoSource ? [] : ["discovery_token_missing"], discovery.Revision),
             new("acquisition", state.Ready, settings.Enabled, state.Blockers, settings.Revision),
             new("seedProtection", seed is not null, null, seed is null ? ["seed_protection_unconfigured"] : [], settings.SeedProtectionRevision),
             new("import", true, settings.ImportEnabled, [], settings.ImportRevision),
@@ -304,8 +315,13 @@ public sealed class SettingsController(
             if (reasons.Count > 0) blocked = true;
         }
 
-        Step("discovery", !(discovery.TokenConfigured || discovery.ApiKeyConfigured) ? ["discovery_token_missing"]
-            : discovery.Verified ? [] : ["discovery_unverified"]);
+        // Jellyfin's TMDb connection needs nothing set up; a saved token must pass a test (P1.FU13).
+        Step("discovery", discovery.Source switch
+        {
+            NoSource => ["discovery_token_missing"],
+            TmdbClient.JellyfinSource => [],
+            _ => discovery.Verified ? [] : ["discovery_unverified"]
+        });
 
         var clientReasons = new List<string>();
         if (state.Client is not { } client) clientReasons.Add("no_download_client");
@@ -335,9 +351,14 @@ public sealed class SettingsController(
         var token = configuration.TmdbReadAccessToken.Length > 0 || await secrets.HasAsync(tokenRef, cancellationToken);
         var key = configuration.TmdbApiKey.Length > 0 || await secrets.HasAsync(configuration.TmdbApiKeyRef, cancellationToken);
         var verified = settings.DiscoveryVerifiedRevision == settings.DiscoveryRevision;
+        var source = token || key ? TmdbClient.TokenSource
+            : services.GetService<JellyfinTmdb>() is { Available: true } ? TmdbClient.JellyfinSource : NoSource;
         return new DiscoverySettingsDto(token, key, verified,
-            verified && settings.DiscoveryVerifiedAt is { } at ? DateTime.SpecifyKind(at, DateTimeKind.Utc) : null, settings.DiscoveryRevision);
+            verified && settings.DiscoveryVerifiedAt is { } at ? DateTime.SpecifyKind(at, DateTimeKind.Utc) : null, settings.DiscoveryRevision, source);
     }
+
+    /// <summary>The discovery source when there is no token and no Jellyfin TMDb connection.</summary>
+    private const string NoSource = "none";
 
     private async Task<SeedProtectionSettingsDto> SeedDtoAsync(AcquisitionSettings settings, CancellationToken cancellationToken)
     {

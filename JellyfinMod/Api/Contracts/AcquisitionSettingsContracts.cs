@@ -298,7 +298,8 @@ public sealed record ConnectionTestDto(
     [property: JsonPropertyName("code")] string Code,
     [property: JsonPropertyName("message")] string Message,
     [property: JsonPropertyName("version"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Version,
-    [property: JsonPropertyName("apiVersion"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ApiVersion);
+    [property: JsonPropertyName("apiVersion"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ApiVersion,
+    [property: JsonPropertyName("source"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Source = null);
 
 /// <summary>A Prowlarr source; the API key is write-only (P7.S9).</summary>
 public sealed record ProwlarrSourceDto(
