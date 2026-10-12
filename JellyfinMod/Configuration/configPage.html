@@ -340,9 +340,8 @@
           <div class="jfmod-group">
             <div data-secret-slot="TmdbReadAccessToken"></div>
             <div class="fieldDescription jfmod-lead">
-              Recommended. Used for JellyfinMod discovery only; Jellyfin's own TMDb metadata provider
-              keeps its separate key, so a discovery result and the item Jellyfin later creates can
-              disagree about title, poster and language.
+              Optional. Leave empty to use Jellyfin's built-in TMDb connection. A saved token is used
+              instead, for JellyfinMod discovery only.
             </div>
           </div>
           <div class="jfmod-group">
@@ -1429,10 +1428,12 @@
           case 'discovery': {
             var discovery = state.discovery;
             if (!discovery) return { kind: 'off', words: 'Not loaded' };
+            // The token is optional: with none saved, discovery uses Jellyfin's built-in TMDb connection (P1.FU13).
+            if (discovery.source === 'jellyfin') return { kind: 'ok', words: "Using Jellyfin's TMDb connection" };
             if (discovery.tokenConfigured) {
               return discovery.verified
-                ? { kind: 'ok', words: 'Read access token configured · tested ' + when(discovery.verifiedAt) }
-                : { kind: 'warn', words: 'Read access token configured · not tested since it changed' };
+                ? { kind: 'ok', words: 'Using your token · tested ' + when(discovery.verifiedAt) }
+                : { kind: 'warn', words: 'Using your token · not tested since it changed' };
             }
             if (discovery.apiKeyConfigured) return { kind: 'warn', words: 'Only the v3 API key is configured' };
             return { kind: 'warn', words: 'No TMDB credential configured' };
