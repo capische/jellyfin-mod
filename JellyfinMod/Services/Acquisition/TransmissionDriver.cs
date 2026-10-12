@@ -101,11 +101,32 @@ public sealed class TransmissionDriver(IHttpClientFactory clients, ILogger<Trans
             cancellationToken, definite: false).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public async Task SetDownloadOrderAsync(DownloadClientConnection connection, string infoHash, IReadOnlyCollection<int> highFiles,
+        IReadOnlyCollection<int> normalFiles, int? bandwidthPriority, bool moveTop, CancellationToken cancellationToken)
+    {
+        // Transmission reads an empty file list as every file, so a list is sent only when it names one.
+        var arguments = new Dictionary<string, object> { ["ids"] = new[] { infoHash } };
+        if (highFiles.Count > 0) arguments["priority-high"] = highFiles.Order().ToArray();
+        if (normalFiles.Count > 0) arguments["priority-normal"] = normalFiles.Order().ToArray();
+        if (bandwidthPriority is { } priority) arguments["bandwidthPriority"] = Math.Clamp(priority, -1, 1);
+        if (arguments.Count > 1)
+        {
+            using var _ = await CallAsync(connection, "torrent-set", arguments, cancellationToken, definite: false).ConfigureAwait(false);
+        }
+
+        if (moveTop)
+        {
+            using var _ = await CallAsync(connection, "queue-move-top", new Dictionary<string, object> { ["ids"] = new[] { infoHash } },
+                cancellationToken, definite: false).ConfigureAwait(false);
+        }
+    }
+
     private static readonly string[] StatusFields =
     [
         "hashString", "name", "downloadDir", "labels", "percentDone", "sizeWhenDone", "leftUntilDone", "rateDownload", "eta",
         "status", "isFinished", "uploadRatio", "secondsSeeding", "seedRatioMode", "seedRatioLimit", "seedIdleMode",
-        "seedIdleLimit", "error", "files", "fileStats"
+        "seedIdleLimit", "error", "files", "fileStats", "bandwidthPriority"
     ];
 
     /// <inheritdoc />
@@ -160,7 +181,8 @@ public sealed class TransmissionDriver(IHttpClientFactory clients, ILogger<Trans
         var parsedFiles = files.Select((file, index) => new ClientTorrentFile(
             (ReadString(file, "name") ?? throw new FormatException("A torrent file has no name.")).Replace('\\', '/'),
             ReadLong(file, "length") ?? 0, ReadLong(file, "bytesCompleted") ?? 0,
-            index >= stats.Length || !stats[index].TryGetProperty("wanted", out var flag) || flag.ValueKind != JsonValueKind.False))
+            index >= stats.Length || !stats[index].TryGetProperty("wanted", out var flag) || flag.ValueKind != JsonValueKind.False,
+            index < stats.Length && ReadLong(stats[index], "priority") is { } priority ? (int)Math.Clamp(priority, -1, 1) : 0))
             .ToArray();
         var ratioMode = ReadLong(torrent, "seedRatioMode");
         var idleMode = ReadLong(torrent, "seedIdleMode");
@@ -175,7 +197,7 @@ public sealed class TransmissionDriver(IHttpClientFactory clients, ILogger<Trans
             Math.Max(0, ReadDouble(torrent, "uploadRatio") ?? 0), ReadLong(torrent, "secondsSeeding") ?? 0,
             ratioMode == 1 ? ReadDouble(torrent, "seedRatioLimit") : null,
             idleMode == 1 && ReadLong(torrent, "seedIdleLimit") is { } idle ? idle * 60 : null,
-            ReadLong(torrent, "error") is > 0, parsedFiles);
+            ReadLong(torrent, "error") is > 0, parsedFiles, (int)Math.Clamp(ReadLong(torrent, "bandwidthPriority") ?? 0, -1, 1));
     }
 
     private static string StatusName(long? status) => status switch

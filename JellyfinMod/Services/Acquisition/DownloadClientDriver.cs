@@ -32,7 +32,8 @@ public sealed record DownloadClientTorrent(
 /// <param name="Length">The file's full length.</param>
 /// <param name="BytesCompleted">The bytes the client holds.</param>
 /// <param name="Wanted">Whether the client downloads this file.</param>
-public sealed record ClientTorrentFile(string Name, long Length, long BytesCompleted, bool Wanted);
+/// <param name="Priority">The client's file priority: -1 low, 0 normal, 1 high (next-up priority, P4.FU2).</param>
+public sealed record ClientTorrentFile(string Name, long Length, long BytesCompleted, bool Wanted, int Priority = 0);
 
 /// <summary>A full status read of one torrent, used by the import monitor and the seed release (P5.I1/I3/I6).</summary>
 /// <remarks>Built from one client read per monitor tick; it never carries credentials.</remarks>
@@ -53,7 +54,8 @@ public sealed record ClientTorrentStatus(
     double? RatioLimit,
     long? IdleLimitSeconds,
     bool HasClientError,
-    IReadOnlyList<ClientTorrentFile> Files)
+    IReadOnlyList<ClientTorrentFile> Files,
+    int BandwidthPriority = 0)
 {
     /// <summary>Gets a value indicating whether every wanted byte is downloaded.</summary>
     public bool Complete => LeftUntilDone == 0 && PercentDone >= 1 && Files.Where(file => file.Wanted)
@@ -120,6 +122,20 @@ public interface IDownloadClientDriver
     /// <exception cref="DownloadClientRejectedException">The client refused the credentials or the connection.</exception>
     Task<IReadOnlyList<ClientTorrentStatus>> GetStatusAsync(DownloadClientConnection connection, IReadOnlyCollection<string> infoHashes,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Sets which files of a torrent download first, and the torrent's own priority (next-up priority, P4.FU2). Files are
+    /// indexes in the client's file order; an empty list changes nothing (never "every file"). Callers prove ownership first.
+    /// </summary>
+    /// <param name="connection">The client.</param>
+    /// <param name="infoHash">The torrent.</param>
+    /// <param name="highFiles">Files to download at high priority.</param>
+    /// <param name="normalFiles">Files to put back to normal priority.</param>
+    /// <param name="bandwidthPriority">The torrent's priority against other torrents (-1, 0 or 1), or null to leave it.</param>
+    /// <param name="moveTop">Whether to move the torrent to the top of the client's download queue.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    Task SetDownloadOrderAsync(DownloadClientConnection connection, string infoHash, IReadOnlyCollection<int> highFiles,
+        IReadOnlyCollection<int> normalFiles, int? bandwidthPriority, bool moveTop, CancellationToken cancellationToken);
 
     /// <summary>Removes one torrent, with its data when asked. Callers prove ownership first.</summary>
     Task RemoveAsync(DownloadClientConnection connection, string infoHash, bool deleteData, CancellationToken cancellationToken);
