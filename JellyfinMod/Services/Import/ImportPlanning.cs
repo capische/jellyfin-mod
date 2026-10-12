@@ -90,6 +90,19 @@ public static class ImportPaths
             mappings.OrderBy(mapping => mapping.Order).Select(mapping =>
                 $"{mapping.Id:N}|{mapping.Order}|{mapping.ClientPathPrefix}|{mapping.LocalPathPrefix}")))))[..16];
 
+    /// <summary>A torrent file's path as the client reports it: its download directory and its name, normalized.</summary>
+    public static string? ClientPath(ClientTorrentStatus torrent, ClientTorrentFile file) =>
+        Normalize((torrent.DownloadDirectory ?? string.Empty).TrimEnd('/') + "/" + file.Name);
+
+    /// <summary>The index, in the client's file order, of the torrent's file at <paramref name="clientPath"/>, or -1.</summary>
+    public static int FileIndex(ClientTorrentStatus torrent, string? clientPath)
+    {
+        if (clientPath is null) return -1;
+        for (var index = 0; index < torrent.Files.Count; index++)
+            if (string.Equals(ClientPath(torrent, torrent.Files[index]), clientPath, StringComparison.Ordinal)) return index;
+        return -1;
+    }
+
     /// <summary>Returns true when <paramref name="path"/> equals or lies below <paramref name="prefix"/>.</summary>
     public static bool Within(string prefix, string path) =>
         prefix == "/" || path == prefix || path.StartsWith(prefix + "/", StringComparison.Ordinal);

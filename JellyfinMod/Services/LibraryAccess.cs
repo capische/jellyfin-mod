@@ -219,6 +219,27 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
         }).Select(item => userData.GetUserData(user, item)).OfType<UserItemData>().Where(data => data.Played).Select(data => data.LastPlayedDate).DefaultIfEmpty().Max();
     }
 
+    /// <summary>
+    /// The furthest episode a user has played of a native series, specials left out (next-up priority, P4.FU3): the highest
+    /// season, then episode, the last number of a multi-episode file included. Read from Jellyfin's own played state with the
+    /// same presentation-key query as <see cref="GetSeriesDatePlayed"/>; null when the user has played none.
+    /// </summary>
+    public (int Season, int Episode)? LastPlayedEpisode(User user, BaseItem series)
+    {
+        if (string.IsNullOrEmpty(series.PresentationUniqueKey)) return null;
+        return library.GetItemList(new InternalItemsQuery(user)
+            {
+                SeriesPresentationUniqueKey = series.PresentationUniqueKey,
+                IncludeItemTypes = [BaseItemKind.Episode],
+                IsPlayed = true,
+                GroupByPresentationUniqueKey = false
+            }).OfType<MediaBrowser.Controller.Entities.TV.Episode>()
+            .Where(episode => episode.ParentIndexNumber is > 0 && episode.IndexNumber is not null)
+            .Select(episode => ((int Season, int Episode)?)(episode.ParentIndexNumber!.Value,
+                Math.Max(episode.IndexNumber!.Value, episode.IndexNumberEnd ?? 0)))
+            .Max();
+    }
+
     /// <summary>Gets playable descendant episodes visible to the requesting user.</summary>
     public IReadOnlyList<BaseItem> GetEpisodes(User user, BaseItem series) => series is Folder folder
         ? folder.GetItemList(new InternalItemsQuery(user)
