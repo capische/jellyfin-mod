@@ -925,12 +925,13 @@ internal static class ApiSmoke
         http.BeforeResponse = null;
         Assert(slow.Status == HttpStatusCode.GatewayTimeout && !await OpenedLoadedAsync(),
             "A TMDB request that times out answers 504 and the list stays unloaded (P1.FU9): " + slow.Status);
+        // P1.FU14: the season's overview and each episode's rating come with the same requests.
         var openedSnapshot = (Func<Uri, HttpResponseMessage>)(uri =>
             uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
-                ? Json("""{"season_number":1,"episodes":[{"id":8841,"season_number":1,"episode_number":1,"name":"Pilot","air_date":"2021-03-01"},{"id":8842,"season_number":1,"episode_number":2,"name":"Second","air_date":"2021-03-08"}]}""")
+                ? Json("""{"season_number":1,"episodes":[{"id":8841,"season_number":1,"episode_number":1,"name":"Pilot","air_date":"2021-03-01","vote_average":7.46,"still_path":"/pilot.jpg","overview":"The pilot.","runtime":52},{"id":8842,"season_number":1,"episode_number":2,"name":"Second","air_date":"2021-03-08","vote_average":0}]}""")
             : uri.AbsolutePath.Contains("/season/2", StringComparison.Ordinal)
                 ? Json("""{"season_number":2,"episodes":[{"id":8843,"season_number":2,"episode_number":1,"name":"Return","air_date":"2022-03-01"}]}""")
-            : Json("""{"id":8840,"name":"Opened","seasons":[{"season_number":1,"name":"Season 1","episode_count":2},{"season_number":2,"name":"Season 2","episode_count":1}]}"""));
+            : Json("""{"id":8840,"name":"Opened","seasons":[{"season_number":1,"name":"Season 1","episode_count":2,"overview":"The first season.","poster_path":"/s1.jpg"},{"season_number":2,"name":"Season 2","episode_count":1}]}"""));
         http.Response = openedSnapshot;
         await using (var lease = await app.Services.GetRequiredService<ReconciliationLibraryLock>()
             .TryAcquireAsync(tvLibrary.Id, TimeSpan.FromSeconds(5), default))
@@ -985,6 +986,42 @@ internal static class ApiSmoke
         Assert(reopened.Status == HttpStatusCode.OK && reopened.Body.GetProperty("episodes").GetArrayLength() == 3 &&
             OpenedRequests().Length == 0,
             "Opening a loaded series again answers its list without asking TMDB (P1.FU9): " + string.Join(" | ", OpenedRequests()));
+        // P1.FU14: an episode Jellyfin has no item for is drawn like one it has, so the detail carries the season's overview and
+        // poster, the episode's still, overview and runtime, and TMDB's episode rating (an unrated episode has none).
+        static string Covers(JsonElement detail)
+        {
+            var metadata = detail.GetProperty("entry").GetProperty("metadata");
+            var season = metadata.GetProperty("seasons").EnumerateArray().Single(row => row.GetProperty("number").GetInt32() == 1);
+            var pilot = detail.GetProperty("episodes").EnumerateArray().Single(row => row.GetProperty("tmdbId").GetInt32() == 8841);
+            var ratings = metadata.GetProperty("episodeRatings");
+            return string.Join("|", season.GetProperty("overview").GetString(), season.GetProperty("posterPath").GetString(),
+                pilot.GetProperty("stillPath").GetString(), pilot.GetProperty("overview").GetString(),
+                pilot.GetProperty("runtimeMinutes").GetInt32(), ratings.ValueKind == JsonValueKind.Object
+                    ? string.Join(",", ratings.EnumerateObject().Select(rating => rating.Name + "=" + rating.Value.GetDouble()))
+                    : ratings.ValueKind.ToString());
+        }
+        const string expectedCovers = "The first season.|/s1.jpg|/pilot.jpg|The pilot.|52|8841=7.5";
+        Assert(Covers(reopened.Body) == expectedCovers,
+            "The loaded list carries the season overview and poster, the episode's still, overview, runtime and rating (P1.FU14): " +
+            Covers(reopened.Body));
+        // A list loaded before the series' metadata kept ratings is loaded once more by the next opening, and then not again.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var stale = await database.Entries.SingleAsync(entry => entry.Id == opened.Id);
+            stale.MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("series", 8840, "Opened", null, null, null, null, null, null,
+                false, null, null, [], [], [new TmdbSeason(1, "Season 1", 2, null, null), new TmdbSeason(2, "Season 2", 1, null, null)]));
+            await database.SaveChangesAsync();
+        }
+        Assert(await OpenedLoadedAsync(), "A list loaded before P1.FU14 still reads as loaded (P1.FU14)");
+        http.Requests.Clear();
+        var backfilled = await OpenAsync(ordinary, opened.Id);
+        var backfillRequests = OpenedRequests().Length;
+        http.Requests.Clear();
+        var settled = await OpenAsync(ordinary, opened.Id);
+        Assert(backfilled.Status == HttpStatusCode.OK && backfillRequests > 0 && Covers(backfilled.Body) == expectedCovers &&
+            backfilled.Body.GetProperty("episodes").GetArrayLength() == 3 && settled.Status == HttpStatusCode.OK && OpenedRequests().Length == 0,
+            "Opening a series whose list predates P1.FU14 loads it once more and fills the overviews and ratings, then answers " +
+            $"without TMDB (P1.FU14): {backfilled.Status} {backfillRequests} {Covers(backfilled.Body)} then {OpenedRequests().Length}");
 
         // The administrator's Refresh still refreshes a loaded list, and stays administrator-only.
         Assert((await ordinary.PostAsync($"/JellyfinMod/Entries/{opened.Id}/Refresh", null)).StatusCode == HttpStatusCode.Forbidden,

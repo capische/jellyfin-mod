@@ -129,7 +129,8 @@ public sealed class EntriesController(
             {
                 MediaType = request.MediaType, TmdbId = request.TmdbId, TargetLibraryId = request.TargetLibraryId,
                 Title = metadata.Title, Year = metadata.PremiereDate?.Year, ImdbId = metadata.ImdbId,
-                Overview = metadata.Overview, PosterPath = metadata.PosterPath, MetadataJson = JsonSerializer.Serialize(metadata),
+                Overview = metadata.Overview, PosterPath = metadata.PosterPath,
+                MetadataJson = JsonSerializer.Serialize(request.MediaType == "series" ? metadata.WithEpisodeRatings(episodes) : metadata),
                 JellyfinItemId = owned?.Id, State = owned is null ? FileState.None : FileState.OnDisk,
                 NativeRating = owned is null ? null : owned.CustomRating ?? owned.OfficialRating,
                 NativeTagsJson = owned is null ? null
@@ -205,7 +206,8 @@ public sealed class EntriesController(
     private sealed record ListLoadFailure(int Status, string? Title, string? Type = null);
 
     /// <summary>
-    /// Loads a series' full TMDB season and episode list the first time anyone who may see the entry opens it (P1.FU9).
+    /// Loads a series' full TMDB season and episode list the first time anyone who may see the entry opens it (P1.FU9),
+    /// and once more for a list loaded before the series' metadata kept season overviews and episode ratings (P1.FU14).
     /// Once the list is loaded, or for a movie, it answers the detail unchanged without asking TMDB; keeping a loaded
     /// list current stays the administrator's Refresh.
     /// </summary>
@@ -219,7 +221,7 @@ public sealed class EntriesController(
         // Exactly who may read the entry detail (GET Entries/{id}).
         if (entry is null || !access.CanRead(user, entry) &&
             !(!access.IsLiveLibrary(entry.TargetLibraryId) && await IsAdministratorAsync())) return NotFound();
-        if (entry.MediaType != "series" || entry.TargetLibraryId is null || await EpisodeListLoadedAsync(id, cancellationToken))
+        if (entry.MediaType != "series" || entry.TargetLibraryId is null || await EpisodeListCurrentAsync(id, cancellationToken))
             return await BuildDetail(entry, cancellationToken);
 
         var load = new TaskCompletionSource<ListLoadFailure?>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -259,13 +261,21 @@ public sealed class EntriesController(
         await database.History.AnyAsync(record => record.EntryId == id &&
             record.EventType == SeriesMetadataRefresher.EpisodeListEvent, cancellationToken);
 
+    /// <summary>
+    /// Whether a series' list is loaded and its stored metadata has the episode ratings (P1.FU14): a list loaded before
+    /// then is loaded once more, which also brings the season overviews.
+    /// </summary>
+    private async Task<bool> EpisodeListCurrentAsync(Guid id, CancellationToken cancellationToken) =>
+        await EpisodeListLoadedAsync(id, cancellationToken) && SeriesMetadataRefresher.HasEpisodeRatings(await database.Entries
+            .AsNoTracking().Where(entry => entry.Id == id).Select(entry => entry.MetadataJson).SingleOrDefaultAsync(cancellationToken));
+
     /// <summary>Runs the Refresh's own load once, unless a load that just finished already did it.</summary>
     private async Task<ListLoadFailure?> LoadEpisodeListAsync(Guid id)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         try
         {
-            if (await EpisodeListLoadedAsync(id, timeout.Token)) return null;
+            if (await EpisodeListCurrentAsync(id, timeout.Token)) return null;
             var outcome = await new SeriesMetadataRefresher(database, tmdb, libraryLock, retentionGate, reconciliation, writeBudget, access)
                 .RefreshAsync(id, timeout.Token);
             return outcome switch

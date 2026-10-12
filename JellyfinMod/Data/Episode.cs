@@ -23,6 +23,11 @@ public sealed class Episode
     public DateTime? AirDate { get; set; }
     /// <summary>Gets or sets the duration in minutes when known.</summary>
     public int? RuntimeMinutes { get; set; }
+    /// <summary>
+    /// Gets or sets TMDB's episode rating as read from a season, never stored on the row: the series' metadata keeps it
+    /// (<c>episodeRatings</c>, P1.FU14), so no column is needed.
+    /// </summary>
+    public double? VoteAverage { get; set; }
     /// <summary>Gets or sets whether future acquisition should monitor this episode.</summary>
     public bool Monitored { get; set; } = true;
     /// <summary>Gets or sets the current file availability.</summary>

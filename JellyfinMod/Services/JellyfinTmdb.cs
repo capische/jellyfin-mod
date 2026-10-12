@@ -87,7 +87,7 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
             {
                 TmdbId = item.Id, SeasonNumber = seasonNumber, EpisodeNumber = number,
                 Title = string.IsNullOrEmpty(item.Name) ? $"Episode {number}" : item.Name, Overview = item.Overview,
-                StillPath = item.StillPath, RuntimeMinutes = item.Runtime, AirDate = Day(item.AirDate)
+                StillPath = item.StillPath, RuntimeMinutes = item.Runtime, VoteAverage = item.VoteAverage, AirDate = Day(item.AirDate)
             });
         }
     }
@@ -164,7 +164,7 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
             (series.ContentRatings?.Results ?? []).Where(rating => rating.Iso_3166_1 is not null && !string.IsNullOrEmpty(rating.Rating))
                 .Select(rating => new TmdbCertification(rating.Iso_3166_1!, rating.Rating!)).Distinct().ToArray(),
             (series.Seasons ?? []).Select(season => new TmdbSeason(season.SeasonNumber, season.Name ?? string.Empty, season.EpisodeCount,
-                season.AirDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), season.PosterPath)).ToArray(),
+                season.AirDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), season.PosterPath, season.Overview)).ToArray(),
             series.OriginalName);
     }
 

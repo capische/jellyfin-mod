@@ -38,6 +38,25 @@ public sealed class SeriesMetadataRefresher(
     public const string EpisodeListEvent = "episodes_listed";
 
     /// <summary>
+    /// Whether a series' stored metadata has its episode ratings and season overviews (P1.FU14): metadata stored before
+    /// then has no <c>episodeRatings</c> at all, while a series TMDB rates no episode of has an empty set.
+    /// </summary>
+    public static bool HasEpisodeRatings(string? metadataJson)
+    {
+        if (metadataJson is null) return false;
+        try
+        {
+            using var json = JsonDocument.Parse(metadataJson);
+            return json.RootElement.ValueKind == JsonValueKind.Object &&
+                json.RootElement.TryGetProperty("episodeRatings", out var ratings) && ratings.ValueKind == JsonValueKind.Object;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Whether a position-identity episode and the TMDB episode listed at its position are evidently the same episode:
     /// the same title ignoring case, punctuation and spacing, or the same air date within a day where no other listed
     /// episode airs that close (RET-R2, RET3-R5).
@@ -241,7 +260,7 @@ public sealed class SeriesMetadataRefresher(
             entry.ImdbId = metadata.ImdbId;
             entry.Overview = metadata.Overview;
             entry.PosterPath = metadata.PosterPath;
-            entry.MetadataJson = JsonSerializer.Serialize(metadata);
+            entry.MetadataJson = JsonSerializer.Serialize(metadata.WithEpisodeRatings(snapshot));
             await database.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             nativeSeriesId = entry.JellyfinItemId;

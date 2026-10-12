@@ -204,7 +204,7 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             {
                 TmdbId = id.Value, SeasonNumber = seasonNumber, EpisodeNumber = number.Value,
                 Title = Text(item, "name") ?? $"Episode {number}", Overview = Text(item, "overview"),
-                StillPath = Text(item, "still_path"), RuntimeMinutes = Number(item, "runtime"),
+                StillPath = Text(item, "still_path"), RuntimeMinutes = Number(item, "runtime"), VoteAverage = Decimal(item, "vote_average"),
                 AirDate = DateTime.TryParseExact(Text(item, "air_date"), "yyyy-MM-dd", CultureInfo.InvariantCulture,
                     DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var date) ? date : null
             });
@@ -326,14 +326,16 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             premiere, Text(item, "overview"), Text(item, "poster_path"), Text(item, "backdrop_path"),
             Text(item, "imdb_id") ?? Text(externalIds, "imdb_id"), Number(externalIds, "tvdb_id"),
             item.TryGetProperty("adult", out var adult) && adult.ValueKind == JsonValueKind.True,
-            item.TryGetProperty("vote_average", out var score) && score.ValueKind == JsonValueKind.Number && score.TryGetDouble(out var number) ? number : null,
+            Decimal(item, "vote_average"),
             Number(item, "runtime"), Array(item, "genres").Select(g => Text(g, "name")).OfType<string>().ToArray(),
             certifications.Distinct().ToArray(), Array(item, "seasons").Select(s => new TmdbSeason(Number(s, "season_number") ?? 0,
-                Text(s, "name") ?? string.Empty, Number(s, "episode_count") ?? 0, Text(s, "air_date"), Text(s, "poster_path"))).ToArray(),
+                Text(s, "name") ?? string.Empty, Number(s, "episode_count") ?? 0, Text(s, "air_date"), Text(s, "poster_path"),
+                Text(s, "overview"))).ToArray(),
             Text(item, mediaType == "movie" ? "original_title" : "original_name"));
     }
 
     private static string? Text(JsonElement item, string name) => item.ValueKind == JsonValueKind.Object && item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+    private static double? Decimal(JsonElement item, string name) => item.ValueKind == JsonValueKind.Object && item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var number) ? number : null;
     private static int? Number(JsonElement item, string name) => item.ValueKind == JsonValueKind.Object && item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number) ? number : null;
     private static IEnumerable<JsonElement> Array(JsonElement item, string name) => item.ValueKind == JsonValueKind.Object && item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Array ? value.EnumerateArray() : [];
 }
@@ -359,7 +361,20 @@ public sealed record TmdbMetadata(
     [property: JsonPropertyName("genres")] string[] Genres,
     [property: JsonPropertyName("certifications")] TmdbCertification[] Certifications,
     [property: JsonPropertyName("seasons")] TmdbSeason[] Seasons,
-    [property: JsonPropertyName("originalTitle")] string? OriginalTitle = null);
+    [property: JsonPropertyName("originalTitle")] string? OriginalTitle = null,
+    [property: JsonPropertyName("episodeRatings")] IReadOnlyDictionary<int, double>? EpisodeRatings = null)
+{
+    /// <summary>
+    /// The series with TMDB's rating of each listed episode, by TMDB episode id (P1.FU14): an episode Jellyfin has no item
+    /// for shows it as a native episode shows its community rating. Kept here, not on the episode rows, so no column is
+    /// needed. A series whose stored metadata has none was loaded before ratings were kept.
+    /// </summary>
+    public TmdbMetadata WithEpisodeRatings(IEnumerable<Episode> episodes) => this with
+    {
+        EpisodeRatings = episodes.Where(episode => episode.TmdbId > 0 && episode.VoteAverage is > 0)
+            .GroupBy(episode => episode.TmdbId).ToDictionary(group => group.Key, group => Math.Round(group.First().VoteAverage!.Value, 1))
+    };
+}
 
 /// <summary>A regional parental certification.</summary>
 public sealed record TmdbCertification(
@@ -372,7 +387,8 @@ public sealed record TmdbSeason(
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("episodeCount")] int EpisodeCount,
     [property: JsonPropertyName("airDate")] string? AirDate,
-    [property: JsonPropertyName("posterPath")] string? PosterPath);
+    [property: JsonPropertyName("posterPath")] string? PosterPath,
+    [property: JsonPropertyName("overview")] string? Overview = null);
 
 /// <summary>A sanitized failure safe to return to an authenticated client.</summary>
 public sealed class TmdbException(string message, HttpStatusCode statusCode, string code = "tmdb_error") : Exception(message)

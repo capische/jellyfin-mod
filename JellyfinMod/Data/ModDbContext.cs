@@ -135,6 +135,7 @@ public class ModDbContext : DbContext
             e.HasIndex(x => new { x.EntryId, x.SeasonNumber, x.EpisodeNumber }, "IX_Episodes_EntryId_Position")
                 .IsUnique().HasFilter("\"TmdbId\" = 0");
             e.Ignore(x => x.IsPositionIdentity);
+            e.Ignore(x => x.VoteAverage);
             e.HasOne<Entry>().WithMany().HasForeignKey(x => x.EntryId).OnDelete(DeleteBehavior.Cascade);
         });
 
