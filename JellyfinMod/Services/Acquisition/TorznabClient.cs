@@ -46,7 +46,8 @@ public sealed record TorznabItem(
     int? Season,
     int? Episode,
     string? Language = null,
-    string? Subs = null);
+    string? Subs = null,
+    string? Comments = null);
 
 /// <summary>One fetched feed page.</summary>
 public sealed record TorznabPage(IReadOnlyList<TorznabItem> Items, int? Offset, int? Total);
@@ -149,7 +150,9 @@ public sealed class TorznabClient(IHttpClientFactory clients, ILogger<TorznabCli
                 Int(Attribute("season")),
                 Int(Attribute("episode")),
                 Attribute("language") ?? Attribute("languages"),
-                Attribute("subs") ?? Attribute("subtitles")));
+                Attribute("subs") ?? Attribute("subtitles"),
+                // The release's page on the tracker (Torznab's RSS comments element); checked before anyone sees it.
+                ((string?)item.Element("comments"))?.Trim()));
         }
 
         return new TorznabPage(items, Int((string?)response?.Attribute("offset")), Int((string?)response?.Attribute("total")));

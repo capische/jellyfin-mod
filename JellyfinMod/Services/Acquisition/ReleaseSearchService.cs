@@ -416,12 +416,14 @@ public sealed class ReleaseSearchService(
         }
 
         // Every query's rows evaluated with the identity they were found by; a release listed by two queries counts once.
+        var apiKey = endpoint.ApiKey;
         List<ReleaseCandidate> EvaluateAll()
         {
             var all = new List<ReleaseCandidate>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var (rows, rowsIdentity, rowsMethod) in answered.Append((items, identity, method)))
-                all.AddRange(Evaluate(indexer, rows.Where(row => seen.Add(row.Guid)), target, profile, rowsIdentity, rowsMethod, allowedHosts));
+                all.AddRange(Evaluate(indexer, rows.Where(row => seen.Add(row.Guid)), target, profile, rowsIdentity, rowsMethod, allowedHosts,
+                    apiKey));
             return all;
         }
 
@@ -474,7 +476,7 @@ public sealed class ReleaseSearchService(
                 // An episode or a title stops at the first query that found rows. A pack stops at the first that found an eligible
                 // pack: a season id search can answer with single episodes only while "Season 2" lists the pack, and every
                 // further query still takes a unit of the indexer's budget and its pacing.
-                if (budgetStopped || items.Count > 0 && (!pack || Evaluate(indexer, items, target, profile, identity, method, allowedHosts)
+                if (budgetStopped || items.Count > 0 && (!pack || Evaluate(indexer, items, target, profile, identity, method, allowedHosts, apiKey)
                         .Any(candidate => candidate.Evaluation.Eligible)))
                     break;
             }
@@ -592,7 +594,7 @@ public sealed class ReleaseSearchService(
     }
 
     private static List<ReleaseCandidate> Evaluate(AcquisitionIndexer indexer, IEnumerable<TorznabItem> items, ReleaseTarget target,
-        EvaluationProfile profile, SearchIdentity identity, string method, IReadOnlySet<string> allowedHosts)
+        EvaluationProfile profile, SearchIdentity identity, string method, IReadOnlySet<string> allowedHosts, string? apiKey)
     {
         var candidates = new List<ReleaseCandidate>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -635,10 +637,35 @@ public sealed class ReleaseSearchService(
                 : Math.Max(indexer.MinimumSeedMinutes ?? 0, itemMinutes ?? 0);
             candidates.Add(new ReleaseCandidate(ReleaseId(indexer.Id, item.Guid), indexer.Id, indexer.Name, indexer.Priority,
                 indexer.Revision, item.Guid, item.Title, parsed, item.Size, item.Seeders, item.Peers, item.PublishedAt, freeleech,
-                hash, evaluation, ratio, minutes, method, allowedHosts, item.DownloadUrl, item.MagnetUrl));
+                hash, evaluation, ratio, minutes, method, allowedHosts, item.DownloadUrl, item.MagnetUrl, PageUrl(item, apiKey)));
         }
 
         return candidates;
+    }
+
+    /// <summary>Query parameter names that carry a credential: apikey, passkey, rsskey, torrent_pass, token, auth and the like.</summary>
+    private static readonly string[] CredentialNames = ["key", "pass", "token", "auth", "secret", "sid", "session"];
+
+    /// <summary>
+    /// The release's page on the tracker, for a person to open in the release picker (2026-10-12): Torznab's <c>comments</c>, else
+    /// a <c>guid</c> that is a web address. Only http(s), and never a URL that can carry a credential: one with user information,
+    /// a credential-like query parameter, the indexer's own API key anywhere in it, or the download link itself (Jackett and some
+    /// Prowlarr definitions put the passkey download link in the guid). Null when nothing qualifies.
+    /// </summary>
+    private static string? PageUrl(TorznabItem item, string? apiKey)
+    {
+        foreach (var value in new[] { item.Comments, item.Guid })
+        {
+            if (string.IsNullOrEmpty(value) || value.Length > 2048 || value == item.DownloadUrl) continue;
+            if (!Uri.TryCreate(value, UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https")) continue;
+            if (url.UserInfo.Length > 0 || (!string.IsNullOrEmpty(apiKey) && value.Contains(apiKey, StringComparison.OrdinalIgnoreCase))) continue;
+            var names = url.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries)
+                .Select(pair => Uri.UnescapeDataString(pair.Split('=')[0]).ToLowerInvariant());
+            if (names.Any(name => CredentialNames.Any(part => name.Contains(part, StringComparison.Ordinal)))) continue;
+            return value;
+        }
+
+        return null;
     }
 
     private static double? Max(double? left, double? right) =>

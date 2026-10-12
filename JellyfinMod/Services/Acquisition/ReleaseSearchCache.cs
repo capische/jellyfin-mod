@@ -25,7 +25,9 @@ public sealed record ReleaseCandidate(
     IReadOnlySet<string> AllowedHosts,
     // Server-only; never serialized. May embed a passkey.
     string? DownloadUrl,
-    string? MagnetUrl);
+    string? MagnetUrl,
+    // The release's page on the tracker, for a person to open; never one that carries a credential (ReleaseSearchService.PageUrl).
+    string? DetailsUrl = null);
 
 /// <summary>The per-indexer outcome of one search.</summary>
 public sealed record IndexerOutcome(

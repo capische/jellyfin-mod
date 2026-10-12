@@ -132,7 +132,8 @@ public sealed record ReleaseCandidateDto(
     [property: JsonPropertyName("seedRatio"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? SeedRatio,
     [property: JsonPropertyName("seedMinutes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeedMinutes,
     [property: JsonPropertyName("heldQuality")] bool HeldQuality = false,
-    [property: JsonPropertyName("coverage"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] PackCoverageDto? Coverage = null);
+    [property: JsonPropertyName("coverage"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] PackCoverageDto? Coverage = null,
+    [property: JsonPropertyName("detailsUrl"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? DetailsUrl = null);
 
 /// <summary>The response of <c>GET /JellyfinMod/Releases</c>.</summary>
 public sealed record ReleaseSearchDto(
@@ -172,7 +173,7 @@ public sealed record ReleaseSearchDto(
                 candidate.Evaluation.Score, candidate.Evaluation.Contributions, candidate.Evaluation.Eligible,
                 candidate.Evaluation.Rejections, candidate.SeedRatio, candidate.SeedMinutes,
                 candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality),
-                PackCoverageDto.For(target, candidate.Parsed))).ToArray(),
+                PackCoverageDto.For(target, candidate.Parsed), candidate.DetailsUrl)).ToArray(),
             snapshot.Candidates.Count(candidate => candidate.Evaluation.Eligible),
             snapshot.Candidates.Count(candidate => !candidate.Evaluation.Eligible),
             snapshot.Indexers.Select(outcome => new IndexerOutcomeDto(outcome.IndexerId, outcome.Name, outcome.Status,

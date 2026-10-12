@@ -142,11 +142,15 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
     secrets.Add(good.ApiKey);
     Dictionary<string, string> Attributes(params (string, string)[] values) => values.ToDictionary(value => value.Item1, value => value.Item2);
     good.MovieItems.AddRange([
+        // The release's page (release picker, 2026-10-12): comments wins; one carrying a passkey or the indexer's API key is
+        // dropped, and a guid that is a web address stands in.
         new("Example.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP", "good-a", dl("movie"), 4_000_000_000, 50,
-            Attributes(("imdbid", "0000100"), ("language", "English, French"), ("subs", "German"))),
+            Attributes(("imdbid", "0000100"), ("language", "English, French"), ("subs", "German")), "https://tracker.example/torrent/100"),
         new("Example.Movie.2024.2160p.BluRay.REMUX.HEVC.TrueHD.Atmos-GRP", "good-b", dl("missing"), 60_000_000_000, 20, []),
-        new("Example.Movie.2024.720p.WEBRip.x264-GRP", "good-c", dl("webrip"), 1_200_000_000, 5, Attributes(("downloadvolumefactor", "0"))),
-        new("Example.Movie.2024.HDCAM.x264-BAD", "good-d", dl("missing"), 1_000_000_000, 900, []),
+        new("Example.Movie.2024.720p.WEBRip.x264-GRP", "good-c", dl("webrip"), 1_200_000_000, 5, Attributes(("downloadvolumefactor", "0")),
+            $"https://tracker.example/details.php?id=3&passkey={passkey}"),
+        new("Example.Movie.2024.HDCAM.x264-BAD", "https://tracker.example/torrent/good-d", dl("missing"), 1_000_000_000, 900, [],
+            $"https://tracker.example/t/4?x={good.ApiKey}"),
         new("Other.Film.2019.1080p.WEB-DL-GRP", "good-e", dl("missing"), 4_000_000_000, 10, Attributes(("imdbid", "9999999"))),
         new("Example.Movie.2024.1080p.WEB-DL-EVIL", "good-f", new Uri(canary.Address, "/torrent").ToString(), 4_000_000_000, 10, []),
         new("Example.Movie.2024.1080p.BluRay.x264-REDIR", "good-g", dl("bounce"), 8_000_000_000, 10, []),
@@ -154,7 +158,7 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             Attributes(("magneturl", $"magnet:?xt=urn:btih:{properBase32}&dn=proper"))),
         new("Example.Movie.2024.1080p.WEB-DL-V2", "good-i", null, 4_000_000_000, 30,
             Attributes(("magneturl", "magnet:?xt=urn:btmh:1220" + new string('a', 64)))),
-        new("Example.Movie.2024.1080p.BluRay.x265-HYB", "good-j", dl("hybrid"), 5_000_000_000, 40, [])
+        new("Example.Movie.2024.1080p.BluRay.x265-HYB", "https://tracker.example/torrent/good-j", dl("hybrid"), 5_000_000_000, 40, [])
     ]);
     good.TvItems.AddRange([
         new("Example.Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP", "tv-1", dl("e1"), 1_500_000_000, 40, Attributes(("tvdbid", "300"))),
@@ -519,6 +523,18 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         var proper = byTitle["Example.Movie.2024.1080p.WEB-DL.PROPER-GRP2"];
         Assert(proper.GetProperty("eligible").GetBoolean() && proper.GetProperty("proper").GetBoolean() &&
             proper.GetProperty("infoHash").GetString() == properHash, "A base32 magnet is normalized to a lower-case v1 hash");
+        // Release picker (2026-10-12): each row carries its page on the tracker for a person to open, from comments, else from a
+        // guid that is a web address, and never one that carries the passkey or the indexer's API key; null when there is none.
+        string? Details(string title) => byTitle[title].GetProperty("detailsUrl").GetString();
+        Assert(Details("Example.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP") == "https://tracker.example/torrent/100" &&
+            Details("Example.Movie.2024.1080p.BluRay.x265-HYB") == "https://tracker.example/torrent/good-j" &&
+            Details("Example.Movie.2024.HDCAM.x264-BAD") == "https://tracker.example/torrent/good-d" &&
+            Details("Example.Movie.2024.720p.WEBRip.x264-GRP") is null &&
+            Details("Example.Movie.2024.2160p.BluRay.REMUX.HEVC.TrueHD.Atmos-GRP") is null &&
+            Details("Example.Movie.2024.1080p.WEB-DL.PROPER-GRP2") is null &&
+            rows.All(row => row.TryGetProperty("detailsUrl", out _)) && !search.GetRawText().Contains(good.ApiKey, StringComparison.Ordinal),
+            "A release's page comes from comments, else an http guid, and never carries a passkey or the API key: " +
+            string.Join(", ", rows.Select(row => row.GetProperty("detailsUrl").GetString() ?? "null")));
         var eligible = rows.TakeWhile(row => row.GetProperty("eligible").GetBoolean()).ToArray();
         Assert(eligible.Length == search.GetProperty("eligibleCount").GetInt32() &&
             rows.Skip(eligible.Length).All(row => !row.GetProperty("eligible").GetBoolean()) &&
