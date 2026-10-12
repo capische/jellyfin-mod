@@ -344,6 +344,18 @@ public sealed class ImportService(
             changed = true;
         }
 
+        // A pack episode's own file is known as soon as the client lists the torrent's files, so it can download first
+        // (next-up priority, P5.FU1). A mapping that finds nothing changes nothing: completion decides as before.
+        var pack = episode is not null && await IsPackAsync(operation.GrabId, cancellationToken).ConfigureAwait(false);
+        if (pack && torrent.Files.Count > 0 && ImportPaths.FileIndex(torrent, operation.SourceClientPath) < 0 &&
+            (await MapPackAsync(operation, torrent, settings, cancellationToken).ConfigureAwait(false)).Files
+                .TryGetValue((episode!.SeasonNumber, episode.EpisodeNumber), out var own) &&
+            ImportPaths.ClientPath(torrent, own) is { } ownPath)
+        {
+            operation.SourceClientPath = ownPath;
+            changed = true;
+        }
+
         if (!torrent.Complete)
         {
             if (changed) await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
@@ -434,13 +446,7 @@ public sealed class ImportService(
         ImportFileChoice choice;
         if (ReleaseScopes.IsPack(grabScope) && episode is not null)
         {
-            // A pack's files are mapped to the episodes it claimed by their names (season and series packs, 2026-10-08).
-            var claimed = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == operation.GrabId)
-                .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id,
-                    (claim, value) => new { value.SeasonNumber, value.EpisodeNumber })
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var mapping = ImportFileSelector.MapPack(torrent, settings.VideoExtensions,
-                claimed.Select(value => (value.SeasonNumber, value.EpisodeNumber)).ToHashSet());
+            var mapping = await MapPackAsync(operation, torrent, settings, cancellationToken).ConfigureAwait(false);
             await RecordPackSkipsAsync(operation, mapping, cancellationToken).ConfigureAwait(false);
             if (mapping.Files.Count == 0 && mapping.Reason is { } packReason)
             {
@@ -468,7 +474,7 @@ public sealed class ImportService(
             return;
         }
 
-        var clientPath = ImportPaths.Normalize((torrent.DownloadDirectory ?? string.Empty).TrimEnd('/') + "/" + file.Name);
+        var clientPath = ImportPaths.ClientPath(torrent, file);
         var client = await database.AcquisitionDownloadClients.AsNoTracking()
             .SingleOrDefaultAsync(value => value.Id == operation.DownloadClientId, cancellationToken).ConfigureAwait(false);
         if (client is null)
@@ -529,6 +535,18 @@ public sealed class ImportService(
         operation.UpdatedAt = Now;
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         await LinkAsync(operation.Id, operation.TargetLibraryId, entry, episode, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>A pack's files mapped to the episodes it claimed, by their names (season and series packs, 2026-10-08).</summary>
+    private async Task<PackMapping> MapPackAsync(ImportOperation operation, ClientTorrentStatus torrent, AcquisitionSettings settings,
+        CancellationToken cancellationToken)
+    {
+        var claimed = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == operation.GrabId)
+            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id,
+                (claim, value) => new { value.SeasonNumber, value.EpisodeNumber })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return ImportFileSelector.MapPack(torrent, settings.VideoExtensions,
+            claimed.Select(value => (value.SeasonNumber, value.EpisodeNumber)).ToHashSet());
     }
 
     /// <summary>
