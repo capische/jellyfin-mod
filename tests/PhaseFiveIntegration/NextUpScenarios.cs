@@ -211,7 +211,9 @@ internal static class NextUpScenarios
             .ToDictionary(item => item.GetProperty("episodeNumber").GetInt32());
         Assert(packRow.GetProperty("state").GetString() == "downloading" && episodes[1].GetProperty("importState").GetString() == "completed" &&
             episodes[1].GetProperty("progress").GetDouble() == 1 && episodes[2].GetProperty("progress").GetDouble() == 0.4 &&
-            episodes[3].GetProperty("progress").GetDouble() == 0, "The pack row stays downloading; each episode shows its own progress: " +
+            episodes[3].GetProperty("progress").GetDouble() == 0 &&
+            episodes[2].GetProperty("sizeBytes").GetInt64() == transmission.Torrents[firstHash].Files[1].Length,
+            "The pack row stays downloading; each episode shows its own progress and file size: " +
             packRow.GetRawText());
 
         // Retention does not count the early episode's file as seeded while its torrent is incomplete: past its deadline, and with

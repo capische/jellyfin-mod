@@ -119,8 +119,9 @@ public static class QueueReadModel
             var progress = import is null ? null
                 : import.State is not (ImportStates.Waiting or ImportStates.Blocked) ? import.CompletedDownloadAt is not null ? 1 : null
                 : torrent is null ? null : FileProgress(torrent, import.SourceClientPath);
+            var file = torrent is null || import is null ? -1 : ImportPaths.FileIndex(torrent, import.SourceClientPath);
             return new QueuePackEpisodeDto(episode.Id, episode.SeasonNumber, episode.EpisodeNumber, import?.Id, import?.State, import?.Reason,
-                progress);
+                progress, file >= 0 ? torrent!.Files[file].Length : null);
         }).ToArray());
     }
 
