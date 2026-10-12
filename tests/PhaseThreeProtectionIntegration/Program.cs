@@ -63,6 +63,18 @@ app.MapGet("/3/{**path}", async context =>
         return;
     }
 
+    // P1.FU4: TMDB appends each requested season/N to the series response as a property of that name.
+    var appended = context.Request.Query["append_to_response"].ToString().Split(',')
+        .Where(item => item.StartsWith("season/", StringComparison.Ordinal)).ToArray();
+    if (appended.Length > 0)
+    {
+        var series = System.Text.Json.Nodes.JsonNode.Parse(json)!.AsObject();
+        foreach (var item in appended)
+            if (TmdbFixtures.Responses.TryGetValue(path + "/" + item, out var season))
+                series[item] = System.Text.Json.Nodes.JsonNode.Parse(season);
+        json = series.ToJsonString();
+    }
+
     context.Response.ContentType = "application/json";
     await context.Response.WriteAsync(json);
 });

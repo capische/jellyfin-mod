@@ -217,6 +217,10 @@ internal sealed class BoundaryHttpFactory : IHttpClientFactory
     public Uri BaseAddress { get; set; } = null!;
     public Func<Uri, HttpResponseMessage>? Response { get; set; }
     public Func<Uri, Task>? BeforeResponse { get; set; }
+    /// <summary>Every TMDB request the boundary answered: its path and what it appended, never its credential (P1.FU4).</summary>
+    public System.Collections.Concurrent.ConcurrentQueue<string> Requests { get; } = new();
+    /// <summary>Seasons the boundary leaves out of an appended series response, as TMDB occasionally does (P1.FU4).</summary>
+    public Func<int, bool>? OmitAppendedSeason { get; set; }
     public string? LastAuthorization { get; set; }
     public string? LastApiKey { get; set; }
     public HttpClient CreateClient(string name) => new(new BoundaryRedirect(BaseAddress));

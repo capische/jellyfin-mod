@@ -80,37 +80,66 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         return new TmdbPage(results, page < Math.Min(Number(root, "total_pages") ?? 0, 500));
     }
 
+    /// <summary>The most objects TMDB appends to one response (<c>append_to_response</c>).</summary>
+    private const int MaxAppendedSeasons = 20;
+
     /// <summary>Fetches all known season episodes before a series add commits any rows.</summary>
+    /// <remarks>
+    /// One request reads up to twenty seasons, appended to the series (P1.FU4), instead of one request per season. A season
+    /// TMDB leaves out of an appended response is read on its own, so an occasional omission never fails the series.
+    /// </remarks>
     public async Task<IReadOnlyList<Episode>> GetEpisodesAsync(TmdbMetadata series, CancellationToken cancellationToken)
     {
         if (series.MediaType != "series") return [];
         var episodes = new ConcurrentBag<Episode>();
-        await Parallel.ForEachAsync(series.Seasons, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken }, async (season, token) =>
-        {
-            using var json = await GetAsync($"tv/{series.TmdbId}/season/{season.Number}", token);
-            if (!json.RootElement.TryGetProperty("episodes", out var episodeArray) || episodeArray.ValueKind != JsonValueKind.Array ||
-                (json.RootElement.TryGetProperty("season_number", out _) && Number(json.RootElement, "season_number") != season.Number))
-                throw new TmdbException("TMDB returned incomplete season metadata.", HttpStatusCode.BadGateway);
-            foreach (var item in episodeArray.EnumerateArray())
+        var omitted = new ConcurrentBag<int>();
+        var parallel = new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken };
+        await Parallel.ForEachAsync(series.Seasons.Select(season => season.Number).Chunk(MaxAppendedSeasons), parallel,
+            async (numbers, token) =>
             {
-                var id = Number(item, "id");
-                var number = Number(item, "episode_number");
-                if (id is not > 0 || number is not > 0 || Number(item, "season_number") != season.Number)
-                    throw new TmdbException("TMDB returned incomplete episode metadata.", HttpStatusCode.BadGateway);
-                episodes.Add(new Episode
+                using var json = await GetAsync($"tv/{series.TmdbId}?append_to_response=" +
+                    string.Join(",", numbers.Select(number => $"season/{number}")), token);
+                foreach (var number in numbers)
                 {
-                    TmdbId = id.Value, SeasonNumber = season.Number, EpisodeNumber = number.Value,
-                    Title = Text(item, "name") ?? $"Episode {number}", Overview = Text(item, "overview"),
-                    StillPath = Text(item, "still_path"), RuntimeMinutes = Number(item, "runtime"),
-                    AirDate = DateTime.TryParseExact(Text(item, "air_date"), "yyyy-MM-dd", CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var date) ? date : null
-                });
-            }
+                    if (json.RootElement.TryGetProperty($"season/{number}", out var season) && season.ValueKind != JsonValueKind.Null)
+                        ReadSeason(season, number, episodes);
+                    else
+                        omitted.Add(number);
+                }
+            });
+        await Parallel.ForEachAsync(omitted, parallel, async (number, token) =>
+        {
+            using var json = await GetAsync($"tv/{series.TmdbId}/season/{number}", token);
+            ReadSeason(json.RootElement, number, episodes);
         });
 
         if (episodes.DistinctBy(e => e.TmdbId).Count() != episodes.Count || episodes.DistinctBy(e => (e.SeasonNumber, e.EpisodeNumber)).Count() != episodes.Count)
             throw new TmdbException("TMDB returned conflicting episode identities.", HttpStatusCode.BadGateway);
         return episodes.OrderBy(episode => episode.SeasonNumber).ThenBy(episode => episode.EpisodeNumber).ToArray();
+    }
+
+    /// <summary>Reads one season's episodes, appended or on its own; incomplete or mismatched metadata fails the series.</summary>
+    private static void ReadSeason(JsonElement season, int seasonNumber, ConcurrentBag<Episode> episodes)
+    {
+        if (season.ValueKind != JsonValueKind.Object || !season.TryGetProperty("episodes", out var episodeArray) ||
+            episodeArray.ValueKind != JsonValueKind.Array ||
+            (season.TryGetProperty("season_number", out _) && Number(season, "season_number") != seasonNumber))
+            throw new TmdbException("TMDB returned incomplete season metadata.", HttpStatusCode.BadGateway);
+        foreach (var item in episodeArray.EnumerateArray())
+        {
+            var id = Number(item, "id");
+            var number = Number(item, "episode_number");
+            if (id is not > 0 || number is not > 0 || Number(item, "season_number") != seasonNumber)
+                throw new TmdbException("TMDB returned incomplete episode metadata.", HttpStatusCode.BadGateway);
+            episodes.Add(new Episode
+            {
+                TmdbId = id.Value, SeasonNumber = seasonNumber, EpisodeNumber = number.Value,
+                Title = Text(item, "name") ?? $"Episode {number}", Overview = Text(item, "overview"),
+                StillPath = Text(item, "still_path"), RuntimeMinutes = Number(item, "runtime"),
+                AirDate = DateTime.TryParseExact(Text(item, "air_date"), "yyyy-MM-dd", CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var date) ? date : null
+            });
+        }
     }
 
     private async Task<string?> StoredTokenRefAsync(CancellationToken cancellationToken)

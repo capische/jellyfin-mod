@@ -120,11 +120,32 @@ internal static class ApiSmoke
                 return;
             }
             var uri = new Uri("https://api.themoviedb.org" + context.Request.Path + context.Request.QueryString);
+            http.Requests.Enqueue(context.Request.Path + "?append_to_response=" + context.Request.Query["append_to_response"]);
             if (http.BeforeResponse is not null) await http.BeforeResponse(uri);
-            using var fixture = http.Response?.Invoke(uri) ?? new HttpResponseMessage(http.Status) { Content = new StringContent(http.Body) };
+            HttpResponseMessage Fixture(Uri target) =>
+                http.Response?.Invoke(target) ?? new HttpResponseMessage(http.Status) { Content = new StringContent(http.Body) };
+            using var fixture = Fixture(uri);
+            var body = await fixture.Content.ReadAsStringAsync();
+            // P1.FU4: TMDB appends each requested season/N to the series response as a property of that name, and leaves out
+            // a season it cannot read; the per-season route above stays for the client's fallback.
+            var appended = context.Request.Query["append_to_response"].ToString().Split(',')
+                .Where(item => item.StartsWith("season/", StringComparison.Ordinal)).ToArray();
+            if (fixture.IsSuccessStatusCode && appended.Length > 0)
+            {
+                var series = System.Text.Json.Nodes.JsonNode.Parse(body)!.AsObject();
+                foreach (var item in appended)
+                {
+                    if (http.OmitAppendedSeason?.Invoke(int.Parse(item["season/".Length..], System.Globalization.CultureInfo.InvariantCulture)) == true)
+                        continue;
+                    using var season = Fixture(new Uri("https://api.themoviedb.org" + context.Request.Path + "/" + item + "?language=en-US"));
+                    if (season.IsSuccessStatusCode)
+                        series[item] = System.Text.Json.Nodes.JsonNode.Parse(await season.Content.ReadAsStringAsync());
+                }
+                body = series.ToJsonString();
+            }
             context.Response.StatusCode = (int)fixture.StatusCode;
             context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(await fixture.Content.ReadAsStringAsync());
+            await context.Response.WriteAsync(body);
         });
         await app.Services.GetRequiredService<DatabaseInitializer>().StartAsync(default);
         Console.WriteLine("HTTP smoke: starting isolated loopback host");
@@ -817,6 +838,83 @@ internal static class ApiSmoke
             database.History.RemoveRange(database.History.Where(history => history.EntryId == discovered.Id));
             await database.SaveChangesAsync();
         }
+
+        // P1.FU4: a series' seasons arrive appended to one request, up to twenty seasons each, instead of one request per
+        // season; a season TMDB leaves out is read on its own.
+        Func<Uri, HttpResponseMessage> ManySeasons(int tmdbId, int seasons) => uri =>
+        {
+            var marker = "/season/";
+            var at = uri.AbsolutePath.IndexOf(marker, StringComparison.Ordinal);
+            if (at < 0)
+                return Json(JsonSerializer.Serialize(new Dictionary<string, object>
+                {
+                    ["id"] = tmdbId, ["name"] = "Long running " + tmdbId,
+                    ["seasons"] = Enumerable.Range(1, seasons).Select(number => new Dictionary<string, object>
+                        { ["season_number"] = number, ["name"] = "Season " + number, ["episode_count"] = 2 }).ToArray()
+                }));
+            var season = int.Parse(uri.AbsolutePath[(at + marker.Length)..], System.Globalization.CultureInfo.InvariantCulture);
+            return Json(JsonSerializer.Serialize(new Dictionary<string, object>
+            {
+                ["season_number"] = season,
+                ["episodes"] = Enumerable.Range(1, 2).Select(number => new Dictionary<string, object>
+                {
+                    ["id"] = tmdbId * 100 + season * 10 + number, ["season_number"] = season, ["episode_number"] = number,
+                    ["name"] = $"S{season}E{number}"
+                }).ToArray()
+            }));
+        };
+
+        async Task<(Guid EntryId, string[] Requests)> AddManySeasonsAsync(int tmdbId, int seasons)
+        {
+            http.Response = ManySeasons(tmdbId, seasons);
+            http.Requests.Clear();
+            using var added = await client.PostAsJsonAsync("/JellyfinMod/Entries", new { mediaType = "series", tmdbId, targetLibraryId = tvLibrary.Id });
+            var body = await added.Content.ReadAsStringAsync();
+            Assert(added.IsSuccessStatusCode, $"A {seasons}-season series is added: {(int)added.StatusCode} {body}");
+            using var json = JsonDocument.Parse(body);
+            var entryId = Guid.Parse(json.RootElement.GetProperty("entry").GetProperty("id").GetString()!);
+            await using var database = new ModDbContext(dbPath);
+            var rows = await database.Episodes.AsNoTracking().Where(episode => episode.EntryId == entryId).ToListAsync();
+            Assert(rows.Count == seasons * 2 && rows.Select(row => row.SeasonNumber).Distinct().Count() == seasons,
+                $"Every season's episodes of a {seasons}-season series are stored: {rows.Count}");
+            return (entryId, http.Requests.Where(request => request.StartsWith("/3/tv/" + tmdbId, StringComparison.Ordinal)).ToArray());
+        }
+
+        async Task RemoveEntryAsync(Guid entryId)
+        {
+            await using var database = new ModDbContext(dbPath);
+            database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == entryId));
+            database.History.RemoveRange(database.History.Where(history => history.EntryId == entryId));
+            await database.SaveChangesAsync();
+        }
+
+        var (threeSeasons, threeRequests) = await AddManySeasonsAsync(8830, 3);
+        Assert(threeRequests.Length == 2 && threeRequests.Count(request => request.Contains("season/1,season/2,season/3", StringComparison.Ordinal)) == 1 &&
+            !threeRequests.Any(request => request.Contains("/season/", StringComparison.Ordinal)),
+            "A three-season series is read with the series details and one request for every season (P1.FU4): " + string.Join(" | ", threeRequests));
+        http.OmitAppendedSeason = season => season == 2;
+        http.Requests.Clear();
+        using (var refreshedOmitted = await client.PostAsync($"/JellyfinMod/Entries/{threeSeasons}/Refresh", null))
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var requests = http.Requests.Where(request => request.StartsWith("/3/tv/8830", StringComparison.Ordinal)).ToArray();
+            Assert(refreshedOmitted.IsSuccessStatusCode && await database.Episodes.CountAsync(episode => episode.EntryId == threeSeasons) == 6 &&
+                requests.Count(request => request.StartsWith("/3/tv/8830/season/", StringComparison.Ordinal)) == 1 &&
+                requests.Single(request => request.StartsWith("/3/tv/8830/season/", StringComparison.Ordinal)).StartsWith("/3/tv/8830/season/2?", StringComparison.Ordinal),
+                "A season TMDB leaves out of the appended response is read on its own instead of failing the series (P1.FU4): " +
+                string.Join(" | ", requests));
+        }
+        http.OmitAppendedSeason = null;
+        await RemoveEntryAsync(threeSeasons);
+
+        var (longRunning, longRequests) = await AddManySeasonsAsync(8831, 25);
+        var appendedRequests = longRequests.Where(request => request.Contains("season/", StringComparison.Ordinal)).ToArray();
+        Assert(longRequests.Length == 3 && appendedRequests.Length == 2 &&
+            appendedRequests.Select(request => request.Split("season/").Length - 1).Order().SequenceEqual([5, 20]) &&
+            !longRequests.Any(request => request.Contains("/season/", StringComparison.Ordinal)),
+            "A 25-season series takes two appended requests of at most twenty seasons (P1.FU4): " + string.Join(" | ", longRequests));
+        await RemoveEntryAsync(longRunning);
+        http.Response = null;
 
         foreach (var malformed in new[] { "{}", "{\"episodes\":{}}", "{\"season_number\":2,\"episodes\":[]}" })
         {
