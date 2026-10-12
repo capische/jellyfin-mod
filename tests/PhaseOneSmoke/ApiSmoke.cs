@@ -543,8 +543,11 @@ internal static class ApiSmoke
         var refreshedPilot = refreshedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9001);
         Assert(refreshed.IsSuccessStatusCode && refreshedPilot.GetProperty("id").GetString() == episodeId &&
             !refreshedPilot.GetProperty("monitored").GetBoolean() && refreshedPilot.GetProperty("state").GetString() == "onDisk" &&
-            refreshedEpisodes.Length == 4 && refreshedJson.RootElement.GetProperty("history").GetArrayLength() == 1,
-            "Complete HTTP metadata refresh preserves local IDs, monitoring, native binding and history while adding episodes");
+            refreshedEpisodes.Length == 4 && refreshedJson.RootElement.GetProperty("history").GetArrayLength() == 1 &&
+            refreshedEpisodes.Single(episode => episode.GetProperty("tmdbId").GetInt32() == 9003).GetProperty("monitored").GetBoolean() &&
+            refreshedJson.RootElement.GetProperty("episodeListLoaded").GetBoolean(),
+            "Complete HTTP metadata refresh preserves local IDs, monitoring, native binding and history while adding episodes, " +
+            "and a monitored series' new episode is monitored (P1.FU)");
         var completeSnapshot = http.Response;
         http.Response = uri => uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
             ? Json("""{"season_number":1,"episodes":[{"id":9001,"season_number":1,"episode_number":2,"name":"Pilot renumbered"},{"id":9002,"season_number":1,"episode_number":1,"name":"Second episode renumbered"},{"id":9003,"season_number":1,"episode_number":3,"name":"New episode"}]}""")
@@ -720,6 +723,98 @@ internal static class ApiSmoke
                 $"{inheriting?.TmdbId}/{inheriting?.RetentionPolicy}/{inheriting?.ReclaimAfterDays}");
             database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == graceSeries.Id));
             database.History.RemoveRange(database.History.Where(history => history.EntryId == graceSeries.Id));
+            await database.SaveChangesAsync();
+        }
+
+        // P1.FU: a series reconciliation discovered in a TVDB-scraped library has only position rows for its files and no TMDB
+        // list. The administrator's Refresh loads the whole list: a row with evidence is adopted, a held position without
+        // evidence gets no second row, every other TMDB episode becomes an unmonitored row, and the first load is recorded.
+        var discovered = new Entry
+        {
+            MediaType = "series", TmdbId = 8820, TargetLibraryId = tvLibrary.Id, Title = "Discovered", Monitored = false,
+            State = FileState.OnDisk,
+            MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("series", 8820, "Discovered", null, null, null, null, null, null,
+                false, null, null, [], [], []))
+        };
+        var discoveredPilot = new Episode { EntryId = discovered.Id, TmdbId = 0, SeasonNumber = 1, EpisodeNumber = 1, Title = "Pilot",
+            AirDate = new DateTime(2021, 3, 1, 0, 0, 0, DateTimeKind.Utc), Monitored = false, State = FileState.OnDisk };
+        var discoveredSecond = new Episode { EntryId = discovered.Id, TmdbId = 0, SeasonNumber = 1, EpisodeNumber = 2,
+            Title = "TVDB Name", AirDate = new DateTime(2021, 3, 8, 0, 0, 0, DateTimeKind.Utc), Monitored = false, State = FileState.OnDisk };
+        var discoveredBinding = new EpisodeBinding { EpisodeId = discoveredPilot.Id, JellyfinItemId = Guid.NewGuid(),
+            SeriesItemId = Guid.NewGuid(), TargetLibraryId = tvLibrary.Id, MediaPath = "/media/Discovered/S01E01.mkv" };
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.Add(discovered);
+            database.Episodes.AddRange(discoveredPilot, discoveredSecond);
+            database.EpisodeBindings.Add(discoveredBinding);
+            database.History.Add(new HistoryRecord { EntryId = discovered.Id, EventType = "backfilled", Summary = "Discovered in Jellyfin library" });
+            await database.SaveChangesAsync();
+        }
+
+        async Task<JsonElement> DiscoveredDetailAsync()
+        {
+            using var response = await client.GetAsync($"/JellyfinMod/Entries/{discovered.Id}");
+            Assert(response.IsSuccessStatusCode, $"The discovered series' detail answers: {(int)response.StatusCode}");
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            return json.RootElement.Clone();
+        }
+
+        var beforeList = await DiscoveredDetailAsync();
+        Assert(!beforeList.GetProperty("episodeListLoaded").GetBoolean() && beforeList.GetProperty("episodes").GetArrayLength() == 2,
+            "A discovered series reports that its TMDB episode list is not loaded yet (P1.FU): " + beforeList.GetProperty("episodeListLoaded"));
+        http.Response = _ => new HttpResponseMessage(HttpStatusCode.NotFound);
+        Assert((await client.PostAsync($"/JellyfinMod/Entries/{discovered.Id}/Refresh", null)).StatusCode == HttpStatusCode.NotFound,
+            "A series TMDB no longer knows answers 404 and nothing is guessed (P1.FU)");
+        var afterMissing = await DiscoveredDetailAsync();
+        Assert(!afterMissing.GetProperty("episodeListLoaded").GetBoolean() && afterMissing.GetProperty("episodes").GetArrayLength() == 2,
+            "A failed load leaves the list as it was and still not loaded (P1.FU)");
+
+        var discoveredSnapshot = (Func<Uri, HttpResponseMessage>)(uri =>
+            uri.AbsolutePath.Contains("/season/0", StringComparison.Ordinal)
+                ? Json("""{"season_number":0,"episodes":[{"id":8829,"season_number":0,"episode_number":1,"name":"Behind the Scenes","air_date":"2021-02-20"}]}""")
+            : uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
+                ? Json("""{"season_number":1,"episodes":[{"id":8821,"season_number":1,"episode_number":1,"name":"Pilot","air_date":"2021-03-01"},{"id":8822,"season_number":1,"episode_number":2,"name":"TMDB Name","air_date":"2021-03-10"},{"id":8823,"season_number":1,"episode_number":3,"name":"Not Downloaded","air_date":"2021-03-15"}]}""")
+            : uri.AbsolutePath.Contains("/season/2", StringComparison.Ordinal)
+                ? Json("""{"season_number":2,"episodes":[{"id":8824,"season_number":2,"episode_number":1,"name":"Next Year","air_date":"2099-03-01"}]}""")
+            : Json("""{"id":8820,"name":"Discovered","seasons":[{"season_number":0,"name":"Specials","episode_count":1},{"season_number":1,"name":"Season 1","episode_count":3},{"season_number":2,"name":"Season 2","episode_count":1}]}"""));
+        http.Response = discoveredSnapshot;
+        using (var loaded = await client.PostAsync($"/JellyfinMod/Entries/{discovered.Id}/Refresh", null))
+        {
+            var body = await loaded.Content.ReadAsStringAsync();
+            Assert(loaded.IsSuccessStatusCode, $"The administrator's Refresh loads a discovered series' list: {(int)loaded.StatusCode} {body}");
+            using var json = JsonDocument.Parse(body);
+            var rows = json.RootElement.GetProperty("episodes").EnumerateArray()
+                .ToDictionary(row => (row.GetProperty("seasonNumber").GetInt32(), row.GetProperty("episodeNumber").GetInt32()));
+            var summary = string.Join(", ", rows.Values.Select(row => $"S{row.GetProperty("seasonNumber")}E{row.GetProperty("episodeNumber")} " +
+                $"{row.GetProperty("tmdbId")} {row.GetProperty("availability")} {row.GetProperty("monitored")}"));
+            Assert(json.RootElement.GetProperty("episodeListLoaded").GetBoolean() && rows.Count == 5 &&
+                Guid.Parse(rows[(1, 1)].GetProperty("id").GetString()!) == discoveredPilot.Id && rows[(1, 1)].GetProperty("tmdbId").GetInt32() == 8821 &&
+                Guid.Parse(rows[(1, 2)].GetProperty("id").GetString()!) == discoveredSecond.Id && rows[(1, 2)].GetProperty("tmdbId").GetInt32() == 0 &&
+                rows[(1, 3)].GetProperty("availability").GetString() == "missing" &&
+                rows[(2, 1)].GetProperty("availability").GetString() == "unaired" &&
+                rows[(0, 1)].GetProperty("tmdbId").GetInt32() == 8829 &&
+                rows.Values.All(row => !row.GetProperty("monitored").GetBoolean()),
+                "The full list arrives: the pilot is adopted by its title, the held S01E02 gets no second row, the missing, " +
+                "unaired and special episodes are rows of their own, and none of them is monitored (P1.FU): " + summary);
+            var listed = json.RootElement.GetProperty("history").EnumerateArray()
+                .Where(record => record.GetProperty("eventType").GetString() == "episodes_listed").ToArray();
+            Assert(listed.Length == 1 && listed[0].GetProperty("summary").GetString() == "Loaded 3 seasons and 5 episodes from TMDB",
+                "The first load is recorded once in History (P1.FU): " + json.RootElement.GetProperty("history"));
+        }
+
+        using (var again = await client.PostAsync($"/JellyfinMod/Entries/{discovered.Id}/Refresh", null))
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var rows = await database.Episodes.AsNoTracking().Where(episode => episode.EntryId == discovered.Id).ToListAsync();
+            var pilotBinding = await database.EpisodeBindings.AsNoTracking().SingleAsync(binding => binding.Id == discoveredBinding.Id);
+            Assert(again.IsSuccessStatusCode && rows.Count == 5 && pilotBinding.EpisodeId == discoveredPilot.Id &&
+                !rows.Any(row => row.TmdbId != 0 && row.SeasonNumber == 1 && row.EpisodeNumber == 2) &&
+                await database.History.CountAsync(record => record.EntryId == discovered.Id && record.EventType == "episodes_listed") == 1 &&
+                !(await database.Entries.SingleAsync(entry => entry.Id == discovered.Id)).Monitored,
+                "A second Refresh changes nothing: the file stays on its row, no TMDB row joins a held position, the load is " +
+                "recorded once and the series stays unmonitored (P1.FU)");
+            database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == discovered.Id));
+            database.History.RemoveRange(database.History.Where(history => history.EntryId == discovered.Id));
             await database.SaveChangesAsync();
         }
 
