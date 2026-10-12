@@ -198,6 +198,93 @@ public sealed class EntriesController(
         }
     }
 
+    /// <summary>One TMDB episode-list load per entry at a time; a concurrent caller shares its result (P1.FU9).</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, Task<ListLoadFailure?>> EpisodeListLoads = new();
+
+    /// <summary>Why a series' first episode-list load failed, as the Refresh answers it.</summary>
+    private sealed record ListLoadFailure(int Status, string? Title, string? Type = null);
+
+    /// <summary>
+    /// Loads a series' full TMDB season and episode list the first time anyone who may see the entry opens it (P1.FU9).
+    /// Once the list is loaded, or for a movie, it answers the detail unchanged without asking TMDB; keeping a loaded
+    /// list current stays the administrator's Refresh.
+    /// </summary>
+    [HttpPost("{id:guid}/EpisodeList")]
+    public async Task<ActionResult<EntryDetail>> EpisodeList(Guid id, CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
+        var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
+        // Exactly who may read the entry detail (GET Entries/{id}).
+        if (entry is null || !access.CanRead(user, entry) &&
+            !(!access.IsLiveLibrary(entry.TargetLibraryId) && await IsAdministratorAsync())) return NotFound();
+        if (entry.MediaType != "series" || entry.TargetLibraryId is null || await EpisodeListLoadedAsync(id, cancellationToken))
+            return await BuildDetail(entry, cancellationToken);
+
+        var load = new TaskCompletionSource<ListLoadFailure?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var shared = EpisodeListLoads.GetOrAdd(id, load.Task);
+        if (shared == load.Task)
+        {
+            // This request runs the load and waits for it whatever its caller does, so its database context outlives the
+            // load and the callers sharing it get its result; the load has its own 60-second limit.
+            try
+            {
+                load.SetResult(await LoadEpisodeListAsync(id));
+            }
+            catch (Exception error)
+            {
+                load.SetException(error);
+            }
+            finally
+            {
+                EpisodeListLoads.TryRemove(new KeyValuePair<Guid, Task<ListLoadFailure?>>(id, load.Task));
+            }
+        }
+
+        var failure = await shared.WaitAsync(cancellationToken);
+        if (failure is not null)
+        {
+            if (failure.Type == "library_busy") return LibraryBusy();
+            return failure.Status == 404 && failure.Title is null ? NotFound() : Problem(statusCode: failure.Status, title: failure.Title);
+        }
+        database.ChangeTracker.Clear();
+        var loaded = await database.Entries.AsNoTracking().SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
+        return loaded is null ? NotFound() : await BuildDetail(loaded, cancellationToken);
+    }
+
+    /// <summary>Whether a series has its TMDB list: a TMDB episode row, or the record of its first load (P1.FU).</summary>
+    private async Task<bool> EpisodeListLoadedAsync(Guid id, CancellationToken cancellationToken) =>
+        await database.Episodes.AnyAsync(episode => episode.EntryId == id && episode.TmdbId > 0, cancellationToken) ||
+        await database.History.AnyAsync(record => record.EntryId == id &&
+            record.EventType == SeriesMetadataRefresher.EpisodeListEvent, cancellationToken);
+
+    /// <summary>Runs the Refresh's own load once, unless a load that just finished already did it.</summary>
+    private async Task<ListLoadFailure?> LoadEpisodeListAsync(Guid id)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        try
+        {
+            if (await EpisodeListLoadedAsync(id, timeout.Token)) return null;
+            var outcome = await new SeriesMetadataRefresher(database, tmdb, libraryLock, retentionGate, reconciliation, writeBudget, access)
+                .RefreshAsync(id, timeout.Token);
+            return outcome switch
+            {
+                SeriesRefreshOutcome.LibraryBusy => new ListLoadFailure(503, null, "library_busy"),
+                SeriesRefreshOutcome.NotFound => new ListLoadFailure(404, null),
+                _ => null
+            };
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            return new ListLoadFailure(504, "TMDB metadata timed out. Please try again.");
+        }
+        catch (TmdbException error)
+        {
+            return new ListLoadFailure((int)error.StatusCode, error.Message);
+        }
+    }
+
     /// <summary>Gets an entry, history and tracked episodes without native IDs for inaccessible media.</summary>
     [HttpGet("{id:guid}")]
     public async Task<ActionResult<EntryDetail>> Detail(Guid id, CancellationToken cancellationToken)

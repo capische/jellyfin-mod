@@ -839,6 +839,169 @@ internal static class ApiSmoke
             await database.SaveChangesAsync();
         }
 
+        // P1.FU9: anyone who may see a series loads its full TMDB list by opening it, through EpisodeList. It loads once, shares
+        // one TMDB fetch between concurrent callers, answers a loaded list or a movie without asking TMDB, is refused like the
+        // detail to a user who may not see the entry, and a failure leaves the list unloaded for the next opening.
+        using var ordinary = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(60) };
+        ordinary.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
+        using var restricted = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(60) };
+        restricted.DefaultRequestHeaders.Add("X-Smoke-User", otherUser.Id.ToString());
+        var opened = new Entry
+        {
+            MediaType = "series", TmdbId = 8840, TargetLibraryId = tvLibrary.Id, Title = "Opened", Monitored = false,
+            State = FileState.OnDisk,
+            MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("series", 8840, "Opened", null, null, null, null, null, null,
+                false, null, null, [], [], []))
+        };
+        var openedPilot = new Episode { EntryId = opened.Id, TmdbId = 0, SeasonNumber = 1, EpisodeNumber = 1, Title = "Pilot",
+            AirDate = new DateTime(2021, 3, 1, 0, 0, 0, DateTimeKind.Utc), Monitored = false, State = FileState.OnDisk };
+        var openedMovie = new Entry
+        {
+            MediaType = "movie", TmdbId = 8849, TargetLibraryId = libraryFolder.Id, Title = "Opened Movie", Monitored = false,
+            State = FileState.Reclaimed,
+            MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("movie", 8849, "Opened Movie", null, null, null, null, null, null,
+                false, null, null, [], [], []))
+        };
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.AddRange(opened, openedMovie);
+            database.Episodes.Add(openedPilot);
+            await database.SaveChangesAsync();
+        }
+        string[] OpenedRequests() => http.Requests.Where(request => request.StartsWith("/3/tv/8840", StringComparison.Ordinal)).ToArray();
+        async Task<(HttpStatusCode Status, JsonElement Body)> OpenAsync(HttpClient caller, Guid entryId)
+        {
+            using var response = await caller.PostAsync($"/JellyfinMod/Entries/{entryId}/EpisodeList", null);
+            var text = await response.Content.ReadAsStringAsync();
+            using var json = JsonDocument.Parse(text.Length == 0 ? "{}" : text);
+            return (response.StatusCode, json.RootElement.Clone());
+        }
+        async Task<bool> OpenedLoadedAsync()
+        {
+            using var response = await ordinary.GetAsync($"/JellyfinMod/Entries/{opened.Id}");
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            return json.RootElement.GetProperty("episodeListLoaded").GetBoolean();
+        }
+
+        http.Requests.Clear();
+        Assert((await OpenAsync(restricted, opened.Id)).Status == HttpStatusCode.NotFound && OpenedRequests().Length == 0,
+            "A user who may not see a series cannot load its list, and is refused like its detail (P1.FU9)");
+        var openedMovieResult = await OpenAsync(ordinary, openedMovie.Id);
+        Assert(openedMovieResult.Status == HttpStatusCode.OK && openedMovieResult.Body.GetProperty("episodeListLoaded").GetBoolean() &&
+            !http.Requests.Any(request => request.StartsWith("/3/movie/8849", StringComparison.Ordinal)),
+            "A movie's detail is answered unchanged without asking TMDB (P1.FU9): " + openedMovieResult.Status);
+
+        // Failures map as the Refresh's, ask TMDB once per call and leave the list unloaded.
+        var (token, apiKey) = (pluginConfiguration.TmdbReadAccessToken, pluginConfiguration.TmdbApiKey);
+        (pluginConfiguration.TmdbReadAccessToken, pluginConfiguration.TmdbApiKey) = (string.Empty, string.Empty);
+        var notConfigured = await OpenAsync(ordinary, opened.Id);
+        (pluginConfiguration.TmdbReadAccessToken, pluginConfiguration.TmdbApiKey) = (token, apiKey);
+        Assert(notConfigured.Status == HttpStatusCode.ServiceUnavailable && OpenedRequests().Length == 0 && !await OpenedLoadedAsync(),
+            "Without a TMDB credential the load answers 503 and the list stays unloaded (P1.FU9): " + notConfigured.Status);
+        http.Response = _ => new HttpResponseMessage(HttpStatusCode.NotFound);
+        var unknown = await OpenAsync(ordinary, opened.Id);
+        Assert(unknown.Status == HttpStatusCode.NotFound && OpenedRequests().Length == 1 && !await OpenedLoadedAsync(),
+            "A series TMDB no longer knows answers 404 after one request and stays unloaded (P1.FU9): " +
+            $"{unknown.Status} {string.Join(" | ", OpenedRequests())}");
+        http.Requests.Clear();
+        http.Response = _ => new HttpResponseMessage(HttpStatusCode.InternalServerError);
+        var broken = await OpenAsync(ordinary, opened.Id);
+        Assert(broken.Status == HttpStatusCode.BadGateway && OpenedRequests().Length == 1 && !await OpenedLoadedAsync(),
+            "A TMDB failure answers 502 after one request and the list stays unloaded (P1.FU9): " + broken.Status);
+        var releaseSlow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        http.BeforeResponse = async uri =>
+        {
+            if (uri.AbsolutePath.StartsWith("/3/tv/8840", StringComparison.Ordinal)) await releaseSlow.Task;
+        };
+        var slow = await OpenAsync(ordinary, opened.Id);
+        releaseSlow.TrySetResult();
+        http.BeforeResponse = null;
+        Assert(slow.Status == HttpStatusCode.GatewayTimeout && !await OpenedLoadedAsync(),
+            "A TMDB request that times out answers 504 and the list stays unloaded (P1.FU9): " + slow.Status);
+        var openedSnapshot = (Func<Uri, HttpResponseMessage>)(uri =>
+            uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
+                ? Json("""{"season_number":1,"episodes":[{"id":8841,"season_number":1,"episode_number":1,"name":"Pilot","air_date":"2021-03-01"},{"id":8842,"season_number":1,"episode_number":2,"name":"Second","air_date":"2021-03-08"}]}""")
+            : uri.AbsolutePath.Contains("/season/2", StringComparison.Ordinal)
+                ? Json("""{"season_number":2,"episodes":[{"id":8843,"season_number":2,"episode_number":1,"name":"Return","air_date":"2022-03-01"}]}""")
+            : Json("""{"id":8840,"name":"Opened","seasons":[{"season_number":1,"name":"Season 1","episode_count":2},{"season_number":2,"name":"Season 2","episode_count":1}]}"""));
+        http.Response = openedSnapshot;
+        await using (var lease = await app.Services.GetRequiredService<ReconciliationLibraryLock>()
+            .TryAcquireAsync(tvLibrary.Id, TimeSpan.FromSeconds(5), default))
+        {
+            Assert(lease is not null, "The smoke holds the TV library for the busy case");
+            var busy = await OpenAsync(ordinary, opened.Id);
+            Assert(busy.Status == HttpStatusCode.ServiceUnavailable && busy.Body.GetProperty("type").GetString() == "library_busy" &&
+                !await OpenedLoadedAsync(),
+                "A library busy being checked answers 503 library_busy and the list stays unloaded (P1.FU9): " + busy.Status);
+        }
+
+        // Two concurrent openings share one load: the second waits for the first's TMDB fetch and answers the loaded list.
+        http.Requests.Clear();
+        var firstReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        http.BeforeResponse = async uri =>
+        {
+            if (!uri.AbsolutePath.StartsWith("/3/tv/8840", StringComparison.Ordinal)) return;
+            firstReached.TrySetResult();
+            await releaseFirst.Task;
+        };
+        var firstOpening = OpenAsync(ordinary, opened.Id);
+        await firstReached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var secondOpening = OpenAsync(ordinary, opened.Id);
+        await Task.Delay(300);
+        releaseFirst.TrySetResult();
+        var openings = await Task.WhenAll(firstOpening, secondOpening);
+        http.BeforeResponse = null;
+        foreach (var opening in openings)
+        {
+            var rows = opening.Body.GetProperty("episodes").EnumerateArray()
+                .Select(row => (row.GetProperty("seasonNumber").GetInt32(), row.GetProperty("episodeNumber").GetInt32(),
+                    row.GetProperty("tmdbId").GetInt32(), row.GetProperty("monitored").GetBoolean())).ToArray();
+            Assert(opening.Status == HttpStatusCode.OK && opening.Body.GetProperty("episodeListLoaded").GetBoolean() &&
+                rows.Length == 3 && rows.Contains((1, 1, 8841, false)) && rows.Contains((1, 2, 8842, false)) && rows.Contains((2, 1, 8843, false)),
+                "An ordinary user's opening loads the full list, unmonitored for an unmonitored series (P1.FU9): " +
+                $"{opening.Status} {string.Join(", ", rows)}");
+        }
+        Assert(OpenedRequests().Length == 2,
+            "Two concurrent openings make one load: the series details and one appended season request (P1.FU9): " +
+            string.Join(" | ", OpenedRequests()));
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var listed = await database.History.AsNoTracking()
+                .Where(record => record.EntryId == opened.Id && record.EventType == "episodes_listed").ToListAsync();
+            Assert(listed.Count == 1 && listed[0].Summary == "Loaded 2 seasons and 3 episodes from TMDB" &&
+                (await database.Episodes.AsNoTracking().SingleAsync(episode => episode.Id == openedPilot.Id)).TmdbId == 8841,
+                "The opening records the first load once, as the Refresh does, and adopts the pilot by its title (P1.FU9)");
+        }
+        http.Requests.Clear();
+        var reopened = await OpenAsync(ordinary, opened.Id);
+        Assert(reopened.Status == HttpStatusCode.OK && reopened.Body.GetProperty("episodes").GetArrayLength() == 3 &&
+            OpenedRequests().Length == 0,
+            "Opening a loaded series again answers its list without asking TMDB (P1.FU9): " + string.Join(" | ", OpenedRequests()));
+
+        // The administrator's Refresh still refreshes a loaded list, and stays administrator-only.
+        Assert((await ordinary.PostAsync($"/JellyfinMod/Entries/{opened.Id}/Refresh", null)).StatusCode == HttpStatusCode.Forbidden,
+            "Refresh stays administrator-only (P1.FU9)");
+        http.Response = uri => uri.AbsolutePath.Contains("/season/2", StringComparison.Ordinal)
+            ? Json("""{"season_number":2,"episodes":[{"id":8843,"season_number":2,"episode_number":1,"name":"Return","air_date":"2022-03-01"},{"id":8844,"season_number":2,"episode_number":2,"name":"Newly Listed","air_date":"2022-03-08"}]}""")
+            : openedSnapshot(uri);
+        using (var openedRefresh = await client.PostAsync($"/JellyfinMod/Entries/{opened.Id}/Refresh", null))
+        {
+            using var json = JsonDocument.Parse(await openedRefresh.Content.ReadAsStringAsync());
+            Assert(openedRefresh.IsSuccessStatusCode && json.RootElement.GetProperty("episodes").GetArrayLength() == 4 &&
+                json.RootElement.GetProperty("history").EnumerateArray()
+                    .Count(record => record.GetProperty("eventType").GetString() == "episodes_listed") == 1,
+                "The administrator's Refresh adds a newly listed episode to a loaded list and records no second load (P1.FU9): " +
+                (int)openedRefresh.StatusCode);
+        }
+        http.Response = null;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            database.Entries.RemoveRange(await database.Entries.Where(entry => entry.Id == opened.Id || entry.Id == openedMovie.Id).ToListAsync());
+            database.History.RemoveRange(database.History.Where(history => history.EntryId == opened.Id || history.EntryId == openedMovie.Id));
+            await database.SaveChangesAsync();
+        }
+
         // P1.FU4: a series' seasons arrive appended to one request, up to twenty seasons each, instead of one request per
         // season; a season TMDB leaves out is read on its own.
         Func<Uri, HttpResponseMessage> ManySeasons(int tmdbId, int seasons) => uri =>
