@@ -1947,6 +1947,9 @@ internal static partial class Phase5
         await PackReviewScenarios.RunAsync(Tick, admin, host.Client(world.RestrictedAdmin, true), world, dbPath, ids, torznab, transmission);
         // Episode upgrades off and the default version (user, 2026-10-09).
         await UpgradesOffScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission);
+        // The first and each viewer's next episode download first, and a pack episode imports as soon as its file is complete
+        // (next-up priority, 2026-10-12).
+        await NextUpScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, time);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))
