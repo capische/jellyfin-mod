@@ -110,7 +110,10 @@ public sealed class QueueController(
                     clients.GetValueOrDefault(representative.DownloadClientId), clientSnapshots.GetValueOrDefault(representative.DownloadClientId),
                     settings, administrator, packSeed is not null && LibraryLinkPresent(packSeed)) with { Episode = null };
                 if (states is { Length: > 0 } && !states.Contains(packRow.State, StringComparer.Ordinal)) continue;
-                rows.Add(packRow with { Pack = QueueReadModel.Pack(pack, claimed, packChildren) });
+                rows.Add(packRow with
+                {
+                    Pack = QueueReadModel.Pack(pack, claimed, packChildren, clientSnapshots.GetValueOrDefault(representative.DownloadClientId))
+                });
                 continue;
             }
 

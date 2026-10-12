@@ -178,6 +178,8 @@ internal sealed class HeldFile
     public required long Length { get; init; }
     public long Completed { get; set; }
     public bool Wanted { get; set; } = true;
+    /// <summary>Transmission's file priority: -1 low, 0 normal, 1 high.</summary>
+    public int Priority { get; set; }
 }
 
 /// <summary>One torrent the Transmission boundary holds.</summary>
@@ -194,6 +196,15 @@ internal sealed class HeldTorrent
     public double UploadRatio { get; set; }
     public long SecondsSeeding { get; set; }
     public long RateDownload { get; set; }
+    /// <summary>The torrent's own priority against other torrents (-1, 0, 1).</summary>
+    public int BandwidthPriority { get; set; }
+    /// <summary>Waiting in the client's download queue (status 3, download_wait) while incomplete.</summary>
+    public bool Queued { get; set; }
+    /// <summary>
+    /// A local folder that holds the files until the whole torrent completes, as Transmission's incomplete folder does; the
+    /// files move to the download folder then. Null writes straight into the download folder.
+    /// </summary>
+    public string? IncompleteDir { get; set; }
     public long Size => Files.Where(file => file.Wanted).Sum(file => file.Length);
     public long Left => Files.Where(file => file.Wanted).Sum(file => file.Length - file.Completed);
 }
@@ -229,6 +240,17 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
     public ConcurrentQueue<bool> RemoveDeletedData { get; } = new();
     public bool Offline { get; set; }
     public Uri Endpoint { get; private set; } = null!;
+    /// <summary>Every torrent-set and queue-move-top as sent: the method and its arguments, for the download order.</summary>
+    public ConcurrentQueue<(string Method, JsonObject Arguments)> Writes { get; } = new();
+    /// <summary>Torrents whose metadata has not arrived, as a magnet before it does: they list no files.</summary>
+    public ConcurrentDictionary<string, bool> MetadataPending { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>The download-order writes for one torrent (torrent-set with a priority, and queue-move-top).</summary>
+    public IReadOnlyList<(string Method, JsonObject Arguments)> OrderWrites(string hash) => Writes.Where(write =>
+            write.Arguments["ids"]!.AsArray().Any(id => string.Equals(id!.GetValue<string>(), hash, StringComparison.OrdinalIgnoreCase)) &&
+            (write.Method == "queue-move-top" || write.Arguments.Any(pair => pair.Key is "priority-high" or "priority-normal" or
+                "priority-low" or "bandwidthPriority")))
+        .ToArray();
 
     public void Register(TorrentFixture fixture) => Fixtures[Convert.ToBase64String(fixture.Bytes)] = fixture;
 
@@ -244,31 +266,59 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
     public void Progress(string hash, double fraction, long rate = 1_000_000)
     {
         var torrent = Torrents[hash];
-        foreach (var file in torrent.Files.Where(file => file.Wanted))
+        foreach (var file in torrent.Files.Where(file => file.Wanted)) Fill(torrent, file, fraction);
+        torrent.RateDownload = fraction >= 1 ? 0 : rate;
+        Settle(torrent);
+    }
+
+    /// <summary>Downloads one file to a fraction, as a client does that finishes files one at a time.</summary>
+    public void ProgressFile(string hash, int index, double fraction, long rate = 1_000_000)
+    {
+        var torrent = Torrents[hash];
+        Fill(torrent, torrent.Files[index], fraction);
+        torrent.RateDownload = torrent.Left == 0 ? 0 : rate;
+        Settle(torrent);
+    }
+
+    private void Fill(HeldTorrent torrent, HeldFile file, double fraction)
+    {
+        var target = (long)Math.Floor(file.Length * Math.Clamp(fraction, 0, 1));
+        var path = torrent.IncompleteDir is { } incomplete ? Path.Combine(incomplete, file.Name)
+            : Local(torrent.DownloadDir + "/" + file.Name);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using (var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write))
         {
-            var target = (long)Math.Floor(file.Length * Math.Clamp(fraction, 0, 1));
-            var path = Local(torrent.DownloadDir + "/" + file.Name);
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            using (var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write))
+            if (stream.Length < target)
             {
-                if (stream.Length < target)
+                stream.Seek(0, SeekOrigin.End);
+                var chunk = new byte[64 * 1024];
+                RandomNumberGenerator.Fill(chunk);
+                for (var written = stream.Length; written < target;)
                 {
-                    stream.Seek(0, SeekOrigin.End);
-                    var chunk = new byte[64 * 1024];
-                    RandomNumberGenerator.Fill(chunk);
-                    for (var written = stream.Length; written < target;)
-                    {
-                        var count = (int)Math.Min(chunk.Length, target - written);
-                        stream.Write(chunk, 0, count);
-                        written += count;
-                    }
+                    var count = (int)Math.Min(chunk.Length, target - written);
+                    stream.Write(chunk, 0, count);
+                    written += count;
                 }
             }
-
-            file.Completed = target;
         }
 
-        torrent.RateDownload = fraction >= 1 ? 0 : rate;
+        file.Completed = target;
+    }
+
+    /// <summary>Moves a completed torrent's files out of its incomplete folder, as Transmission does at completion.</summary>
+    private void Settle(HeldTorrent torrent)
+    {
+        if (torrent.IncompleteDir is not { } incomplete || torrent.Left > 0) return;
+        foreach (var file in torrent.Files)
+        {
+            var from = Path.Combine(incomplete, file.Name);
+            if (!File.Exists(from)) continue;
+            var to = Local(torrent.DownloadDir + "/" + file.Name);
+            Directory.CreateDirectory(Path.GetDirectoryName(to)!);
+            File.Move(from, to);
+        }
+
+        torrent.IncompleteDir = null;
     }
 
     public async Task StartAsync()
@@ -327,7 +377,7 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
                 var list = new JsonArray();
                 var index = 0;
                 foreach (var torrent in Torrents.Values.Where(value => ids is null || ids.Contains(value.Hash)).ToArray())
-                    list.Add(Describe(torrent, ++index));
+                    list.Add(Describe(torrent, ++index, MetadataPending.ContainsKey(torrent.Hash)));
                 result = new JsonObject { ["torrents"] = list };
                 if (AfterGet is { } afterGet) await afterGet(ids);
                 break;
@@ -349,13 +399,25 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
                 result = new JsonObject { ["torrent-added"] = new JsonObject { ["hashString"] = fixture.InfoHash, ["id"] = Torrents.Count } };
                 break;
             case "torrent-set":
+                Writes.Enqueue((method, (JsonObject)arguments.DeepClone()));
                 foreach (var id in arguments["ids"]!.AsArray().Select(value => value!.GetValue<string>()))
                     if (Torrents.TryGetValue(id.ToLowerInvariant(), out var torrent))
                     {
                         if (arguments["seedRatioMode"] is { } ratio) torrent.SeedRatioMode = ratio.GetValue<int>();
                         if (arguments["seedIdleMode"] is { } idle) torrent.SeedIdleMode = idle.GetValue<int>();
+                        if (arguments["bandwidthPriority"] is { } bandwidth) torrent.BandwidthPriority = bandwidth.GetValue<int>();
+                        // As Transmission does, an empty file list means every file.
+                        foreach (var (key, priority) in new[] { ("priority-high", 1), ("priority-normal", 0), ("priority-low", -1) })
+                            if (arguments[key] is JsonArray indexes)
+                                foreach (var fileIndex in indexes.Count == 0 ? Enumerable.Range(0, torrent.Files.Count)
+                                             : indexes.Select(value => value!.GetValue<int>()))
+                                    torrent.Files[fileIndex].Priority = priority;
                     }
 
+                result = [];
+                break;
+            case "queue-move-top":
+                Writes.Enqueue((method, (JsonObject)arguments.DeepClone()));
                 result = [];
                 break;
             case "torrent-remove":
@@ -406,27 +468,30 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
             Directory.Delete(folder, true);
     }
 
-    private static JsonObject Describe(HeldTorrent torrent, int id)
+    private static JsonObject Describe(HeldTorrent torrent, int id, bool metadataPending = false)
     {
-        var size = torrent.Size;
-        var left = torrent.Left;
-        var complete = left == 0;
+        // A magnet without its metadata knows no files and no size yet.
+        var files = metadataPending ? [] : torrent.Files;
+        var size = metadataPending ? 0 : torrent.Size;
+        var left = metadataPending ? 0 : torrent.Left;
+        var complete = !metadataPending && left == 0;
         return new JsonObject
         {
             ["id"] = id, ["hashString"] = torrent.Hash, ["name"] = torrent.Name, ["downloadDir"] = torrent.DownloadDir,
             ["labels"] = new JsonArray(torrent.Labels.Select(label => (JsonNode)label).ToArray()),
             ["percentDone"] = size == 0 ? 0 : (double)(size - left) / size, ["sizeWhenDone"] = size, ["leftUntilDone"] = left,
-            ["rateDownload"] = torrent.RateDownload, ["eta"] = complete ? -1 : 600, ["status"] = complete ? 6 : 4,
+            ["rateDownload"] = torrent.RateDownload, ["eta"] = complete ? -1 : 600, ["status"] = complete ? 6 : torrent.Queued ? 3 : 4,
+            ["bandwidthPriority"] = torrent.BandwidthPriority,
             ["isFinished"] = false, ["uploadRatio"] = torrent.UploadRatio, ["secondsSeeding"] = torrent.SecondsSeeding,
             ["seedRatioMode"] = torrent.SeedRatioMode, ["seedRatioLimit"] = torrent.SeedRatioLimit, ["seedIdleMode"] = torrent.SeedIdleMode,
             ["seedIdleLimit"] = 30, ["etaIdle"] = -1, ["error"] = 0,
-            ["files"] = new JsonArray(torrent.Files.Select(file => (JsonNode)new JsonObject
+            ["files"] = new JsonArray(files.Select(file => (JsonNode)new JsonObject
             {
                 ["name"] = file.Name, ["length"] = file.Length, ["bytesCompleted"] = file.Completed
             }).ToArray()),
-            ["fileStats"] = new JsonArray(torrent.Files.Select(file => (JsonNode)new JsonObject
+            ["fileStats"] = new JsonArray(files.Select(file => (JsonNode)new JsonObject
             {
-                ["wanted"] = file.Wanted, ["bytesCompleted"] = file.Completed, ["priority"] = 0
+                ["wanted"] = file.Wanted, ["bytesCompleted"] = file.Completed, ["priority"] = file.Priority
             }).ToArray())
         };
     }

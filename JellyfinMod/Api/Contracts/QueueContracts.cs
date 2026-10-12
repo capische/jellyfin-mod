@@ -92,14 +92,18 @@ public sealed record QueuePackDto(
     [property: JsonPropertyName("mode")] string Mode,
     [property: JsonPropertyName("episodes")] IReadOnlyList<QueuePackEpisodeDto> Episodes);
 
-/// <summary>One claimed episode of a pack and where its import stands.</summary>
+/// <summary>
+/// One claimed episode of a pack and where its import stands. <c>progress</c> is the episode's own file, 0–1 (next-up
+/// priority, P5.FU3): read from the client while it downloads, 1 once its import left waiting, null when unknown.
+/// </summary>
 public sealed record QueuePackEpisodeDto(
     [property: JsonPropertyName("episodeId")] Guid EpisodeId,
     [property: JsonPropertyName("seasonNumber")] int SeasonNumber,
     [property: JsonPropertyName("episodeNumber")] int EpisodeNumber,
     [property: JsonPropertyName("importId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? ImportId,
     [property: JsonPropertyName("importState"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ImportState,
-    [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Reason);
+    [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Reason,
+    [property: JsonPropertyName("progress"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? Progress = null);
 
 /// <summary>Whether the download client answered the latest read.</summary>
 public sealed record QueueClientStatusDto(

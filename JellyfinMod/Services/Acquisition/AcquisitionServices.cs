@@ -33,6 +33,8 @@ public static class AcquisitionServices
         services.AddTransient<ProwlarrSync>();
         services.AddTransient<GrabService>();
         services.AddSingleton<GrabDispatcher>();
+        // The import monitor applies the download order on each tick (next-up priority, P4.FU3).
+        services.AddTransient<DownloadOrderService>();
         // Path mappings and their probe belong to the download-client configuration (P5.I2).
         services.AddTransient<Import.ImportPathProbe>();
     }

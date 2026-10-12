@@ -344,7 +344,20 @@ public sealed class ImportService(
             changed = true;
         }
 
-        if (!torrent.Complete)
+        // A pack episode's own file is known as soon as the client lists the torrent's files, so it can download first
+        // (next-up priority, P5.FU1). A mapping that finds nothing changes nothing: completion decides as before.
+        var pack = episode is not null && await IsPackAsync(operation.GrabId, cancellationToken).ConfigureAwait(false);
+        if (pack && torrent.Files.Count > 0 && ImportPaths.FileIndex(torrent, operation.SourceClientPath) < 0 &&
+            (await MapPackAsync(operation, torrent, settings, cancellationToken).ConfigureAwait(false)).Files
+                .TryGetValue((episode!.SeasonNumber, episode.EpisodeNumber), out var own) &&
+            ImportPaths.ClientPath(torrent, own) is { } ownPath)
+        {
+            operation.SourceClientPath = ownPath;
+            changed = true;
+        }
+
+        // A pack episode imports as soon as its own file is complete, while the rest of the torrent downloads (P5.FU2).
+        if (!torrent.Complete && !(pack && await OwnFileReadyAsync(operation, torrent, cancellationToken).ConfigureAwait(false)))
         {
             if (changed) await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
             return;
@@ -414,10 +427,14 @@ public sealed class ImportService(
             return;
         }
 
+        var grabScope = await database.GrabOperations.AsNoTracking().Where(value => value.Id == operation.GrabId)
+            .Select(value => value.Scope).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         // Completion is required on every identifying attempt, not only on entry: a client recheck can find missing pieces
         // after it first reported completion, and a preallocated file already has its full length (review P2-o). The
-        // operation then goes back to watching the download, and a later completion starts a fresh settling grace.
-        if (!torrent.Complete)
+        // operation then goes back to watching the download, and a later completion starts a fresh settling grace. A pack
+        // episode's completion is its own file's (next-up priority, P5.FU2).
+        if (!torrent.Complete && !(ReleaseScopes.IsPack(grabScope) && episode is not null &&
+                await OwnFileReadyAsync(operation, torrent, cancellationToken).ConfigureAwait(false)))
         {
             operation.State = ImportStates.Waiting;
             operation.CompletedDownloadAt = null;
@@ -429,18 +446,10 @@ public sealed class ImportService(
             return;
         }
 
-        var grabScope = await database.GrabOperations.AsNoTracking().Where(value => value.Id == operation.GrabId)
-            .Select(value => value.Scope).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         ImportFileChoice choice;
         if (ReleaseScopes.IsPack(grabScope) && episode is not null)
         {
-            // A pack's files are mapped to the episodes it claimed by their names (season and series packs, 2026-10-08).
-            var claimed = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == operation.GrabId)
-                .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id,
-                    (claim, value) => new { value.SeasonNumber, value.EpisodeNumber })
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var mapping = ImportFileSelector.MapPack(torrent, settings.VideoExtensions,
-                claimed.Select(value => (value.SeasonNumber, value.EpisodeNumber)).ToHashSet());
+            var mapping = await MapPackAsync(operation, torrent, settings, cancellationToken).ConfigureAwait(false);
             await RecordPackSkipsAsync(operation, mapping, cancellationToken).ConfigureAwait(false);
             if (mapping.Files.Count == 0 && mapping.Reason is { } packReason)
             {
@@ -468,7 +477,7 @@ public sealed class ImportService(
             return;
         }
 
-        var clientPath = ImportPaths.Normalize((torrent.DownloadDirectory ?? string.Empty).TrimEnd('/') + "/" + file.Name);
+        var clientPath = ImportPaths.ClientPath(torrent, file);
         var client = await database.AcquisitionDownloadClients.AsNoTracking()
             .SingleOrDefaultAsync(value => value.Id == operation.DownloadClientId, cancellationToken).ConfigureAwait(false);
         if (client is null)
@@ -529,6 +538,37 @@ public sealed class ImportService(
         operation.UpdatedAt = Now;
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         await LinkAsync(operation.Id, operation.TargetLibraryId, entry, episode, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether a pack episode's own file is downloaded while its torrent still downloads (next-up priority, P5.FU2): the client
+    /// reports the mapped file wanted and complete, and it lies under its final name at its mapped local path with that length.
+    /// A file the client keeps in its incomplete folder, or still names <c>.part</c>, is not there, so the episode waits for
+    /// the whole torrent as before: no settle grace, no <c>source_missing</c>.
+    /// </summary>
+    private async Task<bool> OwnFileReadyAsync(ImportOperation operation, ClientTorrentStatus torrent, CancellationToken cancellationToken)
+    {
+        var index = ImportPaths.FileIndex(torrent, operation.SourceClientPath);
+        if (index < 0 || torrent.Files[index] is not { Wanted: true, Length: > 0 } file || file.BytesCompleted < file.Length) return false;
+        var client = await database.AcquisitionDownloadClients.AsNoTracking()
+            .SingleOrDefaultAsync(value => value.Id == operation.DownloadClientId, cancellationToken).ConfigureAwait(false);
+        if (client is null) return false;
+        var mappings = await database.DownloadClientPathMappings.AsNoTracking()
+            .Where(mapping => mapping.DownloadClientId == client.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
+        return ImportPaths.Map(operation.SourceClientPath!, mappings, client) is { } localPath && files.TryInspect(localPath, out var source) &&
+            (long)source.LogicalBytes == file.Length;
+    }
+
+    /// <summary>A pack's files mapped to the episodes it claimed, by their names (season and series packs, 2026-10-08).</summary>
+    private async Task<PackMapping> MapPackAsync(ImportOperation operation, ClientTorrentStatus torrent, AcquisitionSettings settings,
+        CancellationToken cancellationToken)
+    {
+        var claimed = await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == operation.GrabId)
+            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id,
+                (claim, value) => new { value.SeasonNumber, value.EpisodeNumber })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return ImportFileSelector.MapPack(torrent, settings.VideoExtensions,
+            claimed.Select(value => (value.SeasonNumber, value.EpisodeNumber)).ToHashSet());
     }
 
     /// <summary>

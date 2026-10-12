@@ -92,6 +92,12 @@ internal sealed partial class NativeWorld
     /// </summary>
     public Func<string, int?>? EpisodeTmdbId { get; set; }
 
+    /// <summary>
+    /// Each user's played items, as Jellyfin's user data holds them, for item queries that ask for played items (the download
+    /// order reads each viewer's furthest played episode). Item reads through the user data manager are unaffected.
+    /// </summary>
+    public ConcurrentDictionary<(Guid UserId, Guid ItemId), bool> Played { get; } = new();
+
     /// <summary>The native items a session is playing now, by item id.</summary>
     public ConcurrentDictionary<Guid, bool> Playing { get; } = new();
 
@@ -239,6 +245,7 @@ internal sealed partial class NativeWorld
         if (series is null)
         {
             series = new TestSeries { Id = Guid.NewGuid(), Name = TitlePattern().Match(Path.GetFileName(seriesFolder)).Groups[1].Value.Trim(), Path = seriesFolder };
+            series.PresentationUniqueKey = series.Id.ToString("N");
             if (TmdbPattern().Match(Path.GetFileName(seriesFolder)) is { Success: true } match) series.ProviderIds["Tmdb"] = match.Groups[1].Value;
             Add(library, series);
         }
@@ -247,7 +254,7 @@ internal sealed partial class NativeWorld
         var episode = new MediaBrowser.Controller.Entities.TV.Episode
         {
             Id = Guid.NewGuid(), Name = Path.GetFileNameWithoutExtension(file), Path = file, SeriesId = series.Id,
-            ParentIndexNumber = numbering.Success ? int.Parse(numbering.Groups[1].Value, CultureInfo.InvariantCulture) : null,
+            SeriesPresentationUniqueKey = series.PresentationUniqueKey, ParentIndexNumber = numbering.Success ? int.Parse(numbering.Groups[1].Value, CultureInfo.InvariantCulture) : null,
             IndexNumber = numbering.Success ? int.Parse(numbering.Groups[2].Value, CultureInfo.InvariantCulture) : null,
             DateCreated = DateTime.UtcNow
         };
@@ -336,6 +343,9 @@ internal sealed partial class NativeWorld
         if (query.ItemIds.Length > 0) items = items.Where(item => query.ItemIds.Contains(item.Id));
         if (query.HasAnyProviderId is { Count: > 0 } providers)
             items = items.Where(item => providers.Any(provider => item.ProviderIds.GetValueOrDefault(provider.Key) == provider.Value));
+        if (query.SeriesPresentationUniqueKey is { } seriesKey)
+            items = items.OfType<MediaBrowser.Controller.Entities.TV.Episode>().Where(episode => episode.SeriesPresentationUniqueKey == seriesKey);
+        if (query.IsPlayed == true && query.User is { } viewer) items = items.Where(item => Played.ContainsKey((viewer.Id, item.Id)));
         if (query.PresentationUniqueKey is { } group)
             items = items.OfType<Movie>().Where(movie => (movie.PrimaryVersionId ?? movie.Id).ToString("N") == group);
         return items.OrderBy(item => item.Name, StringComparer.Ordinal).ThenBy(item => item.Id)

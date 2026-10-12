@@ -49,7 +49,10 @@ public static class QueueReadModel
         return result;
     }
 
-    /// <summary>Returns the freshest known progress: the shared snapshot when it is newer than the stored observation.</summary>
+    /// <summary>
+    /// Returns the freshest known progress: the shared snapshot when it is newer than the stored observation. An import whose
+    /// own file is known (a pack's episode) shows that file's progress, not the whole torrent's (next-up priority, P5.FU3).
+    /// </summary>
     public static double? LiveProgress(ImportOperation operation, ClientSnapshotCache? snapshots)
     {
         if (operation.State != ImportStates.Waiting && operation.State != ImportStates.Blocked)
@@ -57,9 +60,15 @@ public static class QueueReadModel
         var snapshot = snapshots?.Latest(operation.DownloadClientId);
         if (snapshot is { Reachable: true } && snapshot.Find(operation.InfoHash) is { } torrent &&
             (operation.ObservedAt is null || snapshot.CheckedAt >= operation.ObservedAt))
-            return Math.Round(Math.Clamp(torrent.PercentDone, 0, 1), 4);
+            return FileProgress(torrent, operation.SourceClientPath) ?? Math.Round(Math.Clamp(torrent.PercentDone, 0, 1), 4);
         return operation.Progress;
     }
+
+    /// <summary>One file's own progress, 0–1, by its client path; null when the torrent does not list it.</summary>
+    public static double? FileProgress(ClientTorrentStatus torrent, string? clientPath) =>
+        ImportPaths.FileIndex(torrent, clientPath) is >= 0 and var index && torrent.Files[index].Length > 0
+            ? Math.Round(Math.Clamp((double)torrent.Files[index].BytesCompleted / torrent.Files[index].Length, 0, 1), 4)
+            : null;
 
     /// <summary>Builds one queue row. Physical paths and client links appear only for administrators.</summary>
     public static QueueRowDto Row(ImportOperation operation, SeedReleaseOperation? seed, Entry? entry, Episode? episode,
@@ -89,9 +98,14 @@ public static class QueueReadModel
             administrator ? Admin(operation) : null);
     }
 
-    /// <summary>The pack detail of a pack's single queue row: its label and each claimed episode's newest import.</summary>
-    public static QueuePackDto Pack(GrabOperation grab, IReadOnlyList<Episode> claimed, IReadOnlyList<ImportOperation> children)
+    /// <summary>
+    /// The pack detail of a pack's single queue row: its label and each claimed episode's newest import, with that episode's own
+    /// file progress from the client snapshot.
+    /// </summary>
+    public static QueuePackDto Pack(GrabOperation grab, IReadOnlyList<Episode> claimed, IReadOnlyList<ImportOperation> children,
+        ClientSnapshot? snapshot)
     {
+        var torrent = snapshot is { Reachable: true } && grab.InfoHash is { } hash ? snapshot.Find(hash) : null;
         var parsed = System.Text.Json.JsonSerializer.Deserialize<ParsedRelease>(grab.ParsedJson);
         var seasons = parsed?.PackSeasons() ?? [];
         var label = seasons.Count == 1
@@ -102,7 +116,11 @@ public static class QueueReadModel
         {
             var import = children.Where(child => child.GrabId == grab.Id && child.EpisodeId == episode.Id)
                 .OrderByDescending(child => child.CreatedAt).FirstOrDefault();
-            return new QueuePackEpisodeDto(episode.Id, episode.SeasonNumber, episode.EpisodeNumber, import?.Id, import?.State, import?.Reason);
+            var progress = import is null ? null
+                : import.State is not (ImportStates.Waiting or ImportStates.Blocked) ? import.CompletedDownloadAt is not null ? 1 : null
+                : torrent is null ? null : FileProgress(torrent, import.SourceClientPath);
+            return new QueuePackEpisodeDto(episode.Id, episode.SeasonNumber, episode.EpisodeNumber, import?.Id, import?.State, import?.Reason,
+                progress);
         }).ToArray());
     }
 
