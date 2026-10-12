@@ -182,7 +182,10 @@ public sealed class SeriesMetadataRefresher(
                 else
                 {
                     remote.EntryId = entry.Id;
-                    if (LibraryAccess.CoveredUnverified(covered, remote.SeasonNumber, remote.EpisodeNumber, remote.TmdbId))
+                    // A new episode is monitored only when its series is (P1.FU): a series discovered in the library is
+                    // not monitored, so its full TMDB list is never searched for by itself (PHASE10 S11).
+                    if (!entry.Monitored ||
+                        LibraryAccess.CoveredUnverified(covered, remote.SeasonNumber, remote.EpisodeNumber, remote.TmdbId))
                         remote.Monitored = false;
                     database.Episodes.Add(remote);
                 }
