@@ -542,12 +542,17 @@ static async Task VerifyDecisionTwelveMigrationAsync(string folder)
         // The database as the previous release left it: every migration up to PhaseTenRetentionFixes.
         await database.GetService<IMigrator>().MigrateAsync("20260924110006_PhaseTenRetentionFixes");
         database.Entries.AddRange(backlogMovie, freshMovie, undatedMovie, series);
-        database.Episodes.Add(episode);
         database.RetentionPolicySnapshots.Add(new RetentionPolicySnapshot
         {
             Id = RetentionPolicyService.PolicyId, Version = 3, Enabled = true, WatchedUserMode = WatchedUserMode.AllUsers,
             ReclaimAfterDays = 14, EnabledAt = firstEnabled.AddDays(2), FirstEnabledAt = firstEnabled, UpdatedAt = firstEnabled
         });
+        await database.SaveChangesAsync();
+        // The episode is written as that schema had it: the model has columns added since (CreditsJson, P1.FU15).
+        await database.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO Episodes (Id, EntryId, TmdbId, SeasonNumber, EpisodeNumber, Title, Monitored, State)
+            VALUES ({episode.Id}, {series.Id}, {episode.TmdbId}, 1, 1, '', 1, 0)
+            """);
         RetentionEvaluation Scheduled(Guid entryId, Guid? episodeId, DateTime basis) => new()
         {
             EntryId = entryId, EpisodeId = episodeId, TargetId = episodeId ?? entryId, State = "scheduled",

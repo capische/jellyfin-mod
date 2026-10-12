@@ -103,7 +103,8 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
     private async Task<TmdbMetadata> DetailsOverHttpAsync(string path, string mediaType, int id, Credential credential,
         CancellationToken cancellationToken)
     {
-        using var json = await GetAsync($"{path}/{id}?append_to_response=external_ids,{(mediaType == "movie" ? "release_dates" : "content_ratings")}",
+        // A series also brings its regular cast (P1.FU15), in the same request.
+        using var json = await GetAsync($"{path}/{id}?append_to_response=external_ids,{(mediaType == "movie" ? "release_dates" : "content_ratings,credits")}",
             credential, cancellationToken);
         if (mediaType == "series")
         {
@@ -206,7 +207,11 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
                 Title = Text(item, "name") ?? $"Episode {number}", Overview = Text(item, "overview"),
                 StillPath = Text(item, "still_path"), RuntimeMinutes = Number(item, "runtime"), VoteAverage = Decimal(item, "vote_average"),
                 AirDate = DateTime.TryParseExact(Text(item, "air_date"), "yyyy-MM-dd", CultureInfo.InvariantCulture,
-                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var date) ? date : null
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var date) ? date : null,
+                // A season lists each episode's guest stars and crew (P1.FU15).
+                CreditsJson = EpisodeCredits.From(Array(item, "guest_stars").Select(CastCredit),
+                    Array(item, "crew").Select(crew => (Number(crew, "id") ?? 0, Text(crew, "name"), Text(crew, "department"),
+                        Text(crew, "job"), Text(crew, "profile_path")))).ToJson()
             });
         }
     }
@@ -321,6 +326,8 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         }
 
         item.TryGetProperty("external_ids", out var externalIds);
+        // Only a series' details append its credits; a search result has none (null).
+        var cast = item.TryGetProperty("credits", out var credits) ? EpisodeCredits.Cast(Array(credits, "cast").Select(CastCredit)) : null;
         return new TmdbMetadata(
             mediaType, Number(item, "id") ?? 0, Text(item, mediaType == "movie" ? "title" : "name") ?? string.Empty,
             premiere, Text(item, "overview"), Text(item, "poster_path"), Text(item, "backdrop_path"),
@@ -331,8 +338,11 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             certifications.Distinct().ToArray(), Array(item, "seasons").Select(s => new TmdbSeason(Number(s, "season_number") ?? 0,
                 Text(s, "name") ?? string.Empty, Number(s, "episode_count") ?? 0, Text(s, "air_date"), Text(s, "poster_path"),
                 Text(s, "overview"))).ToArray(),
-            Text(item, mediaType == "movie" ? "original_title" : "original_name"));
+            Text(item, mediaType == "movie" ? "original_title" : "original_name"), Cast: cast);
     }
+
+    private static TmdbCastCredit CastCredit(JsonElement person) => new(Number(person, "id") ?? 0, Text(person, "name") ?? string.Empty,
+        Text(person, "character"), Text(person, "profile_path"), Number(person, "order") ?? int.MaxValue);
 
     private static string? Text(JsonElement item, string name) => item.ValueKind == JsonValueKind.Object && item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
     private static double? Decimal(JsonElement item, string name) => item.ValueKind == JsonValueKind.Object && item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var number) ? number : null;
@@ -362,18 +372,99 @@ public sealed record TmdbMetadata(
     [property: JsonPropertyName("certifications")] TmdbCertification[] Certifications,
     [property: JsonPropertyName("seasons")] TmdbSeason[] Seasons,
     [property: JsonPropertyName("originalTitle")] string? OriginalTitle = null,
-    [property: JsonPropertyName("episodeRatings")] IReadOnlyDictionary<int, double>? EpisodeRatings = null)
+    [property: JsonPropertyName("episodeRatings")] IReadOnlyDictionary<int, double>? EpisodeRatings = null,
+    [property: JsonPropertyName("cast")] IReadOnlyList<TmdbCastCredit>? Cast = null)
 {
     /// <summary>
     /// The series with TMDB's rating of each listed episode, by TMDB episode id (P1.FU14): an episode Jellyfin has no item
     /// for shows it as a native episode shows its community rating. Kept here, not on the episode rows, so no column is
-    /// needed. A series whose stored metadata has none was loaded before ratings were kept.
+    /// needed. A series whose stored metadata has none was loaded before ratings were kept. Its regular cast (P1.FU15) is
+    /// kept as read, an empty list when TMDB names none, so a series stored before has no <c>cast</c> at all.
     /// </summary>
     public TmdbMetadata WithEpisodeRatings(IEnumerable<Episode> episodes) => this with
     {
         EpisodeRatings = episodes.Where(episode => episode.TmdbId > 0 && episode.VoteAverage is > 0)
-            .GroupBy(episode => episode.TmdbId).ToDictionary(group => group.Key, group => Math.Round(group.First().VoteAverage!.Value, 1))
+            .GroupBy(episode => episode.TmdbId).ToDictionary(group => group.Key, group => Math.Round(group.First().VoteAverage!.Value, 1)),
+        Cast = Cast ?? []
     };
+}
+
+/// <summary>A person TMDB credits as cast (P1.FU15): a series' regular, or an episode's guest star.</summary>
+public sealed record TmdbCastCredit(
+    [property: JsonPropertyName("id")] int Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("character")] string? Character,
+    [property: JsonPropertyName("profilePath")] string? ProfilePath,
+    [property: JsonPropertyName("order")] int Order);
+
+/// <summary>
+/// A person TMDB credits on an episode's crew whom Jellyfin keeps (P1.FU15): <c>type</c> is Jellyfin's person kind
+/// (Director, Writer or Producer), <c>job</c> TMDB's job, which Jellyfin shows as the role.
+/// </summary>
+public sealed record TmdbCrewCredit(
+    [property: JsonPropertyName("id")] int Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("job")] string Job,
+    [property: JsonPropertyName("profilePath")] string? ProfilePath);
+
+/// <summary>
+/// An episode's guest stars and crew as Jellyfin's own TMDB provider keeps them for an episode it has (P1.FU15, Jellyfin
+/// 12.0's <c>TmdbEpisodeProvider</c> with its default settings): up to 15 guest stars by TMDB's order, and up to 15 of the
+/// crew whose department and job Jellyfin maps to a director, a writer or a producer, in TMDB's order.
+/// </summary>
+public sealed record EpisodeCredits(
+    [property: JsonPropertyName("guestStars")] IReadOnlyList<TmdbCastCredit> GuestStars,
+    [property: JsonPropertyName("crew")] IReadOnlyList<TmdbCrewCredit> Crew)
+{
+    /// <summary>Jellyfin's default <c>MaxCastMembers</c> and <c>MaxCrewMembers</c>.</summary>
+    private const int MaxPeople = 15;
+
+    /// <summary>Jellyfin's writing jobs (<c>TmdbUtils</c>).</summary>
+    private static readonly HashSet<string> WriterJobs = new(["writer", "screenplay", "novel"], StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>A cast list as Jellyfin keeps one: named people only, by TMDB's order, at most 15, names trimmed.</summary>
+    public static TmdbCastCredit[] Cast(IEnumerable<TmdbCastCredit> cast) => cast.Where(person => !string.IsNullOrWhiteSpace(person.Name))
+        .OrderBy(person => person.Order).Take(MaxPeople)
+        .Select(person => person with { Name = person.Name.Trim(), Character = person.Character?.Trim() }).ToArray();
+
+    /// <summary>An episode's credits from TMDB's guest stars and crew.</summary>
+    public static EpisodeCredits From(IEnumerable<TmdbCastCredit> guestStars,
+        IEnumerable<(int Id, string? Name, string? Department, string? Job, string? ProfilePath)> crew) =>
+        new(Cast(guestStars), crew.Where(person => !string.IsNullOrWhiteSpace(person.Name))
+            .Select(person => (Person: person, Type: CrewType(person.Department, person.Job))).Where(entry => entry.Type is not null)
+            .Take(MaxPeople)
+            .Select(entry => new TmdbCrewCredit(entry.Person.Id, entry.Person.Name!.Trim(), entry.Type!, entry.Person.Job!.Trim(),
+                entry.Person.ProfilePath)).ToArray());
+
+    /// <summary>Jellyfin's <c>TmdbUtils.MapCrewToPersonType</c>: the person kind it keeps, or null for one it drops.</summary>
+    private static string? CrewType(string? department, string? job)
+    {
+        if (string.Equals(department, "directing", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(job, "director", StringComparison.OrdinalIgnoreCase)) return "Director";
+        if (string.Equals(department, "production", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(job, "producer", StringComparison.OrdinalIgnoreCase)) return "Producer";
+        if (string.Equals(department, "writing", StringComparison.OrdinalIgnoreCase) && job is not null && WriterJobs.Contains(job))
+            return "Writer";
+        return null;
+    }
+
+    /// <summary>The stored form, <see cref="Episode.CreditsJson"/>.</summary>
+    public string ToJson() => JsonSerializer.Serialize(this);
+
+    /// <summary>The stored credits, or null when the episode has none stored (not loaded) or they cannot be read.</summary>
+    public static EpisodeCredits? Read(string? json)
+    {
+        if (json is null) return null;
+        try
+        {
+            return JsonSerializer.Deserialize<EpisodeCredits>(json) is { GuestStars: not null, Crew: not null } credits ? credits : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 }
 
 /// <summary>A regional parental certification.</summary>

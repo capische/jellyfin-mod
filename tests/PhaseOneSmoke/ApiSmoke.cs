@@ -925,13 +925,19 @@ internal static class ApiSmoke
         http.BeforeResponse = null;
         Assert(slow.Status == HttpStatusCode.GatewayTimeout && !await OpenedLoadedAsync(),
             "A TMDB request that times out answers 504 and the list stays unloaded (P1.FU9): " + slow.Status);
-        // P1.FU14: the season's overview and each episode's rating come with the same requests.
+        // P1.FU14: the season's overview and each episode's rating come with the same requests. P1.FU15: so do each episode's
+        // guest stars and crew (the pilot has 17 guest stars listed out of order, and crew Jellyfin keeps and drops; the second
+        // episode names nobody; season 2's response has no credit lists at all), and the series' regular cast, appended to
+        // the series' details (16 regulars, one unnamed).
+        static string People(int count, int first, string role) => string.Join(",", Enumerable.Range(0, count).Reverse().Select(index =>
+            $$"""{"id":{{first + index}},"name":" {{role}} {{index}} ","character":"Role {{index}}","profile_path":{{(index % 2 == 0 ? $"\"/p{first + index}.jpg\"" : "null")}},"order":{{index}}}"""));
+        const string pilotCrew = """[{"id":71,"name":"Dee Rector","department":"Directing","job":"Director","profile_path":"/d.jpg"},{"id":72,"name":"Ed Itor","department":"Editing","job":"Editor"},{"id":73,"name":"Wren Writer","department":"Writing","job":"Screenplay"},{"id":74,"name":"Story Teller","department":"Writing","job":"Story"},{"id":75,"name":"Pro Ducer","department":"Production","job":"Producer"},{"id":76,"name":"  ","department":"Directing","job":"Director"},{"id":77,"name":"Exec Utive","department":"Production","job":"Executive Producer"},{"id":71,"name":"Dee Rector","department":"Writing","job":"Writer","profile_path":"/d.jpg"}]""";
         var openedSnapshot = (Func<Uri, HttpResponseMessage>)(uri =>
             uri.AbsolutePath.Contains("/season/1", StringComparison.Ordinal)
-                ? Json("""{"season_number":1,"episodes":[{"id":8841,"season_number":1,"episode_number":1,"name":"Pilot","air_date":"2021-03-01","vote_average":7.46,"still_path":"/pilot.jpg","overview":"The pilot.","runtime":52},{"id":8842,"season_number":1,"episode_number":2,"name":"Second","air_date":"2021-03-08","vote_average":0}]}""")
+                ? Json($$$"""{"season_number":1,"episodes":[{"id":8841,"season_number":1,"episode_number":1,"name":"Pilot","air_date":"2021-03-01","vote_average":7.46,"still_path":"/pilot.jpg","overview":"The pilot.","runtime":52,"guest_stars":[{{{People(17, 500, "Guest")}}}],"crew":{{{pilotCrew}}}},{"id":8842,"season_number":1,"episode_number":2,"name":"Second","air_date":"2021-03-08","vote_average":0,"guest_stars":[],"crew":[]}]}""")
             : uri.AbsolutePath.Contains("/season/2", StringComparison.Ordinal)
                 ? Json("""{"season_number":2,"episodes":[{"id":8843,"season_number":2,"episode_number":1,"name":"Return","air_date":"2022-03-01"}]}""")
-            : Json("""{"id":8840,"name":"Opened","seasons":[{"season_number":1,"name":"Season 1","episode_count":2,"overview":"The first season.","poster_path":"/s1.jpg"},{"season_number":2,"name":"Season 2","episode_count":1}]}"""));
+            : Json($$$"""{"id":8840,"name":"Opened","seasons":[{"season_number":1,"name":"Season 1","episode_count":2,"overview":"The first season.","poster_path":"/s1.jpg"},{"season_number":2,"name":"Season 2","episode_count":1}],"credits":{"cast":[{{{People(16, 600, "Regular")}}},{"id":699,"name":"","order":-1}]}}"""));
         http.Response = openedSnapshot;
         await using (var lease = await app.Services.GetRequiredService<ReconciliationLibraryLock>()
             .TryAcquireAsync(tvLibrary.Id, TimeSpan.FromSeconds(5), default))
@@ -1004,6 +1010,46 @@ internal static class ApiSmoke
         Assert(Covers(reopened.Body) == expectedCovers,
             "The loaded list carries the season overview and poster, the episode's still, overview, runtime and rating (P1.FU14): " +
             Covers(reopened.Body));
+        // P1.FU15: an episode Jellyfin has no item for gets the people a downloaded one shows. Each episode carries its guest stars
+        // (TMDB's order, at most 15, names trimmed) and the crew Jellyfin keeps (directors, writers by writer, screenplay or
+        // novel, producers; not an editor, a story credit or an executive producer, nor an unnamed person), in TMDB's order;
+        // an episode TMDB names nobody for has empty lists, never null; the series keeps its first 15 named regulars.
+        static string Text(JsonElement person, string name) =>
+            person.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString()! : "-";
+        static string Credits(JsonElement detail, int tmdbId)
+        {
+            var credits = detail.GetProperty("episodes").EnumerateArray().Single(row => row.GetProperty("tmdbId").GetInt32() == tmdbId)
+                .GetProperty("credits");
+            if (credits.ValueKind != JsonValueKind.Object) return credits.ValueKind.ToString();
+            var guests = credits.GetProperty("guestStars").EnumerateArray().ToArray();
+            return $"{guests.Length}:" + string.Join(",", guests.Take(2).Concat(guests.TakeLast(1)).Select(guest =>
+                    $"{guest.GetProperty("id").GetInt32()}/{Text(guest, "name")}/{Text(guest, "character")}/{Text(guest, "profilePath")}")) +
+                "|" + string.Join(",", credits.GetProperty("crew").EnumerateArray().Select(person =>
+                    $"{person.GetProperty("id").GetInt32()}/{Text(person, "name")}/{Text(person, "type")}/{Text(person, "job")}"));
+        }
+        static string SeriesCast(JsonElement detail)
+        {
+            var metadata = detail.GetProperty("entry").GetProperty("metadata");
+            if (!metadata.TryGetProperty("cast", out var cast) || cast.ValueKind != JsonValueKind.Array) return "absent";
+            var people = cast.EnumerateArray().ToArray();
+            return $"{people.Length}:" + string.Join(",", people.Take(1).Concat(people.TakeLast(1)).Select(person =>
+                $"{Text(person, "name")}/{Text(person, "character")}/{person.GetProperty("order").GetInt32()}"));
+        }
+        const string expectedPilot = "15:500/Guest 0/Role 0//p500.jpg,501/Guest 1/Role 1/-,514/Guest 14/Role 14//p514.jpg|" +
+            "71/Dee Rector/Director/Director,73/Wren Writer/Writer/Screenplay,75/Pro Ducer/Producer/Producer,71/Dee Rector/Writer/Writer";
+        const string expectedCast = "15:Regular 0/Role 0/0,Regular 14/Role 14/14";
+        string CreditsSummary(JsonElement detail) =>
+            $"{Credits(detail, 8841)} || {Credits(detail, 8842)} || {Credits(detail, 8843)} || {SeriesCast(detail)}";
+        var expectedCredits = $"{expectedPilot} || 0:| || 0:| || {expectedCast}";
+        Assert(CreditsSummary(reopened.Body) == expectedCredits,
+            "The loaded list carries each episode's guest stars and crew as Jellyfin keeps them, empty lists where TMDB names nobody, " +
+            "and the series' regular cast (P1.FU15): " + CreditsSummary(reopened.Body));
+        using (var plainDetail = await ordinary.GetAsync($"/JellyfinMod/Entries/{opened.Id}"))
+        {
+            using var json = JsonDocument.Parse(await plainDetail.Content.ReadAsStringAsync());
+            Assert(plainDetail.IsSuccessStatusCode && CreditsSummary(json.RootElement) == expectedCredits,
+                "GET Entries/{id} returns the same credits and cast (P1.FU15): " + CreditsSummary(json.RootElement));
+        }
         // A list loaded before the series' metadata kept ratings is loaded once more by the next opening, and then not again.
         await using (var database = new ModDbContext(dbPath))
         {
@@ -1022,6 +1068,41 @@ internal static class ApiSmoke
             backfilled.Body.GetProperty("episodes").GetArrayLength() == 3 && settled.Status == HttpStatusCode.OK && OpenedRequests().Length == 0,
             "Opening a series whose list predates P1.FU14 loads it once more and fills the overviews and ratings, then answers " +
             $"without TMDB (P1.FU14): {backfilled.Status} {backfillRequests} {Covers(backfilled.Body)} then {OpenedRequests().Length}");
+        // P1.FU15: a list loaded with ratings but before credits were kept (no cast in the series' metadata, no credits on its
+        // episodes, as the EpisodeCredits migration leaves every row) shows null credits, is loaded once more by the next
+        // opening, and is then answered without TMDB, credits filled. A series TMDB names no regulars for is not reloaded.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var stale = await database.Entries.SingleAsync(entry => entry.Id == opened.Id);
+            stale.MetadataJson = JsonSerializer.Serialize(JsonSerializer.Deserialize<TmdbMetadata>(stale.MetadataJson!)! with { Cast = null });
+            foreach (var row in await database.Episodes.Where(episode => episode.EntryId == opened.Id).ToListAsync()) row.CreditsJson = null;
+            await database.SaveChangesAsync();
+        }
+        using (var staleDetail = await ordinary.GetAsync($"/JellyfinMod/Entries/{opened.Id}"))
+        {
+            using var json = JsonDocument.Parse(await staleDetail.Content.ReadAsStringAsync());
+            Assert(CreditsSummary(json.RootElement) == "Null || Null || Null || absent" && json.RootElement.GetProperty("episodeListLoaded").GetBoolean(),
+                "A list loaded before P1.FU15 reads as loaded, with null credits and no cast (P1.FU15): " + CreditsSummary(json.RootElement));
+        }
+        http.Requests.Clear();
+        var creditsBackfill = await OpenAsync(ordinary, opened.Id);
+        var creditsRequests = OpenedRequests().Length;
+        http.Requests.Clear();
+        var creditsSettled = await OpenAsync(ordinary, opened.Id);
+        Assert(creditsBackfill.Status == HttpStatusCode.OK && creditsRequests > 0 && CreditsSummary(creditsBackfill.Body) == expectedCredits &&
+            creditsSettled.Status == HttpStatusCode.OK && OpenedRequests().Length == 0 && CreditsSummary(creditsSettled.Body) == expectedCredits,
+            "Opening a series whose list predates P1.FU15 loads it once more and fills the credits and cast, then answers without " +
+            $"TMDB (P1.FU15): {creditsBackfill.Status} {creditsRequests} {CreditsSummary(creditsBackfill.Body)} then {OpenedRequests().Length}");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var castlessEntry = await database.Entries.SingleAsync(entry => entry.Id == opened.Id);
+            castlessEntry.MetadataJson = JsonSerializer.Serialize(JsonSerializer.Deserialize<TmdbMetadata>(castlessEntry.MetadataJson!)! with { Cast = [] });
+            await database.SaveChangesAsync();
+        }
+        http.Requests.Clear();
+        var castless = await OpenAsync(ordinary, opened.Id);
+        Assert(castless.Status == HttpStatusCode.OK && OpenedRequests().Length == 0 && SeriesCast(castless.Body) == "0:",
+            "A series whose stored cast is empty (TMDB names no regulars) is not loaded again (P1.FU15): " + OpenedRequests().Length);
 
         // The administrator's Refresh still refreshes a loaded list, and stays administrator-only.
         Assert((await ordinary.PostAsync($"/JellyfinMod/Entries/{opened.Id}/Refresh", null)).StatusCode == HttpStatusCode.Forbidden,

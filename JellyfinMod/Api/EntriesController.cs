@@ -207,7 +207,8 @@ public sealed class EntriesController(
 
     /// <summary>
     /// Loads a series' full TMDB season and episode list the first time anyone who may see the entry opens it (P1.FU9),
-    /// and once more for a list loaded before the series' metadata kept season overviews and episode ratings (P1.FU14).
+    /// and once more for a list loaded before the series' metadata kept season overviews and episode ratings (P1.FU14) or
+    /// its cast and the episodes' guest stars and crew (P1.FU15).
     /// Once the list is loaded, or for a movie, it answers the detail unchanged without asking TMDB; keeping a loaded
     /// list current stays the administrator's Refresh.
     /// </summary>
@@ -262,11 +263,12 @@ public sealed class EntriesController(
             record.EventType == SeriesMetadataRefresher.EpisodeListEvent, cancellationToken);
 
     /// <summary>
-    /// Whether a series' list is loaded and its stored metadata has the episode ratings (P1.FU14): a list loaded before
-    /// then is loaded once more, which also brings the season overviews.
+    /// Whether a series' list is loaded and its stored metadata has the episode ratings (P1.FU14) and the regular cast
+    /// (P1.FU15): a list loaded before either is loaded once more, which also brings the season overviews and every
+    /// episode's guest stars and crew.
     /// </summary>
     private async Task<bool> EpisodeListCurrentAsync(Guid id, CancellationToken cancellationToken) =>
-        await EpisodeListLoadedAsync(id, cancellationToken) && SeriesMetadataRefresher.HasEpisodeRatings(await database.Entries
+        await EpisodeListLoadedAsync(id, cancellationToken) && SeriesMetadataRefresher.HasCurrentListMetadata(await database.Entries
             .AsNoTracking().Where(entry => entry.Id == id).Select(entry => entry.MetadataJson).SingleOrDefaultAsync(cancellationToken));
 
     /// <summary>Runs the Refresh's own load once, unless a load that just finished already did it.</summary>

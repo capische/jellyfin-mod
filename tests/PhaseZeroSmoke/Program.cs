@@ -68,10 +68,14 @@ try
         await database.GetService<IMigrator>().MigrateAsync("20261007110102_DetailFileHistory");
         database.Entries.Add(new Entry { Id = showId, MediaType = "series", TmdbId = 1, Title = "Old Show" });
         database.Entries.Add(new Entry { Id = filmId, MediaType = "movie", TmdbId = 2, Title = "Old Movie" });
-        database.Episodes.Add(new Episode { Id = firstEpisode, EntryId = showId, TmdbId = 11, SeasonNumber = 1, EpisodeNumber = 1, Title = "One" });
-        database.Episodes.Add(new Episode { Id = secondEpisode, EntryId = showId, TmdbId = 12, SeasonNumber = 1, EpisodeNumber = 2, Title = "Two",
-            State = FileState.OnDisk });
         await database.SaveChangesAsync();
+        // Episodes are written as that schema had them: the model has columns added since (CreditsJson, P1.FU15).
+        foreach (var (episodeId, tmdbId, number, title, state) in new[]
+                 { (firstEpisode, 11, 1, "One", FileState.None), (secondEpisode, 12, 2, "Two", FileState.OnDisk) })
+            await database.Database.ExecuteSqlInterpolatedAsync($"""
+                INSERT INTO Episodes (Id, EntryId, TmdbId, SeasonNumber, EpisodeNumber, Title, Monitored, State)
+                VALUES ({episodeId}, {showId}, {tmdbId}, 1, {number}, {title}, 1, {(int)state})
+                """);
         var now = DateTime.UtcNow;
         foreach (var (grabId, entryId, episodeId, target, intent, state) in new (Guid, Guid, Guid?, string?, string, string)[]
                  {
@@ -204,6 +208,42 @@ try
     }
 
     Assert(await HasColumnAsync(path, "ImportOperations", "ReplaceTargets"), "A fresh database has ReplaceTargets");
+
+    // P1.FU15: a database at the schema before EpisodeCredits (SeasonPacks, as 28096 runs) gains the nullable CreditsJson column
+    // on start without rebuilding Episodes: its rows, its GrabClaimRelease trigger and its indexes stay, and every existing
+    // episode reads with no credits (null: not loaded), never an empty list.
+    var creditsPath = Path.Combine(directory, "before-credits.db");
+    var creditsShow = Guid.NewGuid();
+    var creditsEpisode = Guid.NewGuid();
+    await using (var database = new ModDbContext(creditsPath))
+    {
+        await database.GetService<IMigrator>().MigrateAsync("20261008043448_SeasonPacks");
+        await database.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO Entries (Id, MediaType, TmdbId, Title, State, Monitored, AddedAt)
+            VALUES ({creditsShow}, 'series', 4, 'Before Credits', 0, 1, {DateTime.UtcNow})
+            """);
+        await database.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO Episodes (Id, EntryId, TmdbId, SeasonNumber, EpisodeNumber, Title, Monitored, State)
+            VALUES ({creditsEpisode}, {creditsShow}, 41, 1, 1, 'Pilot', 1, 0)
+            """);
+    }
+    Assert(!await HasColumnAsync(creditsPath, "Episodes", "CreditsJson"), "The SeasonPacks database is built without CreditsJson");
+    using (var creditsProvider = new ServiceCollection().AddLogging().AddTransient(_ => new ModDbContext(creditsPath)).BuildServiceProvider())
+    {
+        var upgraded = NewInitializer(creditsProvider);
+        await upgraded.StartAsync(CancellationToken.None);
+        await using var database = new ModDbContext(creditsPath);
+        var rows = await database.Episodes.AsNoTracking().Where(episode => episode.EntryId == creditsShow).ToListAsync();
+        var objects = await database.Database.SqlQueryRaw<string>(
+            "SELECT name AS Value FROM sqlite_master WHERE name IN ('GrabClaimRelease', 'IX_Episodes_EntryId_TmdbId', " +
+            "'IX_Episodes_EntryId_Position') ORDER BY name").ToListAsync();
+        Assert(upgraded.IsReady && (await database.Database.GetPendingMigrationsAsync()).Count() == 0 &&
+            await HasColumnAsync(creditsPath, "Episodes", "CreditsJson") && rows.Count == 1 && rows[0].Id == creditsEpisode &&
+            rows[0].Title == "Pilot" && rows[0].CreditsJson is null &&
+            string.Join(",", objects) == "GrabClaimRelease,IX_Episodes_EntryId_Position,IX_Episodes_EntryId_TmdbId",
+            "A SeasonPacks database gains CreditsJson on start, keeping its episodes (credits null), trigger and indexes (P1.FU15): " +
+            string.Join(",", objects));
+    }
 
     var serializer = new XmlSerializer(typeof(PluginConfiguration));
     var selectedUserId = Guid.NewGuid();

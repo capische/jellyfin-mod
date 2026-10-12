@@ -28,6 +28,11 @@ public sealed class Episode
     /// (<c>episodeRatings</c>, P1.FU14), so no column is needed.
     /// </summary>
     public double? VoteAverage { get; set; }
+    /// <summary>
+    /// Gets or sets TMDB's guest stars and crew of the episode as JSON (<see cref="JellyfinMod.Services.EpisodeCredits"/>,
+    /// P1.FU15): null until the series' list is loaded with credits, an empty list where TMDB names nobody.
+    /// </summary>
+    public string? CreditsJson { get; set; }
     /// <summary>Gets or sets whether future acquisition should monitor this episode.</summary>
     public bool Monitored { get; set; } = true;
     /// <summary>Gets or sets the current file availability.</summary>

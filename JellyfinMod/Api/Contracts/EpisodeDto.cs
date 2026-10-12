@@ -40,6 +40,12 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     /// <summary>Gets runtimeMinutes.</summary>
     [JsonPropertyName("runtimeMinutes")]
     public int? RuntimeMinutes { get; } = episode.RuntimeMinutes;
+    /// <summary>
+    /// Gets TMDB's guest stars and crew of the episode (P1.FU15); null until the series' list is loaded with credits, empty
+    /// lists where TMDB names nobody.
+    /// </summary>
+    [JsonPropertyName("credits"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public JellyfinMod.Services.EpisodeCredits? Credits { get; } = JellyfinMod.Services.EpisodeCredits.Read(episode.CreditsJson);
     /// <summary>Gets the episode's own retention override: inherit, days or never (P10.E3).</summary>
     [JsonPropertyName("retentionPolicy")]
     public string RetentionPolicy { get; } = RetentionPolicies.ToWire(episode.RetentionPolicy);

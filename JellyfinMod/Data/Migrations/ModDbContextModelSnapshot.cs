@@ -776,6 +776,9 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<DateTime?>("AirDate")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("CreditsJson")
+                        .HasColumnType("TEXT");
+
                     b.Property<Guid>("EntryId")
                         .HasColumnType("TEXT");
 

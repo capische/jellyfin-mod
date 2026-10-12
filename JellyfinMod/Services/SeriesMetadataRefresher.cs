@@ -38,17 +38,19 @@ public sealed class SeriesMetadataRefresher(
     public const string EpisodeListEvent = "episodes_listed";
 
     /// <summary>
-    /// Whether a series' stored metadata has its episode ratings and season overviews (P1.FU14): metadata stored before
-    /// then has no <c>episodeRatings</c> at all, while a series TMDB rates no episode of has an empty set.
+    /// Whether a series' stored metadata has its episode ratings and season overviews (P1.FU14) and its regular cast, with
+    /// every episode's guest stars and crew beside it (P1.FU15): metadata stored before then has no <c>episodeRatings</c> or
+    /// no <c>cast</c> at all, while a series TMDB rates no episode of, or names no cast for, has an empty set.
     /// </summary>
-    public static bool HasEpisodeRatings(string? metadataJson)
+    public static bool HasCurrentListMetadata(string? metadataJson)
     {
         if (metadataJson is null) return false;
         try
         {
             using var json = JsonDocument.Parse(metadataJson);
             return json.RootElement.ValueKind == JsonValueKind.Object &&
-                json.RootElement.TryGetProperty("episodeRatings", out var ratings) && ratings.ValueKind == JsonValueKind.Object;
+                json.RootElement.TryGetProperty("episodeRatings", out var ratings) && ratings.ValueKind == JsonValueKind.Object &&
+                json.RootElement.TryGetProperty("cast", out var cast) && cast.ValueKind == JsonValueKind.Array;
         }
         catch (JsonException)
         {
@@ -162,6 +164,7 @@ public sealed class SeriesMetadataRefresher(
                             occupant.StillPath = remote.StillPath;
                             occupant.AirDate = remote.AirDate;
                             occupant.RuntimeMinutes = remote.RuntimeMinutes;
+                            occupant.CreditsJson = remote.CreditsJson;
                             database.History.Add(new HistoryRecord
                             {
                                 EntryId = entry.Id,
@@ -184,6 +187,7 @@ public sealed class SeriesMetadataRefresher(
                     local.StillPath = remote.StillPath;
                     local.AirDate = remote.AirDate;
                     local.RuntimeMinutes = remote.RuntimeMinutes;
+                    local.CreditsJson = remote.CreditsJson;
                 }
                 else if (byPosition.TryGetValue((remote.SeasonNumber, remote.EpisodeNumber), out var positional))
                 {
@@ -199,6 +203,7 @@ public sealed class SeriesMetadataRefresher(
                     positional.StillPath = remote.StillPath;
                     positional.AirDate = remote.AirDate;
                     positional.RuntimeMinutes = remote.RuntimeMinutes;
+                    positional.CreditsJson = remote.CreditsJson;
                     database.History.Add(new HistoryRecord
                     {
                         EntryId = entry.Id,

@@ -87,7 +87,11 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
             {
                 TmdbId = item.Id, SeasonNumber = seasonNumber, EpisodeNumber = number,
                 Title = string.IsNullOrEmpty(item.Name) ? $"Episode {number}" : item.Name, Overview = item.Overview,
-                StillPath = item.StillPath, RuntimeMinutes = item.Runtime, VoteAverage = item.VoteAverage, AirDate = Day(item.AirDate)
+                StillPath = item.StillPath, RuntimeMinutes = item.Runtime, VoteAverage = item.VoteAverage, AirDate = Day(item.AirDate),
+                // The season lists each episode's guest stars and crew, as the plugin's own requests read them (P1.FU15).
+                CreditsJson = EpisodeCredits.From((item.GuestStars ?? []).Where(person => person is not null).Select(Credit),
+                    (item.Crew ?? []).Where(person => person is not null)
+                        .Select(person => (person.Id, person.Name, person.Department, person.Job, person.ProfilePath))).ToJson()
             });
         }
     }
@@ -165,8 +169,13 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
                 .Select(rating => new TmdbCertification(rating.Iso_3166_1!, rating.Rating!)).Distinct().ToArray(),
             (series.Seasons ?? []).Select(season => new TmdbSeason(season.SeasonNumber, season.Name ?? string.Empty, season.EpisodeCount,
                 season.AirDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), season.PosterPath, season.Overview)).ToArray(),
-            series.OriginalName);
+            series.OriginalName,
+            // The manager reads a series with its credits; its regular cast is kept as the plugin's own requests keep it (P1.FU15).
+            Cast: EpisodeCredits.Cast((series.Credits?.Cast ?? []).Where(person => person is not null).Select(Credit)));
     }
+
+    private static TmdbCastCredit Credit(TMDbLib.Objects.TvShows.Cast person) =>
+        new(person.Id, person.Name ?? string.Empty, person.Character, person.ProfilePath, person.Order);
 
     private static TmdbMetadata Found(SearchMovie item) => new(
         "movie", item.Id, item.Title ?? string.Empty, Day(item.ReleaseDate), item.Overview, item.PosterPath, item.BackdropPath,
