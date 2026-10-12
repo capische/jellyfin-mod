@@ -32,6 +32,12 @@ public sealed class SeriesMetadataRefresher(
     LibraryAccess? access = null)
 {
     /// <summary>
+    /// The History event of a series' first TMDB season and episode list (P1.FU). A series added through TMDB has its list
+    /// from the start; one discovered in the library gets it from its first Refresh, and this event marks that it has.
+    /// </summary>
+    public const string EpisodeListEvent = "episodes_listed";
+
+    /// <summary>
     /// Whether a position-identity episode and the TMDB episode listed at its position are evidently the same episode:
     /// the same title ignoring case, punctuation and spacing, or the same air date within a day where no other listed
     /// episode airs that close (RET-R2, RET3-R5).
@@ -70,6 +76,10 @@ public sealed class SeriesMetadataRefresher(
             if (entry is null) return SeriesRefreshOutcome.NotFound;
             await using var transaction = await database.Database.BeginTransactionAsync(cancellationToken);
             var existing = await database.Episodes.Where(episode => episode.EntryId == entry.Id).ToListAsync(cancellationToken);
+            // A series discovered in the library has only the rows of its files until its TMDB list first loads (P1.FU).
+            var firstList = !existing.Any(episode => !episode.IsPositionIdentity) &&
+                !await database.History.AnyAsync(record => record.EntryId == entry.Id &&
+                    record.EventType == EpisodeListEvent, cancellationToken);
             var byTmdbId = existing.Where(episode => !episode.IsPositionIdentity).ToDictionary(episode => episode.TmdbId);
             // TMDB is identity; a bound episode keeps Jellyfin's display numbering, so Refresh and
             // reconciliation stop overwriting each other (P2.R9). Unmatched episodes keep theirs too.
@@ -213,6 +223,19 @@ public sealed class SeriesMetadataRefresher(
                     Data = JsonSerializer.Serialize(new { episodeId = row.Id, row.SeasonNumber, row.EpisodeNumber, reason = "covered" })
                 });
             }
+            if (firstList)
+            {
+                var seasons = snapshot.Select(remote => remote.SeasonNumber).Distinct().Count();
+                database.History.Add(new HistoryRecord
+                {
+                    EntryId = entry.Id,
+                    EventType = EpisodeListEvent,
+                    Summary = $"Loaded {seasons} season{(seasons == 1 ? "" : "s")} and {snapshot.Count} episode" +
+                        $"{(snapshot.Count == 1 ? "" : "s")} from TMDB",
+                    Data = JsonSerializer.Serialize(new { seasons, episodes = snapshot.Count })
+                });
+            }
+
             entry.Title = metadata.Title;
             entry.Year = metadata.PremiereDate?.Year;
             entry.ImdbId = metadata.ImdbId;

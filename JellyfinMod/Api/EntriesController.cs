@@ -1008,7 +1008,9 @@ public sealed class EntriesController(
                 ? await versions.ForAsync(entry.Id, null, evaluations.GetValueOrDefault(entry.Id), isAdmin, cancellationToken, user)
                 : [],
             Upgrade = isAdmin && entry.MediaType == "movie" ? await versions.UpgradeAsync(entry, cancellationToken) : null,
-            RetentionWarning = entry.MediaType == "movie" ? warnings.GetValueOrDefault(entry.Id) : null
+            RetentionWarning = entry.MediaType == "movie" ? warnings.GetValueOrDefault(entry.Id) : null,
+            EpisodeListLoaded = entry.MediaType != "series" || episodes.Any(episode => !episode.IsPositionIdentity) ||
+                history.Any(record => record.EventType == SeriesMetadataRefresher.EpisodeListEvent)
         };
     }
 }

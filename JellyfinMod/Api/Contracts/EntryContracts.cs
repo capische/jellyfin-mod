@@ -154,6 +154,13 @@ public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto 
     [JsonPropertyName("retentionWarning"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public RetentionWarningDto? RetentionWarning { get; init; }
 
+    /// <summary>
+    /// Gets whether the series' TMDB season and episode list has been loaded (P1.FU); always true for a movie. A series
+    /// discovered in the library has only the episodes of its files until an administrator's Refresh loads the list.
+    /// </summary>
+    [JsonPropertyName("episodeListLoaded")]
+    public bool EpisodeListLoaded { get; init; } = true;
+
     /// <summary>Gets a movie's upgrade state; administrators only, null otherwise.</summary>
     [JsonPropertyName("upgrade"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public UpgradeStateDto? Upgrade { get; init; }
