@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using System.Text.Json.Serialization;
+using JellyfinMod.Services.Acquisition;
 
 namespace JellyfinMod.Api.Contracts;
 
@@ -83,6 +84,17 @@ public sealed record QueueRowDto(
     /// </summary>
     [JsonPropertyName("pack"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public QueuePackDto? Pack { get; init; }
+
+    /// <summary>
+    /// Gets the release name as the picker parsed it when it was grabbed (resolution, source, codec, audio, languages; the
+    /// grab's stored <c>parsed</c>), for the missing episode page's marks (P1.FU20). Null when the grab kept none.
+    /// </summary>
+    [JsonPropertyName("parsed"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public ParsedRelease? Parsed { get; init; }
+
+    /// <summary>Gets the name of the indexer the release was grabbed from (P1.FU20); null when the grab is gone.</summary>
+    [JsonPropertyName("indexerName"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public string? IndexerName { get; init; }
 }
 
 /// <summary>A pack's queue row detail: "Season 2 pack · 8 episodes", "Complete pack · S01–S05".</summary>

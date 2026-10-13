@@ -417,6 +417,14 @@ internal static partial class Phase5
         rowA = Row(queue, importA.Id);
         Assert(rowA.GetProperty("state").GetString() == "downloading" && Math.Abs(rowA.GetProperty("progress").GetDouble() - 0.25) < 0.001 &&
             rowA.GetProperty("sizeBytes").GetInt64() == Size, "The queue shows real download progress: " + rowA);
+        // The row carries the release as the picker parsed it and the indexer it came from (P1.FU20), as the search showed them.
+        var searchedA = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Releases?entryId={ids["movieA"]}")).GetProperty("candidates")
+            .EnumerateArray().Single(item => item.GetProperty("rawTitle").GetString() == rowA.GetProperty("releaseTitle").GetString());
+        Assert(rowA.GetProperty("parsed").GetRawText() == searchedA.GetProperty("parsed").GetRawText() &&
+            rowA.GetProperty("parsed").GetProperty("resolution").GetString() == "1080p" &&
+            rowA.GetProperty("indexerName").GetString() == searchedA.GetProperty("indexerName").GetString() &&
+            !string.IsNullOrEmpty(rowA.GetProperty("indexerName").GetString()),
+            "The queue row carries the grab's parsed release and indexer name: " + rowA);
         var listed = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Entries?mediaType=movie&state=downloading"));
         var listedA = listed.GetProperty("items").EnumerateArray().Single(item => item.GetProperty("id").AsGuid() == ids["movieA"]);
         Assert(listedA.GetProperty("progress").GetInt32() == 25 && listed.GetProperty("totalRecordCount").GetInt32() == 1,

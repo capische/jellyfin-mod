@@ -125,6 +125,20 @@ public static class QueueReadModel
         }).ToArray());
     }
 
+    /// <summary>The grab's release name as parsed when it was grabbed (P1.FU20); null for a grab that kept none.</summary>
+    public static ParsedRelease? Parsed(GrabOperation grab)
+    {
+        if (string.IsNullOrEmpty(grab.ParsedJson) || grab.ParsedJson == "{}") return null;
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<ParsedRelease>(grab.ParsedJson);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>The row state shown to users (P5 API contract).</summary>
     public static string RowState(ImportOperation operation, SeedReleaseOperation? seed, ClientSnapshot? snapshot, double? progress)
     {

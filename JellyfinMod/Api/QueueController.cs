@@ -77,9 +77,10 @@ public sealed class QueueController(
         // A pack is one row (season and series packs, 2026-10-08): its first listed import stands for the torrent, and the row
         // lists every claimed episode's own state. It is shown only to a user who may see every one of them.
         var grabIds = operations.Select(operation => operation.GrabId).Distinct().ToArray();
-        var packs = await database.GrabOperations.AsNoTracking()
-            .Where(grab => grabIds.Contains(grab.Id) && (grab.Scope == "season" || grab.Scope == "series"))
+        // Every row's grab: a pack's for its one row, and each row's parsed release and indexer (P1.FU20).
+        var grabs = await database.GrabOperations.AsNoTracking().Where(grab => grabIds.Contains(grab.Id))
             .ToDictionaryAsync(grab => grab.Id, cancellationToken);
+        var packs = grabs.Values.Where(grab => grab.Scope == "season" || grab.Scope == "series").ToDictionary(grab => grab.Id);
         var packChildren = packs.Count == 0 ? [] : await database.ImportOperations.AsNoTracking()
             .Where(operation => packs.Keys.Contains(operation.GrabId)).ToListAsync(cancellationToken);
         var packClaims = packs.Count == 0 ? [] : await database.GrabClaims.AsNoTracking().Where(claim => packs.Keys.Contains(claim.GrabId))
@@ -112,7 +113,9 @@ public sealed class QueueController(
                 if (states is { Length: > 0 } && !states.Contains(packRow.State, StringComparer.Ordinal)) continue;
                 rows.Add(packRow with
                 {
-                    Pack = QueueReadModel.Pack(pack, claimed, packChildren, clientSnapshots.GetValueOrDefault(representative.DownloadClientId))
+                    Pack = QueueReadModel.Pack(pack, claimed, packChildren, clientSnapshots.GetValueOrDefault(representative.DownloadClientId)),
+                    Parsed = QueueReadModel.Parsed(pack),
+                    IndexerName = pack.IndexerName
                 });
                 continue;
             }
@@ -123,7 +126,8 @@ public sealed class QueueController(
                 clientSnapshots.GetValueOrDefault(operation.DownloadClientId), settings, administrator,
                 seed is not null && LibraryLinkPresent(seed));
             if (states is { Length: > 0 } && !states.Contains(row.State, StringComparer.Ordinal)) continue;
-            rows.Add(row);
+            var grab = grabs.GetValueOrDefault(operation.GrabId);
+            rows.Add(grab is null ? row : row with { Parsed = QueueReadModel.Parsed(grab), IndexerName = grab.IndexerName });
         }
 
         return new QueueResultDto(rows, rows.Count, time.GetUtcNow().UtcDateTime, clientStatus, settings.ImportEnabled,

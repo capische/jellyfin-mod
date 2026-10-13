@@ -215,6 +215,9 @@ internal static class NextUpScenarios
             episodes[2].GetProperty("sizeBytes").GetInt64() == transmission.Torrents[firstHash].Files[1].Length,
             "The pack row stays downloading; each episode shows its own progress and file size: " +
             packRow.GetRawText());
+        Assert(packRow.GetProperty("parsed").GetProperty("seasonPack").GetBoolean() &&
+            !string.IsNullOrEmpty(packRow.GetProperty("indexerName").GetString()),
+            "The pack row carries the pack's parsed release and its indexer name (P1.FU20): " + packRow.GetRawText());
 
         // Retention does not count the early episode's file as seeded while its torrent is incomplete: past its deadline, and with
         // the torrent's ratio above every goal, it is blocked, not due. Its seed release cannot meet a goal before the torrent is
