@@ -131,6 +131,9 @@ public sealed class RetentionEventListener(
 
     private void OnUserDataSaved(object? sender, UserDataSaveEventArgs eventArgs)
     {
+        // The plugin's own re-save of data Jellyfin re-attached to an item that took a placeholder's place (P1.FU25 follow-up):
+        // nothing was watched or changed, so it is never retention evidence and never a completion.
+        if (Placeholders.PlaceholderUserData.IsResaving) return;
         // A series favourite protects its episodes (P3.T11).
         if (eventArgs.Item is Series series)
         {

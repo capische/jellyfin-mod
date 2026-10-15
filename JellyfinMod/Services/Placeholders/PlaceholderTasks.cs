@@ -4,6 +4,7 @@ using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using MediaBrowser.Controller.Entities;
 using JellyfinEpisode = MediaBrowser.Controller.Entities.TV.Episode;
 
 namespace JellyfinMod.Services.Placeholders;
@@ -12,12 +13,16 @@ namespace JellyfinMod.Services.Placeholders;
 /// Stamps a stub episode as soon as Jellyfin creates or saves its item (P1.FU24): its date added becomes its air date and its
 /// runtime TMDB's, so the new placeholder never heads Latest. Jellyfin's first metadata refresh saves the item it loaded before
 /// the stamp, so a save is stamped again; the stamp's own save changes nothing and ends it. Done off Jellyfin's event thread.
+/// Also refreshes Jellyfin's cached user data of an item that took a placeholder's place, or a placeholder that took a file's
+/// place, once its first refresh has re-attached the data (<see cref="PlaceholderUserData"/>, P1.FU25 follow-up).
 /// </summary>
 public sealed class PlaceholderItemListener(ILibraryManager library, IServiceScopeFactory scopeFactory,
-    ILogger<PlaceholderItemListener> logger) : IHostedService
+    ILogger<PlaceholderItemListener> logger, IUserDataManager? userData = null, IUserManager? users = null) : IHostedService
 {
     private readonly Channel<Guid> queue = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions { SingleReader = true });
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, byte> queued = new();
+    // Items created in place of another whose first refresh has not been handled yet, with when they were created.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, DateTime> fresh = new();
     private CancellationTokenSource? stopping;
     private Task? worker;
 
@@ -26,7 +31,7 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
     {
         stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         library.ItemAdded += OnItemAdded;
-        library.ItemUpdated += OnItemAdded;
+        library.ItemUpdated += OnItemUpdated;
         worker = Task.Run(() => ProcessAsync(stopping.Token), CancellationToken.None);
         return Task.CompletedTask;
     }
@@ -35,7 +40,7 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         library.ItemAdded -= OnItemAdded;
-        library.ItemUpdated -= OnItemAdded;
+        library.ItemUpdated -= OnItemUpdated;
         queue.Writer.TryComplete();
         var source = Interlocked.Exchange(ref stopping, null);
         if (source is null) return;
@@ -55,10 +60,34 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
 
     private void OnItemAdded(object? sender, ItemChangeEventArgs eventArgs)
     {
-        // Cheap: only an episode Jellyfin calls a placeholder whose file is a .disc is queued; the marker is read later.
-        if (eventArgs.Item is JellyfinEpisode { IsPlaceHolder: true } episode && PlaceholderStub.HasStubExtension(episode.Path) &&
-            queued.TryAdd(episode.Id, 0))
-            queue.Writer.TryWrite(episode.Id);
+        try
+        {
+            if (eventArgs.Item is { } item && PlaceholderUserData.IsCandidate(item))
+            {
+                var now = DateTime.UtcNow;
+                if (fresh.Count > 1000)
+                    foreach (var stale in fresh.Where(pair => now - pair.Value > TimeSpan.FromMinutes(30)).Select(pair => pair.Key).ToArray())
+                        fresh.TryRemove(stale, out _);
+                fresh[item.Id] = now;
+            }
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogDebug(error, "JellyfinMod could not note a new item");
+        }
+
+        OnItemUpdated(sender, eventArgs);
+    }
+
+    private void OnItemUpdated(object? sender, ItemChangeEventArgs eventArgs)
+    {
+        // Cheap: only a placeholder whose file is a .disc (the marker is read later), or an item created in place of another
+        // whose first metadata refresh has now saved it (Jellyfin re-attaches the user data right after that save), is queued.
+        if (eventArgs.Item is not { } item) return;
+        var stub = item is Video { IsPlaceHolder: true } && PlaceholderStub.HasStubExtension(item.Path);
+        var refreshed = fresh.ContainsKey(item.Id) && item.DateLastRefreshed != DateTime.MinValue;
+        if ((stub || refreshed) && queued.TryAdd(item.Id, 0))
+            queue.Writer.TryWrite(item.Id);
     }
 
     private async Task ProcessAsync(CancellationToken cancellationToken)
@@ -83,7 +112,11 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
                 {
                     try
                     {
-                        if (library.GetItemById(id) is { } item) await service.StampAsync(item, cancellationToken).ConfigureAwait(false);
+                        if (library.GetItemById(id) is not { } item) continue;
+                        await service.StampAsync(item, cancellationToken).ConfigureAwait(false);
+                        // The first refresh has re-attached the user data by now (the pause above): put it in Jellyfin's cache.
+                        if (item.DateLastRefreshed != DateTime.MinValue && fresh.TryRemove(id, out _) && userData is not null && users is not null)
+                            PlaceholderUserData.Resave(userData, users, item, logger);
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
                     {
