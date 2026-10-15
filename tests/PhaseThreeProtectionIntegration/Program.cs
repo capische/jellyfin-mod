@@ -377,6 +377,13 @@ static async Task VerifyPreviewHttpAsync(
             // A watch an hour ago, so the last check before an unlink sees a completion after every fixture's floor
             // (decision 12 and RET3-R4 count only a watch dated at or after it).
             LastPlayedDate = clock.GetUtcNow().UtcDateTime.AddHours(-1) });
+    // The folders the plugin asks Jellyfin to look at (P1.FU25: where a reclaim left a placeholder).
+    var monitorReports = new System.Collections.Concurrent.ConcurrentQueue<string>();
+    var libraryMonitor = Stub<ILibraryMonitor>.Create((method, arguments) =>
+    {
+        if (method.Name == "ReportFileSystemChanged") monitorReports.Enqueue((string)arguments![0]!);
+        return null;
+    });
     var sessionRows = new List<SessionInfo>();
     var sessionManager = Stub<ISessionManager>.Create((method, _) => method.Name == "get_Sessions"
         ? sessionRows.ToArray()
@@ -428,6 +435,7 @@ static async Task VerifyPreviewHttpAsync(
     apiBuilder.Services.AddSingleton(library);
     apiBuilder.Services.AddSingleton(userData);
     apiBuilder.Services.AddSingleton(sessionManager);
+    apiBuilder.Services.AddSingleton(libraryMonitor);
     apiBuilder.Services.AddSingleton(taskManager);
     apiBuilder.Services.AddSingleton(localization);
     // EntriesController needs the sort-name service since the P1.P7 carry-forward of fba11e3.
@@ -968,6 +976,8 @@ static async Task VerifyPreviewHttpAsync(
             libraryFolder.Id, localVersionIds, linkedVersions, liveStates, retrieveFailures);
         await VerifyDuplicateGraceAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings, tvLibraryFolder, items,
             liveStates);
+        await VerifyReclaimLeavesPlaceholderAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings, tvLibraryFolder,
+            items, liveStates, monitorReports);
     }
     finally
     {
@@ -1261,6 +1271,192 @@ static async Task VerifyDuplicateGraceAsync(
             if (path.Length > 0 && File.Exists(path)) File.Delete(path);
         }
 
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        (snapshot.Enabled, snapshot.FirstEnabledAt, snapshot.EnabledAt, snapshot.ReclaimAfterDays, snapshot.TestWindowMinutes,
+                snapshot.WatchedUserMode) = (original.Enabled, original.FirstEnabledAt, original.EnabledAt, original.ReclaimAfterDays,
+            original.TestWindowMinutes, original.WatchedUserMode);
+        await database.SaveChangesAsync();
+    }
+}
+
+// P1.FU25: a placeholder is never reclaimed, and a reclaim leaves one. A watched episode's file and a multi-episode file are
+// reclaimed through the real executor: each leaves the plugin's marked stub for every episode it held, in the same folder under
+// the import's name, says so in its history and asks Jellyfin to look at the folder; nothing else in the folder changes. A stub
+// that something bound (reconciliation never binds one) is blocked in the preview and refused by the executor, and stays. A
+// movie, or a file directly in a library folder, gets none.
+static async Task VerifyReclaimLeavesPlaceholderAsync(
+    IServiceProvider services,
+    HttpClient http,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    PluginConfiguration settings,
+    FixtureLibrary tvLibrary,
+    IDictionary<Guid, BaseItem> nativeItems,
+    IDictionary<Guid, UserItemData> liveStates,
+    System.Collections.Concurrent.ConcurrentQueue<string> reported)
+{
+    RetentionPolicySnapshot original;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        original = new RetentionPolicySnapshot { Enabled = snapshot.Enabled, FirstEnabledAt = snapshot.FirstEnabledAt,
+            EnabledAt = snapshot.EnabledAt, ReclaimAfterDays = snapshot.ReclaimAfterDays, TestWindowMinutes = snapshot.TestWindowMinutes,
+            WatchedUserMode = snapshot.WatchedUserMode };
+        var start = clock.GetUtcNow().UtcDateTime;
+        snapshot.Enabled = true;
+        (snapshot.FirstEnabledAt, snapshot.EnabledAt) = (start.AddDays(-90), start.AddDays(-90));
+        snapshot.ReclaimAfterDays = 14;
+        snapshot.TestWindowMinutes = 0;
+        snapshot.WatchedUserMode = WatchedUserMode.AllUsers;
+        await database.SaveChangesAsync();
+    }
+
+    var originalSettings = (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites);
+    (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites) =
+        (true, 14, WatchedUserMode.AllUsers, false);
+    var now = clock.GetUtcNow().UtcDateTime;
+    var seriesFolder = Path.Combine(libraryPath, "Stub Series (2020) [tmdbid-900801]");
+    var season = Path.Combine(seriesFolder, "Season 01");
+    Directory.CreateDirectory(season);
+    var series = new FixtureSeries { Id = Guid.NewGuid(), Name = "Stub Series", Path = seriesFolder };
+    tvLibrary.Items.Add(series);
+    nativeItems[series.Id] = series;
+    var entry = new Entry
+    {
+        Id = Guid.NewGuid(), MediaType = "series", TmdbId = 900801, Title = "Stub Series", State = FileState.OnDisk,
+        TargetLibraryId = tvLibrary.Id, JellyfinItemId = series.Id
+    };
+    var episodes = new List<JellyfinMod.Data.Episode>();
+    var bindings = new Dictionary<int, EpisodeBinding>();
+    var natives = new List<Guid>();
+    // S01E02 a file of its own; S01E03 the plugin's stub, bound as nothing should ever bind one; S01E04-E05 one multi-episode file.
+    var stubE3 = Path.Combine(season, "Stub Series (2020) S01E03.disc");
+    await File.WriteAllBytesAsync(stubE3, JellyfinMod.Services.Placeholders.PlaceholderStub.Body("Stub Series", 1, 3, "Three"));
+    var stubE3Bytes = await File.ReadAllBytesAsync(stubE3);
+    var fileE2 = Path.Combine(season, "Stub Series S01E02.mkv");
+    var fileE45 = Path.Combine(season, "Stub Series S01E04-E05.mkv");
+    await File.WriteAllBytesAsync(fileE2, Enumerable.Repeat((byte)9, 2048).ToArray());
+    await File.WriteAllBytesAsync(fileE45, Enumerable.Repeat((byte)10, 2048).ToArray());
+    foreach (var (number, path, end) in new[] { (2, fileE2, (int?)null), (3, stubE3, null), (4, fileE45, 5) })
+    {
+        var native = new MediaBrowser.Controller.Entities.TV.Episode
+        {
+            Id = Guid.NewGuid(), Name = "Stub " + number, Path = path, SeriesId = series.Id, ParentIndexNumber = 1, IndexNumber = number,
+            IndexNumberEnd = end, IsPlaceHolder = path.EndsWith(".disc", StringComparison.Ordinal)
+        };
+        series.Items.Add(native);
+        nativeItems[native.Id] = native;
+        natives.Add(native.Id);
+        liveStates[native.Id] = new UserItemData { Key = native.Id.ToString("N"), Played = true, LastPlayedDate = now.AddDays(-40) };
+        foreach (var episodeNumber in end is { } last ? Enumerable.Range(number, last - number + 1) : [number])
+        {
+            var row = new JellyfinMod.Data.Episode
+            {
+                Id = Guid.NewGuid(), EntryId = entry.Id, TmdbId = 900810 + episodeNumber, SeasonNumber = 1, EpisodeNumber = episodeNumber,
+                Title = "Stub " + episodeNumber, AirDate = new DateTime(2020, 2, episodeNumber, 0, 0, 0, DateTimeKind.Utc), State = FileState.OnDisk,
+                JellyfinItemId = native.Id
+            };
+            episodes.Add(row);
+            if (episodeNumber == number)
+                bindings[number] = new EpisodeBinding
+                {
+                    EpisodeId = row.Id, JellyfinItemId = native.Id, SeriesItemId = series.Id, TargetLibraryId = tvLibrary.Id, MediaPath = path,
+                    StorageIdentity = storage.Capture(path), FileFingerprint = StoredFingerprint(path)
+                };
+        }
+    }
+
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.Entries.Add(entry);
+        database.Episodes.AddRange(episodes);
+        database.EpisodeBindings.AddRange(bindings.Values);
+        database.RetentionEvaluations.AddRange(episodes.Select(row => new RetentionEvaluation
+        {
+            EntryId = entry.Id, EpisodeId = row.Id, TargetId = row.Id, State = "scheduled", Reason = "completion_policy_satisfied",
+            BaselineAt = now.AddDays(-60), CompletionBasisAt = now.AddDays(-40), EligibleAt = now.AddDays(-40), Deadline = now.AddDays(-26),
+            EvaluatedAt = now
+        }));
+        await database.SaveChangesAsync();
+    }
+
+    try
+    {
+        await services.GetRequiredService<RetentionEvaluator>().EvaluateEntriesAsync([entry.Id], default);
+        using (var preview = await http.GetFromJsonAsync<JsonDocument>("/JellyfinMod/Retention/Preview"))
+        {
+            JsonElement Row(int number) => preview!.RootElement.GetProperty("items").EnumerateArray()
+                .Single(item => item.GetProperty("bindingId").GetGuid() == bindings[number].Id);
+            Assert(Row(2).GetProperty("state").GetString() == "due" && Row(2).GetProperty("leavesPlaceholder").GetBoolean() &&
+                Row(4).GetProperty("state").GetString() == "due" && Row(4).GetProperty("leavesPlaceholder").GetBoolean() &&
+                preview!.RootElement.GetProperty("placeholders").GetInt32() >= 2,
+                "The preview says which due episode files leave a placeholder: " + Row(2) + " " + Row(4));
+            Assert(Row(3).GetProperty("state").GetString() == "blocked" && Row(3).GetProperty("reason").GetString() == "placeholder" &&
+                !Row(3).GetProperty("leavesPlaceholder").GetBoolean(),
+                "A bound stub is never due: the preview blocks it as a placeholder: " + Row(3));
+        }
+
+        var refused = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(bindings[3].Id, default);
+        Assert(refused.State != "completed" && refused.Reason == "placeholder" && (await File.ReadAllBytesAsync(stubE3)).SequenceEqual(stubE3Bytes),
+            $"Retention never reclaims a stub: {refused.State}/{refused.Reason}, the stub is untouched");
+
+        reported.Clear();
+        var reclaimed = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(bindings[2].Id, default);
+        var stubE2 = Path.Combine(season, "Stub Series (2020) S01E02.disc");
+        Assert(reclaimed.State == "completed" && !File.Exists(fileE2) && JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stubE2) &&
+            (await File.ReadAllTextAsync(stubE2)).Contains("<title>Stub Series S01E02 - Stub 2</title>", StringComparison.Ordinal) &&
+            reported.Contains(season),
+            $"A reclaim leaves the episode's stub in the same folder under the import's name and asks Jellyfin to look: {reclaimed.State}/{reclaimed.Reason}, " +
+            $"stub {File.Exists(stubE2)}, reported {string.Join(", ", reported)}");
+        var multi = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(bindings[4].Id, default);
+        var stubE4 = Path.Combine(season, "Stub Series (2020) S01E04.disc");
+        var stubE5 = Path.Combine(season, "Stub Series (2020) S01E05.disc");
+        Assert(multi.State == "completed" && !File.Exists(fileE45) && JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stubE4) &&
+            JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stubE5),
+            $"A multi-episode file's reclaim leaves a stub for each episode it held: {multi.State}/{multi.Reason}");
+        var folder = Directory.EnumerateFiles(season).Select(Path.GetFileName).Order(StringComparer.Ordinal).ToArray();
+        Assert(folder.SequenceEqual(["Stub Series (2020) S01E02.disc", "Stub Series (2020) S01E03.disc", "Stub Series (2020) S01E04.disc",
+                "Stub Series (2020) S01E05.disc"]) && (await File.ReadAllBytesAsync(stubE3)).SequenceEqual(stubE3Bytes),
+            "Only the reclaimed files went; the stubs are all that was added, and the earlier stub is untouched: " + string.Join(", ", folder));
+        await using (var database = new ModDbContext(databasePath))
+        {
+            var history = await database.History.AsNoTracking().Where(item => item.EntryId == entry.Id).ToListAsync();
+            var states = await database.Episodes.AsNoTracking().Where(row => row.EntryId == entry.Id && row.EpisodeNumber != 3)
+                .Select(row => new { row.State, row.JellyfinItemId }).ToListAsync();
+            Assert(history.Count == 2 && history.All(item => item.EventType == "reclaimed" &&
+                    item.Summary.EndsWith(RetentionExecutor.PlaceholderLeft, StringComparison.Ordinal)) &&
+                states.All(row => row.State == FileState.Reclaimed && row.JellyfinItemId is null) &&
+                !nativeItems.ContainsKey(natives[0]) && !nativeItems.ContainsKey(natives[2]),
+                "Each reclaim's history says a placeholder was left; the episodes are reclaimed and their old items removed: " +
+                string.Join(" | ", history.Select(item => item.EventType + ": " + item.Summary)));
+        }
+
+        Assert(!Directory.EnumerateFiles(libraryPath, "*.disc").Any(),
+            "Movies and files directly in a library folder never get a placeholder");
+    }
+    finally
+    {
+        (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites) = originalSettings;
+        await using var database = new ModDbContext(databasePath);
+        foreach (var native in natives)
+        {
+            liveStates.Remove(native);
+            nativeItems.Remove(native);
+        }
+
+        tvLibrary.Items.Remove(series);
+        nativeItems.Remove(series.Id);
+        await database.CompletionObservations.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.RetentionOperations.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.RetentionEvaluations.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.EpisodeBindings.Where(item => database.Episodes.Any(row => row.Id == item.EpisodeId && row.EntryId == entry.Id))
+            .ExecuteDeleteAsync();
+        await database.Episodes.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.History.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.Entries.Where(item => item.Id == entry.Id).ExecuteDeleteAsync();
+        Directory.Delete(seriesFolder, true);
         var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
         (snapshot.Enabled, snapshot.FirstEnabledAt, snapshot.EnabledAt, snapshot.ReclaimAfterDays, snapshot.TestWindowMinutes,
                 snapshot.WatchedUserMode) = (original.Enabled, original.FirstEnabledAt, original.EnabledAt, original.ReclaimAfterDays,
