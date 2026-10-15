@@ -206,7 +206,8 @@ public sealed record QualityProfileDto(
     [property: JsonPropertyName("upgradeAllowed")] bool UpgradeAllowed = false,
     [property: JsonPropertyName("upgradeMode")] string UpgradeMode = "replace",
     [property: JsonPropertyName("minimumAutoScore"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumAutoScore = null,
-    [property: JsonPropertyName("minimumSeeders"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumSeeders = null);
+    [property: JsonPropertyName("minimumSeeders"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumSeeders = null,
+    [property: JsonPropertyName("presetId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? PresetId = null);
 
 /// <summary>Quality profile write contract. PATCH must echo the current revision.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -252,6 +253,34 @@ public sealed class QualityProfileRequest
     [JsonPropertyName("revision")]
     public int? Revision { get; set; }
 }
+
+/// <summary>One quality profile preset shipped with the plugin (P4.FU9); <c>added</c> when a profile with its id exists.</summary>
+public sealed record QualityPresetDto(
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("description")] string Description,
+    [property: JsonPropertyName("isDefaultPreset")] bool IsDefaultPreset,
+    [property: JsonPropertyName("qualities")] IReadOnlyList<string> Qualities,
+    [property: JsonPropertyName("minimumBytesPerHour"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? MinimumBytesPerHour,
+    [property: JsonPropertyName("maximumBytesPerHour"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? MaximumBytesPerHour,
+    [property: JsonPropertyName("cutoff"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Cutoff,
+    [property: JsonPropertyName("upgradeAllowed")] bool UpgradeAllowed,
+    [property: JsonPropertyName("upgradeMode")] string UpgradeMode,
+    [property: JsonPropertyName("minimumSeeders"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumSeeders,
+    [property: JsonPropertyName("added")] bool Added);
+
+/// <summary>One preset that Add Preset Profiles left out, with why: <c>already_added</c> or <c>name_in_use</c>.</summary>
+public sealed record QualityPresetSkippedDto(
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("reason")] string Reason);
+
+/// <summary>What Add Preset Profiles did.</summary>
+public sealed record QualityPresetsAddedDto(
+    [property: JsonPropertyName("added")] IReadOnlyList<QualityPresetDto> Added,
+    [property: JsonPropertyName("skipped")] IReadOnlyList<QualityPresetSkippedDto> Skipped,
+    [property: JsonPropertyName("defaultQualityProfileId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? DefaultQualityProfileId,
+    [property: JsonPropertyName("message")] string Message);
 
 /// <summary>The implemented quality vocabulary for the profile editor.</summary>
 public sealed record QualityDefinitionDto(

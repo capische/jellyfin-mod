@@ -312,6 +312,47 @@ public sealed partial class AcquisitionSettingsController(
         return profiles.Select(profile => ToDto(profile, defaultId)).ToArray();
     }
 
+    /// <summary>Lists the shipped quality profile presets and whether each is already a profile (P4.FU9).</summary>
+    [HttpGet("QualityProfiles/Presets")]
+    public async Task<ActionResult<IReadOnlyList<QualityPresetDto>>> QualityPresetList(CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var ids = (await database.AcquisitionQualityProfiles.AsNoTracking().Select(profile => profile.Id).ToListAsync(cancellationToken)).ToHashSet();
+        return QualityPresets.All.Select(preset => ToDto(preset, ids.Contains(preset.Id))).ToArray();
+    }
+
+    /// <summary>
+    /// Adds every preset that is not a profile yet and never changes an existing profile (P4.FU9). With no default profile
+    /// set, the 4K preset becomes the default.
+    /// </summary>
+    [HttpPost("QualityProfiles/Presets")]
+    public async Task<ActionResult<QualityPresetsAddedDto>> AddQualityPresets(CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
+        QualityPresetsAdded result;
+        try
+        {
+            result = await QualityPresets.AddMissingAsync(database, cancellationToken);
+        }
+        catch (DbUpdateException error) when (error.InnerException is SqliteException { SqliteErrorCode: 19 })
+        {
+            database.ChangeTracker.Clear();
+            return Conflict(ProblemBody("name_in_use", "A profile was saved at the same time; add the presets again."));
+        }
+
+        cache.Invalidate();
+        var message = result.Added.Count == 0
+            ? "Every preset is already a profile; nothing was changed."
+            : $"Added {result.Added.Count} preset {(result.Added.Count == 1 ? "profile" : "profiles")}.";
+        if (result.Skipped.Count(item => item.Reason == "name_in_use") is var named and > 0)
+            message += $" {named} left out because another profile has the same name.";
+        if (result.DefaultSet is not null) message += $" {QualityPresets.Default.Name} is now the default.";
+        return new QualityPresetsAddedDto(result.Added.Select(preset => ToDto(preset, true)).ToArray(),
+            result.Skipped.Select(item => new QualityPresetSkippedDto(item.Preset.Id, item.Preset.Name, item.Reason)).ToArray(),
+            result.DefaultSet, message);
+    }
+
     /// <summary>Creates a quality profile.</summary>
     [HttpPost("QualityProfiles")]
     public async Task<ActionResult<QualityProfileDto>> CreateQualityProfile(QualityProfileRequest request, CancellationToken cancellationToken)
@@ -633,7 +674,12 @@ public sealed partial class AcquisitionSettingsController(
 
     private static QualityProfileDto ToDto(AcquisitionQualityProfile profile, Guid? defaultId) => new(profile.Id, profile.Name,
         AcquisitionConfiguration.Qualities(profile), profile.MinimumBytesPerHour, profile.MaximumBytesPerHour, profile.Revision,
-        profile.Id == defaultId, profile.Cutoff, profile.UpgradeAllowed, profile.UpgradeMode, profile.MinimumAutoScore, profile.MinimumSeeders);
+        profile.Id == defaultId, profile.Cutoff, profile.UpgradeAllowed, profile.UpgradeMode, profile.MinimumAutoScore, profile.MinimumSeeders,
+        QualityPresets.PresetIdOf(profile.Id));
+
+    private static QualityPresetDto ToDto(QualityPreset preset, bool added) => new(preset.Id, preset.Name, preset.Description, preset.Default,
+        preset.Qualities, preset.MinimumBytesPerHour, preset.MaximumBytesPerHour, preset.Cutoff, preset.UpgradeAllowed, preset.UpgradeMode,
+        preset.MinimumSeeders, added);
 
     private BadRequestObjectResult Invalid(string code, string? message = null) =>
         BadRequest(new ProblemDetails { Status = 400, Type = code, Title = message ?? "The configuration is not valid." });

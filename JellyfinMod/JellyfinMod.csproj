@@ -38,6 +38,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Configuration\configPage.html" />
+    <EmbeddedResource Include="Assets\quality-presets.json" LogicalName="JellyfinMod.quality-presets.json" />
   </ItemGroup>
 
 </Project>

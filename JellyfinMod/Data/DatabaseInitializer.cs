@@ -47,6 +47,7 @@ public sealed class DatabaseInitializer(
             if (quarantined > 0)
                 logger.LogWarning("JellyfinMod preserved {Count} legacy entries without library scope or metadata. They are quarantined from browsing; an administrator must repair these records before they can be shown. No destination library was guessed.", quarantined);
             await ImportXmlSettingsAsync(scope.ServiceProvider, database, cancellationToken).ConfigureAwait(false);
+            await SeedQualityPresetsAsync(database, cancellationToken).ConfigureAwait(false);
             IsReady = true;
             logger.LogInformation("JellyfinMod database migrations applied");
         }
@@ -78,6 +79,25 @@ public sealed class DatabaseInitializer(
             logger.LogError("JellyfinMod could not move the TMDB token and seed-protection settings out of the plugin XML ({Error}); " +
                 "they stay in the XML, where discovery and seed protection keep reading them, and the move is tried again at the next start",
                 exception.GetType().Name);
+        }
+    }
+
+    /// <summary>
+    /// Gives a fresh install the quality profile presets, with the 4K one as its default (P4.FU9). An install that has a
+    /// profile, or has saved its acquisition settings, is left as it is. A failure is logged and never stops the plugin.
+    /// </summary>
+    private async Task SeedQualityPresetsAsync(ModDbContext database, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (await JellyfinMod.Services.Acquisition.QualityPresets.SeedFreshInstallAsync(database, cancellationToken).ConfigureAwait(false))
+                logger.LogInformation("JellyfinMod created the {Count} quality profile presets; the default profile is {Name}",
+                    JellyfinMod.Services.Acquisition.QualityPresets.All.Count, JellyfinMod.Services.Acquisition.QualityPresets.Default.Name);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            database.ChangeTracker.Clear();
+            logger.LogError(exception, "JellyfinMod could not create the quality profile presets; add them from Settings, Quality Profiles");
         }
     }
 
