@@ -46,6 +46,25 @@ public sealed class EntriesController(
         }
     }
 
+    /// <summary>
+    /// The series of a placeholder episode of the plugin's (P1.FU24), or null: a placeholder is bound to nothing, so a lookup by
+    /// its id finds the series' entry through its series.
+    /// </summary>
+    private Guid? PlaceholderSeriesOf(Guid itemId)
+    {
+        try
+        {
+            return library?.GetItemById(itemId) is MediaBrowser.Controller.Entities.TV.Episode { IsPlaceHolder: true } stub &&
+                JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stub.Path) && stub.SeriesId != Guid.Empty
+                ? stub.SeriesId
+                : null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Lists accessible entries with exact totals after filters.</summary>
     [HttpGet]
     public async Task<ActionResult<EntriesResult>> List([FromQuery] string? mediaType, [FromQuery] Guid? targetLibraryId, [FromQuery] Guid? jellyfinItemId,
@@ -70,7 +89,7 @@ public sealed class EntriesController(
         // of its main item, whether or not the version itself is bound yet (V1, analysis C13).
         if (jellyfinItemId is { } itemId)
         {
-            var ids = new[] { itemId, MainVersionOf(itemId) ?? itemId }.Distinct().ToArray();
+            var ids = new[] { itemId, MainVersionOf(itemId) ?? itemId, PlaceholderSeriesOf(itemId) ?? itemId }.Distinct().ToArray();
             candidates = candidates.Where(entry => entry.JellyfinItemId != null && ids.Contains(entry.JellyfinItemId.Value) ||
                 database.EntryBindings.Any(binding => binding.EntryId == entry.Id && ids.Contains(binding.JellyfinItemId)) ||
                 database.Episodes.Any(episode => episode.EntryId == entry.Id && (episode.JellyfinItemId != null && ids.Contains(episode.JellyfinItemId.Value) ||
@@ -1046,10 +1065,12 @@ public sealed class EntriesController(
         var policy = await database.RetentionPolicySnapshots.AsNoTracking().SingleOrDefaultAsync(
             item => item.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
         var visibleEpisodeIds = new HashSet<Guid>();
+        IReadOnlyList<MediaBrowser.Controller.Entities.BaseItem> visibleItems = [];
         if (entry.JellyfinItemId is { } nativeId)
         {
             var series = access.GetNativeItems(user, "series", entry.TargetLibraryId).SingleOrDefault(item => item.Id == nativeId);
-            if (series is not null) visibleEpisodeIds.UnionWith(access.GetEpisodes(user, series).Select(item => item.Id));
+            if (series is not null) visibleItems = access.GetEpisodes(user, series);
+            visibleEpisodeIds.UnionWith(visibleItems.Select(item => item.Id));
         }
         // Further versions of readable episodes are readable too: an episode covered by S01E01-E02 grouped under S01E01
         // points at that version, which Jellyfin's queries leave out (V1, review P2-6).
@@ -1063,6 +1084,13 @@ public sealed class EntriesController(
         }
         var isAdmin = await IsAdministratorAsync();
         var readableEpisodes = episodes.Where(e => LibraryAccess.CanReadEpisode(e, visibleEpisodeIds)).ToArray();
+        // The placeholder Jellyfin holds for a missing episode, by season and episode (P1.FU24): the item its card, row and page
+        // stand for, so the web finds the episode (and its download) from it.
+        var placeholders = new Dictionary<(int Season, int Episode), Guid>();
+        foreach (var item in visibleItems.OfType<MediaBrowser.Controller.Entities.TV.Episode>())
+            if (item is { IsPlaceHolder: true, ParentIndexNumber: { } season, IndexNumber: { } number } &&
+                JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(item.Path))
+                placeholders.TryAdd((season, number), item.Id);
         // The newest grab per target supplies the acquisition summary; file availability stays separate (P4.A6).
         var grabs = await database.GrabOperations.AsNoTracking().Where(operation => operation.EntryId == entry.Id)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
@@ -1090,6 +1118,8 @@ public sealed class EntriesController(
                 evaluations.GetValueOrDefault(e.Id), e), isAdmin), Summary(e.Id), projections.GetValueOrDefault(e.Id))
             {
                 RetentionWarning = warnings.GetValueOrDefault(e.Id),
+                PlaceholderItemId = e.State == FileState.OnDisk ? null
+                    : placeholders.TryGetValue((e.SeasonNumber, e.EpisodeNumber), out var placeholder) ? placeholder : null,
                 Versions = e.State == FileState.OnDisk
                     ? await versions.ForAsync(entry.Id, e.Id, evaluations.GetValueOrDefault(e.Id), isAdmin, cancellationToken, user)
                     : []

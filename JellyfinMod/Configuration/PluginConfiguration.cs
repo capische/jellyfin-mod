@@ -76,6 +76,12 @@ public class PluginConfiguration : BasePluginConfiguration
     /// </remarks>
     public int WebBundleGraceDays { get; set; } = 14;
 
+    /// <summary>
+    /// Gets or sets the TV libraries whose missing aired episodes are shown as Jellyfin items through placeholders (P1.FU24).
+    /// </summary>
+    /// <remarks>Empty by default: the switch is off for every library until an administrator turns it on.</remarks>
+    public Guid[] PlaceholderLibraryIds { get; set; } = [];
+
     /// <summary>Gets or sets the secret-store reference for the TMDB Read Access Token (user decision 3).</summary>
     public string? TmdbReadAccessTokenRef { get; set; }
 

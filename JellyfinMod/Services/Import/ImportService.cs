@@ -677,6 +677,10 @@ public sealed class ImportService(
                 // under that folder, or under the file when the folders already existed (P5.I5 scan wait).
                 operation.RefreshAnchorPath = created.Count > 0 ? created[0] : plan.Path;
                 await MarkLinkedAsync(operation, linked).ConfigureAwait(false);
+                // The episode's placeholder goes before the scan sees the file, so Jellyfin swaps one item for the other and
+                // carries the user data over, and no placeholder stays beside the file (P1.FU24; the full swap is P1.FU25).
+                if (episode is not null && Path.GetDirectoryName(plan.Path!) is { } episodeFolder)
+                    Placeholders.PlaceholderService.RemoveStubsBeside(files, episodeFolder, episode.SeasonNumber, episode.EpisodeNumber, logger);
                 logger.LogInformation("Import {Operation} hardlinked the download into library {Library}", operation.Id,
                     operation.TargetLibraryId);
             }
@@ -1272,28 +1276,7 @@ public sealed class ImportService(
     private static IReadOnlyList<string> Missing(params string[] directories) =>
         directories.Where(directory => !Directory.Exists(directory)).ToArray();
 
-    private static string? ExistingSeasonFolder(string seriesFolder, int season)
-    {
-        try
-        {
-            if (!Directory.Exists(seriesFolder)) return null;
-            return Directory.EnumerateDirectories(seriesFolder).FirstOrDefault(directory =>
-            {
-                var name = Path.GetFileName(directory);
-                return season == 0
-                    ? string.Equals(name, "Specials", StringComparison.OrdinalIgnoreCase) ||
-                      string.Equals(name, "Season 0", StringComparison.OrdinalIgnoreCase) ||
-                      string.Equals(name, "Season 00", StringComparison.OrdinalIgnoreCase)
-                    : name.StartsWith("Season ", StringComparison.OrdinalIgnoreCase) &&
-                      int.TryParse(name[7..].Trim(), System.Globalization.NumberStyles.None,
-                          System.Globalization.CultureInfo.InvariantCulture, out var number) && number == season;
-            });
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-        {
-            return null;
-        }
-    }
+    private static string? ExistingSeasonFolder(string seriesFolder, int season) => SeriesFolders.ExistingSeasonFolder(seriesFolder, season);
 
     /// <summary>
     /// The folder of a file the movie already holds, where a new version is grouped with it; null with
@@ -1324,56 +1307,10 @@ public sealed class ImportService(
         return (null, heldUngrouped);
     }
 
-    private async Task<string?> BoundSeriesFolderAsync(Entry entry, IReadOnlyList<string> roots, CancellationToken cancellationToken)
-    {
-        var bindings = await (from binding in database.EpisodeBindings.AsNoTracking()
-                join tracked in database.Episodes.AsNoTracking() on binding.EpisodeId equals tracked.Id
-                where tracked.EntryId == entry.Id
-                select binding).ToListAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var binding in bindings.OrderBy(binding => binding.SeriesItemId))
-        {
-            string? folder = null;
-            try
-            {
-                if (library.GetItemById(binding.SeriesItemId) is { Path: { Length: > 0 } seriesPath }) folder = seriesPath;
-            }
-            catch (Exception error) when (error is not OutOfMemoryException)
-            {
-                folder = null;
-            }
+    private Task<string?> BoundSeriesFolderAsync(Entry entry, IReadOnlyList<string> roots, CancellationToken cancellationToken) =>
+        SeriesFolders.BoundSeriesFolderAsync(database, library, files, entry.Id, roots, cancellationToken);
 
-            if (folder is null && binding.MediaPath is { } media)
-            {
-                var parent = Path.GetDirectoryName(media);
-                var name = parent is null ? null : Path.GetFileName(parent);
-                folder = name is not null && (name.StartsWith("Season ", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(name, "Specials", StringComparison.OrdinalIgnoreCase)) ? Path.GetDirectoryName(parent) : parent;
-            }
-
-            if (folder is not null && files.TryCanonicalize(folder, out var canonical) &&
-                roots.Any(root => MediaStorageIdentity.Contains(root, canonical) &&
-                    !string.Equals(Path.TrimEndingDirectorySeparator(root), canonical, StringComparison.Ordinal)))
-                return canonical;
-        }
-
-        return null;
-    }
-
-    private IReadOnlyList<string> LibraryRoots(Guid libraryId)
-    {
-        try
-        {
-            var folder = library.GetVirtualFolders()?.FirstOrDefault(value =>
-                Guid.TryParse(value.ItemId, out var id) && id == libraryId && value.CollectionType is
-                    CollectionTypeOptions.movies or CollectionTypeOptions.tvshows);
-            return (folder?.Locations ?? []).Select(location => files.TryCanonicalize(location, out var canonical) ? canonical : null)
-                .OfType<string>().Where(Directory.Exists).ToArray();
-        }
-        catch (Exception error) when (error is not OutOfMemoryException)
-        {
-            return [];
-        }
-    }
+    private IReadOnlyList<string> LibraryRoots(Guid libraryId) => SeriesFolders.LibraryRoots(library, files, libraryId);
 
     /// <summary>
     /// Returns true when <paramref name="target"/> (or its nearest existing ancestor) is on the source's mount and

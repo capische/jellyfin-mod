@@ -183,6 +183,16 @@ public sealed partial class UnixFileInspector
     }
 
     /// <summary>
+    /// Reports whether this process may create entries in an existing directory (P1.FU24): writable and searchable. A
+    /// read-only mount fails this check even for root.
+    /// </summary>
+    public bool CanCreateIn(string directory)
+    {
+        if (!OperatingSystem.IsLinux() || string.IsNullOrWhiteSpace(directory)) return false;
+        return NativeMethods.Access(directory, AccessWrite | AccessExecute) == 0;
+    }
+
+    /// <summary>
     /// Creates a hardlink with <c>link(2)</c> (P5.I4). Never copies: a failure is reported with its errno and nothing
     /// else is attempted.
     /// </summary>

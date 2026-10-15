@@ -251,6 +251,8 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             };
             foreach (var episode in ReadPages(query, cancellationToken).OfType<Episode>())
             {
+                // A placeholder (a media stub, P1.FU24) is an item but no file: its episode stays missing, never on disk.
+                if (episode.IsPlaceHolder) continue;
                 if (episode.SeriesId != series.Id)
                     throw new InvalidOperationException($"Native episode {episode.Id} has conflicting series provenance.");
                 // Date-named, unparsed or "Season Unknown" episodes cannot be matched by position. They are

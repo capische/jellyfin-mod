@@ -1,14 +1,17 @@
+using JellyfinMod.Api.Filters;
 using JellyfinMod.Data;
 using JellyfinMod.Services;
 using JellyfinMod.Services.Acquisition;
 using JellyfinMod.Services.Automation;
 using JellyfinMod.Services.Import;
+using JellyfinMod.Services.Placeholders;
 using JellyfinMod.Services.Trakt;
 using JellyfinMod.Services.Web;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Plugins;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -93,5 +96,11 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         // The Trakt indicator (P7.Q16): the host's plugin list, and a listener of its own for Trakt's history imports.
         services.AddSingleton<TraktPluginState>();
         services.AddSingleton<IHostedService, TraktObservationListener>();
+        // Placeholders for missing episodes (P1.FU24): the writer, the item stamp, and the filter that keeps stock apps from
+        // offering or playing them. The filter shapes every stock controller's answers; MVC is configured after this runs.
+        services.AddTransient<PlaceholderService>();
+        services.AddSingleton<IHostedService, PlaceholderItemListener>();
+        services.AddSingleton<PlaceholderFilter>();
+        services.Configure<MvcOptions>(options => options.Filters.AddService<PlaceholderFilter>());
     }
 }
