@@ -1966,6 +1966,8 @@ internal static partial class Phase5
         // The first and each viewer's next episode download first, and a pack episode imports as soon as its file is complete
         // (next-up priority, 2026-10-12).
         await NextUpScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, time);
+        // The import swaps a placeholder for the real file (P1.FU25).
+        await PlaceholderSwapScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, logs);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))

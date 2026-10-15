@@ -148,10 +148,18 @@ internal sealed partial class NativeWorld
         return null;
     });
 
-    /// <summary>Adds a native item for every file under <paramref name="path"/> that Jellyfin does not know yet.</summary>
+    /// <summary>
+    /// Adds a native item for every file under <paramref name="path"/> that Jellyfin does not know yet. A placeholder item whose
+    /// file is gone from the refreshed folder (a reported file refreshes its folder) is dropped, as Jellyfin's refresh drops a
+    /// missing child; the fixtures rely on that only for placeholders (P1.FU25), so other items keep their earlier behaviour.
+    /// </summary>
     public void Scan(string path)
     {
         Interlocked.Increment(ref Scans);
+        var scope = File.Exists(path) ? Path.GetDirectoryName(path)! : path;
+        foreach (var gone in _items.Values.OfType<Video>().Where(item => item.IsPlaceHolder && item.Path is { } itemPath &&
+                     itemPath.StartsWith(scope + "/", StringComparison.Ordinal) && !File.Exists(itemPath)).ToArray())
+            Remove(gone);
         var files = File.Exists(path) ? [path] : Directory.Exists(path) ? Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).ToArray() : [];
         foreach (var file in files.Where(file => !Path.GetFileName(file).StartsWith('.')).Order(StringComparer.Ordinal))
         {
@@ -254,6 +262,8 @@ internal sealed partial class NativeWorld
         var episode = new MediaBrowser.Controller.Entities.TV.Episode
         {
             Id = Guid.NewGuid(), Name = Path.GetFileNameWithoutExtension(file), Path = file, SeriesId = series.Id,
+            // A media stub (.disc) is a placeholder episode, as Jellyfin 12 resolves it (P1.FU24).
+            IsPlaceHolder = file.EndsWith(".disc", StringComparison.OrdinalIgnoreCase),
             SeriesPresentationUniqueKey = series.PresentationUniqueKey, ParentIndexNumber = numbering.Success ? int.Parse(numbering.Groups[1].Value, CultureInfo.InvariantCulture) : null,
             IndexNumber = numbering.Success ? int.Parse(numbering.Groups[2].Value, CultureInfo.InvariantCulture) : null,
             DateCreated = DateTime.UtcNow
@@ -385,6 +395,9 @@ internal sealed partial class NativeWorld
             case "GetCollectionFolders":
                 return LibraryOf((BaseItem)arguments![0]!) is { } owner ? new List<Folder> { owner } : new List<Folder>();
             case "DeleteItem": Remove((BaseItem)arguments![0]!); return null;
+            // Jellyfin saving an item (the placeholder sync stamps a stub's date and runtime, P1.FU24): the fixtures keep the
+            // one instance, so there is nothing more to store.
+            case "UpdateItemAsync": return Task.CompletedTask;
             case "add_ItemAdded": _added += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
             case "remove_ItemAdded": _added -= (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
             case "add_ItemUpdated": _updated += (EventHandler<ItemChangeEventArgs>)arguments![0]!; return null;
@@ -523,6 +536,7 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Services.AddTransient<RetentionPreviewService>();
         builder.Services.AddTransient<RetentionLiveCheck>();
         builder.Services.AddTransient<RetentionExecutor>();
+        builder.Services.AddTransient<JellyfinMod.Services.Placeholders.PlaceholderService>();
         builder.Services.AddTransient<RetentionRunner>();
         if (taskManager is not null) builder.Services.AddSingleton(taskManager);
         else builder.Services.AddSingleton(Stub<ITaskManager>.Create((_, _) => null));
