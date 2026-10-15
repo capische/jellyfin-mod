@@ -60,14 +60,36 @@ internal static class SeriesFolders
                     string.Equals(name, "Specials", StringComparison.OrdinalIgnoreCase)) ? Path.GetDirectoryName(parent) : parent;
             }
 
-            if (folder is not null && files.TryCanonicalize(folder, out var canonical) &&
-                roots.Any(root => MediaStorageIdentity.Contains(root, canonical) &&
-                    !string.Equals(Path.TrimEndingDirectorySeparator(root), canonical, StringComparison.Ordinal)))
-                return canonical;
+            if (InsideRoots(files, folder, roots) is { } canonical) return canonical;
+        }
+
+        // No episode of it is bound because every file was reclaimed (P1.FU25): the series item Jellyfin still holds for it, kept
+        // by the placeholders retention left in its folder, so its episodes return to the same folder.
+        if (bindings.Count == 0)
+        {
+            var seriesItemId = await database.Entries.AsNoTracking().Where(entry => entry.Id == entryId && entry.State == FileState.Reclaimed)
+                .Select(entry => entry.JellyfinItemId).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (seriesItemId is { } id && library.GetItemById(id) is MediaBrowser.Controller.Entities.TV.Series { Path: { Length: > 0 } path })
+                    return InsideRoots(files, path, roots);
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                return null;
+            }
         }
 
         return null;
     }
+
+    /// <summary>The canonical folder when it lies inside one of the roots and is not a root itself; otherwise null.</summary>
+    private static string? InsideRoots(UnixFileInspector files, string? folder, IReadOnlyList<string> roots) =>
+        folder is not null && files.TryCanonicalize(folder, out var canonical) &&
+        roots.Any(root => MediaStorageIdentity.Contains(root, canonical) &&
+            !string.Equals(Path.TrimEndingDirectorySeparator(root), canonical, StringComparison.Ordinal))
+            ? canonical
+            : null;
 
     /// <summary>The series' existing folder for a season (<c>Season 3</c>, <c>Season 03</c>, <c>Specials</c>), or null.</summary>
     public static string? ExistingSeasonFolder(string seriesFolder, int season)

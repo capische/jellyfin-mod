@@ -235,29 +235,136 @@ public sealed class PlaceholderService(
     }
 
     /// <summary>
-    /// Removes the plugin's stubs of one episode from a folder, before the scan that finds the episode's new file there, so no
-    /// placeholder stays beside it (P1.FU24's minimal swap; the full import swap is P1.FU25). Never throws.
+    /// The import's half of the swap (P1.FU25): once the episode's real file is linked and verified at
+    /// <paramref name="importedFile"/>, removes the plugin's stubs of that episode from its series folder and every season
+    /// folder in it (a stub can sit in another season folder than the one the import used, or beside the series' files), so
+    /// Jellyfin sees the stub go and the file arrive in one refresh and carries the user data over by key. Only marked stubs are
+    /// removed, each by its inode, and a season folder only when that left it empty. Never throws: a stub that cannot be removed
+    /// (a permission) stays for the sync, which removes it once the episode is on disk. Returns the folders it changed besides
+    /// the file's own, for the caller to report.
     /// </summary>
-    public static void RemoveStubsBeside(UnixFileInspector files, string folder, int season, int episode, ILogger logger)
+    public static IReadOnlyList<string> SwapForImport(UnixFileInspector files, string importedFile, int season, int episode, ILogger logger)
     {
+        var changed = new HashSet<string>(StringComparer.Ordinal);
         try
         {
-            if (!Directory.Exists(folder)) return;
-            foreach (var path in Directory.EnumerateFiles(folder, "*." + PlaceholderStub.Extension))
+            if (season <= 0 || Path.GetDirectoryName(importedFile) is not { } fileFolder) return [];
+            var seriesFolder = IsSeasonFolderName(Path.GetFileName(fileFolder)) ? Path.GetDirectoryName(fileFolder) : fileFolder;
+            if (seriesFolder is null) return [];
+            foreach (var folder in StubFolders(files, seriesFolder))
             {
-                if (!Covers(path, season, episode)) continue;
-                PlaceholderStub.Forget(path);
-                if (!PlaceholderStub.IsStubFile(path) || !files.TryInspect(path, out var stub)) continue;
-                var result = files.UnlinkPinned(stub.CanonicalPath, stub.PhysicalIdentity);
-                PlaceholderStub.Forget(path);
-                if (result.Removed)
-                    logger.LogInformation("JellyfinMod removed the placeholder of S{Season:00}E{Episode:00} before its file is scanned", season, episode);
+                if (Listing(folder) is not { } listing) continue;
+                foreach (var stub in listing.Where(file => file.IsStub && file.Covers(season, episode)))
+                {
+                    var error = RemoveStub(files, stub.Path, changed);
+                    if (error is null)
+                        logger.LogInformation("JellyfinMod removed the placeholder of S{Season:00}E{Episode:00} now that its file is in place", season, episode);
+                    else
+                        logger.LogWarning("JellyfinMod could not remove the placeholder {Path} beside an imported episode; the next placeholder sync removes it: {Error}",
+                            stub.Path, error);
+                }
             }
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
-            logger.LogWarning("JellyfinMod could not remove a placeholder beside an imported episode: {Error}", error.Message);
+            logger.LogWarning("JellyfinMod could not remove a placeholder beside an imported episode; the next placeholder sync removes it: {Error}", error.Message);
         }
+
+        changed.Remove(Path.GetDirectoryName(importedFile)!);
+        return changed.ToArray();
+    }
+
+    /// <summary>One episode a reclaim leaves without a file: its numbers and title, for the stub's name and message.</summary>
+    public sealed record ReclaimedEpisode(int SeasonNumber, int EpisodeNumber, string? Title);
+
+    /// <summary>
+    /// Where a reclaim of <paramref name="mediaPath"/> leaves an episode's stub (P1.FU25), or null when it leaves none: the
+    /// library is a TV library with placeholders on, the episode is not a special, and the file's folder lies inside one of the
+    /// library's folders (never a library folder itself) and can be written. The stub takes the import's name for the episode in
+    /// that same folder.
+    /// </summary>
+    public static string? ReclaimStubPath(ILibraryManager library, UnixFileInspector files, Guid libraryId, string? mediaPath,
+        int season, int episode) => ReclaimStubPath(files, ReclaimRoots(library, files, libraryId), mediaPath, season, episode);
+
+    /// <summary>
+    /// The folders of a library a reclaim may leave stubs in: its readable folders when it is a TV library with placeholders on,
+    /// else none. A caller that asks for many files of one library reads this once.
+    /// </summary>
+    public static IReadOnlyList<string> ReclaimRoots(ILibraryManager library, UnixFileInspector files, Guid libraryId)
+    {
+        try
+        {
+            if (!PlaceholderSettings.IsEnabled(libraryId) || library.GetVirtualFolders()?.Any(folder => Guid.TryParse(folder.ItemId, out var id) &&
+                    id == libraryId && folder.CollectionType == CollectionTypeOptions.tvshows) != true) return [];
+            return SeriesFolders.LibraryRoots(library, files, libraryId);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return [];
+        }
+    }
+
+    /// <summary><see cref="ReclaimStubPath(ILibraryManager, UnixFileInspector, Guid, string?, int, int)"/> with the library's
+    /// <see cref="ReclaimRoots"/> already read.</summary>
+    public static string? ReclaimStubPath(UnixFileInspector files, IReadOnlyList<string> roots, string? mediaPath, int season, int episode)
+    {
+        try
+        {
+            if (season <= 0 || string.IsNullOrEmpty(mediaPath) || roots.Count == 0) return null;
+            if (Path.GetDirectoryName(mediaPath) is not { } folder || !files.TryCanonicalize(folder, out var canonical)) return null;
+            if (!roots.Any(root => MediaStorageIdentity.Contains(root, canonical) &&
+                    !string.Equals(Path.TrimEndingDirectorySeparator(root), canonical, StringComparison.Ordinal))) return null;
+            var seriesFolder = IsSeasonFolderName(Path.GetFileName(canonical)) ? Path.GetDirectoryName(canonical) : canonical;
+            if (seriesFolder is null || roots.Any(root => string.Equals(Path.TrimEndingDirectorySeparator(root), seriesFolder, StringComparison.Ordinal)) ||
+                !files.CanCreateIn(canonical)) return null;
+            var name = ImportNaming.EpisodeFile(Path.GetFileName(seriesFolder), season, episode, PlaceholderStub.Extension);
+            return ImportNaming.FitsFileName(name) ? Path.Combine(canonical, name) : null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The retention half (P1.FU25): after a reclaim has unlinked <paramref name="mediaPath"/> and recorded it, writes a stub for
+    /// each episode the file held, so the episode stays a Jellyfin item (its user data re-attached by key when Jellyfin finds the
+    /// stub) instead of disappearing. Writes only where <c>ReclaimStubPath</c> allows, never over or beside a file that
+    /// already is the episode, and never deletes anything. Never throws. Returns the stubs written.
+    /// </summary>
+    public static IReadOnlyList<string> LeaveAfterReclaim(ILibraryManager library, UnixFileInspector files, ILibraryMonitor? libraryMonitor,
+        Guid libraryId, string mediaPath, string seriesTitle, IReadOnlyList<ReclaimedEpisode> episodes, ILogger logger)
+    {
+        var written = new List<string>();
+        try
+        {
+            foreach (var episode in episodes.DistinctBy(item => (item.SeasonNumber, item.EpisodeNumber)))
+            {
+                if (ReclaimStubPath(library, files, libraryId, mediaPath, episode.SeasonNumber, episode.EpisodeNumber) is not { } path)
+                    continue;
+                var folder = Path.GetDirectoryName(path)!;
+                // Nothing beside a file (or a stub) that already is this episode, and never over any file.
+                if (Listing(folder) is not { } listing ||
+                    listing.Any(file => (file.IsStub || file.IsVideo) && file.Covers(episode.SeasonNumber, episode.EpisodeNumber)) ||
+                    files.Probe(path) != PathPresence.Absent) continue;
+                var error = WriteStub(files, path, PlaceholderStub.Body(seriesTitle, episode.SeasonNumber, episode.EpisodeNumber, episode.Title));
+                if (error is null) written.Add(path);
+                else logger.LogWarning("JellyfinMod could not leave a placeholder for a reclaimed episode at {Path}: {Error}", path, error);
+            }
+
+            if (written.Count > 0)
+            {
+                libraryMonitor?.ReportFileSystemChanged(Path.GetDirectoryName(written[0])!);
+                logger.LogInformation("JellyfinMod left {Count} placeholder(s) for reclaimed episode(s) in {Folder}", written.Count,
+                    Path.GetDirectoryName(written[0]));
+            }
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogWarning("JellyfinMod could not leave a placeholder for a reclaimed episode: {Error}", error.Message);
+        }
+
+        return written;
     }
 
     /// <summary>
@@ -277,8 +384,11 @@ public sealed class PlaceholderService(
     {
         if (item is not JellyfinEpisode { IsPlaceHolder: true } stub || !PlaceholderStub.IsStubFile(stub.Path) ||
             stub.ParentIndexNumber is not { } season || stub.IndexNumber is not { } number) return false;
+        // The series' entry by its bound episodes, or by the series item itself once a reclaim left it no file (P1.FU25).
         var entryIds = database.EpisodeBindings.AsNoTracking().Where(binding => binding.SeriesItemId == stub.SeriesId)
-            .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id, (binding, episode) => episode.EntryId);
+            .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id, (binding, episode) => episode.EntryId)
+            .Concat(database.Entries.AsNoTracking().Where(entry => entry.MediaType == "series" && entry.JellyfinItemId == stub.SeriesId)
+                .Select(entry => entry.Id));
         var tracked = await database.Episodes.AsNoTracking()
             .Where(episode => entryIds.Contains(episode.EntryId) && episode.SeasonNumber == season && episode.EpisodeNumber == number)
             .Select(episode => new { episode.AirDate, episode.RuntimeMinutes }).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
@@ -348,14 +458,23 @@ public sealed class PlaceholderService(
         var entryIds = entries.Select(entry => entry.Id).ToArray();
         var episodes = (await database.Episodes.AsNoTracking().Where(episode => entryIds.Contains(episode.EntryId))
             .ToListAsync(cancellationToken).ConfigureAwait(false)).ToLookup(episode => episode.EntryId);
+        // Episodes being grabbed, downloaded or imported (an open import): their file is on its way, and the import removes their
+        // stub once it is in place, so no new stub is written for them meanwhile (P1.FU25: a sync running while an import links
+        // the file must not put a stub back beside it). A stub already there stays until the import swaps it.
+        var importing = (await database.ImportOperations.AsNoTracking()
+            .Where(operation => operation.EntryId != null && entryIds.Contains(operation.EntryId.Value) && operation.EpisodeId != null &&
+                ImportStates.Open.Contains(operation.State))
+            .Select(operation => operation.EpisodeId!.Value).ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet();
 
         foreach (var entry in entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var own = episodes[entry.Id].ToArray();
             // Aired episodes the plugin lists without a file (specials are not offered, as on the mod's own surfaces); an
-            // unaired one keeps the mod's card with its date. A reclaimed one is missing too.
-            var wanted = own.Where(episode => episode.SeasonNumber > 0 && episode.AirDate is { } airDate && airDate.Date <= today &&
+            // unaired one keeps the mod's card with its date. A reclaimed one is missing too, and aired whatever its date says (it
+            // had a file).
+            var wanted = own.Where(episode => episode.SeasonNumber > 0 &&
+                (episode.AirDate is { } airDate && airDate.Date <= today || episode.State == FileState.Reclaimed) &&
                 episode.State != FileState.OnDisk && episode.JellyfinItemId is null).ToArray();
             var wantedKeys = wanted.Select(episode => (episode.SeasonNumber, episode.EpisodeNumber)).ToHashSet();
             if (roots.Count == 0)
@@ -374,28 +493,26 @@ public sealed class PlaceholderService(
                 continue;
             }
 
-            // Stale stubs in this series' season folders: their episode has a file now, is no longer missing or listed, or a file
-            // for it sits beside the stub.
-            foreach (var folder in SeasonFolders(seriesFolder))
+            // Every file of the series: in its folder and its season folders (a reclaim leaves its stub where the file was).
+            var seriesFiles = StubFolders(files, seriesFolder).Select(Listing).OfType<List<FolderFile>>().SelectMany(listing => listing)
+                .ToArray();
+            // Stale stubs of this series: their episode has a file now (anywhere in the series), is no longer missing or listed.
+            foreach (var stub in seriesFiles.Where(file => file.IsStub))
             {
-                if (Listing(folder) is not { } listing) continue;
-                foreach (var stub in listing.Where(file => file.IsStub))
+                if (stub.Season is not { } season || stub.Episodes.Count != 1)
                 {
-                    if (stub.Season is not { } season || stub.Episodes.Count != 1)
-                    {
-                        removals.Add(new(stub.Path, "unnumbered"));
-                        continue;
-                    }
-
-                    var number = stub.Episodes[0];
-                    var tracked = own.FirstOrDefault(episode => episode.SeasonNumber == season && episode.EpisodeNumber == number);
-                    var reason = listing.Any(file => !file.IsStub && file.IsVideo && file.Covers(season, number)) ? "file_present"
-                        : tracked is null ? "not_listed"
-                        : tracked.State == FileState.OnDisk || tracked.JellyfinItemId is not null ? "on_disk"
-                        : !wantedKeys.Contains((season, number)) ? "not_aired"
-                        : null;
-                    if (reason is not null) removals.Add(new(stub.Path, reason));
+                    removals.Add(new(stub.Path, "unnumbered"));
+                    continue;
                 }
+
+                var number = stub.Episodes[0];
+                var tracked = own.FirstOrDefault(episode => episode.SeasonNumber == season && episode.EpisodeNumber == number);
+                var reason = seriesFiles.Any(file => !file.IsStub && file.IsVideo && file.Covers(season, number)) ? "file_present"
+                    : tracked is null ? "not_listed"
+                    : tracked.State == FileState.OnDisk || tracked.JellyfinItemId is not null ? "on_disk"
+                    : !wantedKeys.Contains((season, number)) ? "not_aired"
+                    : null;
+                if (reason is not null) removals.Add(new(stub.Path, reason));
             }
 
             var seriesWritable = files.CanCreateIn(seriesFolder);
@@ -447,16 +564,23 @@ public sealed class PlaceholderService(
                 foreach (var episode in group.OrderBy(episode => episode.EpisodeNumber))
                 {
                     var number = episode.EpisodeNumber;
-                    if (listing.Any(file => file.IsStub && file.Covers(season, number)))
+                    if (seriesFiles.Any(file => file.IsStub && file.Covers(season, number)))
                     {
                         existing++;
                         continue;
                     }
 
-                    if (listing.Any(file => !file.IsStub && file.IsVideo && file.Covers(season, number)))
+                    if (seriesFiles.Concat(listing).Any(file => !file.IsStub && file.IsVideo && file.Covers(season, number)))
                     {
                         skipped.Add(new(entry.Id, entry.Title, season, 1, "file_present",
-                            $"A file for S{season:00}E{number:00} is already in {Path.GetFileName(folder)}; nothing is written beside it."));
+                            $"A file for S{season:00}E{number:00} is already in the series' folders; nothing is written beside it."));
+                        continue;
+                    }
+
+                    if (importing.Contains(episode.Id))
+                    {
+                        skipped.Add(new(entry.Id, entry.Title, season, 1, "importing",
+                            $"S{season:00}E{number:00} is being downloaded or imported; its file takes the place of a placeholder."));
                         continue;
                     }
 
@@ -491,7 +615,7 @@ public sealed class PlaceholderService(
         {
             if (await SeriesFolders.BoundSeriesFolderAsync(database, library, files, entryId, roots, cancellationToken).ConfigureAwait(false)
                 is not { } seriesFolder) continue;
-            foreach (var folder in SeasonFolders(seriesFolder))
+            foreach (var folder in StubFolders(files, seriesFolder))
                 foreach (var stub in Listing(folder)?.Where(file => file.IsStub) ?? [])
                     paths.Add(stub.Path);
         }
@@ -505,7 +629,6 @@ public sealed class PlaceholderService(
         var folder = Path.GetDirectoryName(write.Path)!;
         var seriesFolder = Path.GetDirectoryName(folder)!;
         var created = false;
-        string? temp = null;
         try
         {
             if (!Directory.Exists(folder))
@@ -520,17 +643,8 @@ public sealed class PlaceholderService(
                 return "The season folder changed.";
             }
 
-            temp = Path.Combine(folder, ".jfmod-stub-" + Guid.NewGuid().ToString("N"));
-            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            {
-                stream.Write(body);
-                stream.Flush(true);
-            }
-
-            var linked = files.Link(temp, write.Path);
-            if (!linked.Linked)
-                return linked.Exists ? "A file appeared with the placeholder's name; it was left untouched." : $"The placeholder could not be created (errno {linked.Errno}).";
-            PlaceholderStub.Forget(write.Path);
+            var error = WriteStub(files, write.Path, body);
+            if (error is not null) return error;
             changed.Add(created ? seriesFolder : folder);
             return null;
         }
@@ -540,25 +654,55 @@ public sealed class PlaceholderService(
         }
         finally
         {
-            if (temp is not null)
-            {
-                try
-                {
-                    File.Delete(temp);
-                }
-                catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-                {
-                    logger.LogWarning("JellyfinMod could not remove a temporary placeholder file: {Error}", error.Message);
-                }
-            }
-
             // A season folder made for a stub that was not written goes again, while it is still empty.
             if (created && !File.Exists(write.Path)) files.RemoveEmptyDirectory(folder);
         }
     }
 
+    /// <summary>
+    /// Writes one stub into an existing folder: a hidden temp file, then <c>link(2)</c> to the final name, which refuses an
+    /// existing name, so the stub is complete before it appears and never replaces a file. Null when written, else why not.
+    /// </summary>
+    private static string? WriteStub(UnixFileInspector files, string path, byte[] body)
+    {
+        var temp = Path.Combine(Path.GetDirectoryName(path)!, ".jfmod-stub-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(body);
+                stream.Flush(true);
+            }
+
+            var linked = files.Link(temp, path);
+            if (!linked.Linked)
+                return linked.Exists ? "A file appeared with the placeholder's name; it was left untouched." : $"The placeholder could not be created (errno {linked.Errno}).";
+            PlaceholderStub.Forget(path);
+            return null;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return "The placeholder could not be written: " + error.Message;
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(temp);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                // A hidden temp file left behind is skipped by every listing and Jellyfin; nothing else to do.
+                _ = error;
+            }
+        }
+    }
+
     /// <summary>Removes one stub after checking the marker again, and its season folder when that left it empty.</summary>
-    private string? RemoveOne(string path, HashSet<string> changed)
+    private string? RemoveOne(string path, HashSet<string> changed) => RemoveStub(files, path, changed);
+
+    /// <summary>Removes one stub after checking the marker again, and its season folder when that left it empty.</summary>
+    private static string? RemoveStub(UnixFileInspector files, string path, HashSet<string> changed)
     {
         PlaceholderStub.Forget(path);
         if (!PlaceholderStub.IsStubFile(path)) return "Not a JellyfinMod placeholder any more; left untouched.";
@@ -567,9 +711,7 @@ public sealed class PlaceholderService(
         PlaceholderStub.Forget(path);
         if (!result.Removed) return result.Detail ?? "The placeholder could not be removed.";
         var folder = Path.GetDirectoryName(stub.CanonicalPath)!;
-        var name = Path.GetFileName(folder);
-        var isSeason = name.StartsWith("Season ", StringComparison.OrdinalIgnoreCase) || string.Equals(name, "Specials", StringComparison.OrdinalIgnoreCase);
-        if (isSeason && IsEmpty(folder) && files.RemoveEmptyDirectory(folder)) changed.Add(Path.GetDirectoryName(folder)!);
+        if (IsSeasonFolderName(Path.GetFileName(folder)) && IsEmpty(folder) && files.RemoveEmptyDirectory(folder)) changed.Add(Path.GetDirectoryName(folder)!);
         else changed.Add(folder);
         return null;
     }
@@ -598,8 +740,12 @@ public sealed class PlaceholderService(
         }
     }
 
+    /// <summary>Whether a folder's name makes it a season folder (<c>Season NN</c>, <c>Specials</c>).</summary>
+    private static bool IsSeasonFolderName(string name) =>
+        name.StartsWith("Season ", StringComparison.OrdinalIgnoreCase) || string.Equals(name, "Specials", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>The series' season folders that are real folders inside it (no links out).</summary>
-    private IEnumerable<string> SeasonFolders(string seriesFolder)
+    private static IEnumerable<string> SeasonFolders(UnixFileInspector files, string seriesFolder)
     {
         string[] folders;
         try
@@ -613,12 +759,17 @@ public sealed class PlaceholderService(
 
         foreach (var folder in folders)
         {
-            var name = Path.GetFileName(folder);
-            if (!name.StartsWith("Season ", StringComparison.OrdinalIgnoreCase) && !string.Equals(name, "Specials", StringComparison.OrdinalIgnoreCase))
-                continue;
+            if (!IsSeasonFolderName(Path.GetFileName(folder))) continue;
             if (files.TryCanonicalize(folder, out var canonical) && canonical == folder) yield return folder;
         }
     }
+
+    /// <summary>
+    /// Every folder of a series a stub of the plugin's can be in: the series folder itself (a reclaim leaves its stub where the
+    /// file was, P1.FU25) and its season folders.
+    /// </summary>
+    private static IEnumerable<string> StubFolders(UnixFileInspector files, string seriesFolder) =>
+        Directory.Exists(seriesFolder) ? SeasonFolders(files, seriesFolder).Prepend(seriesFolder) : [];
 
     /// <summary>One file in a season folder: the plugin's stub or not, a video or not, and the episodes its name reads as.</summary>
     private sealed record FolderFile(string Path, bool IsStub, bool IsVideo, int? Season, IReadOnlyList<int> Episodes)
@@ -647,11 +798,5 @@ public sealed class PlaceholderService(
         }
 
         return result;
-    }
-
-    private static bool Covers(string path, int season, int episode)
-    {
-        var parsed = ReleaseParser.Parse(Path.GetFileNameWithoutExtension(path));
-        return parsed.SeasonNumber == season && parsed.EpisodeNumbers.Contains(episode);
     }
 }
