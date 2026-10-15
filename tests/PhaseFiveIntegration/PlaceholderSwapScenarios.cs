@@ -252,6 +252,143 @@ internal static class PlaceholderSwapScenarios
             Assert(!await database.History.AnyAsync(history => history.EntryId == ids["stub"] &&
                     (history.EventType == "reclaimed" || history.EventType == "media_missing" || history.EventType == "episode_media_missing")),
                 "No swap reads as media lost or reclaimed in the history");
+
+        await MovieAndFilelessSeriesAsync(tick, admin, world, dbPath, ids, torznab, transmission, host);
+    }
+
+    /// <summary>
+    /// P1.FU26: a movie with no file gets its placeholder where its import puts the file (<c>Title (Year) [tmdbid-N]</c> in the
+    /// library folder), is never bound or called on disk for it, is found by it, and its import swaps it for the file in one step
+    /// into the same folder; a series with nothing on disk gets its own folder with a placeholder for each aired episode, and
+    /// removing that never-imported title from the catalog removes its placeholders and the folders made for them, and nothing else.
+    /// </summary>
+    private static async Task MovieAndFilelessSeriesAsync(Func<Task> tick, HttpClient admin, World world, string dbPath,
+        Dictionary<string, Guid> ids, TorznabBoundary torznab, TransmissionBoundary transmission, PluginHost host)
+    {
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var movie = new Entry
+            {
+                MediaType = "movie", TmdbId = 651, Title = "Stub Movie", Year = 2021, ImdbId = "tt0000651", TargetLibraryId = world.Movies.Id,
+                MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("movie", 651, "Stub Movie", new DateTime(2021, 5, 1, 0, 0, 0, DateTimeKind.Utc),
+                    null, null, null, "tt0000651", null, false, null, 100, [], [], []))
+            };
+            var unreleased = new Entry
+            {
+                MediaType = "movie", TmdbId = 653, Title = "Future Movie", Year = 2099, TargetLibraryId = world.Movies.Id,
+                MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("movie", 653, "Future Movie", new DateTime(2099, 5, 1, 0, 0, 0, DateTimeKind.Utc),
+                    null, null, null, null, null, false, null, 100, [], [], []))
+            };
+            var series = new Entry
+            {
+                MediaType = "series", TmdbId = 652, Title = "Fileless Show", Year = 2020, TargetLibraryId = world.Tv.Id,
+                MetadataJson = JsonSerializer.Serialize(new TmdbMetadata("series", 652, "Fileless Show", new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                    null, null, null, null, 752, false, null, 30, [], [], [new TmdbSeason(1, "Season 1", 3, null, null)]))
+            };
+            database.Entries.AddRange(movie, unreleased, series);
+            ids["stubMovie"] = movie.Id;
+            ids["futureMovie"] = unreleased.Id;
+            ids["fileless"] = series.Id;
+            for (var number = 1; number <= 3; number++)
+                database.Episodes.Add(new Episode
+                {
+                    EntryId = series.Id, TmdbId = 65200 + number, SeasonNumber = 1, EpisodeNumber = number, Title = $"Fileless {number}",
+                    RuntimeMinutes = 30, AirDate = number < 3 ? new DateTime(2020, 1, number, 0, 0, 0, DateTimeKind.Utc) : new DateTime(2099, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+                });
+            await database.SaveChangesAsync();
+        }
+
+        var movieFolder = Path.Combine(world.Movies.Location, "Stub Movie (2021) [tmdbid-651]");
+        var movieStub = Path.Combine(movieFolder, "Stub Movie (2021) [tmdbid-651].disc");
+        var showFolder = Path.Combine(world.Tv.Location, "Fileless Show (2020) [tmdbid-652]");
+        string ShowStub(int number) => Path.Combine(showFolder, "Season 01", $"Fileless Show (2020) S01E0{number}.disc");
+        using (var scope = host.App.Services.CreateScope())
+        {
+            var placeholders = scope.ServiceProvider.GetRequiredService<PlaceholderService>();
+            var moviePlan = await placeholders.PlanAsync(world.Movies.Id, default);
+            Assert(moviePlan.Writes.Any(write => write.Path == movieStub && write.Kind == PlaceholderKinds.Movie && write.NewFolder) &&
+                !moviePlan.Writes.Any(write => write.EntryId == ids["futureMovie"]) && !Directory.Exists(movieFolder),
+                "The movie library's dry run lists the released movie's placeholder in its import folder, none for the unreleased one, " +
+                "and writes nothing: " + JsonSerializer.Serialize(moviePlan.Writes));
+            var synced = await placeholders.SyncAsync(world.Movies.Id, default);
+            Assert(PlaceholderStub.IsStubFile(movieStub) && synced.Writes.Any(write => write.Path == movieStub) &&
+                Directory.EnumerateFileSystemEntries(movieFolder).Count() == 1 &&
+                !Directory.EnumerateDirectories(world.Movies.Location, "*tmdbid-653*").Any(),
+                "A sync writes the movie's marked placeholder, alone in its new folder, and nothing for the unreleased movie");
+            var showSync = await placeholders.SyncAsync(world.Tv.Id, default);
+            Assert(PlaceholderStub.IsStubFile(ShowStub(1)) && PlaceholderStub.IsStubFile(ShowStub(2)) && !File.Exists(ShowStub(3)) &&
+                showSync.Writes.Count(write => write.EntryId == ids["fileless"]) == 2,
+                "A series with nothing on disk gets its own folder in the library with a placeholder for each aired episode only: " +
+                JsonSerializer.Serialize(showSync.Writes.Where(write => write.EntryId == ids["fileless"])));
+        }
+
+        world.Native.Scan(movieFolder);
+        world.Native.Scan(showFolder);
+        var stubItem = world.Native.Items.OfType<MediaBrowser.Controller.Entities.Movies.Movie>().Single(item => item.Path == movieStub);
+        Assert(stubItem.IsPlaceHolder, "Jellyfin holds the movie's placeholder as a placeholder movie");
+        await tick();
+        await Task.Delay(1500);
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var entry = await database.Entries.AsNoTracking().SingleAsync(value => value.Id == ids["stubMovie"]);
+            Assert(entry.State == FileState.None && entry.JellyfinItemId is null &&
+                !await database.EntryBindings.AnyAsync(binding => binding.EntryId == entry.Id) &&
+                !await database.Entries.AnyAsync(value => value.MediaType == "movie" && value.TmdbId == 651 && value.Id != entry.Id),
+                $"The placeholder movie is never bound or called on disk, and backfills nothing ({entry.State}, {entry.JellyfinItemId})");
+        }
+
+        var lookup = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries?jellyfinItemId={stubItem.Id}&limit=1"));
+        var detail = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["stubMovie"]}"));
+        Assert(lookup.GetProperty("items").EnumerateArray().Single().GetProperty("id").AsGuid() == ids["stubMovie"] &&
+            detail.GetProperty("entry").GetProperty("placeholderItemId").AsGuid() == stubItem.Id,
+            "The placeholder finds its entry, and the entry names it as its placeholder item");
+
+        // The import swaps the placeholder for the file, in the same folder.
+        var fixture = TorrentFixture.Single("Stub.Movie.2021.1080p.WEB-DL-GRP.mkv", Size);
+        torznab.Torrents["stubMovie"] = fixture.Bytes;
+        transmission.Register(fixture);
+        lock (torznab.MovieItems)
+            torznab.MovieItems.Add(new("Stub.Movie.2021.1080p.WEB-DL-GRP", "guid-stubMovie", torznab.Download("stubMovie"), Size, 25,
+                new() { ["imdbid"] = "0000651" }));
+        var search = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={ids["stubMovie"]}"), 200, "Search the movie");
+        var candidate = search.GetProperty("candidates").EnumerateArray().Single(item => item.GetProperty("rawTitle").GetString() == "Stub.Movie.2021.1080p.WEB-DL-GRP");
+        var grab = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+        {
+            searchId = search.GetProperty("searchId").AsGuid(), releaseId = candidate.GetProperty("releaseId").GetString(),
+            idempotencyKey = "p5m-" + Guid.NewGuid().ToString("N")
+        }), 202, "Administrator grabs the movie");
+        var grabId = grab.GetProperty("id").AsGuid();
+        await WaitAsync(async () => Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Grabs/{grabId}")).GetProperty("state").GetString() ==
+            "accepted" ? true : (bool?)null, "The movie's grab is accepted");
+        transmission.Progress(fixture.InfoHash, 1.0);
+        var imported = await WaitAsync(async () =>
+        {
+            await tick();
+            await using var database = new ModDbContext(dbPath);
+            var operation = await database.ImportOperations.AsNoTracking().SingleOrDefaultAsync(value => value.GrabId == grabId);
+            Assert(operation?.State is not (ImportStates.Blocked or ImportStates.Failed), $"The movie's import stopped: {operation?.State} {operation?.Reason}");
+            return operation?.State == ImportStates.Completed ? operation : null;
+        }, "The movie's import completes", 60);
+        var files = Directory.EnumerateFiles(movieFolder).ToArray();
+        Assert(Path.GetDirectoryName(imported.DestinationPath) == movieFolder && !File.Exists(movieStub) && files.Length == 1 &&
+            files[0] == imported.DestinationPath,
+            "The movie's file goes into its placeholder's folder and the placeholder goes in the same step: " + string.Join(", ", files));
+        await WaitAsync(async () =>
+        {
+            await tick();
+            await using var database = new ModDbContext(dbPath);
+            var entry = await database.Entries.AsNoTracking().SingleAsync(value => value.Id == ids["stubMovie"]);
+            return entry.State == FileState.OnDisk && entry.JellyfinItemId is { } bound && bound != stubItem.Id &&
+                world.Native.Items.All(item => item.Path != movieStub) ? true : null;
+        }, "The movie is on disk, bound to its file's item, and the placeholder item is gone");
+
+        // Removing the series that was never imported removes its placeholders and the folders made for them.
+        var removed = await admin.DeleteAsync($"/JellyfinMod/Entries/{ids["fileless"]}");
+        Assert(removed.StatusCode == System.Net.HttpStatusCode.NoContent && !Directory.Exists(showFolder),
+            $"Removing a series that has only placeholders removes it, its placeholders and its folders ({(int)removed.StatusCode})");
+        var removedMovie = await admin.DeleteAsync($"/JellyfinMod/Entries/{ids["futureMovie"]}");
+        Assert(removedMovie.StatusCode == System.Net.HttpStatusCode.NoContent && Directory.Exists(movieFolder) && File.Exists(imported.DestinationPath!),
+            "Removing an unreleased movie works and touches no other title's folder");
     }
 
     private static void Assert(bool condition, string message) => Phase5.Assert(condition, message);

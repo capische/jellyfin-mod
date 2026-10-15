@@ -978,6 +978,8 @@ static async Task VerifyPreviewHttpAsync(
             liveStates);
         await VerifyReclaimLeavesPlaceholderAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings, tvLibraryFolder,
             items, liveStates, monitorReports);
+        await VerifyMovieReclaimLeavesPlaceholderAsync(api.Services, http, databasePath, libraryPath, storage, clock, settings, libraryFolder,
+            items, liveStates, monitorReports);
     }
     finally
     {
@@ -1283,7 +1285,7 @@ static async Task VerifyDuplicateGraceAsync(
 // reclaimed through the real executor: each leaves the plugin's marked stub for every episode it held, in the same folder under
 // the import's name, says so in its history and asks Jellyfin to look at the folder; nothing else in the folder changes. A stub
 // that something bound (reconciliation never binds one) is blocked in the preview and refused by the executor, and stays. A
-// movie, or a file directly in a library folder, gets none.
+// file directly in a library folder gets none (a movie in a folder of its own does, P1.FU26, below).
 static async Task VerifyReclaimLeavesPlaceholderAsync(
     IServiceProvider services,
     HttpClient http,
@@ -1434,7 +1436,7 @@ static async Task VerifyReclaimLeavesPlaceholderAsync(
         }
 
         Assert(!Directory.EnumerateFiles(libraryPath, "*.disc").Any(),
-            "Movies and files directly in a library folder never get a placeholder");
+            "Files directly in a library folder never get a placeholder");
     }
     finally
     {
@@ -1457,6 +1459,125 @@ static async Task VerifyReclaimLeavesPlaceholderAsync(
         await database.History.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
         await database.Entries.Where(item => item.Id == entry.Id).ExecuteDeleteAsync();
         Directory.Delete(seriesFolder, true);
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        (snapshot.Enabled, snapshot.FirstEnabledAt, snapshot.EnabledAt, snapshot.ReclaimAfterDays, snapshot.TestWindowMinutes,
+                snapshot.WatchedUserMode) = (original.Enabled, original.FirstEnabledAt, original.EnabledAt, original.ReclaimAfterDays,
+            original.TestWindowMinutes, original.WatchedUserMode);
+        await database.SaveChangesAsync();
+    }
+}
+
+// P1.FU26: a reclaim of a movie's last file in a folder of its own leaves the movie's marked stub in that folder, named after
+// the folder, says so in its history and in the preview, and asks Jellyfin to look at the folder; nothing else changes.
+static async Task VerifyMovieReclaimLeavesPlaceholderAsync(
+    IServiceProvider services,
+    HttpClient http,
+    string databasePath,
+    string libraryPath,
+    MediaStorageIdentity storage,
+    FixedTimeProvider clock,
+    PluginConfiguration settings,
+    FixtureLibrary movieLibrary,
+    IDictionary<Guid, BaseItem> nativeItems,
+    IDictionary<Guid, UserItemData> liveStates,
+    System.Collections.Concurrent.ConcurrentQueue<string> reported)
+{
+    RetentionPolicySnapshot original;
+    await using (var database = new ModDbContext(databasePath))
+    {
+        var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
+        original = new RetentionPolicySnapshot { Enabled = snapshot.Enabled, FirstEnabledAt = snapshot.FirstEnabledAt,
+            EnabledAt = snapshot.EnabledAt, ReclaimAfterDays = snapshot.ReclaimAfterDays, TestWindowMinutes = snapshot.TestWindowMinutes,
+            WatchedUserMode = snapshot.WatchedUserMode };
+        var start = clock.GetUtcNow().UtcDateTime;
+        snapshot.Enabled = true;
+        (snapshot.FirstEnabledAt, snapshot.EnabledAt) = (start.AddDays(-90), start.AddDays(-90));
+        snapshot.ReclaimAfterDays = 14;
+        snapshot.TestWindowMinutes = 0;
+        snapshot.WatchedUserMode = WatchedUserMode.AllUsers;
+        await database.SaveChangesAsync();
+    }
+
+    var originalSettings = (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites);
+    (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites) =
+        (true, 14, WatchedUserMode.AllUsers, false);
+    var now = clock.GetUtcNow().UtcDateTime;
+    var folder = Path.Combine(libraryPath, "Stub Film (2019) [tmdbid-900901]");
+    Directory.CreateDirectory(folder);
+    var file = Path.Combine(folder, "Stub Film (2019) [tmdbid-900901] - 1080p.mkv");
+    var sidecar = Path.Combine(folder, "movie.nfo");
+    await File.WriteAllBytesAsync(file, Enumerable.Repeat((byte)11, 2048).ToArray());
+    await File.WriteAllTextAsync(sidecar, "sidecar stays");
+    var native = new Movie { Id = Guid.NewGuid(), Name = "Stub Film", Path = file };
+    movieLibrary.Items.Add(native);
+    nativeItems[native.Id] = native;
+    liveStates[native.Id] = new UserItemData { Key = native.Id.ToString("N"), Played = true, LastPlayedDate = now.AddDays(-40) };
+    var entry = new Entry
+    {
+        Id = Guid.NewGuid(), MediaType = "movie", TmdbId = 900901, Title = "Stub Film", Year = 2019, State = FileState.OnDisk,
+        TargetLibraryId = movieLibrary.Id, JellyfinItemId = native.Id
+    };
+    var binding = new EntryBinding
+    {
+        Id = Guid.NewGuid(), EntryId = entry.Id, JellyfinItemId = native.Id, TargetLibraryId = movieLibrary.Id, VersionGroupId = native.Id,
+        MediaPath = file, StorageIdentity = storage.Capture(file), FileFingerprint = StoredFingerprint(file)
+    };
+    await using (var database = new ModDbContext(databasePath))
+    {
+        database.Entries.Add(entry);
+        database.EntryBindings.Add(binding);
+        database.RetentionEvaluations.Add(new RetentionEvaluation
+        {
+            EntryId = entry.Id, TargetId = entry.Id, State = "scheduled", Reason = "completion_policy_satisfied",
+            BaselineAt = now.AddDays(-60), CompletionBasisAt = now.AddDays(-40), EligibleAt = now.AddDays(-40), Deadline = now.AddDays(-26),
+            EvaluatedAt = now
+        });
+        await database.SaveChangesAsync();
+    }
+
+    var stub = Path.Combine(folder, "Stub Film (2019) [tmdbid-900901].disc");
+    try
+    {
+        await services.GetRequiredService<RetentionEvaluator>().EvaluateEntriesAsync([entry.Id], default);
+        using (var preview = await http.GetFromJsonAsync<JsonDocument>("/JellyfinMod/Retention/Preview"))
+        {
+            var row = preview!.RootElement.GetProperty("items").EnumerateArray().Single(item => item.GetProperty("bindingId").GetGuid() == binding.Id);
+            Assert(row.GetProperty("state").GetString() == "due" && row.GetProperty("leavesPlaceholder").GetBoolean(),
+                "The preview says the due movie's reclaim leaves a placeholder: " + row);
+        }
+
+        reported.Clear();
+        var reclaimed = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(binding.Id, default);
+        Assert(reclaimed.State == "completed" && !File.Exists(file) && JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stub) &&
+            (await File.ReadAllTextAsync(stub)).Contains("<title>Stub Film (2019)</title>", StringComparison.Ordinal) && reported.Contains(folder),
+            $"A movie's reclaim leaves its stub in its folder, named after the folder, and asks Jellyfin to look: {reclaimed.State}/{reclaimed.Reason}, " +
+            $"stub {File.Exists(stub)}, reported {string.Join(", ", reported)}");
+        Assert(Directory.EnumerateFiles(folder).Select(Path.GetFileName).Order(StringComparer.Ordinal)
+                .SequenceEqual(["Stub Film (2019) [tmdbid-900901].disc", "movie.nfo"]) && await File.ReadAllTextAsync(sidecar) == "sidecar stays",
+            "Only the movie's file went and only its stub was added; the sidecar stays");
+        await using var database = new ModDbContext(databasePath);
+        var history = await database.History.AsNoTracking().Where(item => item.EntryId == entry.Id).ToListAsync();
+        var state = (await database.Entries.AsNoTracking().SingleAsync(item => item.Id == entry.Id)).State;
+        Assert(history.Count == 1 && history[0].EventType == "reclaimed" &&
+            history[0].Summary.EndsWith(RetentionExecutor.MoviePlaceholderLeft, StringComparison.Ordinal) && state == FileState.Reclaimed &&
+            !nativeItems.ContainsKey(native.Id),
+            "The movie's reclaim history says a placeholder was left; the movie is reclaimed and its old item removed: " +
+            string.Join(" | ", history.Select(item => item.EventType + ": " + item.Summary)));
+    }
+    finally
+    {
+        (settings.RetentionEnabled, settings.ReclaimAfterDays, settings.RetentionWatchedUserMode, settings.ExemptFavourites) = originalSettings;
+        liveStates.Remove(native.Id);
+        nativeItems.Remove(native.Id);
+        movieLibrary.Items.Remove(native);
+        await using var database = new ModDbContext(databasePath);
+        await database.CompletionObservations.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.RetentionOperations.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.RetentionEvaluations.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.EntryBindings.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.History.Where(item => item.EntryId == entry.Id).ExecuteDeleteAsync();
+        await database.Entries.Where(item => item.Id == entry.Id).ExecuteDeleteAsync();
+        Directory.Delete(folder, true);
         var snapshot = await database.RetentionPolicySnapshots.SingleAsync(item => item.Id == RetentionPolicyService.PolicyId);
         (snapshot.Enabled, snapshot.FirstEnabledAt, snapshot.EnabledAt, snapshot.ReclaimAfterDays, snapshot.TestWindowMinutes,
                 snapshot.WatchedUserMode) = (original.Enabled, original.FirstEnabledAt, original.EnabledAt, original.ReclaimAfterDays,

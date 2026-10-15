@@ -199,7 +199,9 @@ internal sealed partial class NativeWorld
         var movie = new Movie
         {
             Id = NewItemId(file, typeof(Movie)), Name = TitlePattern().Match(Path.GetFileName(folder)).Groups[1].Value.Trim(),
-            Path = file, DateCreated = DateTime.UtcNow
+            Path = file, DateCreated = DateTime.UtcNow,
+            // A media stub (.disc) is a placeholder movie, as Jellyfin 12 resolves it (P1.FU26).
+            IsPlaceHolder = file.EndsWith(".disc", StringComparison.OrdinalIgnoreCase)
         };
         if (tmdb is not null) movie.ProviderIds["Tmdb"] = tmdb;
         Add(library, movie);

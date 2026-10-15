@@ -54,7 +54,8 @@ internal static class ApiSmoke
             "GetVirtualFolders" => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }
                 .Select(folder => new VirtualFolderInfo { ItemId = folder.Id.ToString(), Name = folder.Id.ToString("N"),
                     CollectionType = folder.CollectionType == Jellyfin.Data.Enums.CollectionType.tvshows
-                        ? MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows : null })
+                        ? MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows
+                        : folder.CollectionType == Jellyfin.Data.Enums.CollectionType.movies ? MediaBrowser.Model.Entities.CollectionTypeOptions.movies : null })
                 .ToList(),
             "GetCollectionFolders" when args?[0] is BaseItem item => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }
                 .Where(folder => folder.Items.Any(native => native.Id == item.Id)).Cast<Folder>().ToList(),
@@ -1337,16 +1338,24 @@ internal static class ApiSmoke
             using var placeholders = await client.GetAsync("/JellyfinMod/Placeholders");
             using var placeholderJson = JsonDocument.Parse(await placeholders.Content.ReadAsStringAsync());
             var listed = placeholderJson.RootElement.EnumerateArray().ToArray();
-            Assert(placeholders.IsSuccessStatusCode && listed.Length == 2 && listed.All(item => item.GetProperty("enabled").GetBoolean()) &&
-                listed.Any(item => Guid.Parse(item.GetProperty("libraryId").GetString()!) == tvLibrary.Id),
-                "Every TV library's placeholder switch is on by default (P1.FU24)");
+            Assert(placeholders.IsSuccessStatusCode && listed.Length == 5 && listed.All(item => item.GetProperty("enabled").GetBoolean()) &&
+                listed.Any(item => Guid.Parse(item.GetProperty("libraryId").GetString()!) == tvLibrary.Id &&
+                    item.GetProperty("mediaType").GetString() == "series") &&
+                listed.Any(item => Guid.Parse(item.GetProperty("libraryId").GetString()!) == libraryFolder.Id &&
+                    item.GetProperty("mediaType").GetString() == "movie"),
+                "Every TV and movie library's placeholder switch is on by default (P1.FU24, P1.FU26)");
             using var sync = await client.PostAsync($"/JellyfinMod/Placeholders/{tvLibrary.Id}/Sync", null);
             using var syncJson = JsonDocument.Parse(await sync.Content.ReadAsStringAsync());
             Assert(sync.IsSuccessStatusCode && syncJson.RootElement.GetProperty("enabled").GetBoolean() &&
                 syncJson.RootElement.GetProperty("writes").GetArrayLength() == 0 && !syncJson.RootElement.GetProperty("dryRun").GetBoolean(),
                 "A sync of a library with no writable folder writes nothing (P1.FU24)");
-            Assert((await client.GetAsync($"/JellyfinMod/Placeholders/{libraryFolder.Id}/Plan")).StatusCode == HttpStatusCode.NotFound,
-                "A movie library has no placeholder switch");
+            using (var moviePlan = await client.GetAsync($"/JellyfinMod/Placeholders/{libraryFolder.Id}/Plan"))
+            {
+                using var moviePlanJson = JsonDocument.Parse(await moviePlan.Content.ReadAsStringAsync());
+                Assert(moviePlan.IsSuccessStatusCode && moviePlanJson.RootElement.GetProperty("dryRun").GetBoolean() &&
+                    moviePlanJson.RootElement.GetProperty("writes").GetArrayLength() == 0,
+                    "A movie library has its placeholder switch too, and with no writable folder plans no placeholder (P1.FU26)");
+            }
             client.DefaultRequestHeaders.Remove("X-Smoke-Role");
             if (role.Length > 0) client.DefaultRequestHeaders.Add("X-Smoke-Role", role);
         }
