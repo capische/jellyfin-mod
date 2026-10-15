@@ -112,7 +112,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
 
         // ---- Authorization on every Prowlarr route.
         var any = Guid.NewGuid();
-        foreach (var (method, path) in new[] { ("GET", ""), ("POST", ""), ("PATCH", $"/{any}"), ("DELETE", $"/{any}"), ("POST", $"/{any}/Test"), ("POST", $"/{any}/Sync") })
+        foreach (var (method, path) in new[] { ("GET", ""), ("POST", ""), ("PATCH", $"/{any}"), ("DELETE", $"/{any}"), ("POST", $"/{any}/Test"), ("POST", $"/{any}/Sync"),
+                     ("GET", $"/{any}/DownloadClients") })
         {
             HttpRequestMessage Message() => new(new HttpMethod(method), "/JellyfinMod/Settings/Prowlarr" + path)
             {
@@ -145,6 +146,72 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         test = await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Test", null), 200, "Test");
         Assert(test.GetProperty("ok").GetBoolean() && test.GetProperty("version").GetString() == "1.99.0-boundary",
             "Test reads system status, health and one enabled torrent indexer");
+
+        // ---- P6.FU1: the download clients Prowlarr knows, read with the saved key; never a password.
+        var clientPassword = "txpass-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(12));
+        secrets.Add(clientPassword);
+        JsonObject Field(string name, JsonNode? value) => new() { ["order"] = 0, ["name"] = name, ["label"] = name, ["value"] = value, ["type"] = "textbox" };
+        prowlarr.DownloadClients.Add(new JsonObject
+        {
+            ["id"] = 1, ["name"] = "Seedbox", ["implementation"] = "Transmission", ["implementationName"] = "Transmission", ["configContract"] = "TransmissionSettings",
+            ["enable"] = true, ["protocol"] = "torrent", ["priority"] = 1,
+            ["fields"] = new JsonArray(Field("host", "localhost"), Field("port", 9091), Field("useSsl", false), Field("urlBase", "/transmission/"),
+                Field("username", "jfmod"), Field("password", "********"), Field("category", "prowlarr"))
+        });
+        // A stand-in that does not mask: the plugin must drop the password whatever Prowlarr sends.
+        prowlarr.DownloadClients.Add(new JsonObject
+        {
+            ["id"] = 2, ["name"] = "Box Two", ["implementation"] = "Transmission", ["enable"] = false, ["protocol"] = "torrent",
+            ["fields"] = new JsonArray(Field("host", "tx.internal"), Field("port", 443), Field("useSsl", true), Field("urlBase", "custom"),
+                Field("username", ""), Field("password", clientPassword))
+        });
+        prowlarr.DownloadClients.Add(new JsonObject
+        {
+            ["id"] = 3, ["name"] = "Q", ["implementation"] = "QBittorrent", ["enable"] = true, ["protocol"] = "torrent",
+            ["fields"] = new JsonArray(Field("host", "qbit"), Field("port", 8080), Field("password", clientPassword))
+        });
+        prowlarr.DownloadClients.Add(new JsonObject
+        {
+            ["id"] = 4, ["name"] = "Bad Host", ["implementation"] = "Transmission", ["enable"] = true,
+            ["fields"] = new JsonArray(Field("host", "user:pw@evil"), Field("port", 9091))
+        });
+        var found = await Read(admin.GetAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/DownloadClients"), 200, "Administrator reads Prowlarr's download clients");
+        var foundBody = found.GetRawText();
+        var foundClients = found.GetProperty("clients").EnumerateArray().ToArray();
+        Assert(found.GetProperty("code").GetString() == "ok" && foundClients.Length == 4, "Every download client Prowlarr knows is listed: " + foundBody);
+        var seedbox = foundClients[0];
+        Assert(seedbox.GetProperty("name").GetString() == "Seedbox" && seedbox.GetProperty("implementation").GetString() == "Transmission" &&
+            seedbox.GetProperty("enabled").GetBoolean() && seedbox.GetProperty("host").GetString() == "localhost" && seedbox.GetProperty("port").GetInt32() == 9091 &&
+            !seedbox.GetProperty("useSsl").GetBoolean() && seedbox.GetProperty("urlBase").GetString() == "/transmission/" &&
+            seedbox.GetProperty("username").GetString() == "jfmod" && seedbox.GetProperty("kind").GetString() == "transmission" &&
+            seedbox.GetProperty("baseUrl").GetString() == "http://localhost:9091/transmission/rpc",
+            "A Transmission client carries its connection fields and the RPC address the plugin's Transmission client expects");
+        Assert(foundClients[1].GetProperty("baseUrl").GetString() == "https://tx.internal/custom/rpc" && !foundClients[1].GetProperty("enabled").GetBoolean(),
+            "TLS, a custom URL base and a client turned off in Prowlarr are carried as they are");
+        Assert(foundClients[2].GetProperty("kind").ValueKind == JsonValueKind.Null && foundClients[2].GetProperty("baseUrl").ValueKind == JsonValueKind.Null,
+            "A client this plugin has no driver for is listed without a kind or an address");
+        Assert(foundClients[3].GetProperty("baseUrl").ValueKind == JsonValueKind.Null, "A host that would carry credentials gives no address");
+        Assert(!foundBody.Contains("password", StringComparison.OrdinalIgnoreCase) && !foundBody.Contains("********", StringComparison.Ordinal) &&
+            !foundBody.Contains(clientPassword, StringComparison.Ordinal) && !foundBody.Contains("category", StringComparison.Ordinal),
+            "No password, masked or not, and no other Prowlarr field reaches the answer");
+        Assert(prowlarr.DownloadClientKeys.All(key => key == prowlarr.ApiKey) && prowlarr.DownloadClientKeys.Count == 1,
+            "The read went to Prowlarr once, with the saved key, server-side");
+        var gateway = found.GetProperty("gateway");
+        Assert(gateway.ValueKind == JsonValueKind.Null || (System.Net.IPAddress.TryParse(gateway.GetString(), out var gatewayAddress) &&
+            gatewayAddress.GetAddressBytes() is [10, ..] or [172, >= 16 and <= 31, ..] or [192, 168, ..]),
+            $"The gateway is a private IPv4 address or null ({(OperatingSystem.IsLinux() ? "Linux, /proc/net/route" : "no /proc here")}): {gateway}");
+        prowlarr.BigDownloadClients = true;
+        found = await Read(admin.GetAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/DownloadClients"), 200, "An oversized list");
+        Assert(found.GetProperty("code").GetString() == "response_too_large" && found.GetProperty("clients").GetArrayLength() == 0,
+            "A list over the size cap is refused with no client");
+        prowlarr.BigDownloadClients = false;
+        prowlarr.Fault = "401";
+        found = await Read(admin.GetAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/DownloadClients"), 200, "A refused read");
+        Assert(found.GetProperty("code").GetString() == "unauthorized" && found.GetProperty("clients").GetArrayLength() == 0,
+            "A Prowlarr that refuses answers its code and no client");
+        prowlarr.Fault = null;
+        Assert((await admin.GetAsync($"/JellyfinMod/Settings/Prowlarr/{Guid.NewGuid()}/DownloadClients")).StatusCode == HttpStatusCode.NotFound,
+            "An unknown source is 404");
 
         // ---- First sync: one row per torrent indexer, verified through Prowlarr with the source's key.
         sync = await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Sync", null), 200, "Sync");
@@ -465,6 +532,9 @@ internal sealed class ProwlarrBoundary(TorznabBoundary torznab, string host = "1
     public string ApiKey { get; set; } = string.Empty;
     public Dictionary<int, JsonObject> Indexers { get; } = [];
     public Dictionary<int, string> Feeds { get; } = [];
+    public List<JsonObject> DownloadClients { get; } = [];
+    public ConcurrentBag<string> DownloadClientKeys { get; } = [];
+    public bool BigDownloadClients { get; set; }
     public ConcurrentDictionary<int, DateTime> DisabledTill { get; } = new();
     public string? Fault { get; set; }
     public Uri Address { get; private set; } = null!;
@@ -488,6 +558,15 @@ internal sealed class ProwlarrBoundary(TorznabBoundary torznab, string host = "1
             if (Fault == "schema") return new JsonArray(new JsonObject { ["id"] = 9, ["name"] = "Broken" });
             return new JsonArray(Indexers.Values.Select(value => (JsonNode)value.DeepClone()).ToArray());
         }));
+        // Prowlarr's DownloadClientResource list (P6.FU1): `fields` as name/value pairs, the password as Prowlarr's SchemaBuilder
+        // masks it unless a test stores another value. BigDownloadClients pads the answer past the plugin's 256 KiB cap.
+        _app.MapGet("/api/v1/downloadclient", context =>
+        {
+            DownloadClientKeys.Add(context.Request.Headers["X-Api-Key"].ToString());
+            return Api(context, () => BigDownloadClients
+                ? new JsonArray(Enumerable.Range(0, 2000).Select(index => (JsonNode)new JsonObject { ["name"] = new string('x', 200), ["implementation"] = "Transmission" }).ToArray())
+                : new JsonArray(DownloadClients.Select(value => (JsonNode)value.DeepClone()).ToArray()));
+        });
         _app.MapGet("/api/v1/indexerstatus", context => Api(context, () => new JsonArray(DisabledTill.Select(pair =>
             (JsonNode)new JsonObject { ["indexerId"] = pair.Key, ["disabledTill"] = pair.Value.ToString("O") }).ToArray())));
         // A reverse proxy that redirects (whole-review P1 4): whatever follows it to /capture would carry the key there.

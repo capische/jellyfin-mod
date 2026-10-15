@@ -12,6 +12,10 @@ namespace JellyfinMod.Services.Acquisition;
 public sealed record ProwlarrSyncOutcome(string Code, int Seen, int Created, int Updated, int Disabled, int Removed, int Verified,
     IReadOnlyList<string> Failed);
 
+/// <summary>A download client as Prowlarr knows it, without its password (P6.FU1).</summary>
+public sealed record ProwlarrDownloadClient(string Implementation, string Name, bool Enabled, string? Host, int? Port, bool UseSsl, string? UrlBase,
+    string? Username);
+
 /// <summary>A refused Prowlarr call, carrying a stable code.</summary>
 public sealed class ProwlarrException(string code, string message) : Exception(message)
 {
@@ -350,7 +354,59 @@ public sealed class ProwlarrSync(
         return wanted.Length > 0 ? wanted : [2000, 5000];
     }
 
-    private async Task<JsonDocument> GetAsync(ProwlarrSource source, string path, CancellationToken cancellationToken)
+    /// <summary>
+    /// Reads the download clients Prowlarr knows (P6.FU1), with the source's saved key, for the Download Client step to
+    /// fill its form. Only the connection fields are read, by name; the password (masked by Prowlarr as <c>********</c>)
+    /// and every other field are never read. Changes nothing; a failure answers its code and no client.
+    /// </summary>
+    public async Task<(string Code, IReadOnlyList<ProwlarrDownloadClient> Clients)> ReadDownloadClientsAsync(ProwlarrSource source,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var document = await GetAsync(source, "api/v1/downloadclient", cancellationToken, DownloadClientListLimit).ConfigureAwait(false);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return ("prowlarr_schema", []);
+            var clients = new List<ProwlarrDownloadClient>();
+            foreach (var item in document.RootElement.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object || Text(item, "implementation") is not { } implementation || Text(item, "name") is not { } name)
+                    continue;
+                var fields = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+                if (item.TryGetProperty("fields", out var list) && list.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var field in list.EnumerateArray())
+                    {
+                        if (field.ValueKind == JsonValueKind.Object && Text(field, "name") is { } fieldName && ClientFields.Contains(fieldName) &&
+                            field.TryGetProperty("value", out var value))
+                            fields[fieldName] = value.Clone();
+                    }
+                }
+
+                string? Field(string key) => fields.TryGetValue(key, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+                var port = fields.TryGetValue("port", out var portValue) && portValue.TryGetInt32(out var number) && number is > 0 and <= 65535 ? number : (int?)null;
+                clients.Add(new ProwlarrDownloadClient(implementation, name,
+                    item.TryGetProperty("enable", out var enable) && enable.ValueKind == JsonValueKind.True,
+                    Field("host"), port, fields.TryGetValue("useSsl", out var ssl) && ssl.ValueKind == JsonValueKind.True, Field("urlBase"), Field("username")));
+            }
+
+            return ("ok", clients);
+        }
+        catch (ProwlarrException failure)
+        {
+            return (failure.Code, []);
+        }
+    }
+
+    /// <summary>The only download-client fields ever read from Prowlarr: never <c>password</c> or any other.</summary>
+    private static readonly HashSet<string> ClientFields = new(["host", "port", "useSsl", "urlBase", "username"], StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The most a download-client list may weigh; Prowlarr's is a few KiB per client.</summary>
+    private const int DownloadClientListLimit = 256 * 1024;
+
+    private static string? Text(JsonElement item, string property) =>
+        item.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String && value.GetString() is { Length: > 0 } text ? text : null;
+
+    private async Task<JsonDocument> GetAsync(ProwlarrSource source, string path, CancellationToken cancellationToken, int? maxBytes = null)
     {
         var key = await secrets.GetAsync(source.ApiKeySecretRef, cancellationToken).ConfigureAwait(false);
         if (key is null) throw new ProwlarrException("unauthorized", "No Prowlarr API key is saved.");
@@ -373,7 +429,20 @@ public sealed class ProwlarrSync(
             if (!response.IsSuccessStatusCode)
                 throw new ProwlarrException("unreachable", $"Prowlarr answered HTTP {(int)response.StatusCode}.");
             await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
-            return await JsonDocument.ParseAsync(stream, cancellationToken: timeout.Token).ConfigureAwait(false);
+            if (maxBytes is not { } limit) return await JsonDocument.ParseAsync(stream, cancellationToken: timeout.Token).ConfigureAwait(false);
+            // A bounded read: a body larger than the limit is refused before it is parsed, whatever its Content-Length says.
+            if (response.Content.Headers.ContentLength > limit) throw new ProwlarrException("response_too_large", "Prowlarr's answer is too large.");
+            using var buffer = new MemoryStream();
+            var chunk = new byte[16 * 1024];
+            int read;
+            while ((read = await stream.ReadAsync(chunk, timeout.Token).ConfigureAwait(false)) > 0)
+            {
+                if (buffer.Length + read > limit) throw new ProwlarrException("response_too_large", "Prowlarr's answer is too large.");
+                buffer.Write(chunk, 0, read);
+            }
+
+            buffer.Position = 0;
+            return await JsonDocument.ParseAsync(buffer, cancellationToken: timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {

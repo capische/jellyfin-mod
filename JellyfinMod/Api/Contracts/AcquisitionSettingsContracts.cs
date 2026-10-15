@@ -316,6 +316,28 @@ public sealed record ProwlarrSourceDto(
     [property: JsonPropertyName("indexerCount")] int IndexerCount,
     [property: JsonPropertyName("revision")] int Revision);
 
+/// <summary>
+/// One download client Prowlarr knows, as the Download Client step offers it (P6.FU1). Never a password: Prowlarr masks
+/// it, and the plugin does not read it. <c>kind</c> and <c>baseUrl</c> are set only for a client this plugin can drive.
+/// </summary>
+public sealed record ProwlarrDownloadClientDto(
+    [property: JsonPropertyName("implementation")] string Implementation,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("enabled")] bool Enabled,
+    [property: JsonPropertyName("host"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Host,
+    [property: JsonPropertyName("port"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? Port,
+    [property: JsonPropertyName("useSsl")] bool UseSsl,
+    [property: JsonPropertyName("urlBase"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? UrlBase,
+    [property: JsonPropertyName("username"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Username,
+    [property: JsonPropertyName("kind"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Kind,
+    [property: JsonPropertyName("baseUrl"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? BaseUrl);
+
+/// <summary>Prowlarr's download clients, the read's outcome code, and this server's private default gateway, if any (P6.FU1).</summary>
+public sealed record ProwlarrDownloadClientsDto(
+    [property: JsonPropertyName("code")] string Code,
+    [property: JsonPropertyName("clients")] IReadOnlyList<ProwlarrDownloadClientDto> Clients,
+    [property: JsonPropertyName("gateway"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Gateway);
+
 /// <summary>Creates or replaces a Prowlarr source.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed class ProwlarrSourceRequest

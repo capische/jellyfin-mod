@@ -158,6 +158,78 @@ public sealed class ProwlarrController(
         };
     }
 
+    /// <summary>
+    /// The download clients the source's Prowlarr knows, for the Download Client step to fill its form (P6.FU1). Read here
+    /// with the saved key, which never reaches the browser; passwords are neither read nor returned. A Prowlarr that fails
+    /// answers its code and no client. Changes nothing.
+    /// </summary>
+    [HttpGet("{id:guid}/DownloadClients")]
+    public async Task<ActionResult<ProwlarrDownloadClientsDto>> DownloadClients(Guid id, CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var source = await database.ProwlarrSources.AsNoTracking().SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
+        if (source is null) return NotFound();
+        var (code, clients) = await sync.ReadDownloadClientsAsync(source, cancellationToken);
+        return new ProwlarrDownloadClientsDto(code, clients.Select(client =>
+        {
+            var transmission = string.Equals(client.Implementation, "Transmission", StringComparison.OrdinalIgnoreCase);
+            var baseUrl = transmission ? TransmissionRpcUrl(client) : null;
+            return new ProwlarrDownloadClientDto(client.Implementation, client.Name, client.Enabled, client.Host, client.Port, client.UseSsl, client.UrlBase,
+                client.Username, baseUrl is null ? null : TransmissionDriver.DriverKind, baseUrl);
+        }).ToList(), DefaultGateway());
+    }
+
+    /// <summary>
+    /// Transmission's RPC address as Prowlarr builds it: scheme, host and port, then the URL base (Prowlarr's default
+    /// <c>/transmission/</c>) and <c>rpc</c>. Null when the host or port would not make an http(s) address without credentials.
+    /// </summary>
+    private static string? TransmissionRpcUrl(ProwlarrDownloadClient client)
+    {
+        var host = client.Host?.Trim();
+        if (string.IsNullOrEmpty(host) || client.Port is not { } port || Uri.CheckHostName(host) == UriHostNameType.Unknown) return null;
+        var urlBase = (client.UrlBase ?? string.Empty).Trim().Trim('/');
+        try
+        {
+            var uri = new UriBuilder(client.UseSsl ? "https" : "http", host, port, (urlBase.Length == 0 ? string.Empty : "/" + urlBase) + "/rpc").Uri;
+            return string.IsNullOrEmpty(uri.UserInfo) && string.IsNullOrEmpty(uri.Query) && string.IsNullOrEmpty(uri.Fragment) ? uri.ToString() : null;
+        }
+        catch (UriFormatException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// This server's IPv4 default gateway from <c>/proc/net/route</c>, when it is in a private range (10/8, 172.16/12,
+    /// 192.168/16): the address a service published on the Docker host is often reached at. Null anywhere else.
+    /// </summary>
+    private static string? DefaultGateway()
+    {
+        try
+        {
+            foreach (var line in System.IO.File.ReadLines("/proc/net/route").Skip(1))
+            {
+                var columns = line.Split('\t', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                // Iface, Destination, Gateway, Flags, RefCnt, Use, Metric, Mask: the default route has destination and mask 0.
+                if (columns.Length < 8 || columns[1] != "00000000" || columns[7] != "00000000" ||
+                    !uint.TryParse(columns[2], System.Globalization.NumberStyles.HexNumber, null, out var value) || value == 0) continue;
+                // The kernel writes the address in host byte order of its network-order bytes: little-endian on x86 and ARM.
+                var bytes = BitConverter.GetBytes(value);
+                if (!BitConverter.IsLittleEndian) Array.Reverse(bytes);
+                var isPrivate = bytes[0] == 10 || (bytes[0] == 172 && bytes[1] is >= 16 and <= 31) || (bytes[0] == 192 && bytes[1] == 168);
+                return isPrivate ? new System.Net.IPAddress(bytes).ToString() : null;
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        return null;
+    }
+
     private async Task<ProwlarrSourceDto> ToDtoAsync(ProwlarrSource source, CancellationToken cancellationToken) => new(
         source.Id, source.Name, source.BaseUrl, await secrets.HasAsync(source.ApiKeySecretRef, cancellationToken), source.Enabled,
         source.SyncIntervalMinutes, source.LastSyncAt is { } at ? DateTime.SpecifyKind(at, DateTimeKind.Utc) : null, source.LastSyncOutcome,
