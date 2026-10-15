@@ -323,6 +323,9 @@ public sealed class SettingsController(
             _ => discovery.Verified ? [] : ["discovery_unverified"]
         });
 
+        // Indexers come before the download client (P6.FU1, user 2026-10-15): the Prowlarr saved there offers its own
+        // download clients to the next step.
+        Step("indexers", state.Blockers.Contains("no_verified_indexer") ? ["no_verified_indexer"] : []);
         var clientReasons = new List<string>();
         if (state.Client is not { } client) clientReasons.Add("no_download_client");
         else
@@ -335,7 +338,6 @@ public sealed class SettingsController(
         }
 
         Step("downloadClient", clientReasons);
-        Step("indexers", state.Blockers.Contains("no_verified_indexer") ? ["no_verified_indexer"] : []);
         Step("qualityProfile", settings.DefaultQualityProfileId is null ? ["no_default_profile"] : []);
         Step("enable", settings.Enabled ? [] : state.Ready ? ["acquisition_disabled"] : ["acquisition_not_ready"]);
         steps.Add(new SetupStepDto("optional", "done", true, []));

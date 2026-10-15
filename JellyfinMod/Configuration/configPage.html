@@ -355,15 +355,15 @@
       <footer class="jfmod-check-secfoot">
         <button is="emby-button" type="button" class="raised button-submit" data-submit="discovery"><span>Save</span></button>
         <span class="jfmod-savemeta" data-savemeta="discovery"></span>
-        <button type="button" class="jfmod-next" data-goto="client">Next: Download Client →</button>
+        <button type="button" class="jfmod-next" data-goto="indexers">Next: Indexers →</button>
       </footer>
     </section>
 
-    <!-- 2 Download client -->
+    <!-- 3 Download client: after Indexers, so a Prowlarr saved there can offer its clients (P6.FU1) -->
     <section class="jfmod-check-section" data-section="client" aria-labelledby="jfmod-h-client" hidden>
       <header class="jfmod-check-sechead">
         <div>
-          <div class="jfmod-eyebrow">Step 2 of 10</div>
+          <div class="jfmod-eyebrow">Step 3 of 10</div>
           <h2 id="jfmod-h-client" tabindex="-1">Download Client</h2>
           <span class="jfmod-state" data-secstate="client"><i aria-hidden="true"></i><span></span></span>
         </div>
@@ -437,15 +437,15 @@
         <button is="emby-button" type="button" class="raised button-submit" data-submit="client"><span>Save</span></button>
         <button is="emby-button" type="button" class="raised button-delete" id="DeleteClient"><span>Delete This Client</span></button>
         <span class="jfmod-savemeta" data-savemeta="client"></span>
-        <button type="button" class="jfmod-next" data-goto="indexers">Next: Indexers →</button>
+        <button type="button" class="jfmod-next" data-goto="profiles">Next: Quality Profiles →</button>
       </footer>
     </section>
 
-    <!-- 3 Indexers -->
+    <!-- 2 Indexers -->
     <section class="jfmod-check-section" data-section="indexers" aria-labelledby="jfmod-h-indexers" hidden>
       <header class="jfmod-check-sechead">
         <div>
-          <div class="jfmod-eyebrow">Step 3 of 10</div>
+          <div class="jfmod-eyebrow">Step 2 of 10</div>
           <h2 id="jfmod-h-indexers" tabindex="-1">Indexers</h2>
           <span class="jfmod-state" data-secstate="indexers"><i aria-hidden="true"></i><span></span></span>
         </div>
@@ -459,7 +459,7 @@
       </div>
       <footer class="jfmod-check-secfoot">
         <span class="jfmod-savemeta">Each indexer saves on its own, in its editor.</span>
-        <button type="button" class="jfmod-next" data-goto="profiles">Next: Quality Profiles →</button>
+        <button type="button" class="jfmod-next" data-goto="client">Next: Download Client →</button>
       </footer>
     </section>
 
@@ -1409,8 +1409,8 @@
       // ---------------------------------------------------------------------
       var SECTIONS = [
         { id: 'discovery', title: 'Discovery' },
-        { id: 'client', title: 'Download Client' },
         { id: 'indexers', title: 'Indexers' },
+        { id: 'client', title: 'Download Client' },
         { id: 'profiles', title: 'Quality Profiles' },
         { id: 'grabbing', title: 'Grabbing' },
         { id: 'import', title: 'Import and Seeding' },

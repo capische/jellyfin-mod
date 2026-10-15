@@ -384,6 +384,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         Assert(!setup.GetProperty("complete").GetBoolean() && Status(setup, "discovery") == "done" && Status(setup, "downloadClient") == "done" &&
             Status(setup, "indexers") == "pending" && Status(setup, "qualityProfile") == "blocked" && Status(setup, "enable") == "blocked",
             "Setup is derived from readiness: discovery and the client done, indexers the first incomplete step");
+        Assert(setup.GetProperty("steps").EnumerateArray().Select(step => step.GetProperty("id").GetString())
+                .SequenceEqual(["discovery", "indexers", "downloadClient", "qualityProfile", "enable", "optional"]),
+            "P6.FU1: the indexer step comes before the download client step");
         var overview = await Read(admin.GetAsync("/JellyfinMod/Settings/Overview"), 200, "Overview reads");
         acquisition = await Read(admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition reads");
         var acquisitionArea = overview.GetProperty("areas").EnumerateArray().Single(area => area.GetProperty("id").GetString() == "acquisition");
