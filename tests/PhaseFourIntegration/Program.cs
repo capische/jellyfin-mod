@@ -30,6 +30,8 @@ var logs = new CapturingLoggerProvider();
 var secrets = new List<string>();
 try
 {
+    // Quality profile presets on their own databases first (P4.FU9).
+    await PresetScenarios.RunAsync(folder, logs);
     await RunAsync(folder, far, foreign, logs, secrets);
     // No credential, API key or tracker passkey may appear in any log line the plugin wrote.
     foreach (var secret in secrets)
