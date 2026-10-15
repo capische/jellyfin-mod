@@ -61,6 +61,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             var seen = new HashSet<(int? TmdbId, Guid NativeId)>();
             foreach (var item in ReadPages(TitleQuery(folder, mediaType), cancellationToken))
             {
+                if (IsPlaceholderMovie(item)) continue;
                 var tmdbId = ProviderTmdbId(item);
                 if (seen.Add((tmdbId, tmdbId.HasValue ? Guid.Empty : item.Id)))
                     yield return new(item.Id, libraryId, mediaType, tmdbId, item.Name);
@@ -75,7 +76,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         var item = library.GetItemById(itemId);
         if (item is Episode episode)
             item = episode.Series;
-        if (item is not (Movie or Series)) yield break;
+        if (item is not (Movie or Series) || IsPlaceholderMovie(item)) yield break;
         var mediaType = item is Movie ? "movie" : "series";
         foreach (var folder in library.GetCollectionFolders(item).OfType<CollectionFolder>())
         {
@@ -96,7 +97,7 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         else
             query.ItemIds = [work.NativeItemId];
         var copies = ReadPages(query, cancellationToken)
-            .Where(item => item is Movie or Series)
+            .Where(item => item is Movie or Series && !IsPlaceholderMovie(item))
             .Where(item => library.GetCollectionFolders(item).Any(candidate => candidate.Id == work.TargetLibraryId))
             .DistinctBy(item => item.Id).ToArray();
         if (copies.Length == 0)
@@ -132,11 +133,16 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         {
             var mounts = _mediaStorage.ReadMountTable();
             var skipped = new List<SkippedNativeEpisode>();
+            var placeholders = 0;
             var episodes = work.MediaType == "series"
-                ? GetEpisodes(copies.Cast<Series>().ToArray(), folder.Id, skipped, mounts, cancellationToken) : [];
+                ? GetEpisodes(copies.Cast<Series>().ToArray(), folder.Id, skipped, mounts, out placeholders, cancellationToken) : [];
             return new(representative.Id, folder.Id, representative.Name,
                 Snapshot(work.MediaType, providerId, folder.Id, representative, copies,
-                    copies.Select(item => item.Id).ToHashSet(), episodes, mounts, versionSets) with { SkippedEpisodes = skipped },
+                    copies.Select(item => item.Id).ToHashSet(), episodes, mounts, versionSets) with
+                {
+                    SkippedEpisodes = skipped,
+                    PlaceholderEpisodes = placeholders
+                },
                 false, null);
         }
         catch (InvalidOperationException error)
@@ -235,9 +241,11 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         Guid libraryId,
         ICollection<SkippedNativeEpisode> skipped,
         MountTable mounts,
+        out int placeholders,
         CancellationToken cancellationToken)
     {
         var episodes = new List<NativeEpisodeSnapshot>();
+        placeholders = 0;
         foreach (var series in seriesCopies)
         {
             // Series.GetItemList rewrites recursive queries to a presentation key (Series.cs, 12.0.0).
@@ -252,7 +260,12 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             foreach (var episode in ReadPages(query, cancellationToken).OfType<Episode>())
             {
                 // A placeholder (a media stub, P1.FU24) is an item but no file: its episode stays missing, never on disk.
-                if (episode.IsPlaceHolder) continue;
+                if (episode.IsPlaceHolder)
+                {
+                    if (Placeholders.PlaceholderStub.IsStubFile(episode.Path)) placeholders++;
+                    continue;
+                }
+
                 if (episode.SeriesId != series.Id)
                     throw new InvalidOperationException($"Native episode {episode.Id} has conflicting series provenance.");
                 // Date-named, unparsed or "Season Unknown" episodes cannot be matched by position. They are
@@ -306,6 +319,13 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
         video.PrimaryVersionId is { } id && !id.Equals(Guid.Empty) ? id : null;
 
     private static bool IsPlayable(BaseItem item) => !string.IsNullOrWhiteSpace(item.Path);
+
+    /// <summary>
+    /// A movie that is one of the plugin's placeholders (P1.FU26): not media, so reconciliation never binds it, never calls its
+    /// entry on disk and never backfills an entry from it. Its entry finds it by TMDB id instead.
+    /// </summary>
+    private static bool IsPlaceholderMovie(BaseItem item) =>
+        item is Movie { IsPlaceHolder: true } movie && Placeholders.PlaceholderStub.IsStubFile(movie.Path);
 
     private static int? ProviderTmdbId(BaseItem item) => ParseProviderId(item, "Tmdb");
 

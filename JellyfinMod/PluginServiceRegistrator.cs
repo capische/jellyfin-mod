@@ -100,6 +100,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         // offering or playing them. The filter shapes every stock controller's answers; MVC is configured after this runs.
         services.AddTransient<PlaceholderService>();
         services.AddSingleton<IHostedService, PlaceholderItemListener>();
+        services.AddSingleton<PlaceholderSyncQueue>();
+        services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<PlaceholderSyncQueue>());
         services.AddSingleton<PlaceholderFilter>();
         services.Configure<MvcOptions>(options => options.Filters.AddService<PlaceholderFilter>());
     }

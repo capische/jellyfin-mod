@@ -146,7 +146,7 @@ public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibr
     public string Key => "JellyfinModPlaceholderSync";
 
     /// <inheritdoc />
-    public string Description => "Adds placeholders for missing aired episodes in the TV libraries where they are on (all, unless turned off), a few series per run, and removes the ones whose episode has a file.";
+    public string Description => "Adds placeholders for missing aired episodes and released movies with no file in the libraries where they are on (all, unless turned off), a few titles per run, and removes the ones whose title has a file.";
 
     /// <inheritdoc />
     public string Category => "JellyfinMod";
@@ -162,7 +162,8 @@ public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibr
     {
         // Every TV library with a switch on, and every other one too: stale stubs go and stub items are stamped even after the
         // switch is turned off (stubs written before stay until an administrator removes them).
-        var libraries = library.GetVirtualFolders().Where(folder => folder.CollectionType == MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows)
+        var libraries = library.GetVirtualFolders().Where(folder => folder.CollectionType is MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows or
+                MediaBrowser.Model.Entities.CollectionTypeOptions.movies)
             .Select(folder => Guid.TryParse(folder.ItemId, out var id) ? id : Guid.Empty).Where(id => id != Guid.Empty).ToArray();
         for (var index = 0; index < libraries.Length; index++)
         {
@@ -171,6 +172,84 @@ public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibr
             if (service.NeedsSync(libraries[index]))
                 await service.SyncAsync(libraries[index], cancellationToken).ConfigureAwait(false);
             progress.Report(100.0 * (index + 1) / libraries.Length);
+        }
+    }
+}
+
+/// <summary>
+/// Writes a title's placeholders right after it is added from TMDb or its episode list loads (P1.FU26), so it becomes a Jellyfin
+/// item within seconds instead of at the next scheduled sync. One entry per request, off the request, one at a time.
+/// </summary>
+public sealed class PlaceholderSyncQueue(IServiceScopeFactory scopeFactory, ILogger<PlaceholderSyncQueue> logger) : IHostedService
+{
+    private readonly Channel<(Guid LibraryId, Guid EntryId)> queue =
+        Channel.CreateUnbounded<(Guid, Guid)>(new UnboundedChannelOptions { SingleReader = true });
+    private CancellationTokenSource? stopping;
+    private Task? worker;
+
+    /// <summary>Asks for one entry's placeholders to be written now.</summary>
+    public void Enqueue(Guid? libraryId, Guid entryId)
+    {
+        if (libraryId is { } id && id != Guid.Empty) queue.Writer.TryWrite((id, entryId));
+    }
+
+    /// <inheritdoc />
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        worker = Task.Run(() => ProcessAsync(stopping.Token), CancellationToken.None);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        queue.Writer.TryComplete();
+        var source = Interlocked.Exchange(ref stopping, null);
+        if (source is null) return;
+        await source.CancelAsync().ConfigureAwait(false);
+        try
+        {
+            if (worker is not null) await worker.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            source.Dispose();
+        }
+    }
+
+    private async Task ProcessAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (await queue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var batch = new HashSet<(Guid, Guid)>();
+                while (queue.Reader.TryRead(out var item)) batch.Add(item);
+                foreach (var (libraryId, entryId) in batch)
+                {
+                    try
+                    {
+                        using var scope = scopeFactory.CreateScope();
+                        await scope.ServiceProvider.GetRequiredService<PlaceholderService>().SyncEntryAsync(libraryId, entryId, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (KeyNotFoundException)
+                    {
+                        // Not a TV or movie library: nothing to write.
+                    }
+                    catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
+                    {
+                        logger.LogWarning("JellyfinMod could not write the placeholders of a new title; the next sync does: {Error}", error.Message);
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
         }
     }
 }

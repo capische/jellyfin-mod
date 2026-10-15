@@ -697,8 +697,14 @@ public sealed class ImportService(
     /// </summary>
     private void SwapPlaceholders(ImportOperation operation, Episode? episode)
     {
-        if (episode is null || operation.DestinationPath is not { } destination) return;
-        foreach (var folder in Placeholders.PlaceholderService.SwapForImport(files, destination, episode.SeasonNumber, episode.EpisodeNumber, logger))
+        if (operation.DestinationPath is not { } destination) return;
+        // A movie's placeholder goes the same way (P1.FU26): from the file's folder and any title folder of its TMDB id.
+        var tmdbId = episode is null ? database.Entries.AsNoTracking().Where(entry => entry.Id == operation.EntryId)
+            .Select(entry => entry.TmdbId).SingleOrDefault() : 0;
+        var changed = episode is null
+            ? Placeholders.PlaceholderService.SwapMovieForImport(files, LibraryRoots(operation.TargetLibraryId), destination, tmdbId, logger)
+            : Placeholders.PlaceholderService.SwapForImport(files, destination, episode.SeasonNumber, episode.EpisodeNumber, logger);
+        foreach (var folder in changed)
         {
             try
             {
@@ -1182,6 +1188,10 @@ public sealed class ImportService(
             return DestinationPlan.Blocked(ImportReasons.CrossFilesystem,
                 "The movie's folder is on a different mount from the download; nothing was copied.");
         string movieRoot;
+        // The title folder already there for the movie (its placeholder's, P1.FU26), when it is on the download's mount: the file
+        // joins the placeholder, which the swap then removes.
+        if (movieFolder is null && SeriesFolders.TitleFolderByTmdbId(files, sameMountRoots, entry.TmdbId) is { } titled)
+            movieFolder = titled;
         if (movieFolder is null)
         {
             if (sameMountRoots.Length == 0) return CrossMount();

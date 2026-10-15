@@ -19,7 +19,8 @@ namespace JellyfinMod.Api;
 [ApiController, Authorize, Route("JellyfinMod/Browse")]
 public sealed class BrowseController(ModDbContext database, DatabaseInitializer readiness, LibraryAccess access,
     CatalogSortName sortNames, IDtoService dto, IUserDataManager userData, IMediaSourceManager mediaSources,
-    IAuthorizationService? authorization = null, JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null) : ControllerBase
+    IAuthorizationService? authorization = null, JellyfinMod.Services.Import.ClientSnapshotCache? snapshots = null,
+    ILibraryManager? library = null) : ControllerBase
 {
     private static readonly HashSet<string> SupportedSorts = ["SortName", "DateCreated", "ProductionYear", "PremiereDate", "CommunityRating", "CriticRating", "Runtime", "DateLastContentAdded", "OfficialRating", "DatePlayed", "PlayCount", "Random", "SeriesDatePlayed"];
 
@@ -93,9 +94,14 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         }
         var boundEntries = entries.Where(entry => entry.JellyfinItemId.HasValue && nativeIds.Contains(entry.JellyfinItemId.Value))
             .GroupBy(entry => entry.JellyfinItemId!.Value).ToDictionary(group => group.Key, group => group.OrderBy(entry => entry.Id).First());
-        var candidates = native.Select(item => new Candidate(item, boundEntries.GetValueOrDefault(item.Id), null, item.SortName, userData.GetUserData(user, item),
+        // A title with no file that Jellyfin shows through the plugin's placeholders (P1.FU26): the placeholder movie, or the series
+        // its placeholders make, is the title's one row and carries the entry; no separate file-less row is drawn for it.
+        var placeholderEntries = PlaceholderEntries(native, boundEntries, entries, nativeIds);
+        var attached = placeholderEntries.Values.Select(entry => entry.Id).ToHashSet();
+        var candidates = native.Select(item => new Candidate(item, boundEntries.GetValueOrDefault(item.Id) ?? placeholderEntries.GetValueOrDefault(item.Id), null,
+                item.SortName, userData.GetUserData(user, item),
                 request.MediaType == "series" && request.SortBy.Contains("SeriesDatePlayed") ? access.GetSeriesDatePlayed(user, item, userData) : null))
-            .Concat(entries.Where(entry => !entry.JellyfinItemId.HasValue || !nativeIds.Contains(entry.JellyfinItemId.Value))
+            .Concat(entries.Where(entry => (!entry.JellyfinItemId.HasValue || !nativeIds.Contains(entry.JellyfinItemId.Value)) && !attached.Contains(entry.Id))
                 .Select(entry => new Candidate(null, entry, entry.MetadataJson is null ? null : JsonSerializer.Deserialize<TmdbMetadata>(entry.MetadataJson), sortNames.GetKey(entry.Title), null, null)));
         candidates = candidates.Where(row => row.Native is null ? MatchesMetadata(row, filters) : nativeMatches.Contains(row.Native.Id) && MatchesStatus(row.UserData, rowStatus));
         if (!string.IsNullOrEmpty(request.Alphabet)) candidates = candidates.Where(row => request.Alphabet == "#"
@@ -106,7 +112,8 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             candidates = candidates.Where(row => row.SearchValues.Any(value => sortNames.GetSearchKey(value).Contains(search, StringComparison.Ordinal)));
         }
         var projections = await JellyfinMod.Services.Import.QueueReadModel.ProjectAsync(database, snapshots, entryIds, cancellationToken);
-        if (request.State.Length > 0) candidates = candidates.Where(row => request.State.Contains(row.Native is null
+        // A placeholder row is in the entry's state (not downloaded, downloading), never on disk.
+        if (request.State.Length > 0) candidates = candidates.Where(row => request.State.Contains(row.Native is null || row.IsPlaceholder
             ? new EntryDto(row.Entry!, projections.GetValueOrDefault(row.Entry!.Id)).State : "onDisk"));
         if (request.DueWithinDays.HasValue)
         {
@@ -137,7 +144,10 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
             (await authorization.AuthorizeAsync(User, MediaBrowser.Common.Api.Policies.RequiresElevation)).Succeeded;
         var options = new DtoOptions { Fields = [ItemFields.PrimaryImageAspectRatio, ItemFields.MediaSourceCount, ItemFields.DateCreated] };
         var rows = page.Select(row => new BrowseRow(row.Native is null ? "entry" : "native",
-            row.Native is null ? null : dto.GetBaseItemDto(row.Native, options, user), row.Entry is null ? null : new EntryDto(row.Entry, projections.GetValueOrDefault(row.Entry.Id)),
+            row.Native is null ? null : dto.GetBaseItemDto(row.Native, options, user), row.Entry is null ? null : new EntryDto(row.Entry, projections.GetValueOrDefault(row.Entry.Id))
+            {
+                PlaceholderItemId = row.IsPlaceholder ? row.Native!.Id : null
+            },
             row.Entry is null ? null : RetentionSummaries.ForViewer(
                 RetentionSummaries.ForEntry(row.Entry, retentionPolicy, evaluations), isAdmin))).ToArray();
         return new BrowseResult(rows, filtered.Length, entries.Length > 0);
@@ -219,8 +229,47 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
     private static int CompareValue(IComparable? left, IComparable? right) => left is null ? (right is null ? 0 : -1) :
         right is null ? 1 : left is string text ? StringComparer.Ordinal.Compare(text, (string)right) : left.CompareTo(right);
 
+    /// <summary>
+    /// The entries of titles with no file whose Jellyfin item is a placeholder (P1.FU26), by that item: a placeholder movie of the
+    /// plugin's, or a series item, for an entry of the same TMDB id in the item's library that is not on disk and not bound to
+    /// another item listed here.
+    /// </summary>
+    private Dictionary<Guid, Entry> PlaceholderEntries(IReadOnlyList<BaseItem> native, Dictionary<Guid, Entry> boundEntries, IReadOnlyList<Entry> entries,
+        HashSet<Guid> nativeIds)
+    {
+        var result = new Dictionary<Guid, Entry>();
+        var waiting = entries.Where(entry => entry.State != FileState.OnDisk && (!entry.JellyfinItemId.HasValue || !nativeIds.Contains(entry.JellyfinItemId.Value)))
+            .GroupBy(entry => entry.TmdbId).ToDictionary(group => group.Key, group => group.ToArray());
+        if (waiting.Count == 0) return result;
+        foreach (var item in native)
+        {
+            if (boundEntries.ContainsKey(item.Id) ||
+                !(item is MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: true } movie && JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(movie.Path) ||
+                  item is MediaBrowser.Controller.Entities.TV.Series)) continue;
+            if (!item.ProviderIds.TryGetValue("Tmdb", out var raw) || !int.TryParse(raw, out var tmdbId) ||
+                !waiting.TryGetValue(tmdbId, out var candidates)) continue;
+            Guid[] libraries;
+            try
+            {
+                libraries = library?.GetCollectionFolders(item).Select(folder => folder.Id).ToArray() ?? [];
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                libraries = [];
+            }
+
+            var entry = candidates.FirstOrDefault(candidate => candidate.TargetLibraryId is { } id && libraries.Contains(id) &&
+                !result.ContainsValue(candidate));
+            if (entry is not null) result[item.Id] = entry;
+        }
+
+        return result;
+    }
+
     private sealed record Candidate(BaseItem? Native, Entry? Entry, TmdbMetadata? Metadata, string SortName, UserItemData? UserData, DateTime? SeriesDatePlayed)
     {
+        /// <summary>A native row that stands for an entry it is not bound to: the title's placeholder item (P1.FU26).</summary>
+        public bool IsPlaceholder => Native is not null && Entry is not null && Entry.JellyfinItemId != Native.Id;
         public string Title => Native?.Name ?? Entry!.Title;
         public IEnumerable<string> SearchValues => new[] { Title, Native?.OriginalTitle, Native?.SortName, Metadata?.OriginalTitle }.OfType<string>();
         public string Identity => Native is null ? "entry:" + Entry!.Id : "native:" + Native.Id;

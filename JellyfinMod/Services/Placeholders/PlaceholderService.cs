@@ -4,6 +4,7 @@ using JellyfinMod.Data;
 using JellyfinMod.Services.Acquisition;
 using JellyfinMod.Services.Import;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
@@ -20,7 +21,18 @@ public sealed record PlaceholderWrite(
     [property: JsonPropertyName("seasonNumber")] int SeasonNumber,
     [property: JsonPropertyName("episodeNumber")] int EpisodeNumber,
     [property: JsonPropertyName("path")] string Path,
-    [property: JsonPropertyName("newFolder")] bool NewFolder);
+    [property: JsonPropertyName("newFolder")] bool NewFolder,
+    [property: JsonPropertyName("kind")] string Kind = PlaceholderKinds.Episode);
+
+/// <summary>What a placeholder stands for.</summary>
+public static class PlaceholderKinds
+{
+    /// <summary>A missing episode of a series (P1.FU24), or of a series with no file at all (P1.FU26).</summary>
+    public const string Episode = "episode";
+
+    /// <summary>A movie with no file (P1.FU26): <c>Title (Year) [tmdbid-N]/Title (Year) [tmdbid-N].disc</c>.</summary>
+    public const string Movie = "movie";
+}
 
 /// <summary>One stub the plugin would remove (or removed), and why.</summary>
 public sealed record PlaceholderRemoval(
@@ -59,13 +71,14 @@ public sealed record PlaceholderPlan(
     public int Pending { get; init; }
 }
 
-/// <summary>A TV library and its placeholder switch.</summary>
+/// <summary>A TV or movie library and its placeholder switch.</summary>
 public sealed record PlaceholderLibrary(
     [property: JsonPropertyName("libraryId")] Guid LibraryId,
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("enabled")] bool Enabled,
     [property: JsonPropertyName("stubs")] int Stubs,
-    [property: JsonPropertyName("writable")] bool Writable);
+    [property: JsonPropertyName("writable")] bool Writable,
+    [property: JsonPropertyName("mediaType")] string MediaType = "series");
 
 /// <summary>
 /// Placeholders for missing episodes (P1.FU24, user-approved 2026-10-15: "Go and implement isPlaceHolder"). For a series
@@ -112,10 +125,12 @@ public sealed class PlaceholderService(
     public IReadOnlyList<PlaceholderLibrary> Libraries()
     {
         var disabled = PlaceholderSettings.DisabledLibraries();
-        return library.GetVirtualFolders().Where(folder => folder.CollectionType == CollectionTypeOptions.tvshows)
+        return library.GetVirtualFolders().Where(folder => folder.CollectionType is CollectionTypeOptions.tvshows or CollectionTypeOptions.movies)
             .Select(folder => Guid.TryParse(folder.ItemId, out var id) ? new PlaceholderLibrary(id, folder.Name, !disabled.Contains(id),
-                StubItems(id).Count, SeriesFolders.LibraryRoots(library, files, id).Any(files.CanCreateIn)) : null)
-            .OfType<PlaceholderLibrary>().OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+                StubItems(id).Count, SeriesFolders.LibraryRoots(library, files, id).Any(files.CanCreateIn),
+                folder.CollectionType == CollectionTypeOptions.movies ? "movie" : "series") : null)
+            .OfType<PlaceholderLibrary>().OrderBy(item => item.MediaType == "movie" ? 0 : 1).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 
     /// <summary>Whether a library has anything to sync: its switch is on, or Jellyfin holds stubs of the plugin's in it.</summary>
@@ -125,7 +140,7 @@ public sealed class PlaceholderService(
     public async Task<PlaceholderPlan> PlanAsync(Guid libraryId, CancellationToken cancellationToken)
     {
         var (name, _) = LibraryOf(libraryId);
-        var (writes, removals, skipped, existing) = await ComputeAsync(libraryId, cancellationToken).ConfigureAwait(false);
+        var (writes, removals, skipped, existing) = await ComputeAsync(libraryId, null, cancellationToken).ConfigureAwait(false);
         return new(libraryId, name, PlaceholderSettings.IsEnabled(libraryId), true, existing, writes, removals, skipped);
     }
 
@@ -136,12 +151,22 @@ public sealed class PlaceholderService(
     /// is written by the next run (<see cref="PlaceholderPlan.Pending"/>). With the switch off it only stamps and removes stale
     /// stubs, never writes.
     /// </summary>
-    public async Task<PlaceholderPlan> SyncAsync(Guid libraryId, CancellationToken cancellationToken)
+    public Task<PlaceholderPlan> SyncAsync(Guid libraryId, CancellationToken cancellationToken) =>
+        SyncAsync(libraryId, null, cancellationToken);
+
+    /// <summary>
+    /// Syncs one entry's placeholders at once (P1.FU26): a title just added, or a series whose episode list just loaded, becomes
+    /// a Jellyfin item without waiting for the next scheduled sync. Same rules as <see cref="SyncAsync(Guid, CancellationToken)"/>.
+    /// </summary>
+    public Task<PlaceholderPlan> SyncEntryAsync(Guid libraryId, Guid entryId, CancellationToken cancellationToken) =>
+        SyncAsync(libraryId, entryId, cancellationToken);
+
+    private async Task<PlaceholderPlan> SyncAsync(Guid libraryId, Guid? entryId, CancellationToken cancellationToken)
     {
         var (name, _) = LibraryOf(libraryId);
         var enabled = PlaceholderSettings.IsEnabled(libraryId);
         await using var lease = await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
-        var (writes, removals, skipped, existing) = await ComputeAsync(libraryId, cancellationToken).ConfigureAwait(false);
+        var (writes, removals, skipped, existing) = await ComputeAsync(libraryId, entryId, cancellationToken).ConfigureAwait(false);
         var failures = new List<PlaceholderRemoval>();
         var changed = new HashSet<string>(StringComparer.Ordinal);
         var done = new List<PlaceholderWrite>();
@@ -163,6 +188,9 @@ public sealed class PlaceholderService(
             var titles = await database.Episodes.AsNoTracking().Where(episode => entryIds.Contains(episode.EntryId))
                 .Select(episode => new { episode.EntryId, episode.SeasonNumber, episode.EpisodeNumber, episode.Title })
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
+            var years = await database.Entries.AsNoTracking().Where(entry => entryIds.Contains(entry.Id))
+                .Select(entry => new { entry.Id, entry.Year }).ToDictionaryAsync(entry => entry.Id, entry => entry.Year, cancellationToken)
+                .ConfigureAwait(false);
             for (var index = 0; index < batch.Length; index++)
             {
                 // A pause between series, so Jellyfin scans one series' folders before the next arrives.
@@ -172,7 +200,10 @@ public sealed class PlaceholderService(
                 {
                     var title = titles.FirstOrDefault(row => row.EntryId == write.EntryId && row.SeasonNumber == write.SeasonNumber &&
                         row.EpisodeNumber == write.EpisodeNumber)?.Title;
-                    var error = WriteOne(write, PlaceholderStub.Body(write.Title, write.SeasonNumber, write.EpisodeNumber, title), changed);
+                    var body = write.Kind == PlaceholderKinds.Movie
+                        ? PlaceholderStub.MovieBody(write.Title, years.GetValueOrDefault(write.EntryId))
+                        : PlaceholderStub.Body(write.Title, write.SeasonNumber, write.EpisodeNumber, title);
+                    var error = WriteOne(write, body, changed);
                     if (error is null)
                     {
                         done.Add(write);
@@ -272,6 +303,152 @@ public sealed class PlaceholderService(
 
         changed.Remove(Path.GetDirectoryName(importedFile)!);
         return changed.ToArray();
+    }
+
+    /// <summary>
+    /// The import's half of a movie's swap (P1.FU26): once the movie's file is linked and verified at
+    /// <paramref name="importedFile"/>, removes the plugin's stubs of the movie from the file's folder and from any title folder of
+    /// its TMDB id in the library's folders (a stub written in another library folder than the one the import used), and such a
+    /// folder when that left it empty. Only marked stubs, each by its inode. Never throws. Returns the folders it changed
+    /// besides the file's own, for the caller to report.
+    /// </summary>
+    public static IReadOnlyList<string> SwapMovieForImport(UnixFileInspector files, IReadOnlyList<string> roots, string importedFile,
+        int tmdbId, ILogger logger)
+    {
+        var changed = new HashSet<string>(StringComparer.Ordinal);
+        try
+        {
+            if (Path.GetDirectoryName(importedFile) is not { } fileFolder) return [];
+            var folders = new List<string> { fileFolder };
+            if (tmdbId > 0 && SeriesFolders.TitleFolderByTmdbId(files, roots, tmdbId) is { } titled && titled != fileFolder) folders.Add(titled);
+            foreach (var folder in folders)
+            {
+                // Never a library folder itself: a stub is only ever in a title's own folder.
+                if (roots.Any(root => string.Equals(Path.TrimEndingDirectorySeparator(root), folder, StringComparison.Ordinal))) continue;
+                foreach (var stub in Listing(folder)?.Where(file => file.IsStub) ?? [])
+                {
+                    var error = RemoveStub(files, stub.Path, changed);
+                    if (error is null)
+                        logger.LogInformation("JellyfinMod removed the movie's placeholder now that its file is in place");
+                    else
+                        logger.LogWarning("JellyfinMod could not remove the placeholder {Path} beside an imported movie; the next placeholder sync removes it: {Error}",
+                            stub.Path, error);
+                }
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            logger.LogWarning("JellyfinMod could not remove a placeholder beside an imported movie; the next placeholder sync removes it: {Error}", error.Message);
+        }
+
+        changed.Remove(Path.GetDirectoryName(importedFile)!);
+        return changed.ToArray();
+    }
+
+    /// <summary>
+    /// Removes an entry's placeholders when an administrator removes the title from the catalog (P1.FU26): every marked stub in
+    /// the series' folders or the movie's folders, and the season and title folders that left empty. Nothing else is ever
+    /// deleted. The caller holds the library lock. Returns the stubs removed and the ones that could not be.
+    /// </summary>
+    public async Task<(IReadOnlyList<string> Removed, IReadOnlyList<PlaceholderRemoval> Failures)> RemoveForEntryAsync(Entry entry,
+        CancellationToken cancellationToken)
+    {
+        var removed = new List<string>();
+        var failures = new List<PlaceholderRemoval>();
+        if (entry.TargetLibraryId is not { } libraryId) return (removed, failures);
+        var roots = SeriesFolders.LibraryRoots(library, files, libraryId);
+        var paths = new SortedSet<string>(StringComparer.Ordinal);
+        if (entry.MediaType == "movie")
+        {
+            foreach (var folder in MovieStubFolders(roots, entry.TmdbId, StubItems(libraryId, entry.TmdbId).OfType<Movie>().ToArray(), []))
+                foreach (var stub in Listing(folder)?.Where(file => file.IsStub) ?? [])
+                    paths.Add(stub.Path);
+        }
+        else if (await SeriesFolders.BoundSeriesFolderAsync(database, library, files, entry.Id, roots, cancellationToken).ConfigureAwait(false)
+                 is { } seriesFolder)
+        {
+            foreach (var folder in StubFolders(files, seriesFolder))
+                foreach (var stub in Listing(folder)?.Where(file => file.IsStub) ?? [])
+                    paths.Add(stub.Path);
+        }
+
+        var changed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var path in paths)
+        {
+            var error = RemoveOne(path, changed);
+            if (error is null) removed.Add(path);
+            else failures.Add(new(path, error));
+        }
+
+        foreach (var folder in changed) Report(folder);
+        if (paths.Count > 0)
+            logger.LogInformation("JellyfinMod removed {Removed} placeholder(s) of a title removed from the catalog, {Failed} failed", removed.Count,
+                failures.Count);
+        return (removed, failures);
+    }
+
+    /// <summary>
+    /// The retention half for a movie (P1.FU26): after a reclaim unlinked the movie's last file <paramref name="mediaPath"/> and
+    /// recorded it, writes the movie's stub in that same folder (named after the folder), so the movie stays a Jellyfin item with
+    /// its user data re-attached by key. Only in a movie library with placeholders on, in a folder inside one of its folders
+    /// (never a library folder itself: a loose file gets none), that can be written and holds no other video. Never deletes,
+    /// never throws. Returns the stub's path, or null.
+    /// </summary>
+    public static string? LeaveAfterMovieReclaim(ILibraryManager library, UnixFileInspector files, ILibraryMonitor? libraryMonitor,
+        Guid libraryId, string mediaPath, string title, int? year, ILogger logger)
+    {
+        try
+        {
+            if (MovieReclaimStubPath(library, files, libraryId, mediaPath) is not { } path) return null;
+            var canonical = Path.GetDirectoryName(path)!;
+            var error = WriteStub(files, path, PlaceholderStub.MovieBody(title, year));
+            if (error is not null)
+            {
+                logger.LogWarning("JellyfinMod could not leave a placeholder for a reclaimed movie at {Path}: {Error}", path, error);
+                return null;
+            }
+
+            libraryMonitor?.ReportFileSystemChanged(canonical);
+            logger.LogInformation("JellyfinMod left a placeholder for a reclaimed movie in {Folder}", canonical);
+            return path;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogWarning("JellyfinMod could not leave a placeholder for a reclaimed movie: {Error}", error.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Where a reclaim of a movie's last file <paramref name="mediaPath"/> leaves the movie's stub (P1.FU26), or null when it
+    /// leaves none: a movie library with placeholders on, the file in a folder inside one of its folders (never a library folder
+    /// itself), that can be written and holds no other video or stub besides the file itself. The stub is named after the folder.
+    /// </summary>
+    public static string? MovieReclaimStubPath(ILibraryManager library, UnixFileInspector files, Guid libraryId, string? mediaPath)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(mediaPath) || !PlaceholderSettings.IsEnabled(libraryId) ||
+                library.GetVirtualFolders()?.Any(folder => Guid.TryParse(folder.ItemId, out var id) && id == libraryId &&
+                    folder.CollectionType == CollectionTypeOptions.movies) != true) return null;
+            var roots = SeriesFolders.LibraryRoots(library, files, libraryId);
+            if (Path.GetDirectoryName(mediaPath) is not { } folder || !files.TryCanonicalize(folder, out var canonical)) return null;
+            if (!roots.Any(root => MediaStorageIdentity.Contains(root, canonical) &&
+                    !string.Equals(Path.TrimEndingDirectorySeparator(root), canonical, StringComparison.Ordinal)) || !files.CanCreateIn(canonical))
+                return null;
+            // Another version or a stub there keeps the movie an item; nothing is written beside it.
+            var own = Path.GetFileName(mediaPath);
+            if (Listing(canonical) is not { } listing ||
+                listing.Any(file => (file.IsStub || file.IsVideo) && !string.Equals(Path.GetFileName(file.Path), own, StringComparison.Ordinal)))
+                return null;
+            var name = Path.GetFileName(canonical) + "." + PlaceholderStub.Extension;
+            var path = Path.Combine(canonical, name);
+            return ImportNaming.FitsFileName(name) && files.Probe(path) == PathPresence.Absent ? path : null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return null;
+        }
     }
 
     /// <summary>One episode a reclaim leaves without a file: its numbers and title, for the stub's name and message.</summary>
@@ -382,13 +559,22 @@ public sealed class PlaceholderService(
     /// <summary>Stamps one item when it is one of the plugin's stubs; true when it changed.</summary>
     public async Task<bool> StampAsync(BaseItem item, CancellationToken cancellationToken)
     {
+        if (item is Movie { IsPlaceHolder: true } movie && PlaceholderStub.IsStubFile(movie.Path))
+            return await StampMovieAsync(movie, cancellationToken).ConfigureAwait(false);
         if (item is not JellyfinEpisode { IsPlaceHolder: true } stub || !PlaceholderStub.IsStubFile(stub.Path) ||
             stub.ParentIndexNumber is not { } season || stub.IndexNumber is not { } number) return false;
         // The series' entry by its bound episodes, or by the series item itself once a reclaim left it no file (P1.FU25).
+        // A series with no file at all (P1.FU26): its series item bound to the entry, or the entry of the series' TMDB id in its
+        // library, before reconciliation has bound it.
+        var seriesTmdb = stub.Series is { } series ? TmdbIdOf(series) : null;
+        var libraryIds = seriesTmdb is null ? [] : LibraryIdsOf(stub);
         var entryIds = database.EpisodeBindings.AsNoTracking().Where(binding => binding.SeriesItemId == stub.SeriesId)
             .Join(database.Episodes.AsNoTracking(), binding => binding.EpisodeId, episode => episode.Id, (binding, episode) => episode.EntryId)
             .Concat(database.Entries.AsNoTracking().Where(entry => entry.MediaType == "series" && entry.JellyfinItemId == stub.SeriesId)
-                .Select(entry => entry.Id));
+                .Select(entry => entry.Id))
+            .Concat(database.EntryBindings.AsNoTracking().Where(binding => binding.JellyfinItemId == stub.SeriesId).Select(binding => binding.EntryId))
+            .Concat(database.Entries.AsNoTracking().Where(entry => entry.MediaType == "series" && seriesTmdb != null && entry.TmdbId == seriesTmdb &&
+                entry.TargetLibraryId != null && libraryIds.Contains(entry.TargetLibraryId.Value)).Select(entry => entry.Id));
         var tracked = await database.Episodes.AsNoTracking()
             .Where(episode => entryIds.Contains(episode.EntryId) && episode.SeasonNumber == season && episode.EpisodeNumber == number)
             .Select(episode => new { episode.AirDate, episode.RuntimeMinutes }).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
@@ -412,20 +598,111 @@ public sealed class PlaceholderService(
         return change;
     }
 
-    /// <summary>The plugin's stub episodes Jellyfin holds in a library.</summary>
-    private IReadOnlyList<JellyfinEpisode> StubItems(Guid libraryId)
+    /// <summary>
+    /// A movie stub's date added becomes the movie's release date and its runtime TMDB's (P1.FU26), from the entry of that TMDB
+    /// id in the movie's library; true when it changed.
+    /// </summary>
+    private async Task<bool> StampMovieAsync(Movie stub, CancellationToken cancellationToken)
+    {
+        if (TmdbIdOf(stub) is not { } tmdbId) return false;
+        var libraryIds = LibraryIdsOf(stub);
+        var metadata = await database.Entries.AsNoTracking()
+            .Where(entry => entry.MediaType == "movie" && entry.TmdbId == tmdbId && entry.TargetLibraryId != null &&
+                libraryIds.Contains(entry.TargetLibraryId.Value))
+            .Select(entry => entry.MetadataJson).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        var parsed = Metadata(metadata);
+        var date = parsed?.PremiereDate ?? stub.PremiereDate;
+        var created = date is { } value ? DateTime.SpecifyKind(value.Date, DateTimeKind.Utc) : (DateTime?)null;
+        var runtime = parsed?.RuntimeMinutes is { } minutes && minutes > 0 ? TimeSpan.FromMinutes(minutes).Ticks : (long?)null;
+        var change = false;
+        if (created is { } day && stub.DateCreated != day)
+        {
+            stub.DateCreated = day;
+            change = true;
+        }
+
+        if (runtime is { } ticks && stub.RunTimeTicks != ticks)
+        {
+            stub.RunTimeTicks = ticks;
+            change = true;
+        }
+
+        if (change) await stub.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+        return change;
+    }
+
+    private static TmdbMetadata? Metadata(string? json)
+    {
+        if (string.IsNullOrEmpty(json)) return null;
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<TmdbMetadata>(json);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static int? TmdbIdOf(BaseItem item) =>
+        item.ProviderIds.FirstOrDefault(pair => pair.Key.Equals("Tmdb", StringComparison.OrdinalIgnoreCase)).Value is { } raw &&
+        int.TryParse(raw, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var id) && id > 0
+            ? id
+            : null;
+
+    private Guid[] LibraryIdsOf(BaseItem item)
+    {
+        try
+        {
+            return library.GetCollectionFolders(item).Select(folder => folder.Id).ToArray();
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// The Jellyfin item that stands for a title with no file (P1.FU26): the plugin's stub movie of the entry's TMDB id in its
+    /// library, or the series item Jellyfin holds for a series entry with no file on disk (its placeholders' folder); null when
+    /// the title has a file or no such item.
+    /// </summary>
+    public async Task<Guid?> TitleItemIdAsync(Entry entry, CancellationToken cancellationToken)
+    {
+        if (entry.State == FileState.OnDisk || entry.TargetLibraryId is not { } libraryId) return null;
+        try
+        {
+            if (entry.MediaType == "movie")
+                return StubItems(libraryId, entry.TmdbId).FirstOrDefault()?.Id;
+            var bound = await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entry.Id)
+                .Select(binding => binding.JellyfinItemId).ToListAsync(cancellationToken).ConfigureAwait(false);
+            return bound.Order().FirstOrDefault(id => library.GetItemById(id) is Series) is var id && id != Guid.Empty ? id : null;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException and not OperationCanceledException)
+        {
+            logger.LogWarning("JellyfinMod could not find the placeholder item of entry {Entry}: {Error}", entry.Id, error.Message);
+            return null;
+        }
+    }
+
+    /// <summary>The plugin's stub episodes and movies Jellyfin holds in a library (one TMDB id's movies only, when given).</summary>
+    private IReadOnlyList<Video> StubItems(Guid libraryId, int? movieTmdbId = null)
     {
         try
         {
             if (library.GetItemById(libraryId) is not Folder folder) return [];
-            return library.GetItemList(new InternalItemsQuery
+            var query = new InternalItemsQuery
             {
                 Parent = folder,
                 Recursive = true,
-                IncludeItemTypes = [BaseItemKind.Episode],
+                IncludeItemTypes = movieTmdbId is null ? [BaseItemKind.Episode, BaseItemKind.Movie] : [BaseItemKind.Movie],
                 IsPlaceHolder = true,
                 IsVirtualItem = false
-            }).OfType<JellyfinEpisode>().Where(item => PlaceholderStub.IsStubFile(item.Path)).ToArray();
+            };
+            if (movieTmdbId is { } tmdbId)
+                query.HasAnyProviderId = new() { ["Tmdb"] = tmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture) };
+            return library.GetItemList(query).OfType<Video>().Where(item => item is JellyfinEpisode or Movie && PlaceholderStub.IsStubFile(item.Path) &&
+                (movieTmdbId is null || TmdbIdOf(item) == movieTmdbId)).ToArray();
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
@@ -434,18 +711,22 @@ public sealed class PlaceholderService(
         }
     }
 
-    private (string Name, IReadOnlyList<string> Roots) LibraryOf(Guid libraryId)
+    private (string Name, bool IsMovies) LibraryOf(Guid libraryId)
     {
         var folder = library.GetVirtualFolders().FirstOrDefault(value => Guid.TryParse(value.ItemId, out var id) && id == libraryId &&
-            value.CollectionType == CollectionTypeOptions.tvshows)
-            ?? throw new KeyNotFoundException("No TV library has this id.");
-        return (folder.Name, SeriesFolders.LibraryRoots(library, files, libraryId));
+            value.CollectionType is CollectionTypeOptions.tvshows or CollectionTypeOptions.movies)
+            ?? throw new KeyNotFoundException("No TV or movie library has this id.");
+        return (folder.Name, folder.CollectionType == CollectionTypeOptions.movies);
     }
 
-    /// <summary>The plan: stubs to write for missing aired episodes, stale stubs to remove, and what is left without one.</summary>
+    /// <summary>
+    /// The plan: stubs to write for missing aired episodes (and released movies), stale stubs to remove, and what is left
+    /// without one. <paramref name="entryId"/> limits it to one entry.
+    /// </summary>
     private async Task<(List<PlaceholderWrite> Writes, List<PlaceholderRemoval> Removals, List<PlaceholderSkip> Skipped, int Existing)>
-        ComputeAsync(Guid libraryId, CancellationToken cancellationToken)
+        ComputeAsync(Guid libraryId, Guid? entryId, CancellationToken cancellationToken)
     {
+        if (LibraryOf(libraryId).IsMovies) return await ComputeMoviesAsync(libraryId, entryId, cancellationToken).ConfigureAwait(false);
         var writes = new List<PlaceholderWrite>();
         var removals = new List<PlaceholderRemoval>();
         var skipped = new List<PlaceholderSkip>();
@@ -453,8 +734,13 @@ public sealed class PlaceholderService(
         var roots = SeriesFolders.LibraryRoots(library, files, libraryId);
         var today = time.GetUtcNow().UtcDateTime.Date;
         var entries = await database.Entries.AsNoTracking()
-            .Where(entry => entry.MediaType == "series" && entry.TargetLibraryId == libraryId)
+            .Where(entry => entry.MediaType == "series" && entry.TargetLibraryId == libraryId && (entryId == null || entry.Id == entryId))
             .OrderBy(entry => entry.Title).ToListAsync(cancellationToken).ConfigureAwait(false);
+        // Series with a file of their own (a bound episode): they get placeholders only in the folder their files are in.
+        var listed = entries.Select(entry => entry.Id).ToArray();
+        var held = (await database.Episodes.AsNoTracking().Where(episode => listed.Contains(episode.EntryId) &&
+                database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id))
+            .Select(episode => episode.EntryId).Distinct().ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet();
         var entryIds = entries.Select(entry => entry.Id).ToArray();
         var episodes = (await database.Episodes.AsNoTracking().Where(episode => entryIds.Contains(episode.EntryId))
             .ToListAsync(cancellationToken).ConfigureAwait(false)).ToLookup(episode => episode.EntryId);
@@ -486,11 +772,36 @@ public sealed class PlaceholderService(
 
             var seriesFolder = await SeriesFolders.BoundSeriesFolderAsync(database, library, files, entry.Id, roots, cancellationToken)
                 .ConfigureAwait(false);
+            var newSeries = false;
             if (seriesFolder is null)
             {
-                if (wanted.Length > 0) skipped.Add(new(entry.Id, entry.Title, null, wanted.Length, "no_series_folder",
-                    "Jellyfin holds no file of this series yet, so there is no series folder to add placeholders to."));
-                continue;
+                // A series with nothing on disk (P1.FU26): its own folder in the library root the import would use, made with its
+                // first placeholders, so Jellyfin builds the series with its seasons and episodes. A series that has files Jellyfin
+                // cannot place keeps the mod's own surfaces.
+                if (wanted.Length == 0) continue;
+                if (held.Contains(entry.Id) || entry.State == FileState.OnDisk)
+                {
+                    skipped.Add(new(entry.Id, entry.Title, null, wanted.Length, "no_series_folder",
+                        "The series' files are in no folder of this library that the plugin can find."));
+                    continue;
+                }
+
+                if (roots.FirstOrDefault(files.CanCreateIn) is not { } writableRoot)
+                {
+                    skipped.Add(new(entry.Id, entry.Title, null, wanted.Length, "read_only",
+                        "No folder of the library can be written (a read-only folder or mount)."));
+                    continue;
+                }
+
+                var folderName = ImportNaming.TitleFolder(entry.Title, entry.Year, entry.TmdbId);
+                seriesFolder = Path.Combine(writableRoot, folderName);
+                newSeries = true;
+                if (!ImportNaming.FitsFileName(folderName) || files.Probe(seriesFolder) != PathPresence.Absent)
+                {
+                    skipped.Add(new(entry.Id, entry.Title, null, wanted.Length, "name_taken",
+                        $"{folderName} cannot be used (too long, or something already has the name)."));
+                    continue;
+                }
             }
 
             // Every file of the series: in its folder and its season folders (a reclaim leaves its stub where the file was).
@@ -515,12 +826,12 @@ public sealed class PlaceholderService(
                 if (reason is not null) removals.Add(new(stub.Path, reason));
             }
 
-            var seriesWritable = files.CanCreateIn(seriesFolder);
+            var seriesWritable = newSeries || files.CanCreateIn(seriesFolder);
             var seriesName = Path.GetFileName(seriesFolder);
             foreach (var group in wanted.GroupBy(episode => episode.SeasonNumber).OrderBy(group => group.Key))
             {
                 var season = group.Key;
-                var existingFolder = SeriesFolders.ExistingSeasonFolder(seriesFolder, season);
+                var existingFolder = newSeries ? null : SeriesFolders.ExistingSeasonFolder(seriesFolder, season);
                 string folder;
                 bool newFolder;
                 if (existingFolder is not null)
@@ -601,6 +912,147 @@ public sealed class PlaceholderService(
         return (writes, removals, skipped, existing);
     }
 
+    /// <summary>
+    /// The plan for a movie library (P1.FU26): a stub for every released movie of the catalog with no file, in the folder the
+    /// import would put its file (<c>Title (Year) [tmdbid-N]/Title (Year) [tmdbid-N].disc</c> in the first writable library
+    /// folder, or the title folder already there), and the stale stubs (the movie has a file, is not released, or left the
+    /// catalog) to remove. An unreleased movie keeps the mod's own card with its date.
+    /// </summary>
+    private async Task<(List<PlaceholderWrite> Writes, List<PlaceholderRemoval> Removals, List<PlaceholderSkip> Skipped, int Existing)>
+        ComputeMoviesAsync(Guid libraryId, Guid? entryId, CancellationToken cancellationToken)
+    {
+        var writes = new List<PlaceholderWrite>();
+        var removals = new List<PlaceholderRemoval>();
+        var skipped = new List<PlaceholderSkip>();
+        var existing = 0;
+        var roots = SeriesFolders.LibraryRoots(library, files, libraryId);
+        var today = time.GetUtcNow().UtcDateTime.Date;
+        var entries = await database.Entries.AsNoTracking()
+            .Where(entry => entry.MediaType == "movie" && entry.TargetLibraryId == libraryId && (entryId == null || entry.Id == entryId))
+            .OrderBy(entry => entry.Title).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var ids = entries.Select(entry => entry.Id).ToArray();
+        var bound = (await database.EntryBindings.AsNoTracking().Where(binding => ids.Contains(binding.EntryId))
+            .Select(binding => binding.EntryId).Distinct().ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet();
+        var importing = (await database.ImportOperations.AsNoTracking()
+            .Where(operation => operation.EntryId != null && ids.Contains(operation.EntryId.Value) && ImportStates.Open.Contains(operation.State))
+            .Select(operation => operation.EntryId!.Value).ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet();
+        var reclaimed = (await database.RetentionOperations.AsNoTracking()
+                .Where(operation => operation.EntryId != null && ids.Contains(operation.EntryId.Value) && operation.EpisodeId == null &&
+                    operation.State == RetentionOperationStates.Completed)
+                .Select(operation => new { EntryId = operation.EntryId!.Value, operation.MediaPath }).ToListAsync(cancellationToken).ConfigureAwait(false))
+            .ToLookup(operation => operation.EntryId, operation => operation.MediaPath);
+        var stubItems = StubItems(libraryId).OfType<Movie>().ToArray();
+        var listedTmdb = entryId is null
+            ? (await database.Entries.AsNoTracking().Where(entry => entry.MediaType == "movie" && entry.TargetLibraryId == libraryId)
+                .Select(entry => entry.TmdbId).ToListAsync(cancellationToken).ConfigureAwait(false)).ToHashSet()
+            : null;
+
+        foreach (var entry in entries)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var folders = MovieStubFolders(roots, entry.TmdbId, stubItems, reclaimed[entry.Id]);
+            var listing = folders.Select(folder => Listing(folder) ?? []).SelectMany(files => files).ToArray();
+            var stubs = listing.Where(file => file.IsStub).Select(file => file.Path).Distinct(StringComparer.Ordinal).ToArray();
+            var hasFile = entry.State == FileState.OnDisk || bound.Contains(entry.Id);
+            var release = Metadata(entry.MetadataJson)?.PremiereDate;
+            var released = entry.State == FileState.Reclaimed || release is { } date && date.Date <= today;
+            if (hasFile || !released)
+            {
+                removals.AddRange(stubs.Select(path => new PlaceholderRemoval(path, hasFile ? "on_disk" : "not_released")));
+                continue;
+            }
+
+            if (stubs.Length > 0)
+            {
+                existing++;
+                continue;
+            }
+
+            if (listing.Any(file => !file.IsStub && file.IsVideo))
+            {
+                skipped.Add(new(entry.Id, entry.Title, null, 1, "file_present",
+                    "A video is already in the movie's folder; nothing is written beside it."));
+                continue;
+            }
+
+            if (importing.Contains(entry.Id))
+            {
+                skipped.Add(new(entry.Id, entry.Title, null, 1, "importing",
+                    "The movie is being downloaded or imported; its file takes the place of a placeholder."));
+                continue;
+            }
+
+            if (roots.Count == 0)
+            {
+                skipped.Add(new(entry.Id, entry.Title, null, 1, "library_root_missing", "The library has no readable folder."));
+                continue;
+            }
+
+            var folder = SeriesFolders.TitleFolderByTmdbId(files, roots, entry.TmdbId);
+            var newFolder = folder is null;
+            if (folder is null)
+            {
+                if (roots.FirstOrDefault(files.CanCreateIn) is not { } writableRoot)
+                {
+                    skipped.Add(new(entry.Id, entry.Title, null, 1, "read_only",
+                        "No folder of the library can be written (a read-only folder or mount)."));
+                    continue;
+                }
+
+                folder = Path.Combine(writableRoot, ImportNaming.TitleFolder(entry.Title, entry.Year, entry.TmdbId));
+            }
+            else if (!files.CanCreateIn(folder))
+            {
+                skipped.Add(new(entry.Id, entry.Title, null, 1, "read_only",
+                    $"{Path.GetFileName(folder)} cannot be written (a read-only folder or mount)."));
+                continue;
+            }
+
+            var name = Path.GetFileName(folder) + "." + PlaceholderStub.Extension;
+            var path = Path.Combine(folder, name);
+            if (!ImportNaming.FitsFileName(name) || newFolder && files.Probe(folder) != PathPresence.Absent ||
+                files.Probe(path) != PathPresence.Absent)
+            {
+                skipped.Add(new(entry.Id, entry.Title, null, 1, "name_taken",
+                    $"{name} cannot be used (too long, or something already has the name)."));
+                continue;
+            }
+
+            writes.Add(new(entry.Id, entry.Title, 0, 0, path, newFolder, PlaceholderKinds.Movie));
+        }
+
+        // A stub of a movie that left the catalog: no entry of its TMDB id in this library any more.
+        if (listedTmdb is not null)
+            foreach (var orphan in stubItems.Where(item => TmdbIdOf(item) is not { } tmdb || !listedTmdb.Contains(tmdb)))
+                if (files.TryCanonicalize(orphan.Path, out var canonical) && roots.Any(root => MediaStorageIdentity.Contains(root, canonical)) &&
+                    removals.All(removal => removal.Path != canonical))
+                    removals.Add(new(canonical, "not_listed"));
+
+        return (writes, removals, skipped, existing);
+    }
+
+    /// <summary>
+    /// The folders a movie's stub can be in: its title folder (<c>[tmdbid-N]</c>), the folders of the stub items Jellyfin holds
+    /// for its TMDB id, and the folder its last reclaimed file was in (the stub a reclaim left). Never a library folder itself.
+    /// </summary>
+    private IReadOnlyList<string> MovieStubFolders(IReadOnlyList<string> roots, int tmdbId, IReadOnlyList<Movie> stubItems,
+        IEnumerable<string> reclaimedPaths)
+    {
+        var candidates = new List<string?> { SeriesFolders.TitleFolderByTmdbId(files, roots, tmdbId) };
+        candidates.AddRange(stubItems.Where(item => TmdbIdOf(item) == tmdbId).Select(item => Path.GetDirectoryName(item.Path)));
+        candidates.AddRange(reclaimedPaths.Select(Path.GetDirectoryName));
+        var result = new List<string>();
+        foreach (var candidate in candidates)
+        {
+            if (candidate is null || !Directory.Exists(candidate) || !files.TryCanonicalize(candidate, out var canonical)) continue;
+            if (!roots.Any(root => MediaStorageIdentity.Contains(root, canonical) &&
+                    !string.Equals(Path.TrimEndingDirectorySeparator(root), canonical, StringComparison.Ordinal))) continue;
+            if (!result.Contains(canonical, StringComparer.Ordinal)) result.Add(canonical);
+        }
+
+        return result;
+    }
+
     /// <summary>Every path of a stub of the plugin's in the library: Jellyfin's stub items and the stubs in each series' folders.</summary>
     private async Task<IReadOnlyList<string>> AllStubPathsAsync(Guid libraryId, CancellationToken cancellationToken)
     {
@@ -609,6 +1061,12 @@ public sealed class PlaceholderService(
         foreach (var item in StubItems(libraryId))
             if (files.TryCanonicalize(item.Path, out var canonical) && roots.Any(root => MediaStorageIdentity.Contains(root, canonical)))
                 paths.Add(canonical);
+        var movieTmdbIds = await database.Entries.AsNoTracking().Where(entry => entry.MediaType == "movie" && entry.TargetLibraryId == libraryId)
+            .Select(entry => entry.TmdbId).ToListAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var tmdbId in movieTmdbIds)
+            if (SeriesFolders.TitleFolderByTmdbId(files, roots, tmdbId) is { } folder)
+                foreach (var stub in Listing(folder)?.Where(file => file.IsStub) ?? [])
+                    paths.Add(stub.Path);
         var entryIds = await database.Entries.AsNoTracking().Where(entry => entry.MediaType == "series" && entry.TargetLibraryId == libraryId)
             .Select(entry => entry.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
         foreach (var entryId in entryIds)
@@ -629,11 +1087,21 @@ public sealed class PlaceholderService(
         var folder = Path.GetDirectoryName(write.Path)!;
         var seriesFolder = Path.GetDirectoryName(folder)!;
         var created = false;
+        var createdParent = false;
         try
         {
             if (!Directory.Exists(folder))
             {
-                // The series folder must still be what the plan saw: a real folder, not a link put in its place since.
+                if (!Directory.Exists(seriesFolder))
+                {
+                    // A new series' own folder (P1.FU26): only directly in a library folder that is still a real folder.
+                    var root = Path.GetDirectoryName(seriesFolder)!;
+                    if (!files.TryCanonicalize(root, out var rootCanonical) || rootCanonical != root) return "The library folder changed.";
+                    Directory.CreateDirectory(seriesFolder);
+                    createdParent = true;
+                }
+
+                // The parent folder must still be what the plan saw: a real folder, not a link put in its place since.
                 if (!files.TryCanonicalize(seriesFolder, out var canonical) || canonical != seriesFolder) return "The series folder changed.";
                 Directory.CreateDirectory(folder);
                 created = true;
@@ -645,7 +1113,7 @@ public sealed class PlaceholderService(
 
             var error = WriteStub(files, write.Path, body);
             if (error is not null) return error;
-            changed.Add(created ? seriesFolder : folder);
+            changed.Add(createdParent ? Path.GetDirectoryName(seriesFolder)! : created ? seriesFolder : folder);
             return null;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
@@ -654,8 +1122,9 @@ public sealed class PlaceholderService(
         }
         finally
         {
-            // A season folder made for a stub that was not written goes again, while it is still empty.
+            // A folder made for a stub that was not written goes again, while it is still empty.
             if (created && !File.Exists(write.Path)) files.RemoveEmptyDirectory(folder);
+            if (createdParent && !File.Exists(write.Path) && IsEmpty(seriesFolder)) files.RemoveEmptyDirectory(seriesFolder);
         }
     }
 
@@ -711,8 +1180,13 @@ public sealed class PlaceholderService(
         PlaceholderStub.Forget(path);
         if (!result.Removed) return result.Detail ?? "The placeholder could not be removed.";
         var folder = Path.GetDirectoryName(stub.CanonicalPath)!;
-        if (IsSeasonFolderName(Path.GetFileName(folder)) && IsEmpty(folder) && files.RemoveEmptyDirectory(folder)) changed.Add(Path.GetDirectoryName(folder)!);
-        else changed.Add(folder);
+        if (IsSeasonFolderName(Path.GetFileName(folder)) && IsEmpty(folder) && files.RemoveEmptyDirectory(folder))
+            folder = Path.GetDirectoryName(folder)!;
+        // A title folder (the import's or the placeholders' own shape, [tmdbid-N]) that removing the stub left empty goes too
+        // (P1.FU26): a movie's folder, or a series' folder with no season left. Anything else in it keeps it.
+        if (SeriesFolders.IsTitleFolderName(Path.GetFileName(folder)) && IsEmpty(folder) && files.RemoveEmptyDirectory(folder))
+            folder = Path.GetDirectoryName(folder)!;
+        changed.Add(folder);
         return null;
     }
 

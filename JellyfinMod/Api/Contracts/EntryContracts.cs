@@ -49,6 +49,12 @@ public sealed class EntryDto(Entry entry, JellyfinMod.Services.Import.ProjectedA
     /// <summary>Gets targetLibraryId.</summary>
     [JsonPropertyName("targetLibraryId")]
     public Guid? TargetLibraryId { get; } = entry.TargetLibraryId;
+    /// <summary>
+    /// Gets the Jellyfin item that stands for this title while it has no file (P1.FU26): the plugin's placeholder movie, or the
+    /// series item of a series with only placeholders; set on entry detail and Browse answers, null otherwise.
+    /// </summary>
+    [JsonPropertyName("placeholderItemId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Guid? PlaceholderItemId { get; init; }
     /// <summary>Gets progress.</summary>
     [JsonPropertyName("progress")]
     public int? Progress => _projected is null ? entry.Progress : _projected.Progress;

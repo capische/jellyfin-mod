@@ -549,6 +549,11 @@ public sealed class ReconciliationService(
             candidate.TmdbId == snapshot.TmdbId && candidate.TargetLibraryId == snapshot.TargetLibraryId,
             cancellationToken).ConfigureAwait(false);
         var created = entry is null;
+        // A series made only of the plugin's placeholders whose entry is gone (removed from the catalog while Jellyfin still lists
+        // its placeholders for a moment): it is not a title the library holds, so it is never backfilled as one (P1.FU26).
+        if (entry is null && snapshot.MediaType == "series" && snapshot.PlaceholderEpisodes > 0 &&
+            !snapshot.Representations.Any(representation => snapshot.HasPlayableEpisode(representation.JellyfinItemId)))
+            return new(ReconciliationOutcome.Unchanged, null, 0, "Only JellyfinMod placeholders; not backfilled.");
         if (entry is null)
         {
             entry = new Entry
@@ -1527,6 +1532,9 @@ public sealed record NativeTitleSnapshot(string MediaType, int? TmdbId, Guid Tar
 
     /// <summary>Native episodes left out of matching because they have no season and episode number (P2.R6).</summary>
     public IReadOnlyList<SkippedNativeEpisode> SkippedEpisodes { get; init; } = [];
+
+    /// <summary>How many of the series' episodes are the plugin's placeholders, which are never matched (P1.FU24, P1.FU26).</summary>
+    public int PlaceholderEpisodes { get; init; }
 
     /// <summary>Returns true when a series copy has at least one playable episode, numbered or not.</summary>
     public bool HasPlayableEpisode(Guid seriesItemId) =>

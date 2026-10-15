@@ -29,8 +29,34 @@ public sealed class EntriesController(
     UnixFileInspector? files = null,
     TimeProvider? clock = null,
     MediaBrowser.Controller.Library.ILibraryManager? library = null,
-    MediaBrowser.Controller.Library.IUserDataManager? userData = null) : ControllerBase
+    MediaBrowser.Controller.Library.IUserDataManager? userData = null,
+    JellyfinMod.Services.Placeholders.PlaceholderSyncQueue? placeholderQueue = null,
+    JellyfinMod.Services.Placeholders.PlaceholderService? placeholderService = null) : ControllerBase
 {
+    /// <summary>
+    /// The catalog entries a placeholder movie of the plugin's stands for (P1.FU26): a placeholder is never bound, so a lookup
+    /// by its id finds the movie entry of its TMDB id in its library.
+    /// </summary>
+    private async Task<Guid[]> PlaceholderMovieEntriesAsync(Guid itemId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (library?.GetItemById(itemId) is not MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: true } stub ||
+                !JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stub.Path) ||
+                !int.TryParse(stub.ProviderIds.FirstOrDefault(pair => pair.Key.Equals("Tmdb", StringComparison.OrdinalIgnoreCase)).Value,
+                    System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var tmdbId))
+                return [];
+            var libraries = library.GetCollectionFolders(stub).Select(folder => (Guid?)folder.Id).ToArray();
+            return await database.Entries.AsNoTracking()
+                .Where(entry => entry.MediaType == "movie" && entry.TmdbId == tmdbId && libraries.Contains(entry.TargetLibraryId))
+                .Select(entry => entry.Id).ToArrayAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException and not OperationCanceledException)
+        {
+            return [];
+        }
+    }
+
     /// <summary>The main item of a native version, or null when the item is its own main item or cannot be read (V1).</summary>
     private Guid? MainVersionOf(Guid itemId)
     {
@@ -90,7 +116,9 @@ public sealed class EntriesController(
         if (jellyfinItemId is { } itemId)
         {
             var ids = new[] { itemId, MainVersionOf(itemId) ?? itemId, PlaceholderSeriesOf(itemId) ?? itemId }.Distinct().ToArray();
+            var placeholderMovieEntries = await PlaceholderMovieEntriesAsync(itemId, cancellationToken);
             candidates = candidates.Where(entry => entry.JellyfinItemId != null && ids.Contains(entry.JellyfinItemId.Value) ||
+                placeholderMovieEntries.Contains(entry.Id) ||
                 database.EntryBindings.Any(binding => binding.EntryId == entry.Id && ids.Contains(binding.JellyfinItemId)) ||
                 database.Episodes.Any(episode => episode.EntryId == entry.Id && (episode.JellyfinItemId != null && ids.Contains(episode.JellyfinItemId.Value) ||
                     database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id && ids.Contains(binding.JellyfinItemId)))) ||
@@ -173,6 +201,8 @@ public sealed class EntriesController(
                 return await CompleteConcurrentAdd(existing, episodes, user, cancellationToken);
             }
 
+            // A title added with no file becomes a Jellyfin placeholder item within seconds (P1.FU26).
+            placeholderQueue?.Enqueue(entry.TargetLibraryId, entry.Id);
             return new CreateEntryResult(new EntryDto(entry), true);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
@@ -204,6 +234,7 @@ public sealed class EntriesController(
                 .RefreshAsync(id, timeout.Token);
             if (outcome == SeriesRefreshOutcome.LibraryBusy) return LibraryBusy();
             if (outcome == SeriesRefreshOutcome.NotFound) return NotFound();
+            placeholderQueue?.Enqueue(visible.TargetLibraryId, id);
             database.ChangeTracker.Clear();
             var refreshed = await database.Entries.AsNoTracking().SingleAsync(e => e.Id == id, cancellationToken);
             return await BuildDetail(refreshed, cancellationToken);
@@ -270,6 +301,8 @@ public sealed class EntriesController(
             if (failure.Type == "library_busy") return LibraryBusy();
             return failure.Status == 404 && failure.Title is null ? NotFound() : Problem(statusCode: failure.Status, title: failure.Title);
         }
+        // The episodes just listed get their placeholders now (P1.FU26), a series with no file its own folder.
+        if (shared == load.Task) placeholderQueue?.Enqueue(entry.TargetLibraryId, id);
         database.ChangeTracker.Clear();
         var loaded = await database.Entries.AsNoTracking().SingleOrDefaultAsync(e => e.Id == id, cancellationToken);
         return loaded is null ? NotFound() : await BuildDetail(loaded, cancellationToken);
@@ -797,8 +830,14 @@ public sealed class EntriesController(
             });
         var episodeIds = await database.Episodes.Where(episode => episode.EntryId == id).Select(episode => episode.Id)
             .ToArrayAsync(cancellationToken);
-        if (await database.EntryBindings.AnyAsync(binding => binding.EntryId == id, cancellationToken) ||
-            await database.EpisodeBindings.AnyAsync(binding => episodeIds.Contains(binding.EpisodeId), cancellationToken))
+        var entryBindings = await database.EntryBindings.Where(binding => binding.EntryId == id).ToListAsync(cancellationToken);
+        // A series with no file whose only Jellyfin item is the series its placeholders make (P1.FU26) has no media: its binding
+        // goes with it, and so do its placeholders.
+        var placeholderOnly = entry.State != FileState.OnDisk && entry.MediaType == "series" && entryBindings.Count > 0 &&
+            !await database.EpisodeBindings.AnyAsync(binding => episodeIds.Contains(binding.EpisodeId), cancellationToken) &&
+            entryBindings.All(binding => IsPlaceholderSeries(binding.JellyfinItemId));
+        if (!placeholderOnly && (entryBindings.Count > 0 ||
+            await database.EpisodeBindings.AnyAsync(binding => episodeIds.Contains(binding.EpisodeId), cancellationToken)))
             return Conflict(new ProblemDetails
             {
                 Status = 409,
@@ -806,10 +845,40 @@ public sealed class EntriesController(
                     "so it cannot be removed while the media exists."
             });
 
+        // Its placeholders go first (only the plugin's marked stubs and the folders that left empty), under the library lock held
+        // here, so no sync writes them back meanwhile.
+        if (placeholderService is not null) await placeholderService.RemoveForEntryAsync(entry, cancellationToken);
+        if (placeholderOnly) database.EntryBindings.RemoveRange(entryBindings);
         database.Entries.Remove(entry);
         database.History.RemoveRange(database.History.Where(h => h.EntryId == id));
         await database.SaveChangesAsync(cancellationToken);
         return NoContent();
+    }
+
+    /// <summary>
+    /// Whether a series item holds nothing but the plugin's placeholders: at least one, and no episode that is a file. An item
+    /// Jellyfin no longer holds counts as one, as there is no media behind it.
+    /// </summary>
+    private bool IsPlaceholderSeries(Guid itemId)
+    {
+        try
+        {
+            if (library?.GetItemById(itemId) is not { } item) return true;
+            if (item is not MediaBrowser.Controller.Entities.TV.Series series) return false;
+            var episodes = library.GetItemList(new MediaBrowser.Controller.Entities.InternalItemsQuery
+            {
+                AncestorIds = [series.Id],
+                IncludeItemTypes = [Jellyfin.Data.Enums.BaseItemKind.Episode],
+                IsVirtualItem = false
+            });
+            // At least one placeholder and no file: a series folder the user made empty (no episode at all) is theirs, not ours.
+            return episodes.Count > 0 && episodes.All(episode => episode is MediaBrowser.Controller.Entities.Video { IsPlaceHolder: true } video &&
+                JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(video.Path));
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return false;
+        }
     }
 
     private async Task<ActionResult<CreateEntryResult>> CompleteConcurrentAdd(Entry existing,
@@ -1066,7 +1135,9 @@ public sealed class EntriesController(
             item => item.Id == RetentionPolicyService.PolicyId, cancellationToken).ConfigureAwait(false);
         var visibleEpisodeIds = new HashSet<Guid>();
         IReadOnlyList<MediaBrowser.Controller.Entities.BaseItem> visibleItems = [];
-        if (entry.JellyfinItemId is { } nativeId)
+        // A title with no file shows through its placeholder item (P1.FU26): a series' placeholders are its episodes' items.
+        var titleItem = placeholderService is null ? null : await placeholderService.TitleItemIdAsync(entry, cancellationToken).ConfigureAwait(false);
+        if ((entry.JellyfinItemId ?? (entry.MediaType == "series" ? titleItem : null)) is { } nativeId)
         {
             var series = access.GetNativeItems(user, "series", entry.TargetLibraryId).SingleOrDefault(item => item.Id == nativeId);
             if (series is not null) visibleItems = access.GetEpisodes(user, series);
@@ -1130,7 +1201,8 @@ public sealed class EntriesController(
             evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
         var readableHistory = await ReadableHistoryAsync(user, history, episodes, readableEpisodes, entry.MediaType == "series",
             cancellationToken).ConfigureAwait(false);
-        return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id)), readableHistory, episodeDtos, entryRetention,
+        return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id)) { PlaceholderItemId = titleItem }, readableHistory,
+            episodeDtos, entryRetention,
             entry.MediaType == "movie" ? Summary(null) : null)
         {
             Versions = entry.MediaType == "movie" && entry.State == FileState.OnDisk

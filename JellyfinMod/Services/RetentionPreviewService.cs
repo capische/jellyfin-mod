@@ -264,6 +264,14 @@ public sealed class RetentionPreviewService(
     private async Task<RetentionRepresentationDto[]> MarkPlaceholdersAsync(RetentionRepresentationDto[] items, PreviewTarget[] targets,
         CancellationToken cancellationToken)
     {
+        // A movie's last file leaves the movie's placeholder (P1.FU26), by the executor's own rule.
+        var movieCopies = targets.Where(target => target.EpisodeId is null).GroupBy(target => target.EntryId)
+            .ToDictionary(group => group.Key, group => group.Count());
+        items = items.Select(item => item.EpisodeId is null && item.State is RetentionPreviewStates.Due or RetentionPreviewStates.Scheduled &&
+            movieCopies.GetValueOrDefault(item.EntryId) == 1 &&
+            Placeholders.PlaceholderService.MovieReclaimStubPath(library, files, item.TargetLibraryId, item.CanonicalPath ?? item.Path) is not null
+                ? item with { LeavesPlaceholder = true }
+                : item).ToArray();
         var rows = items.Where(item => item.EpisodeId is not null &&
             item.State is RetentionPreviewStates.Due or RetentionPreviewStates.Scheduled).ToArray();
         if (rows.Length == 0) return items;

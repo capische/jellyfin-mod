@@ -71,17 +71,72 @@ internal static class SeriesFolders
                 .Select(entry => entry.JellyfinItemId).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                if (seriesItemId is { } id && library.GetItemById(id) is MediaBrowser.Controller.Entities.TV.Series { Path: { Length: > 0 } path })
-                    return InsideRoots(files, path, roots);
+                if (seriesItemId is { } id && library.GetItemById(id) is MediaBrowser.Controller.Entities.TV.Series { Path: { Length: > 0 } path } &&
+                    InsideRoots(files, path, roots) is { } reclaimed)
+                    return reclaimed;
             }
             catch (Exception error) when (error is not OutOfMemoryException)
             {
                 return null;
             }
+
+            // A series Jellyfin holds with no file of its own (P1.FU26): its placeholders' folder, or an empty series folder the
+            // user made, bound to the entry as its series item. Only a folder that can be written takes new files; a read-only one
+            // keeps the import's own new folder, as before.
+            var seriesItems = await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entryId)
+                .Select(binding => binding.JellyfinItemId).ToListAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var id in seriesItems.Order())
+            {
+                try
+                {
+                    if (library.GetItemById(id) is MediaBrowser.Controller.Entities.TV.Series { Path: { Length: > 0 } path } &&
+                        InsideRoots(files, path, roots) is { } held && files.CanCreateIn(held))
+                        return held;
+                }
+                catch (Exception error) when (error is not OutOfMemoryException)
+                {
+                    // An item that cannot be read gives no folder.
+                }
+            }
+
+            // A title folder of the entry's, made by the import or for its placeholders before Jellyfin bound it (P1.FU26).
+            var tmdbId = await database.Entries.AsNoTracking().Where(entry => entry.Id == entryId).Select(entry => entry.TmdbId)
+                .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            if (tmdbId > 0 && TitleFolderByTmdbId(files, roots, tmdbId) is { } titled) return titled;
         }
 
         return null;
     }
+
+    /// <summary>
+    /// The first folder directly in one of <paramref name="roots"/> whose name carries the title's TMDB tag
+    /// (<c>[tmdbid-N]</c>, the shape of every folder the import and the placeholders make), and that is a real folder, not a
+    /// link; null when there is none (P1.FU26).
+    /// </summary>
+    public static string? TitleFolderByTmdbId(UnixFileInspector files, IReadOnlyList<string> roots, int tmdbId)
+    {
+        var tag = "[tmdbid-" + tmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "]";
+        foreach (var root in roots)
+        {
+            try
+            {
+                foreach (var folder in Directory.EnumerateDirectories(root, "*" + tag + "*"))
+                {
+                    if (!Path.GetFileName(folder).Contains(tag, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (files.TryCanonicalize(folder, out var canonical) && canonical == folder) return folder;
+                }
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                // An unreadable root has no folder to offer.
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>Whether a folder's name carries a TMDB tag (<c>[tmdbid-N]</c>): a title folder of the import's or the placeholders'.</summary>
+    public static bool IsTitleFolderName(string name) => name.Contains("[tmdbid-", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The canonical folder when it lies inside one of the roots and is not a root itself; otherwise null.</summary>
     private static string? InsideRoots(UnixFileInspector files, string? folder, IReadOnlyList<string> roots) =>

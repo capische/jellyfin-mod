@@ -35,6 +35,15 @@ public static class PlaceholderStub
         return bytes.Length < MaxBytes ? bytes : Encoding.UTF8.GetBytes(Marker + "\n<discstub><message>Not downloaded yet.</message></discstub>\n");
     }
 
+    /// <summary>A movie's stub body (P1.FU26): the marker, then Kodi's stub message naming the movie.</summary>
+    public static byte[] MovieBody(string title, int? year)
+    {
+        var name = title + (year is { } value ? " (" + value.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")" : string.Empty);
+        var bytes = Encoding.UTF8.GetBytes(Marker + "\n<discstub>\n  <title>" + SecurityElement.Escape(name) + "</title>\n" +
+            "  <message>Not downloaded yet. Open JellyfinMod to get it.</message>\n</discstub>\n");
+        return bytes.Length < MaxBytes ? bytes : Encoding.UTF8.GetBytes(Marker + "\n<discstub><message>Not downloaded yet.</message></discstub>\n");
+    }
+
     /// <summary>Whether a path names a <c>.disc</c> file at all (cheap; no I/O).</summary>
     public static bool HasStubExtension(string? path) =>
         path is not null && path.EndsWith("." + Extension, StringComparison.OrdinalIgnoreCase);
