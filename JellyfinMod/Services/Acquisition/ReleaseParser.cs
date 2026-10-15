@@ -22,8 +22,11 @@ public static class QualityCatalog
     {
         var result = new List<(string, string, string)>();
         foreach (var resolution in new[] { "2160p", "1080p" }) result.Add(($"remux-{resolution}", "remux", resolution));
+        // 1440p (2K) is an encode or web resolution: no remux (no 1440p disc) and no broadcast carries it (P4.FU9).
         foreach (var source in new[] { "bluray", "webdl", "webrip", "hdtv" })
-            foreach (var resolution in new[] { "2160p", "1080p", "720p", "576p", "480p" })
+            foreach (var resolution in source is not "hdtv"
+                         ? new[] { "2160p", "1440p", "1080p", "720p", "576p", "480p" }
+                         : new[] { "2160p", "1080p", "720p", "576p", "480p" })
                 result.Add(($"{source}-{resolution}", source, resolution));
         foreach (var resolution in new[] { "576p", "480p" }) result.Add(($"dvd-{resolution}", "dvd", resolution));
         return result;
@@ -75,7 +78,7 @@ public static partial class ReleaseParser
 {
     private static readonly HashSet<string> NotGroups = new(StringComparer.OrdinalIgnoreCase)
     {
-        "dl", "rip", "web", "hd", "x264", "x265", "h264", "h265", "hevc", "avc", "1080p", "720p", "2160p",
+        "dl", "rip", "web", "hd", "x264", "x265", "h264", "h265", "hevc", "avc", "1080p", "720p", "2160p", "1440p",
         "480p", "576p", "remux", "bluray", "hdtv", "atmos", "dts", "aac", "ac3", "ddp", "truehd", "proper",
         "repack", "internal", "multi", "subs"
     };
@@ -427,7 +430,7 @@ public static partial class ReleaseParser
     private static partial Regex DigitsOnly();
     [GeneratedRegex(@"[._\-\[\]()]+")]
     private static partial Regex SeparatorPattern();
-    [GeneratedRegex(B + @"(?:2160p|1080p|1080i|720p|576p|480p|4k|uhd)" + E, RegexOptions.IgnoreCase)]
+    [GeneratedRegex(B + @"(?:2160p|1440p|1080p|1080i|720p|576p|480p|4k|uhd)" + E, RegexOptions.IgnoreCase)]
     private static partial Regex ResolutionPattern();
     [GeneratedRegex(B + @"(?:remux|blu[ .-]?ray|bdrip|brrip|web[ .-]?dl|web[ .-]?rip|web|hdtv|pdtv|dvdrip|dvd|hdcam|telesync|hdts)" + E, RegexOptions.IgnoreCase)]
     private static partial Regex SourcePattern();

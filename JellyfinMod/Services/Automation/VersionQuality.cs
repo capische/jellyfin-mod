@@ -42,7 +42,8 @@ public static class VersionQuality
     public static int RankOf(string? resolution) => resolution switch
     {
         "2160p" => 4,
-        "1080p" => 3,
+        // 1440p is the 1080p tier, as NativeResolution classifies a 2560x1440 picture (P4.FU9).
+        "1080p" or "1440p" => 3,
         "720p" => 2,
         "576p" or "480p" => 1,
         _ => 0
@@ -73,7 +74,7 @@ public static class VersionQuality
     public static int OrderOf(string? resolution) => resolution switch
     {
         "2160p" => 5,
-        "1080p" => 4,
+        "1080p" or "1440p" => 4,
         "720p" => 3,
         "576p" => 2,
         "480p" => 1,
