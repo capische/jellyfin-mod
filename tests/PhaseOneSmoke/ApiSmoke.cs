@@ -52,7 +52,9 @@ internal static class ApiSmoke
             "GetUserRootFolder" => root,
             "GetItemById" or "RetrieveItem" when args?[0] is Guid id => nativeById.GetValueOrDefault(id),
             "GetVirtualFolders" => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }
-                .Select(folder => new VirtualFolderInfo { ItemId = folder.Id.ToString(), Name = folder.Id.ToString("N") })
+                .Select(folder => new VirtualFolderInfo { ItemId = folder.Id.ToString(), Name = folder.Id.ToString("N"),
+                    CollectionType = folder.CollectionType == Jellyfin.Data.Enums.CollectionType.tvshows
+                        ? MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows : null })
                 .ToList(),
             "GetCollectionFolders" when args?[0] is BaseItem item => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }
                 .Where(folder => folder.Items.Any(native => native.Id == item.Id)).Cast<Folder>().ToList(),
@@ -84,6 +86,10 @@ internal static class ApiSmoke
         builder.Services.AddSingleton<RetentionExecutionGate>();
         builder.Services.AddSingleton(library);
         builder.Services.AddTransient(_ => new LibraryAccess(users, library, localization));
+        builder.Services.AddSingleton<UnixFileInspector>();
+        builder.Services.AddSingleton(TimeProvider.System);
+        builder.Services.AddSingleton(Stub<ILibraryMonitor>.Create((_, _) => null));
+        builder.Services.AddTransient<JellyfinMod.Services.Placeholders.PlaceholderService>();
         builder.Services.AddTransient(provider => new RetentionEvaluator(
             provider.GetRequiredService<ModDbContext>(), users,
             provider.GetRequiredService<LibraryAccess>(), TimeProvider.System));
@@ -1320,6 +1326,30 @@ internal static class ApiSmoke
         await VerifyDiscoveryBudgetAsync(client, http, user);
         await VerifyContractHygieneAsync(client, dbPath, user, libraryFolder.Id, tvLibrary.Id);
         await VerifyBoundCopyPreferenceAsync(client, dbPath, libraryFolder, secondLibrary, raceLibrary, nativeById);
+        // P1.FU24 (user, 2026-10-15: "should be enabled by default"): every TV library lists its placeholder switch on, with no
+        // setting saved; only administrators read or change it; a library with no folder that can be written writes nothing.
+        {
+            var role = client.DefaultRequestHeaders.TryGetValues("X-Smoke-Role", out var roles) ? roles.ToArray() : [];
+            client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+            Assert((await client.GetAsync("/JellyfinMod/Placeholders")).StatusCode == HttpStatusCode.Forbidden,
+                "The placeholder settings are administrators only");
+            client.DefaultRequestHeaders.Add("X-Smoke-Role", "admin");
+            using var placeholders = await client.GetAsync("/JellyfinMod/Placeholders");
+            using var placeholderJson = JsonDocument.Parse(await placeholders.Content.ReadAsStringAsync());
+            var listed = placeholderJson.RootElement.EnumerateArray().ToArray();
+            Assert(placeholders.IsSuccessStatusCode && listed.Length == 2 && listed.All(item => item.GetProperty("enabled").GetBoolean()) &&
+                listed.Any(item => Guid.Parse(item.GetProperty("libraryId").GetString()!) == tvLibrary.Id),
+                "Every TV library's placeholder switch is on by default (P1.FU24)");
+            using var sync = await client.PostAsync($"/JellyfinMod/Placeholders/{tvLibrary.Id}/Sync", null);
+            using var syncJson = JsonDocument.Parse(await sync.Content.ReadAsStringAsync());
+            Assert(sync.IsSuccessStatusCode && syncJson.RootElement.GetProperty("enabled").GetBoolean() &&
+                syncJson.RootElement.GetProperty("writes").GetArrayLength() == 0 && !syncJson.RootElement.GetProperty("dryRun").GetBoolean(),
+                "A sync of a library with no writable folder writes nothing (P1.FU24)");
+            Assert((await client.GetAsync($"/JellyfinMod/Placeholders/{libraryFolder.Id}/Plan")).StatusCode == HttpStatusCode.NotFound,
+                "A movie library has no placeholder switch");
+            client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+            if (role.Length > 0) client.DefaultRequestHeaders.Add("X-Smoke-Role", role);
+        }
         // P1.W14: Health lists the request fields this build understands.
         using (var health = await client.GetAsync("/JellyfinMod/Health"))
         {
