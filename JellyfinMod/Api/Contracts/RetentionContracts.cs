@@ -22,7 +22,12 @@ public sealed record RetentionPreviewDto(
     [property: JsonPropertyName("waiting")] int Waiting,
     [property: JsonPropertyName("disabled")] int Disabled,
     [property: JsonPropertyName("items")] IReadOnlyList<RetentionRepresentationDto> Items,
-    [property: JsonPropertyName("seedIndexUnresolvedFiles")] int SeedIndexUnresolvedFiles = 0);
+    [property: JsonPropertyName("seedIndexUnresolvedFiles")] int SeedIndexUnresolvedFiles = 0)
+{
+    /// <summary>Gets how many due or scheduled episode files leave a placeholder when they are reclaimed (P1.FU25).</summary>
+    [JsonPropertyName("placeholders")]
+    public int Placeholders { get; init; }
+}
 
 /// <summary>One physical media representation in an admin retention preview.</summary>
 /// <param name="BindingId">The durable binding identity.</param>
@@ -57,7 +62,15 @@ public sealed record RetentionRepresentationDto(
     [property: JsonPropertyName("torrentManaged")] bool? TorrentManaged,
     [property: JsonPropertyName("uploadRatio")] double? UploadRatio,
     [property: JsonPropertyName("ratioGoal")] double? RatioGoal,
-    [property: JsonPropertyName("secondsSeeding")] long? SecondsSeeding);
+    [property: JsonPropertyName("secondsSeeding")] long? SecondsSeeding)
+{
+    /// <summary>
+    /// Gets whether reclaiming this due or scheduled episode file leaves a placeholder, so the episode stays in Jellyfin with its
+    /// watched mark (P1.FU25): its only file, in a TV library that shows missing episodes, in a folder the plugin can write.
+    /// </summary>
+    [JsonPropertyName("leavesPlaceholder")]
+    public bool LeavesPlaceholder { get; init; }
+}
 
 /// <summary>One durable automatic or administrator-triggered retention run.</summary>
 public sealed record RetentionRunDto(

@@ -21,7 +21,8 @@ public sealed class RetentionExecutor(
     UnixFileInspector files,
     TimeProvider clock,
     ILogger<RetentionExecutor> logger,
-    RetentionLiveCheck liveCheck)
+    RetentionLiveCheck liveCheck,
+    ILibraryMonitor? libraryMonitor = null)
 {
     /// <summary>Revalidates and reclaims one binding selected by the shared retention preview.</summary>
     public async Task<RetentionExecutionResult> ReclaimAsync(Guid bindingId, CancellationToken cancellationToken)
@@ -82,6 +83,9 @@ public sealed class RetentionExecutor(
         {
             if (!TryInspect(item, out var observed, out var inspectionReason))
                 return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
+            // A placeholder is not media: never a reclaim, whatever binds it (P1.FU25; reconciliation never binds one).
+            if (Placeholders.PlaceholderStub.IsStubFile(observed.CanonicalPath))
+                return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.Placeholder);
             // Still the very file the binding recorded (whole-review P1 1), read again just before it is prepared.
             if (await FingerprintReasonAsync(item, observed, cancellationToken).ConfigureAwait(false) is { } fingerprintReason)
                 return RetentionExecutionResult.NotStarted(bindingId, fingerprintReason);
@@ -736,6 +740,9 @@ public sealed class RetentionExecutor(
             return RetentionExecutionResult.From(operation);
         }
 
+        // The episodes this reclaim leaves without any file, for the placeholders written once it is recorded (P1.FU25).
+        var leftWithoutFile = new List<Placeholders.PlaceholderService.ReclaimedEpisode>();
+        string? seriesTitle = null;
         if (operation.EpisodeId.HasValue)
         {
             var binding = await database.EpisodeBindings.SingleOrDefaultAsync(
@@ -754,12 +761,15 @@ public sealed class RetentionExecutor(
             // not fetch it again (V1, user, 2026-09-28); retention's leaves it reclaimed.
             episode.State = remaining.Length > 0 ? FileState.OnDisk : removed ? FileState.None : FileState.Reclaimed;
             if (removed && remaining.Length == 0) episode.Monitored = false;
+            var reclaim = operation.Provenance == RetentionProvenances.Retention && remaining.Length == 0;
+            if (reclaim) leftWithoutFile.Add(new(episode.SeasonNumber, episode.EpisodeNumber, episode.Title));
             // Episodes a multi-episode file covered without files of their own went with it (PHASE10 Q5).
             foreach (var covered in await database.Episodes.Where(candidate => candidate.EntryId == entryId &&
                          candidate.Id != episode.Id && candidate.JellyfinItemId == operation.JellyfinItemId &&
                          !database.EpisodeBindings.Any(binding => binding.EpisodeId == candidate.Id))
                          .ToListAsync(cancellationToken).ConfigureAwait(false))
             {
+                if (reclaim) leftWithoutFile.Add(new(covered.SeasonNumber, covered.EpisodeNumber, covered.Title));
                 covered.JellyfinItemId = null;
                 covered.State = removed ? FileState.None : FileState.Reclaimed;
                 // Every episode that loses its last copy with an administrator's removal stops being monitored (review P2-7).
@@ -782,6 +792,10 @@ public sealed class RetentionExecutor(
                     (await database.Entries.SingleAsync(candidate => candidate.Id == entryId, cancellationToken)
                         .ConfigureAwait(false)).State = removed ? FileState.None : FileState.Reclaimed;
             }
+
+            if (leftWithoutFile.Count > 0)
+                seriesTitle = await database.Entries.AsNoTracking().Where(candidate => candidate.Id == entryId)
+                    .Select(candidate => candidate.Title).SingleAsync(cancellationToken).ConfigureAwait(false);
         }
         else
         {
@@ -868,8 +882,40 @@ public sealed class RetentionExecutor(
         operation.CompletedAt = clock.GetUtcNow().UtcDateTime;
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        if (leftWithoutFile.Count > 0)
+            await LeavePlaceholdersAsync(operation, actionEntryLeaderId, seriesTitle!, leftWithoutFile).ConfigureAwait(false);
         return RetentionExecutionResult.From(operation);
     }
+
+    /// <summary>
+    /// After a reclaim is unlinked and recorded (P1.FU25): writes a placeholder for each episode the file held, where the library
+    /// shows missing episodes and the folder can be written, so the episode stays in Jellyfin with its artwork and its user data
+    /// (re-attached by key to the stub's item) instead of disappearing. Only ever writes; never deletes. The reclaim's history
+    /// says a placeholder was left. A failure here leaves the reclaim as it is (the next placeholder sync can still write it).
+    /// </summary>
+    private async Task LeavePlaceholdersAsync(RetentionOperation operation, Guid historyId, string seriesTitle,
+        IReadOnlyList<Placeholders.PlaceholderService.ReclaimedEpisode> episodes)
+    {
+        var written = Placeholders.PlaceholderService.LeaveAfterReclaim(library, files, libraryMonitor, operation.TargetLibraryId,
+            operation.MediaPath, seriesTitle, episodes, logger);
+        if (written.Count == 0) return;
+        try
+        {
+            var history = await database.History.SingleOrDefaultAsync(record => record.Id == historyId, CancellationToken.None)
+                .ConfigureAwait(false);
+            if (history is null || history.Summary.Contains(PlaceholderLeft, StringComparison.Ordinal)) return;
+            history.Summary += PlaceholderLeft;
+            await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogWarning("JellyfinMod left a placeholder for reclaimed {Path} but could not say so in its history: {Error}",
+                operation.MediaPath, error.Message);
+        }
+    }
+
+    /// <summary>What a reclaim's history adds when it left a placeholder (P1.FU25).</summary>
+    public const string PlaceholderLeft = "; a placeholder keeps the episode in Jellyfin";
 
     /// <summary>
     /// Records that the file is gone. The unlink already happened, so this save must not be lost to a busy database: it is
@@ -1227,6 +1273,9 @@ internal static class RetentionExecutionReasons
 {
     /// <summary>The library path is a download JellyfinMod keeps on disk, or another name for one.</summary>
     public const string RetainedDownload = "retained_download";
+
+    /// <summary>The file is one of JellyfinMod's placeholders, which is not media and is never reclaimed (P1.FU25).</summary>
+    public const string Placeholder = RetentionPreviewReasons.Placeholder;
 
     public const string BindingUnavailable = "binding_unavailable";
     public const string PolicyChanged = "policy_changed";

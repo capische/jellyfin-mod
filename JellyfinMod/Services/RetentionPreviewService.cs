@@ -123,7 +123,10 @@ public sealed class RetentionPreviewService(
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
             var path = candidate.File?.CanonicalPath ?? candidate.Target.Path;
-            if (!string.IsNullOrEmpty(path) && !files.CanUnlink(path))
+            // A placeholder of the plugin's is not media and never reclaimed, whatever binds it (P1.FU25).
+            if (Placeholders.PlaceholderStub.IsStubFile(path))
+                candidate.Block(RetentionPreviewReasons.Placeholder);
+            else if (!string.IsNullOrEmpty(path) && !files.CanUnlink(path))
                 candidate.Block(RetentionPreviewReasons.MediaNotWritable);
         }
 
@@ -243,11 +246,41 @@ public sealed class RetentionPreviewService(
         var items = inspected.OrderBy(candidate => candidate.Target.EntryId)
             .ThenBy(candidate => candidate.Target.EpisodeId).ThenBy(candidate => candidate.Target.BindingId)
             .Select(candidate => candidate.ToDto()).ToArray();
+        items = await MarkPlaceholdersAsync(items, targets, cancellationToken).ConfigureAwait(false);
         return new(now, items.Length, items.Count(item => item.State == RetentionPreviewStates.Due),
             items.Count(item => item.State == RetentionPreviewStates.Blocked),
             items.Count(item => item.State == RetentionPreviewStates.Scheduled),
             items.Count(item => item.State == RetentionEvaluationStates.Waiting),
-            items.Count(item => item.State == RetentionEvaluationStates.Disabled), items, unresolvedSeedFiles);
+            items.Count(item => item.State == RetentionEvaluationStates.Disabled), items, unresolvedSeedFiles)
+        {
+            Placeholders = items.Count(item => item.LeavesPlaceholder)
+        };
+    }
+
+    /// <summary>
+    /// Marks the due and scheduled episode files whose reclaim leaves a placeholder (P1.FU25): the episode's only file, in a TV
+    /// library that shows missing episodes, in a folder the plugin can write (the executor writes it by the same rule).
+    /// </summary>
+    private async Task<RetentionRepresentationDto[]> MarkPlaceholdersAsync(RetentionRepresentationDto[] items, PreviewTarget[] targets,
+        CancellationToken cancellationToken)
+    {
+        var rows = items.Where(item => item.EpisodeId is not null &&
+            item.State is RetentionPreviewStates.Due or RetentionPreviewStates.Scheduled).ToArray();
+        if (rows.Length == 0) return items;
+        var ids = rows.Select(item => item.EpisodeId!.Value).Distinct().ToArray();
+        var numbers = await database.Episodes.AsNoTracking().Where(episode => ids.Contains(episode.Id))
+            .Select(episode => new { episode.Id, episode.SeasonNumber, episode.EpisodeNumber })
+            .ToDictionaryAsync(episode => episode.Id, cancellationToken).ConfigureAwait(false);
+        var copies = targets.Where(target => target.EpisodeId is not null).GroupBy(target => target.EpisodeId!.Value)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var roots = rows.Select(item => item.TargetLibraryId).Distinct()
+            .ToDictionary(id => id, id => Placeholders.PlaceholderService.ReclaimRoots(library, files, id));
+        return items.Select(item => item.EpisodeId is { } episodeId && item.State is RetentionPreviewStates.Due or RetentionPreviewStates.Scheduled &&
+            copies.GetValueOrDefault(episodeId) == 1 && numbers.TryGetValue(episodeId, out var number) &&
+            Placeholders.PlaceholderService.ReclaimStubPath(files, roots[item.TargetLibraryId], item.CanonicalPath ?? item.Path,
+                number.SeasonNumber, number.EpisodeNumber) is not null
+                ? item with { LeavesPlaceholder = true }
+                : item).ToArray();
     }
 
     private async Task<PreviewTarget[]> LoadTargetsAsync(
@@ -743,6 +776,9 @@ internal static class RetentionPreviewStates
 internal static class RetentionPreviewReasons
 {
     public const string EvaluationMissing = "evaluation_missing";
+
+    /// <summary>The file is one of JellyfinMod's placeholders, which is not media (P1.FU25).</summary>
+    public const string Placeholder = "placeholder";
     public const string NotDue = "not_due";
     public const string LibraryRootMissing = "library_root_missing";
     public const string StorageUnavailable = "storage_unavailable";
