@@ -77,10 +77,13 @@ public class PluginConfiguration : BasePluginConfiguration
     public int WebBundleGraceDays { get; set; } = 14;
 
     /// <summary>
-    /// Gets or sets the TV libraries whose missing aired episodes are shown as Jellyfin items through placeholders (P1.FU24).
+    /// Gets or sets the TV libraries an administrator turned placeholders off for (P1.FU24). Every other TV library, a new one
+    /// included, shows its missing aired episodes as Jellyfin items: on by default (user, 2026-10-15: "Show missing episodes -
+    /// should be enabled by default. That's the point.").
     /// </summary>
-    /// <remarks>Empty by default: the switch is off for every library until an administrator turns it on.</remarks>
-    public Guid[] PlaceholderLibraryIds { get; set; } = [];
+    /// <remarks>An older configuration's opt-in list (<c>PlaceholderLibraryIds</c>, only ever on a local test environment) is an
+    /// unknown element the XML reader skips.</remarks>
+    public Guid[] PlaceholderDisabledLibraryIds { get; set; } = [];
 
     /// <summary>Gets or sets the secret-store reference for the TMDB Read Access Token (user decision 3).</summary>
     public string? TmdbReadAccessTokenRef { get; set; }

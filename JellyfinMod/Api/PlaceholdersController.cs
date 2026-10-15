@@ -12,7 +12,7 @@ public sealed record PlaceholderSwitchRequest([property: JsonPropertyName("enabl
 
 /// <summary>
 /// Placeholders for missing episodes (P1.FU24), administrators only: each TV library's switch "Show missing episodes as
-/// Jellyfin items" (off by default), the dry run that lists exactly the files a sync would write and remove, the sync itself,
+/// Jellyfin items" (on by default, turned off per library), the dry run that lists exactly the files a sync would write and remove, the sync itself,
 /// and <i>Remove placeholders</i> with its own dry run. See <c>API.md</c>, <i>Placeholders</i>.
 /// </summary>
 [ApiController, Authorize(Policy = Policies.RequiresElevation), Route("JellyfinMod/Placeholders")]

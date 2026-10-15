@@ -99,8 +99,10 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
 }
 
 /// <summary>
-/// Keeps every library's placeholders up to date (P1.FU24): writes stubs for newly aired missing episodes where the switch is
-/// on, removes stubs whose episode got a file, and stamps new stub items. Every six hours, and on demand from the settings.
+/// Keeps every library's placeholders up to date (P1.FU24): writes stubs for missing aired episodes where the switch is on (every
+/// TV library unless turned off), at most <see cref="PlaceholderService.SeriesPerRun"/> series per library and run, removes stubs
+/// whose episode got a file, and stamps new stub items. Every 15 minutes, so a large library is filled in batches over a few
+/// hours (the first run comes one interval after the plugin starts, never in the start-up rush), and on demand from the settings.
 /// </summary>
 public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibraryManager library) : IScheduledTask
 {
@@ -111,7 +113,7 @@ public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibr
     public string Key => "JellyfinModPlaceholderSync";
 
     /// <inheritdoc />
-    public string Description => "Adds placeholders for missing aired episodes in the TV libraries where they are switched on, and removes the ones whose episode has a file.";
+    public string Description => "Adds placeholders for missing aired episodes in the TV libraries where they are on (all, unless turned off), a few series per run, and removes the ones whose episode has a file.";
 
     /// <inheritdoc />
     public string Category => "JellyfinMod";
@@ -119,7 +121,7 @@ public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibr
     /// <inheritdoc />
     public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() =>
     [
-        new TaskTriggerInfo { Type = TaskTriggerInfoType.IntervalTrigger, IntervalTicks = TimeSpan.FromHours(6).Ticks }
+        new TaskTriggerInfo { Type = TaskTriggerInfoType.IntervalTrigger, IntervalTicks = TimeSpan.FromMinutes(15).Ticks }
     ];
 
     /// <inheritdoc />
