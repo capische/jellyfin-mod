@@ -132,12 +132,125 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
 }
 
 /// <summary>
-/// Keeps every library's placeholders up to date (P1.FU24): writes stubs for missing aired episodes where the switch is on (every
-/// TV library unless turned off), at most <see cref="PlaceholderService.SeriesPerRun"/> series per library and run, removes stubs
-/// whose episode got a file, and stamps new stub items. Every 15 minutes, so a large library is filled in batches over a few
-/// hours (the first run comes one interval after the plugin starts, never in the start-up rush), and on demand from the settings.
+/// The backfill (P1.FU27): one batch over every TV and movie library, never two at once. The scheduled sync and an administrator's
+/// <i>Sync Now</i> both run it. Each library writes at most <see cref="PlaceholderService.SeriesPerRun"/> titles with
+/// <see cref="PlaceholderService.PauseBetweenSeries"/> between them, gives way to Jellyfin's own library scans, and asks Jellyfin
+/// to look at the folders it changed once, at the end. While a batch leaves placeholders pending the scheduled sync runs every
+/// <see cref="BusyInterval"/>; once nothing is pending, every <see cref="IdleInterval"/>.
 /// </summary>
-public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibraryManager library) : IScheduledTask
+public static class PlaceholderBackfill
+{
+    /// <summary>How often the scheduled sync runs while placeholders are pending: its trigger's interval.</summary>
+    public static readonly TimeSpan BusyInterval = TimeSpan.FromMinutes(5);
+
+    /// <summary>How often it runs once nothing is pending (it then skips the triggers in between).</summary>
+    public static readonly TimeSpan IdleInterval = TimeSpan.FromMinutes(15);
+
+    private static readonly SemaphoreSlim Gate = new(1, 1);
+    private static readonly object StateLock = new();
+    private static DateTime? _lastRunAt;
+    private static int _lastPending;
+    private static string? _lastDeferred;
+
+    /// <summary>Gets a value indicating whether a batch runs now.</summary>
+    public static bool IsRunning => Gate.CurrentCount == 0;
+
+    /// <summary>Gets when the last batch ended, what it left pending and why it wrote less than it could, if it did.</summary>
+    public static (DateTime? LastRunAt, int Pending, string? Deferred) State
+    {
+        get
+        {
+            lock (StateLock) return (_lastRunAt, _lastPending, _lastDeferred);
+        }
+    }
+
+    /// <summary>
+    /// Whether a scheduled trigger runs a batch: always while the last batch left work (pending placeholders, or a batch that gave
+    /// way to a scan) or none ran since start, else once the idle interval has passed since the last one.
+    /// </summary>
+    public static bool Due(DateTime now)
+    {
+        var (last, pending, deferred) = State;
+        // A trigger fires a little early or late: half a minute of slack keeps the idle pace at 15 minutes, not 20.
+        return last is null || pending > 0 || deferred is not null || now - last.Value >= IdleInterval - TimeSpan.FromSeconds(30);
+    }
+
+    /// <summary>When the scheduled sync runs a batch next, as far as the plugin knows (its trigger fires every busy interval).</summary>
+    public static TimeSpan NextRunIn(DateTime now)
+    {
+        var (last, pending, deferred) = State;
+        if (last is null || pending > 0 || deferred is not null) return BusyInterval;
+        var idle = last.Value + IdleInterval - now;
+        return idle < BusyInterval ? BusyInterval : idle;
+    }
+
+    /// <summary>
+    /// Runs one batch over every TV and movie library that needs it, unless one already runs (then null: never two at once).
+    /// Libraries with the switch off only remove stale placeholders and stamp items, as before.
+    /// </summary>
+    public static async Task<IReadOnlyList<PlaceholderPlan>?> TryRunAsync(IServiceScopeFactory scopeFactory, ILibraryManager library,
+        TimeProvider time, ILogger logger, IProgress<double>? progress, CancellationToken cancellationToken)
+    {
+        if (!await Gate.WaitAsync(0, cancellationToken).ConfigureAwait(false)) return null;
+        try
+        {
+            var libraries = library.GetVirtualFolders().Where(folder => folder.CollectionType is MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows or
+                    MediaBrowser.Model.Entities.CollectionTypeOptions.movies)
+                .Select(folder => Guid.TryParse(folder.ItemId, out var id) ? id : Guid.Empty).Where(id => id != Guid.Empty).ToArray();
+            var plans = new List<PlaceholderPlan>();
+            for (var index = 0; index < libraries.Length; index++)
+            {
+                using var scope = scopeFactory.CreateScope();
+                var service = scope.ServiceProvider.GetRequiredService<PlaceholderService>();
+                try
+                {
+                    if (service.NeedsSync(libraries[index]))
+                        plans.Add(await service.SyncBatchAsync(libraries[index], cancellationToken).ConfigureAwait(false));
+                }
+                catch (KeyNotFoundException)
+                {
+                    // The library went between the listing and its sync.
+                }
+
+                progress?.Report(100.0 * (index + 1) / libraries.Length);
+            }
+
+            var pending = plans.Sum(plan => plan.Pending);
+            var deferred = plans.Select(plan => plan.Deferred).FirstOrDefault(reason => reason is not null);
+            lock (StateLock)
+            {
+                _lastRunAt = time.GetUtcNow().UtcDateTime;
+                _lastPending = pending;
+                _lastDeferred = deferred;
+            }
+
+            var written = plans.Sum(plan => plan.Writes.Count);
+            if (deferred is not null)
+                logger.LogInformation("JellyfinMod placeholder backfill gave way to a library scan: wrote {Written} placeholder(s), {Done} of {Titles} title(s) done, {Pending} placeholder(s) pending; next run in {Minutes} minutes",
+                    written, plans.Sum(plan => plan.TitlesDone), plans.Sum(plan => plan.Titles), pending, (int)BusyInterval.TotalMinutes);
+            else if (written > 0 || pending > 0)
+                logger.LogInformation("JellyfinMod placeholder backfill: wrote {Written} placeholder(s), {Done} of {Titles} title(s) done, {Pending} placeholder(s) pending; next run in {Minutes} minutes",
+                    written, plans.Sum(plan => plan.TitlesDone), plans.Sum(plan => plan.Titles), pending,
+                    (int)(pending > 0 ? BusyInterval : IdleInterval).TotalMinutes);
+            return plans;
+        }
+        finally
+        {
+            Gate.Release();
+        }
+    }
+}
+
+/// <summary>
+/// Keeps every library's placeholders up to date (P1.FU24, P1.FU27): writes stubs for missing aired episodes and released movies
+/// where the switch is on (every library unless turned off), at most <see cref="PlaceholderService.SeriesPerRun"/> titles per
+/// library and run, removes stubs whose title got a file, and stamps new stub items. Its trigger fires every 5 minutes; a run
+/// does the work only while placeholders are pending (a first backfill of a large catalogue) or every 15 minutes once nothing
+/// is (<see cref="PlaceholderBackfill"/>). The first run comes one trigger interval after the plugin starts, never in the start-up
+/// rush. An administrator's <i>Sync Now</i> runs the same batch at once; the two never run together.
+/// </summary>
+public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibraryManager library, TimeProvider time,
+    ILogger<PlaceholderSyncTask> logger) : IScheduledTask
 {
     /// <inheritdoc />
     public string Name => "Sync JellyfinMod placeholders";
@@ -146,7 +259,7 @@ public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibr
     public string Key => "JellyfinModPlaceholderSync";
 
     /// <inheritdoc />
-    public string Description => "Adds placeholders for missing aired episodes and released movies with no file in the libraries where they are on (all, unless turned off), a few titles per run, and removes the ones whose title has a file.";
+    public string Description => "Adds placeholders for missing aired episodes and released movies with no file in the libraries where they are on (all, unless turned off), a few titles per run (every 5 minutes while some are pending, else every 15), and removes the ones whose title has a file.";
 
     /// <inheritdoc />
     public string Category => "JellyfinMod";
@@ -154,25 +267,77 @@ public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibr
     /// <inheritdoc />
     public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() =>
     [
-        new TaskTriggerInfo { Type = TaskTriggerInfoType.IntervalTrigger, IntervalTicks = TimeSpan.FromMinutes(15).Ticks }
+        new TaskTriggerInfo { Type = TaskTriggerInfoType.IntervalTrigger, IntervalTicks = PlaceholderBackfill.BusyInterval.Ticks }
     ];
 
     /// <inheritdoc />
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
     {
-        // Every TV library with a switch on, and every other one too: stale stubs go and stub items are stamped even after the
-        // switch is turned off (stubs written before stay until an administrator removes them).
-        var libraries = library.GetVirtualFolders().Where(folder => folder.CollectionType is MediaBrowser.Model.Entities.CollectionTypeOptions.tvshows or
-                MediaBrowser.Model.Entities.CollectionTypeOptions.movies)
-            .Select(folder => Guid.TryParse(folder.ItemId, out var id) ? id : Guid.Empty).Where(id => id != Guid.Empty).ToArray();
-        for (var index = 0; index < libraries.Length; index++)
+        // Every library with a switch on, and every other one too: stale stubs go and stub items are stamped even after the
+        // switch is turned off (stubs written before stay until an administrator removes them). Nothing pending: the idle pace.
+        if (PlaceholderBackfill.Due(time.GetUtcNow().UtcDateTime))
+            await PlaceholderBackfill.TryRunAsync(scopeFactory, library, time, logger, progress, cancellationToken).ConfigureAwait(false);
+        progress.Report(100);
+    }
+}
+
+/// <summary>
+/// Starts the first backfill 5 minutes after the plugin starts on a server where the placeholder sync has never completed (P1.FU27).
+/// Jellyfin 12 starts an interval task that has never completed only one hour after start (<c>IntervalTrigger</c>), which would
+/// leave an existing catalogue without placeholders for that hour after the plugin is installed or updated. The task is queued
+/// through Jellyfin's task manager, so it shows and runs as the task, never beside it; once that run has completed its triggers are
+/// armed again from its result (Jellyfin re-arms them only when one fires), so the task's own trigger paces it from then on, and
+/// on a server where it has completed before this does nothing.
+/// </summary>
+public sealed class PlaceholderBackfillStarter(ITaskManager taskManager, ILogger<PlaceholderBackfillStarter> logger) : IHostedService
+{
+    /// <summary>How long after start the first batch waits: past the start-up rush, one busy interval.</summary>
+    public static readonly TimeSpan FirstRunDelay = PlaceholderBackfill.BusyInterval;
+
+    private CancellationTokenSource? stopping;
+
+    /// <inheritdoc />
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        stopping = new CancellationTokenSource();
+        var token = stopping.Token;
+        _ = Task.Run(async () =>
         {
-            using var scope = scopeFactory.CreateScope();
-            var service = scope.ServiceProvider.GetRequiredService<PlaceholderService>();
-            if (service.NeedsSync(libraries[index]))
-                await service.SyncAsync(libraries[index], cancellationToken).ConfigureAwait(false);
-            progress.Report(100.0 * (index + 1) / libraries.Length);
-        }
+            try
+            {
+                await Task.Delay(FirstRunDelay, token).ConfigureAwait(false);
+                var worker = taskManager.ScheduledTasks.FirstOrDefault(task => task.ScheduledTask is PlaceholderSyncTask);
+                if (worker is null || worker.LastExecutionResult is not null) return;
+                logger.LogInformation("JellyfinMod starts the first placeholder sync now rather than an hour after start");
+                taskManager.QueueIfNotRunning<PlaceholderSyncTask>();
+                // Jellyfin re-arms a task's triggers only when a trigger fires, so the hour set at start would stand after this
+                // queued run: once it has completed, the triggers are armed again from its result (the busy pace follows).
+                for (var waited = TimeSpan.Zero; waited < TimeSpan.FromHours(1); waited += TimeSpan.FromSeconds(10))
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(10), token).ConfigureAwait(false);
+                    if (worker.LastExecutionResult is null || worker.State != TaskState.Idle) continue;
+                    worker.ReloadTriggerEvents();
+                    break;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                logger.LogWarning("JellyfinMod could not start the first placeholder sync; its schedule starts it: {Error}", error.Message);
+            }
+        }, CancellationToken.None);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        stopping?.Cancel();
+        stopping?.Dispose();
+        stopping = null;
+        return Task.CompletedTask;
     }
 }
 

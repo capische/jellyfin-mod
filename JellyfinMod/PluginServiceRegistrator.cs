@@ -99,7 +99,10 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         // Placeholders for missing episodes (P1.FU24): the writer, the item stamp, and the filter that keeps stock apps from
         // offering or playing them. The filter shapes every stock controller's answers; MVC is configured after this runs.
         services.AddTransient<PlaceholderService>();
+        // The administrator's watched restore from retention history (P1.FU27).
+        services.AddTransient<PlaceholderWatchedRestore>();
         services.AddSingleton<IHostedService, PlaceholderItemListener>();
+        services.AddSingleton<IHostedService, PlaceholderBackfillStarter>();
         services.AddSingleton<PlaceholderSyncQueue>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<PlaceholderSyncQueue>());
         services.AddSingleton<PlaceholderFilter>();

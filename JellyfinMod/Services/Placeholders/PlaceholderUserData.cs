@@ -36,6 +36,25 @@ public static class PlaceholderUserData
     /// <summary>Gets a value indicating whether the current thread is re-saving re-attached data (listeners skip it).</summary>
     public static bool IsResaving => _resaving;
 
+    /// <summary>
+    /// Saves one user's data of an item with <see cref="UserDataSaveReason.UpdateUserData"/> under the quiet flag, as
+    /// <see cref="Resave"/> does: the retention listener records no completion from it and the Trakt plugin sends nothing (the
+    /// watched restore, P1.FU27).
+    /// </summary>
+    public static void SaveQuietly(IUserDataManager userData, Jellyfin.Database.Implementations.Entities.User user, BaseItem item,
+        UserItemData data, CancellationToken cancellationToken)
+    {
+        _resaving = true;
+        try
+        {
+            userData.SaveUserData(user, item, data, UserDataSaveReason.UpdateUserData, cancellationToken);
+        }
+        finally
+        {
+            _resaving = false;
+        }
+    }
+
     /// <summary>Whether a new item is one whose user data Jellyfin may re-attach from a removed item: a movie or an episode.</summary>
     public static bool IsCandidate(BaseItem item) => item is Movie or Episode && item.Path is { Length: > 0 };
 
