@@ -1968,6 +1968,8 @@ internal static partial class Phase5
         await NextUpScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, time);
         // The import swaps a placeholder for the real file (P1.FU25).
         await PlaceholderSwapScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, logs);
+        // The backfill of an existing catalogue and the watched restore (P1.FU27).
+        await BackfillScenarios.RunAsync(admin, host.Client(world.Ordinary, false), world, dbPath);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))

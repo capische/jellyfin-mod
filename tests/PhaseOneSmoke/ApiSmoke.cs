@@ -91,6 +91,10 @@ internal static class ApiSmoke
         builder.Services.AddSingleton(TimeProvider.System);
         builder.Services.AddSingleton(Stub<ILibraryMonitor>.Create((_, _) => null));
         builder.Services.AddTransient<JellyfinMod.Services.Placeholders.PlaceholderService>();
+        builder.Services.AddTransient(provider => new JellyfinMod.Services.Placeholders.PlaceholderWatchedRestore(
+            provider.GetRequiredService<ModDbContext>(), library, users, provider.GetRequiredService<IUserDataManager>(),
+            provider.GetRequiredService<JellyfinMod.Services.Placeholders.PlaceholderService>(), TimeProvider.System,
+            NullLogger<JellyfinMod.Services.Placeholders.PlaceholderWatchedRestore>.Instance));
         builder.Services.AddTransient(provider => new RetentionEvaluator(
             provider.GetRequiredService<ModDbContext>(), users,
             provider.GetRequiredService<LibraryAccess>(), TimeProvider.System));
@@ -1334,6 +1338,11 @@ internal static class ApiSmoke
             client.DefaultRequestHeaders.Remove("X-Smoke-Role");
             Assert((await client.GetAsync("/JellyfinMod/Placeholders")).StatusCode == HttpStatusCode.Forbidden,
                 "The placeholder settings are administrators only");
+            Assert((await client.GetAsync("/JellyfinMod/Placeholders/Progress")).StatusCode == HttpStatusCode.Forbidden &&
+                (await client.PostAsync("/JellyfinMod/Placeholders/SyncNow", null)).StatusCode == HttpStatusCode.Forbidden &&
+                (await client.GetAsync("/JellyfinMod/Placeholders/RestoreWatched")).StatusCode == HttpStatusCode.Forbidden &&
+                (await client.PostAsync("/JellyfinMod/Placeholders/RestoreWatched", null)).StatusCode == HttpStatusCode.Forbidden,
+                "The backfill's progress, Sync Now and the watched restore are administrators only (P1.FU27)");
             client.DefaultRequestHeaders.Add("X-Smoke-Role", "admin");
             using var placeholders = await client.GetAsync("/JellyfinMod/Placeholders");
             using var placeholderJson = JsonDocument.Parse(await placeholders.Content.ReadAsStringAsync());
@@ -1355,6 +1364,33 @@ internal static class ApiSmoke
                 Assert(moviePlan.IsSuccessStatusCode && moviePlanJson.RootElement.GetProperty("dryRun").GetBoolean() &&
                     moviePlanJson.RootElement.GetProperty("writes").GetArrayLength() == 0,
                     "A movie library has its placeholder switch too, and with no writable folder plans no placeholder (P1.FU26)");
+            }
+            // P1.FU27: the backfill's progress over every library, Sync Now answering it, and the restore's dry run, none of which
+            // writes anything in libraries that cannot be written.
+            using (var progress = await client.GetAsync("/JellyfinMod/Placeholders/Progress"))
+            {
+                using var progressJson = JsonDocument.Parse(await progress.Content.ReadAsStringAsync());
+                var state = progressJson.RootElement;
+                Assert(progress.IsSuccessStatusCode && state.GetProperty("libraries").GetArrayLength() == 5 && state.GetProperty("pending").GetInt32() == 0 &&
+                    state.GetProperty("titles").GetInt32() == 0 && !state.GetProperty("running").GetBoolean() &&
+                    state.GetProperty("nextRunMinutes").GetInt32() == 5,
+                    "Progress lists every library with nothing pending where nothing can be written (P1.FU27): " + state.GetRawText());
+            }
+
+            using (var syncNow = await client.PostAsync("/JellyfinMod/Placeholders/SyncNow", null))
+            {
+                using var syncNowJson = JsonDocument.Parse(await syncNow.Content.ReadAsStringAsync());
+                Assert(syncNow.IsSuccessStatusCode && syncNowJson.RootElement.GetProperty("lastRunAt").ValueKind == JsonValueKind.String &&
+                    syncNowJson.RootElement.GetProperty("pending").GetInt32() == 0,
+                    "Sync Now runs a batch and answers the progress after it (P1.FU27)");
+            }
+
+            using (var restore = await client.GetAsync("/JellyfinMod/Placeholders/RestoreWatched"))
+            {
+                using var restoreJson = JsonDocument.Parse(await restore.Content.ReadAsStringAsync());
+                Assert(restore.IsSuccessStatusCode && restoreJson.RootElement.GetProperty("dryRun").GetBoolean() &&
+                    restoreJson.RootElement.GetProperty("items").GetArrayLength() == 0,
+                    "The watched restore's dry run answers, with nothing to restore here (P1.FU27)");
             }
             client.DefaultRequestHeaders.Remove("X-Smoke-Role");
             if (role.Length > 0) client.DefaultRequestHeaders.Add("X-Smoke-Role", role);

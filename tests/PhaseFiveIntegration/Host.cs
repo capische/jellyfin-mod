@@ -86,6 +86,12 @@ internal sealed partial class NativeWorld
     public ConcurrentQueue<string> ScanRequests { get; } = new();
     public bool AutoScan { get; set; } = true;
 
+    /// <summary>Whether Jellyfin reports a library scan running (<c>ILibraryManager.IsScanRunning</c>; the backfill gives way, P1.FU27).</summary>
+    public bool ScanRunning { get; set; }
+
+    /// <summary>Every user data save through the user data manager: user, item, and the data saved (the watched restore, P1.FU27).</summary>
+    public ConcurrentQueue<(Guid UserId, Guid ItemId, UserItemData Data)> SavedUserData { get; } = new();
+
     /// <summary>
     /// The TMDB id Jellyfin's metadata gives a scanned episode file, or null for one it only numbers (season and series packs:
     /// a file bound by its number alone is not verified as that episode).
@@ -369,6 +375,7 @@ internal sealed partial class NativeWorld
         switch (method.Name)
         {
             case "GetUserRootFolder": return new TestRoot(UserLibraries);
+            case "get_IsScanRunning": return ScanRunning;
             case "GetVirtualFolders":
                 var folders = Libraries.Select(folder => new VirtualFolderInfo
                 {
@@ -465,9 +472,20 @@ internal sealed class PluginHost : IAsyncDisposable
         var serverConfiguration = Stub<IServerConfigurationManager>.Create((method, _) => method.Name == "get_Configuration"
             ? new ServerConfiguration { SortRemoveWords = ["the", "a"], SortRemoveCharacters = [], SortReplaceCharacters = [] } : null);
         // Every native item reads as finished by every user: completion evidence exists as soon as an item is bound.
-        var userData = Stub<IUserDataManager>.Create((method, args) => method.Name == "GetUserData" && args?[1] is BaseItem item
-            ? new UserItemData { Key = item.Id.ToString("N"), Played = true, LastPlayedDate = time.GetUtcNow().UtcDateTime }
-            : null);
+        var userData = Stub<IUserDataManager>.Create((method, args) =>
+        {
+            if (method.Name == "GetUserData" && args?[1] is BaseItem item)
+                return new UserItemData { Key = item.Id.ToString("N"), Played = true, LastPlayedDate = time.GetUtcNow().UtcDateTime };
+            // A save is recorded and stored on the item, as Jellyfin stores a user data row for it (the watched restore, P1.FU27).
+            if (method.Name == "SaveUserData" && args is [User saver, BaseItem saved, UserItemData data, ..])
+            {
+                world.Native.SavedUserData.Enqueue((saver.Id, saved.Id, data));
+                saved.UserData = [.. saved.UserData ?? [], new UserData { ItemId = saved.Id, UserId = saver.Id, CustomDataKey = data.Key ?? saved.Id.ToString("N"),
+                    Played = data.Played, LastPlayedDate = data.LastPlayedDate, Item = null!, User = null! }];
+            }
+
+            return null;
+        });
         // A session plays an item while the run says so: its media source names the item, as a client's play state does.
         ISessionManager? sessionManager = null;
         var sessions = sessionManager = Stub<ISessionManager>.Create((method, _) => method.Name == "get_Sessions"
@@ -539,6 +557,7 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Services.AddTransient<RetentionLiveCheck>();
         builder.Services.AddTransient<RetentionExecutor>();
         builder.Services.AddTransient<JellyfinMod.Services.Placeholders.PlaceholderService>();
+        builder.Services.AddTransient<JellyfinMod.Services.Placeholders.PlaceholderWatchedRestore>();
         builder.Services.AddTransient<RetentionRunner>();
         if (taskManager is not null) builder.Services.AddSingleton(taskManager);
         else builder.Services.AddSingleton(Stub<ITaskManager>.Create((_, _) => null));
