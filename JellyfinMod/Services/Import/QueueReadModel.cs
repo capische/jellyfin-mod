@@ -125,6 +125,27 @@ public static class QueueReadModel
         }).ToArray());
     }
 
+    /// <summary>
+    /// A grab that is held, being sent or waiting for the client to confirm it, before its import exists (P4.FU10): a queued
+    /// row from the moment the grab is made, so every page, tab and device shows it as queued, never as Not Downloaded. Its id
+    /// is the grab's; <c>importState</c> is <c>held</c> while it can still be cancelled and <c>submitting</c> after. Once the
+    /// client accepts it, the import row (created in the same commit) takes its place.
+    /// </summary>
+    public static QueueRowDto Held(GrabOperation grab, Entry? entry, Episode? episode, IReadOnlyList<Episode> claimed,
+        AcquisitionDownloadClient? client, bool administrator) => new QueueRowDto(grab.Id, grab.Id,
+            entry is null ? null : new QueueEntryDto(entry.Id, entry.MediaType, entry.Title, entry.Year, entry.PosterPath,
+                entry.JellyfinItemId, entry.TargetLibraryId),
+            episode is null ? null : new QueueEpisodeDto(episode.Id, episode.SeasonNumber, episode.EpisodeNumber, episode.Title),
+            grab.RawTitle, "queued", grab.State == GrabStates.Pending ? "held" : "submitting", null, null, null, grab.Size, null, null,
+            null, null, null, null, grab.Intent, Utc(grab.CreatedAt)!.Value, Utc(grab.UpdatedAt)!.Value,
+            administrator && client is not null ? new QueueClientDto(client.Id, client.Name, client.OpenUrl) : null, null,
+            administrator && grab.InfoHash is { } hash ? new QueueAdminDetailDto(null, null, null, null, null, null, null, hash) : null)
+    {
+        Pack = ReleaseScopes.IsPack(grab.Scope) ? Pack(grab, claimed, [], null) : null,
+        Parsed = Parsed(grab),
+        IndexerName = grab.IndexerName
+    };
+
     /// <summary>The grab's release name as parsed when it was grabbed (P1.FU20); null for a grab that kept none.</summary>
     public static ParsedRelease? Parsed(GrabOperation grab)
     {

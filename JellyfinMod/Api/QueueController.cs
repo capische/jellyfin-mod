@@ -48,6 +48,14 @@ public sealed class QueueController(
         if (!administrator && !settings.QueueVisibleToUsers)
             return Refuse(403, "queue_admin_only", "The download queue is available to administrators.");
 
+        // Grabs not handed to the client yet (held, being sent, unconfirmed) are queued rows too (P4.FU10). They are read before
+        // the imports: a grab accepted between the two reads then shows as both (its held row is dropped below), never as neither.
+        var held = await database.GrabOperations.AsNoTracking()
+            .Where(grab => grab.ActiveTarget != null && GrabStates.Unresolved.Contains(grab.State) &&
+                !database.ImportOperations.Any(operation => operation.GrabId == grab.Id))
+            .OrderBy(grab => grab.CreatedAt).ToListAsync(cancellationToken);
+        if (entryId is { } heldEntry) held = held.Where(grab => grab.EntryId == heldEntry).ToList();
+
         var seeds = await database.SeedReleaseOperations.AsNoTracking()
             .Where(seed => SeedReleaseStates.Open.Contains(seed.State)).ToListAsync(cancellationToken);
         var seedImportIds = seeds.Select(seed => seed.ImportOperationId).ToHashSet();
@@ -129,6 +137,10 @@ public sealed class QueueController(
             var grab = grabs.GetValueOrDefault(operation.GrabId);
             rows.Add(grab is null ? row : row with { Parsed = QueueReadModel.Parsed(grab), IndexerName = grab.IndexerName });
         }
+
+        held = held.Where(grab => !grabs.ContainsKey(grab.Id)).ToList();
+        if (held.Count > 0 && (states is not { Length: > 0 } || states.Contains("queued", StringComparer.Ordinal)))
+            rows.AddRange(await HeldRowsAsync(held, user, administrator, clients, cancellationToken));
 
         return new QueueResultDto(rows, rows.Count, time.GetUtcNow().UtcDateTime, clientStatus, settings.ImportEnabled,
             settings.SeedReleaseEnabled)
@@ -472,6 +484,34 @@ public sealed class QueueController(
             .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (_, value) => value)
             .ToListAsync(cancellationToken);
         return claimed.All(value => CanSee(user, administrator, entry, value));
+    }
+
+    /// <summary>
+    /// The queued rows of grabs the client has not accepted yet (P4.FU10), with the visibility of the rows they become: a title
+    /// and episode the user may read, and for a pack every episode it claimed.
+    /// </summary>
+    private async Task<List<QueueRowDto>> HeldRowsAsync(IReadOnlyList<GrabOperation> held, User user, bool administrator,
+        IReadOnlyDictionary<Guid, AcquisitionDownloadClient> clients, CancellationToken cancellationToken)
+    {
+        var entryIds = held.Where(grab => grab.EntryId.HasValue).Select(grab => grab.EntryId!.Value).Distinct().ToArray();
+        var entries = await database.Entries.AsNoTracking().Where(entry => entryIds.Contains(entry.Id))
+            .ToDictionaryAsync(entry => entry.Id, cancellationToken);
+        var heldIds = held.Select(grab => grab.Id).ToArray();
+        var claims = await database.GrabClaims.AsNoTracking().Where(claim => heldIds.Contains(claim.GrabId))
+            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (claim, value) => new { claim.GrabId, Episode = value })
+            .ToListAsync(cancellationToken);
+        var rows = new List<QueueRowDto>();
+        foreach (var grab in held)
+        {
+            var entry = grab.EntryId is { } id ? entries.GetValueOrDefault(id) : null;
+            var claimed = claims.Where(claim => claim.GrabId == grab.Id).Select(claim => claim.Episode)
+                .OrderBy(value => value.SeasonNumber).ThenBy(value => value.EpisodeNumber).ToArray();
+            var episode = grab.EpisodeId is { } episodeId ? claimed.FirstOrDefault(value => value.Id == episodeId) : null;
+            if (!CanSee(user, administrator, entry, episode) || claimed.Any(value => !CanSee(user, administrator, entry, value))) continue;
+            rows.Add(QueueReadModel.Held(grab, entry, episode, claimed, clients.GetValueOrDefault(grab.DownloadClientId), administrator));
+        }
+
+        return rows;
     }
 
     private async Task<Dictionary<Guid, Entry>> LoadEntriesAsync(IEnumerable<ImportOperation> operations, CancellationToken cancellationToken)
