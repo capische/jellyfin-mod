@@ -1122,6 +1122,41 @@ public sealed class EntriesController(
         _ => "Updated this title"
     };
 
+    /// <summary>
+    /// The Jellyfin item that plays each readable episode's file, and the movie's, by target id (P4.FU12): the navigable item of
+    /// the binding whose file Jellyfin can play now (<see cref="NativeReadiness"/>). A stale binding, a placeholder, an item not
+    /// refreshed yet or a further version without a real owner is not listed. Bindings are read once and Jellyfin once per item.
+    /// </summary>
+    private async Task<Dictionary<Guid, Guid>> PlayableItemsAsync(Entry entry, IReadOnlyList<Episode> readableEpisodes,
+        CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<Guid, Guid>();
+        if (library is null) return result;
+        var now = DateTime.UtcNow;
+        if (entry.MediaType == "movie")
+        {
+            if (entry.State != FileState.OnDisk) return result;
+            foreach (var binding in await database.EntryBindings.AsNoTracking().Where(value => value.EntryId == entry.Id)
+                         .OrderBy(value => value.OwnerItemId == null ? 0 : 1).ThenBy(value => value.JellyfinItemId).ToListAsync(cancellationToken).ConfigureAwait(false))
+                if (NativeReadiness.IsReady(library, mediaSources, binding.JellyfinItemId, binding.OwnerItemId, now))
+                {
+                    result[entry.Id] = binding.OwnerItemId ?? binding.JellyfinItemId;
+                    break;
+                }
+
+            return result;
+        }
+
+        var ids = readableEpisodes.Where(episode => episode.State == FileState.OnDisk).Select(episode => episode.Id).ToArray();
+        if (ids.Length == 0) return result;
+        foreach (var binding in (await database.EpisodeBindings.AsNoTracking().Where(value => ids.Contains(value.EpisodeId))
+                     .ToListAsync(cancellationToken).ConfigureAwait(false))
+                 .OrderBy(value => value.OwnerItemId == null ? 0 : 1).ThenBy(value => value.JellyfinItemId))
+            if (!result.ContainsKey(binding.EpisodeId) && NativeReadiness.IsReady(library, mediaSources, binding.JellyfinItemId, binding.OwnerItemId, now))
+                result[binding.EpisodeId] = binding.OwnerItemId ?? binding.JellyfinItemId;
+        return result;
+    }
+
     private async Task<EntryDetail> BuildDetail(Entry entry, CancellationToken cancellationToken)
     {
         var user = access.GetUser(User)!;
@@ -1183,12 +1218,15 @@ public sealed class EntriesController(
         var versions = new JellyfinMod.Services.Automation.VersionReader(database, mediaSources, files ?? new UnixFileInspector(),
             library, userData);
         var warnings = await RetentionWarningsAsync(entry, episodes, policy, evaluations, history, isAdmin, cancellationToken).ConfigureAwait(false);
+        // The item that plays each file once Jellyfin can play it (P4.FU12), read from Jellyfin now, one pass over the bindings.
+        var playable = await PlayableItemsAsync(entry, readableEpisodes, cancellationToken).ConfigureAwait(false);
         var episodeDtos = new List<EpisodeDto>();
         foreach (var e in readableEpisodes)
             episodeDtos.Add(new EpisodeDto(e, RetentionSummaries.ForViewer(RetentionSummaries.ForTarget(entry, policy,
                 evaluations.GetValueOrDefault(e.Id), e), isAdmin), Summary(e.Id), projections.GetValueOrDefault(e.Id))
             {
                 RetentionWarning = warnings.GetValueOrDefault(e.Id),
+                PlayableItemId = playable.TryGetValue(e.Id, out var playableEpisode) ? playableEpisode : null,
                 PlaceholderItemId = e.State == FileState.OnDisk ? null
                     : placeholders.TryGetValue((e.SeasonNumber, e.EpisodeNumber), out var placeholder) ? placeholder : null,
                 Versions = e.State == FileState.OnDisk
@@ -1201,7 +1239,8 @@ public sealed class EntriesController(
             evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
         var readableHistory = await ReadableHistoryAsync(user, history, episodes, readableEpisodes, entry.MediaType == "series",
             cancellationToken).ConfigureAwait(false);
-        return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id)) { PlaceholderItemId = titleItem }, readableHistory,
+        return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id))
+            { PlaceholderItemId = titleItem, PlayableItemId = playable.TryGetValue(entry.Id, out var playableTitle) ? playableTitle : null }, readableHistory,
             episodeDtos, entryRetention,
             entry.MediaType == "movie" ? Summary(null) : null)
         {

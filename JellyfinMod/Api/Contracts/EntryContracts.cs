@@ -55,6 +55,13 @@ public sealed class EntryDto(Entry entry, JellyfinMod.Services.Import.ProjectedA
     /// </summary>
     [JsonPropertyName("placeholderItemId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Guid? PlaceholderItemId { get; init; }
+    /// <summary>
+    /// Gets the Jellyfin item that plays this movie's file once Jellyfin can play it (P4.FU12): bound, no placeholder, refreshed and
+    /// probed. A response-only projection of Jellyfin's current state (not the stored availability), set on entry detail answers;
+    /// null while the file is only listed or absent. The web keeps an import's ring until the page has drawn this item.
+    /// </summary>
+    [JsonPropertyName("playableItemId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Guid? PlayableItemId { get; init; }
     /// <summary>Gets progress.</summary>
     [JsonPropertyName("progress")]
     public int? Progress => _projected is null ? entry.Progress : _projected.Progress;

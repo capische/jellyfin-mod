@@ -79,6 +79,12 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     /// </summary>
     [JsonPropertyName("placeholderItemId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Guid? PlaceholderItemId { get; init; }
+    /// <summary>
+    /// Gets the Jellyfin item that plays this episode's file once Jellyfin can play it (P4.FU12): bound, no placeholder, refreshed and
+    /// probed, from Jellyfin's current state rather than the stored availability; null while it is only listed or absent.
+    /// </summary>
+    [JsonPropertyName("playableItemId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Guid? PlayableItemId { get; init; }
     /// <summary>Gets the privacy-safe automatic retention state on entry detail responses.</summary>
     [JsonPropertyName("retention")]
     public RetentionSummaryDto? Retention { get; } = retention;
