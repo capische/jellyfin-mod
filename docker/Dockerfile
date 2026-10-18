@@ -6,8 +6,9 @@
 # for amd64 and arm64; build it on the host that runs it, or with buildx for another platform.
 
 # The host is pinned by digest, never by a moving tag: a host upgrade is a deliberate image release
-# that runs the upstream merge routine (PHASE7 §3.4). This digest reports Jellyfin 12.0.0.
-ARG JELLYFIN_IMAGE=jellyfin/jellyfin@sha256:baba630419915985442f315f08b0cf46d9f4c8a0cc4bd38e94a6d35751dd5ef5
+# that runs the upstream merge routine (PHASE7 §3.4). This digest reports Jellyfin 12.2.0 (tag
+# 12.2.20261005-225228, the same digest as 12.2 and latest on 2026-10-18; there is no 12.2.0 tag).
+ARG JELLYFIN_IMAGE=jellyfin/jellyfin@sha256:357724bf0ae27a672c7cbaa899db2d9abeb13dbd8657ccce750258a4c059d037
 FROM ${JELLYFIN_IMAGE}
 
 LABEL org.opencontainers.image.title="JellyfinMod" \

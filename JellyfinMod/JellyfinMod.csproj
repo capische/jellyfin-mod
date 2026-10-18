@@ -6,17 +6,17 @@
     <Version>0.1.0.0</Version>
   </PropertyGroup>
 
-  <!-- Pinned to the server every instance runs: Jellyfin 12.0.0 on .NET 10 (the Docker image's
-       digest). There is no Jellyfin 11.x: versions ran 10.x to 10.11, then dropped the leading "10.",
+  <!-- Pinned to the server every instance runs: Jellyfin 12.2.0 on .NET 10 (the Docker image's
+       digest; retargeted from 12.0.0 on 2026-10-18, P0.FU1). There is no Jellyfin 11.x: versions ran 10.x to 10.11, then dropped the leading "10.",
        so 10.12 became 12.0. 10.11 is no longer supported (decided 2026-09-24) - see
        ../../jellyfin-web/docs/jellyfinmod/README.md 7.1. -->
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Controller" Version="12.0.0" />
-    <PackageReference Include="Jellyfin.Model" Version="12.0.0" />
+    <PackageReference Include="Jellyfin.Controller" Version="12.2.0" />
+    <PackageReference Include="Jellyfin.Model" Version="12.2.0" />
   </ItemGroup>
 
-  <!-- The EF Core the Jellyfin 12.0.0 host ships (Jellyfin.Database.Implementations 12.0.0 depends on
-       10.0.11, and the host's deps.json loads 10.0.11). The host supplies it at runtime; only
+  <!-- The EF Core the Jellyfin 12.2.0 host ships (unchanged from 12.0.0: the 12.2 image's deps.json loads
+       Microsoft.EntityFrameworkCore 10.0.11). The host supplies it at runtime; only
        JellyfinMod.dll is packaged, so compiling against the same version is what keeps every call
        binding to a member the host really has. -->
   <ItemGroup>
@@ -27,7 +27,7 @@
   </ItemGroup>
 
   <!-- Jellyfin's own TMDb connection (P1.FU13): the host's TmdbClientManager returns TMDbLib types, and the host
-       ships TMDbLib 3.0.0 (the Jellyfin 12.0.0 image). Compile against the same version; the host's copy binds at
+       ships TMDbLib 3.0.0 (the Jellyfin 12.2.0 image, as 12.0.0). Compile against the same version; the host's copy binds at
        runtime, so nothing of it is packaged or copied. The suites carry their own copy (Directory.Build.props). -->
   <ItemGroup>
     <PackageReference Include="TMDbLib" Version="3.0.0">

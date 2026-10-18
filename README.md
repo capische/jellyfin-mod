@@ -28,18 +28,18 @@ decision logs; several questions in them are settled.
 ## Target
 
 Pinned to the server every instance runs, and the one the Docker image pins by digest: Jellyfin
-12.0.0 on .NET 10.
+12.2.0 on .NET 10 (retargeted from 12.0.0 on 2026-10-18; EF Core and TMDbLib are unchanged).
 
 | | |
 | --- | --- |
 | Framework | `net10.0` |
-| Packages | `Jellyfin.Controller` / `Jellyfin.Model` `12.0.0` |
+| Packages | `Jellyfin.Controller` / `Jellyfin.Model` `12.2.0` |
 | EF Core | `Microsoft.EntityFrameworkCore.Sqlite` `10.0.11`, the version the host ships |
-| `targetAbi` | `12.0.0.0` |
+| `targetAbi` | `12.2.0.0` |
 
 There is no Jellyfin 11.x — versions ran 10.x to 10.11, then dropped the leading `10.`, so 10.12
 became 12.0. **Jellyfin 10.11 is no longer supported** (decided 2026-09-24): the plugin compiles
-against 12.0.0 and a 10.11 server refuses to load it (`targetAbi` is a minimum). The compatibility
+against 12.2.0 and an older server (12.0, 12.1 or 10.11) refuses to load it (`targetAbi` is a minimum). The compatibility
 matrix is PHASE7 §3.5. Building needs the .NET 10 SDK.
 
 ## Layout
@@ -82,10 +82,10 @@ python3 -m venv .venv
 
 Copy all three generated files (`JellyfinMod.dll`, `logo.png`, `meta.json`) from `artifacts/package`
 into the plugin's own folder under the server's persistent `plugins/` directory, then restart
-Jellyfin. The helper reads `build.yaml` and adds the `imagePath` field Jellyfin 12.0.0 reads;
+Jellyfin. The helper reads `build.yaml` and adds the `imagePath` field Jellyfin 12 reads;
 copying only the DLL leaves the installed plugin card without its logo.
 The assembly version matches `build.yaml` (`0.1.0.0`).
-Jellyfin 12.0.0 already supplies EF Core 10 and SQLite, including the native SQLite library; do
+Jellyfin 12.2.0 already supplies EF Core 10 and SQLite, including the native SQLite library; do
 not copy the host assemblies or a second database stack into the plugin directory.
 
 For plugin-only deployment from the sibling web checkout:
@@ -156,7 +156,7 @@ services:
     #   JELLYFINMOD_UI_TAKEOVER: "false"   # first start only: keep the stock page at /web
 ```
 
-The image is the pinned `jellyfin/jellyfin` digest (Jellyfin 12.0.0) plus the plugin at
+The image is the pinned `jellyfin/jellyfin` digest (Jellyfin 12.2.0) plus the plugin at
 `/opt/jellyfinmod/plugin/`. Its entrypoint runs before Jellyfin and then `exec`s it:
 
 - **Plugin install.** Copies the plugin into `/config/plugins/JellyfinMod_<version>/` when it is
