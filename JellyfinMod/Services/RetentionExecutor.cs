@@ -22,7 +22,6 @@ public sealed class RetentionExecutor(
     TimeProvider clock,
     ILogger<RetentionExecutor> logger,
     RetentionLiveCheck liveCheck,
-    ILibraryMonitor? libraryMonitor = null,
     LibraryNotifications? notifications = null)
 {
     /// <summary>Revalidates and reclaims one binding selected by the shared retention preview.</summary>
@@ -84,9 +83,6 @@ public sealed class RetentionExecutor(
         {
             if (!TryInspect(item, out var observed, out var inspectionReason))
                 return RetentionExecutionResult.NotStarted(bindingId, inspectionReason);
-            // A placeholder is not media: never a reclaim, whatever binds it (P1.FU25; reconciliation never binds one).
-            if (Placeholders.PlaceholderStub.IsStubFile(observed.CanonicalPath))
-                return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.Placeholder);
             // Still the very file the binding recorded (whole-review P1 1), read again just before it is prepared.
             if (await FingerprintReasonAsync(item, observed, cancellationToken).ConfigureAwait(false) is { } fingerprintReason)
                 return RetentionExecutionResult.NotStarted(bindingId, fingerprintReason);
@@ -743,9 +739,8 @@ public sealed class RetentionExecutor(
 
         // The episodes this reclaim leaves without any file, for the placeholders written once it is recorded (P1.FU25).
         var leftWithoutFile = new List<Placeholders.PlaceholderService.ReclaimedEpisode>();
-        string? seriesTitle = null;
         // A movie this reclaim leaves without any file, for its placeholder written once the reclaim is recorded (P1.FU26).
-        (string Title, int? Year)? movieLeft = null;
+        (string Title, int? Year, int TmdbId)? movieLeft = null;
         if (operation.EpisodeId.HasValue)
         {
             var binding = await database.EpisodeBindings.SingleOrDefaultAsync(
@@ -796,9 +791,6 @@ public sealed class RetentionExecutor(
                         .ConfigureAwait(false)).State = removed ? FileState.None : FileState.Reclaimed;
             }
 
-            if (leftWithoutFile.Count > 0)
-                seriesTitle = await database.Entries.AsNoTracking().Where(candidate => candidate.Id == entryId)
-                    .Select(candidate => candidate.Title).SingleAsync(cancellationToken).ConfigureAwait(false);
         }
         else
         {
@@ -821,7 +813,7 @@ public sealed class RetentionExecutor(
             var removedMovie = operation.Provenance == RetentionProvenances.VersionRemoved;
             entry.State = remaining.Length > 0 ? FileState.OnDisk : removedMovie ? FileState.None : FileState.Reclaimed;
             if (removedMovie && remaining.Length == 0) entry.Monitored = false;
-            if (operation.Provenance == RetentionProvenances.Retention && remaining.Length == 0) movieLeft = (entry.Title, entry.Year);
+            if (operation.Provenance == RetentionProvenances.Retention && remaining.Length == 0) movieLeft = (entry.Title, entry.Year, entry.TmdbId);
             if (remaining.Length > 0)
                 await ReconciliationService.RepointRepresentationEvidenceAsync(database, entry.Id, operation.JellyfinItemId,
                     remaining[0].JellyfinItemId, cancellationToken).ConfigureAwait(false);
@@ -887,27 +879,28 @@ public sealed class RetentionExecutor(
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         if (leftWithoutFile.Count > 0)
-            await LeavePlaceholdersAsync(operation, actionEntryLeaderId, seriesTitle!, leftWithoutFile).ConfigureAwait(false);
+            await LeavePlaceholdersAsync(operation, actionEntryLeaderId, leftWithoutFile).ConfigureAwait(false);
         if (movieLeft is { } movie &&
-            Placeholders.PlaceholderService.LeaveAfterMovieReclaim(library, files, libraryMonitor, operation.TargetLibraryId, operation.MediaPath,
-                movie.Title, movie.Year, logger) is not null)
+            await Placeholders.PlaceholderItems.LeaveAfterMovieReclaimAsync(library, operation.TargetLibraryId, movie.TmdbId, movie.Title,
+                movie.Year, logger).ConfigureAwait(false))
             await NotePlaceholderAsync(operation, actionEntryLeaderId, MoviePlaceholderLeft).ConfigureAwait(false);
         return RetentionExecutionResult.From(operation);
     }
 
     /// <summary>
-    /// After a reclaim is unlinked and recorded (P1.FU25): writes a placeholder for each episode the file held, where the library
-    /// shows missing episodes and the folder can be written, so the episode stays in Jellyfin with its artwork and its user data
-    /// (re-attached by key to the stub's item) instead of disappearing. Only ever writes; never deletes. The reclaim's history
-    /// says a placeholder was left. A failure here leaves the reclaim as it is (the next placeholder sync can still write it).
+    /// After a reclaim is unlinked and recorded (P1.FU25, P1.FU30): makes a placeholder item for each episode the file held, where
+    /// the library shows missing episodes, so the episode stays in Jellyfin with its user data (re-attached by key) instead of
+    /// disappearing. Only ever makes items; never deletes. The reclaim's history says a placeholder was left. A failure here
+    /// leaves the reclaim as it is (the next placeholder sync can still make it).
     /// </summary>
-    private async Task LeavePlaceholdersAsync(RetentionOperation operation, Guid historyId, string seriesTitle,
+    private async Task LeavePlaceholdersAsync(RetentionOperation operation, Guid historyId,
         IReadOnlyList<Placeholders.PlaceholderService.ReclaimedEpisode> episodes)
     {
-        var written = Placeholders.PlaceholderService.LeaveAfterReclaim(library, files, libraryMonitor, operation.TargetLibraryId,
-            operation.MediaPath, seriesTitle, episodes, logger);
-        if (written.Count == 0) return;
-        await NotePlaceholderAsync(operation, historyId, PlaceholderLeft).ConfigureAwait(false);
+        var tmdbId = await database.Entries.AsNoTracking().Where(entry => entry.Id == operation.EntryId).Select(entry => entry.TmdbId)
+            .SingleOrDefaultAsync(CancellationToken.None).ConfigureAwait(false);
+        if (await Placeholders.PlaceholderItems.LeaveAfterReclaimAsync(library, operation.TargetLibraryId, operation.MediaPath, tmdbId, episodes,
+                logger).ConfigureAwait(false) > 0)
+            await NotePlaceholderAsync(operation, historyId, PlaceholderLeft).ConfigureAwait(false);
     }
 
     /// <summary>Appends to the reclaim's history that it left a placeholder; a failure only logs.</summary>

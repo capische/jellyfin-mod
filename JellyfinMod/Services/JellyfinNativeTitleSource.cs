@@ -259,10 +259,10 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
             };
             foreach (var episode in ReadPages(query, cancellationToken).OfType<Episode>())
             {
-                // A placeholder (a media stub, P1.FU24) is an item but no file: its episode stays missing, never on disk.
+                // A placeholder (an item with no file, P1.FU30) is an item but no file: its episode stays missing, never on disk.
                 if (episode.IsPlaceHolder)
                 {
-                    if (Placeholders.PlaceholderStub.IsStubFile(episode.Path)) placeholders++;
+                    if (Placeholders.PlaceholderItems.IsOwn(episode.Path)) placeholders++;
                     continue;
                 }
 
@@ -321,11 +321,11 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
     private static bool IsPlayable(BaseItem item) => !string.IsNullOrWhiteSpace(item.Path);
 
     /// <summary>
-    /// A movie that is one of the plugin's placeholders (P1.FU26): not media, so reconciliation never binds it, never calls its
-    /// entry on disk and never backfills an entry from it. Its entry finds it by TMDB id instead.
+    /// A series or movie that is one of the plugin's placeholder items with no file (P1.FU26, P1.FU30): not media, so
+    /// reconciliation never binds it, never calls its entry on disk and never backfills an entry from it. Its entry finds it by
+    /// TMDB id instead.
     /// </summary>
-    private static bool IsPlaceholderMovie(BaseItem item) =>
-        item is Movie { IsPlaceHolder: true } movie && Placeholders.PlaceholderStub.IsStubFile(movie.Path);
+    private static bool IsPlaceholderMovie(BaseItem item) => Placeholders.PlaceholderItems.IsOwn(item);
 
     private static int? ProviderTmdbId(BaseItem item) => ParseProviderId(item, "Tmdb");
 

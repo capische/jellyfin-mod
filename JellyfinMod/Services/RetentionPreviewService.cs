@@ -123,10 +123,7 @@ public sealed class RetentionPreviewService(
         foreach (var candidate in inspected.Where(candidate => candidate.State == RetentionPreviewStates.PendingProtection))
         {
             var path = candidate.File?.CanonicalPath ?? candidate.Target.Path;
-            // A placeholder of the plugin's is not media and never reclaimed, whatever binds it (P1.FU25).
-            if (Placeholders.PlaceholderStub.IsStubFile(path))
-                candidate.Block(RetentionPreviewReasons.Placeholder);
-            else if (!string.IsNullOrEmpty(path) && !files.CanUnlink(path))
+            if (!string.IsNullOrEmpty(path) && !files.CanUnlink(path))
                 candidate.Block(RetentionPreviewReasons.MediaNotWritable);
         }
 
@@ -258,35 +255,30 @@ public sealed class RetentionPreviewService(
     }
 
     /// <summary>
-    /// Marks the due and scheduled episode files whose reclaim leaves a placeholder (P1.FU25): the episode's only file, in a TV
-    /// library that shows missing episodes, in a folder the plugin can write (the executor writes it by the same rule).
+    /// Marks the due and scheduled files whose reclaim leaves a placeholder (P1.FU25, P1.FU26, P1.FU30): a movie's or a regular
+    /// episode's only file, in a library whose placeholder switch is on (the executor makes the item by the same rule).
     /// </summary>
     private async Task<RetentionRepresentationDto[]> MarkPlaceholdersAsync(RetentionRepresentationDto[] items, PreviewTarget[] targets,
         CancellationToken cancellationToken)
     {
-        // A movie's last file leaves the movie's placeholder (P1.FU26), by the executor's own rule.
         var movieCopies = targets.Where(target => target.EpisodeId is null).GroupBy(target => target.EntryId)
             .ToDictionary(group => group.Key, group => group.Count());
         items = items.Select(item => item.EpisodeId is null && item.State is RetentionPreviewStates.Due or RetentionPreviewStates.Scheduled &&
-            movieCopies.GetValueOrDefault(item.EntryId) == 1 &&
-            Placeholders.PlaceholderService.MovieReclaimStubPath(library, files, item.TargetLibraryId, item.CanonicalPath ?? item.Path) is not null
+            movieCopies.GetValueOrDefault(item.EntryId) == 1 && Placeholders.PlaceholderSettings.IsEnabled(item.TargetLibraryId)
                 ? item with { LeavesPlaceholder = true }
                 : item).ToArray();
         var rows = items.Where(item => item.EpisodeId is not null &&
             item.State is RetentionPreviewStates.Due or RetentionPreviewStates.Scheduled).ToArray();
         if (rows.Length == 0) return items;
         var ids = rows.Select(item => item.EpisodeId!.Value).Distinct().ToArray();
-        var numbers = await database.Episodes.AsNoTracking().Where(episode => ids.Contains(episode.Id))
-            .Select(episode => new { episode.Id, episode.SeasonNumber, episode.EpisodeNumber })
-            .ToDictionaryAsync(episode => episode.Id, cancellationToken).ConfigureAwait(false);
+        var seasons = await database.Episodes.AsNoTracking().Where(episode => ids.Contains(episode.Id))
+            .Select(episode => new { episode.Id, episode.SeasonNumber })
+            .ToDictionaryAsync(episode => episode.Id, episode => episode.SeasonNumber, cancellationToken).ConfigureAwait(false);
         var copies = targets.Where(target => target.EpisodeId is not null).GroupBy(target => target.EpisodeId!.Value)
             .ToDictionary(group => group.Key, group => group.Count());
-        var roots = rows.Select(item => item.TargetLibraryId).Distinct()
-            .ToDictionary(id => id, id => Placeholders.PlaceholderService.ReclaimRoots(library, files, id));
         return items.Select(item => item.EpisodeId is { } episodeId && item.State is RetentionPreviewStates.Due or RetentionPreviewStates.Scheduled &&
-            copies.GetValueOrDefault(episodeId) == 1 && numbers.TryGetValue(episodeId, out var number) &&
-            Placeholders.PlaceholderService.ReclaimStubPath(files, roots[item.TargetLibraryId], item.CanonicalPath ?? item.Path,
-                number.SeasonNumber, number.EpisodeNumber) is not null
+            copies.GetValueOrDefault(episodeId) == 1 && seasons.GetValueOrDefault(episodeId) > 0 &&
+            Placeholders.PlaceholderSettings.IsEnabled(item.TargetLibraryId)
                 ? item with { LeavesPlaceholder = true }
                 : item).ToArray();
     }

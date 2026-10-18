@@ -42,7 +42,7 @@ public sealed class EntriesController(
         try
         {
             if (library?.GetItemById(itemId) is not MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: true } stub ||
-                !JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stub.Path) ||
+                !JellyfinMod.Services.Placeholders.PlaceholderItems.IsOwn(stub.Path) ||
                 !int.TryParse(stub.ProviderIds.FirstOrDefault(pair => pair.Key.Equals("Tmdb", StringComparison.OrdinalIgnoreCase)).Value,
                     System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var tmdbId))
                 return [];
@@ -81,7 +81,7 @@ public sealed class EntriesController(
         try
         {
             return library?.GetItemById(itemId) is MediaBrowser.Controller.Entities.TV.Episode { IsPlaceHolder: true } stub &&
-                JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stub.Path) && stub.SeriesId != Guid.Empty
+                JellyfinMod.Services.Placeholders.PlaceholderItems.IsOwn(stub.Path) && stub.SeriesId != Guid.Empty
                 ? stub.SeriesId
                 : null;
         }
@@ -845,8 +845,7 @@ public sealed class EntriesController(
                     "so it cannot be removed while the media exists."
             });
 
-        // Its placeholders go first (only the plugin's marked stubs and the folders that left empty), under the library lock held
-        // here, so no sync writes them back meanwhile.
+        // Its placeholder items go first, under the library lock held here, so no sync makes them again meanwhile.
         if (placeholderService is not null) await placeholderService.RemoveForEntryAsync(entry, cancellationToken);
         if (placeholderOnly) database.EntryBindings.RemoveRange(entryBindings);
         database.Entries.Remove(entry);
@@ -873,7 +872,7 @@ public sealed class EntriesController(
             });
             // At least one placeholder and no file: a series folder the user made empty (no episode at all) is theirs, not ours.
             return episodes.Count > 0 && episodes.All(episode => episode is MediaBrowser.Controller.Entities.Video { IsPlaceHolder: true } video &&
-                JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(video.Path));
+                JellyfinMod.Services.Placeholders.PlaceholderItems.IsOwn(video.Path));
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
@@ -1195,7 +1194,7 @@ public sealed class EntriesController(
         var placeholders = new Dictionary<(int Season, int Episode), Guid>();
         foreach (var item in visibleItems.OfType<MediaBrowser.Controller.Entities.TV.Episode>())
             if (item is { IsPlaceHolder: true, ParentIndexNumber: { } season, IndexNumber: { } number } &&
-                JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(item.Path))
+                JellyfinMod.Services.Placeholders.PlaceholderItems.IsOwn(item.Path))
                 placeholders.TryAdd((season, number), item.Id);
         // The newest grab per target supplies the acquisition summary; file availability stays separate (P4.A6).
         var grabs = await database.GrabOperations.AsNoTracking().Where(operation => operation.EntryId == entry.Id)

@@ -30,14 +30,13 @@ internal sealed record RemovedItem(Guid Id, string Kind, string Path, Guid Serie
 /// library-wide pass:
 /// <list type="number">
 /// <item>under the library lease, the bindings the removals name whose files are provably gone are cleared
-/// (<see cref="ReconciliationService.ConfirmAbsenceInScopeUnderLeaseAsync"/>), and each affected title's placeholders are written
-/// where the title was (<see cref="PlaceholderService.SyncEntryUnderLeaseAsync"/>);</item>
-/// <item>once the lease is released, Jellyfin is made to hold the written folders (<see cref="IMediaDiscovery"/>).</item>
+/// (<see cref="ReconciliationService.ConfirmAbsenceInScopeUnderLeaseAsync"/>), and each affected title's placeholder items are made
+/// (<see cref="PlaceholderService.SyncEntryUnderLeaseAsync"/>, P1.FU30): they exist at once, and the clients are told.</item>
 /// </list>
-/// Removals the plugin made itself (the import's swap, a stale stub, Remove Placeholders, Remove Entry) are expected once each and
-/// start nothing. At start, bindings whose files are gone (a delete made while the server was down) are repaired the same way.
-/// A title that left the catalog, a library turned off, a read-only folder, a file already in place or storage that cannot be
-/// proved gone gets nothing, as in every sync.
+/// The plugin's own items (<see cref="PlaceholderItems"/>) start nothing. At start, bindings whose files are gone (a delete made
+/// while the server was down) are repaired the same way, and Jellyfin is made to look at the nearest folder still there
+/// (<see cref="IMediaDiscovery"/>). A title that left the catalog, a library turned off, a file already in place or storage that
+/// cannot be proved gone gets nothing, as in every sync.
 /// </summary>
 public sealed class DeleteRepair(ILibraryManager library, IServiceScopeFactory scopeFactory, TimeProvider time,
     ILogger<DeleteRepair> logger, DatabaseInitializer? readiness = null, IMediaDiscovery? discovery = null,
@@ -102,15 +101,10 @@ public sealed class DeleteRepair(ILibraryManager library, IServiceScopeFactory s
                 JellyfinEpisode episode => ((string?)"episode", episode.SeriesId),
                 _ => ((string?)null, Guid.Empty)
             };
-            if (kind is null) return;
-            // The plugin's own removals: by item id when it deleted the item itself, else by path (the import's swap). Both are taken.
-            var byItem = PlaceholderStub.ConsumeExpectedItem(item.Id);
-            var byPath = PlaceholderStub.ConsumeExpectedRemoval(item.Path);
-            if (byItem || byPath)
-            {
-                logger.LogDebug("JellyfinMod expected the removal of {Path}", item.Path);
-                return;
-            }
+            // The plugin's own items are its own removals; a real series' or movie's provider ids are kept a while, so the item made
+            // in its place carries the same keys and the user data comes back by key.
+            if (kind is null || PlaceholderItems.IsOwn(item)) return;
+            PlaceholderItems.RememberRemoved(item);
 
             int? tmdb = item.ProviderIds.TryGetValue("Tmdb", out var raw) &&
                 int.TryParse(raw, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : null;
@@ -195,8 +189,7 @@ public sealed class DeleteRepair(ILibraryManager library, IServiceScopeFactory s
         var outermost = paths.Where(path => !paths.Any(other => other != path && path.StartsWith(other + Path.DirectorySeparatorChar, StringComparison.Ordinal))).ToList();
         var removed = new RemovedScope(items.Where(item => item.Kind is "movie" or "series" or "episode" or "missing").Select(item => item.Id).Distinct().ToList(), outermost);
         var started = time.GetTimestamp();
-        var changed = new HashSet<string>(StringComparer.Ordinal);
-        var written = new List<string>();
+        var made = 0;
         var titles = 0;
         await using (await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false))
         {
@@ -221,35 +214,19 @@ public sealed class DeleteRepair(ILibraryManager library, IServiceScopeFactory s
                 entry.MediaType == mediaType).Select(entry => new { entry.Id, entry.TmdbId }).ToListAsync(cancellationToken).ConfigureAwait(false);
             foreach (var entry in entries)
             {
-                // The folder the title had, from the removal of the title itself (a series' folder, a movie's folder).
-                var own = items.FirstOrDefault(item => item.Kind == mediaType && item.Tmdb == entry.TmdbId);
-                var preferred = own is null ? null : movies ? Path.GetDirectoryName(own.Path) : own.Path;
-                var result = await placeholders.SyncEntryUnderLeaseAsync(libraryId, entry.Id, preferred, cancellationToken).ConfigureAwait(false);
-                changed.UnionWith(result.ChangedFolders);
-                written.AddRange(result.Written.Select(write => write.Path));
+                made += (await placeholders.SyncEntryUnderLeaseAsync(libraryId, entry.Id, cancellationToken).ConfigureAwait(false)).Writes.Count;
                 titles++;
             }
 
-            logger.LogInformation("JellyfinMod repaired a delete in library {Library}: {Bindings} binding(s) cleared, {Titles} title(s) looked at, {Unverified} not provable, {Folders} folder(s) changed",
-                libraryId, absence.RemovedBindings, titles, absence.Unverified.Count, changed.Count);
+            logger.LogInformation("JellyfinMod repaired a delete in library {Library}: {Bindings} binding(s) cleared, {Titles} title(s) looked at, {Unverified} not provable, {Made} placeholder item(s) made in {Seconds:F1} s",
+                libraryId, absence.RemovedBindings, titles, absence.Unverified.Count, made, time.GetElapsedTime(started).TotalSeconds);
         }
 
-        // The clients are told twice (P4.FU12): at once, that the items are gone and the catalog's own rows stand in, and once
-        // Jellyfin holds the placeholders, that they are there. Each is one early LibraryChanged, sent only to who may see it.
+        // The clients are told at once that the removed items are gone (one early LibraryChanged, only to who may see it); the
+        // sync has told them of the placeholder items it made.
         var (rating, tags) = RatingOf(items);
         var removedIds = items.Where(item => item.Kind != "missing").Select(item => item.Id).Distinct().ToArray();
         notifications?.Notify(new(libraryId, movies, [], removedIds, [libraryId], rating, tags));
-
-        // Jellyfin is made to hold what was written only after the lease is free, so an import or an Add is never made to wait for it.
-        if (changed.Count > 0 && discovery is not null)
-        {
-            await discovery.DiscoverAsync(libraryId, written.Concat(changed).ToArray(), cancellationToken).ConfigureAwait(false);
-            logger.LogInformation("JellyfinMod delete repair in library {Library} took {Seconds:F1} s until Jellyfin held the placeholders", libraryId,
-                time.GetElapsedTime(started).TotalSeconds);
-            var addedIds = written.Select(path => library.FindByPath(path, false)?.Id).OfType<Guid>().ToArray();
-            var folderIds = changed.Select(path => library.FindByPath(path, true)?.Id).OfType<Guid>().Append(libraryId).Distinct().ToArray();
-            notifications?.Notify(new(libraryId, movies, addedIds, [], folderIds, rating, tags));
-        }
     }
 
     /// <summary>
@@ -320,8 +297,8 @@ public sealed class DeleteRepair(ILibraryManager library, IServiceScopeFactory s
                     await discovery.DiscoverAsync(folder.Id, ancestors.Take(20).ToArray(), cancellationToken).ConfigureAwait(false);
             }
 
-            // And the normal bounded sync once, for titles with no binding (placeholders only) whose stubs went while the server was
-            // down; it yields to a library scan and writes a few titles per library, the schedule finishing the rest.
+            // And the normal bounded sync once, for what changed while the server was down (a placeholder a file arrived for, a title
+            // with no binding); it yields to a library scan and makes a few titles per library, the schedule finishing the rest.
             if (SyncAtStart) await PlaceholderBackfill.TryRunAsync(scopeFactory, library, time, logger, null, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)

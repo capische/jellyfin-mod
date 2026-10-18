@@ -96,19 +96,21 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         // The Trakt indicator (P7.Q16): the host's plugin list, and a listener of its own for Trakt's history imports.
         services.AddSingleton<TraktPluginState>();
         services.AddSingleton<IHostedService, TraktObservationListener>();
-        // Placeholders for missing episodes (P1.FU24): the writer, the item stamp, and the filter that keeps stock apps from
+        // Placeholders for missing episodes (P1.FU24, P1.FU30): the item store, and the filter that keeps stock apps from
         // offering or playing them. The filter shapes every stock controller's answers; MVC is configured after this runs.
         services.AddTransient<PlaceholderService>();
         // The administrator's watched restore from retention history (P1.FU27).
         services.AddTransient<PlaceholderWatchedRestore>();
         services.AddSingleton<IHostedService, PlaceholderItemListener>();
         services.AddSingleton<IHostedService, PlaceholderBackfillStarter>();
-        // A delete in Jellyfin brings the title's placeholders back at once (P1.FU29, P4.FU12).
+        // A delete in Jellyfin brings the title's placeholders back at once (P1.FU29, P4.FU12), and a real item that arrives
+        // takes its placeholder's place (P1.FU30).
         services.AddSingleton<IHostedService, DeleteRepair>();
+        services.AddSingleton<IHostedService, PlaceholderItemRepair>();
         // The clients hear of a plugin change at once, through Jellyfin's own LibraryChanged message (P4.FU12).
         services.AddSingleton<LibraryNotifications>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<LibraryNotifications>());
-        // Jellyfin holds the files the plugin writes at once, by its own folder validation (P4.FU12).
+        // Jellyfin holds the files the import links at once, by its own folder validation (P4.FU12).
         services.AddSingleton<FolderRefresh>();
         services.AddSingleton<IMediaDiscovery>(provider => provider.GetRequiredService<FolderRefresh>());
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<FolderRefresh>());

@@ -742,32 +742,18 @@ public sealed class ImportService(
     }
 
     /// <summary>
-    /// The import's half of the placeholder swap (P1.FU25), under the library lock, after the real file is linked, verified and
-    /// recorded and before the scan is requested: the episode's stubs leave its series' folders, so the one refresh of the
-    /// folder finds the stub gone and the file there, and Jellyfin carries the stub item's user data over to the new item by
-    /// key. A failure here never fails the import (the sync removes a leftover stub once the episode is on disk). A stub in
-    /// another season folder than the file's has that folder reported too.
+    /// The import's half of the placeholder swap (P1.FU25, P1.FU30), under the library lock, after the real file is linked,
+    /// verified and recorded and before the scan is requested: the plugin's placeholder items of the episode or movie go first,
+    /// so the new item takes their parked user data by key on its first refresh. A failure here never fails the import (the
+    /// sync removes a leftover placeholder once the real item is there).
     /// </summary>
     private void SwapPlaceholders(ImportOperation operation, Episode? episode)
     {
-        if (operation.DestinationPath is not { } destination) return;
-        // A movie's placeholder goes the same way (P1.FU26): from the file's folder and any title folder of its TMDB id.
-        var tmdbId = episode is null ? database.Entries.AsNoTracking().Where(entry => entry.Id == operation.EntryId)
-            .Select(entry => entry.TmdbId).SingleOrDefault() : 0;
-        var changed = episode is null
-            ? Placeholders.PlaceholderService.SwapMovieForImport(files, LibraryRoots(operation.TargetLibraryId), destination, tmdbId, logger)
-            : Placeholders.PlaceholderService.SwapForImport(files, destination, episode.SeasonNumber, episode.EpisodeNumber, logger);
-        foreach (var folder in changed)
-        {
-            try
-            {
-                libraryMonitor.ReportFileSystemChanged(folder);
-            }
-            catch (Exception error) when (error is not OutOfMemoryException)
-            {
-                logger.LogWarning("Import {Operation} could not ask Jellyfin to look at {Folder}: {Error}", operation.Id, folder, error.Message);
-            }
-        }
+        if (operation.DestinationPath is null) return;
+        var tmdbId = database.Entries.AsNoTracking().Where(entry => entry.Id == operation.EntryId)
+            .Select(entry => entry.TmdbId).SingleOrDefault();
+        Placeholders.PlaceholderItems.SwapForImport(library, operation.TargetLibraryId, tmdbId, episode?.SeasonNumber, episode?.EpisodeNumber,
+            logger);
     }
 
     private async Task MarkLinkedAsync(ImportOperation operation, UnixFileSnapshot linked)

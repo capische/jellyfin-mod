@@ -74,7 +74,7 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     [JsonPropertyName("jellyfinItemId")]
     public Guid? JellyfinItemId { get; } = episode.JellyfinItemId;
     /// <summary>
-    /// Gets the Jellyfin placeholder item that stands for this missing episode (P1.FU24: a media stub, <c>IsPlaceHolder</c>), on
+    /// Gets the Jellyfin placeholder item that stands for this missing episode (P1.FU24, P1.FU30: an item with no file, <c>IsPlaceHolder</c>), on
     /// entry detail responses; null when the episode has a file or no placeholder.
     /// </summary>
     [JsonPropertyName("placeholderItemId"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

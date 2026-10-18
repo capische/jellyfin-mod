@@ -7,8 +7,7 @@ namespace JellyfinMod.Services.Import;
 
 /// <summary>
 /// Where an episode of a series lives on disk, by the import's own rules (PHASE5 <i>Destination naming</i>): a library's
-/// readable roots, the series folder its bound episodes are in, and an existing season folder. Shared by the import and the
-/// placeholder writer (P1.FU24), so a placeholder sits exactly where the import will put the episode's file.
+/// readable roots, the series folder its bound episodes are in, and an existing season folder.
 /// </summary>
 internal static class SeriesFolders
 {
@@ -134,9 +133,6 @@ internal static class SeriesFolders
 
         return null;
     }
-
-    /// <summary>Whether a folder's name carries a TMDB tag (<c>[tmdbid-N]</c>): a title folder of the import's or the placeholders'.</summary>
-    public static bool IsTitleFolderName(string name) => name.Contains("[tmdbid-", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The canonical folder when it lies inside one of the roots and is not a root itself; otherwise null.</summary>
     private static string? InsideRoots(UnixFileInspector files, string? folder, IReadOnlyList<string> roots) =>

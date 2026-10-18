@@ -47,6 +47,27 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
         }
     }
 
+    /// <summary>
+    /// Removes the plugin's placeholder items with no file before the plugin goes (P1.FU30): nothing else in Jellyfin removes them,
+    /// and no user can, so an uninstall must not leave them behind as items nobody can play or delete.
+    /// </summary>
+    public override void OnUninstalling()
+    {
+        try
+        {
+            if (MediaBrowser.Controller.Entities.BaseItem.LibraryManager is { } library)
+                JellyfinMod.Services.Placeholders.PlaceholderItems.RemoveEverywhere(library,
+                    Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            // An uninstall goes ahead whatever happens here; Settings' Remove All Virtual Items does the same before it.
+            _ = error;
+        }
+
+        base.OnUninstalling();
+    }
+
     /// <summary>A submitted secret field with this value removes the stored secret.</summary>
     public const string ClearSecret = "__clear__";
 

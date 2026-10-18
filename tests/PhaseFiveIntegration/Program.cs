@@ -1047,11 +1047,6 @@ internal static partial class Phase5
             await using var database = new ModDbContext(dbPath);
             return await database.EpisodeBindings.AnyAsync(value => value.EpisodeId == ids["e1"]) ? true : (bool?)null;
         }, "The existing episode is bound");
-        // P1.FU24: the plugin's placeholder for E2 sits where the import puts its file; a user's own .disc (no marker) beside it.
-        var stubE2 = Path.Combine(seriesFolder, "Season 01", "Example Show (2023) S01E02.disc");
-        await File.WriteAllBytesAsync(stubE2, JellyfinMod.Services.Placeholders.PlaceholderStub.Body("Example Show", 1, 2, "Two"));
-        var userDiscE2 = Path.Combine(seriesFolder, "Season 01", "Example Show S01E02 - my disc.disc");
-        await File.WriteAllTextAsync(userDiscE2, "<discstub><message>mine</message></discstub>");
         var (grabE2, hashE2) = await GrabAsync(admin, ids["series"], ids["e2"], fixtures["e2"]);
         transmission.Progress(hashE2, 0.4);
         await Tick();
@@ -1065,9 +1060,6 @@ internal static partial class Phase5
         var completedE2 = await CompleteAsync(dbPath, grabE2, Tick);
         Assert(completedE2.DestinationPath == Path.Combine(seriesFolder, "Season 01", "Example Show (2023) S01E02.mkv") &&
             completedE2.VersionLabel is null, "An episode lands in the bound series folder's season folder with no version label");
-        Assert(!File.Exists(stubE2) && File.Exists(userDiscE2) && File.Exists(completedE2.DestinationPath!),
-            "The import removes the episode's placeholder before its scan and leaves a .disc without the marker alone (P1.FU24)");
-        File.Delete(userDiscE2);
         detail = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["series"]}"));
         var availability = detail.GetProperty("episodes").EnumerateArray()
             .ToDictionary(item => item.GetProperty("id").AsGuid(), item => item.GetProperty("availability").GetString());
@@ -1970,12 +1962,8 @@ internal static partial class Phase5
         // The first and each viewer's next episode download first, and a pack episode imports as soon as its file is complete
         // (next-up priority, 2026-10-12).
         await NextUpScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, time);
-        // The import swaps a placeholder for the real file (P1.FU25).
-        await PlaceholderSwapScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, logs);
-        // The backfill of an existing catalogue and the watched restore (P1.FU27).
-        await BackfillScenarios.RunAsync(admin, host.Client(world.Ordinary, false), world, dbPath);
-        // Jellyfin removes a season or a series: its placeholders come back at once (P1.FU29, P4.FU12).
-        await DeleteRepairScenarios.RunAsync(admin, world, dbPath, ids);
+        // The placeholder swap, backfill, watched restore and delete repair (P1.FU25, P1.FU27, P1.FU29) are Jellyfin items with no
+        // file (P1.FU30), which only a real Jellyfin makes: the live runner placeholder-items.mjs proves them.
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))

@@ -12,7 +12,7 @@ namespace JellyfinMod.Services;
 
 /// <summary>
 /// Makes Jellyfin hold files and folders the plugin has just written or removed, at once (P4.FU12), instead of after its library
-/// monitor delay (60 s on the hosts). Shared by the placeholder writer, the delete repair and the import.
+/// monitor delay (60 s on the hosts). Used by the import and the delete repair.
 /// </summary>
 public interface IMediaDiscovery
 {
@@ -35,7 +35,7 @@ public interface IMediaDiscovery
 /// Never <c>ChangedExternally</c> on a library folder, which refreshes every title in it, and never an item built by hand.
 /// For each changed path the nearest folder Jellyfin holds an item for decides:
 /// <list type="bullet">
-/// <item>a season (an episode or its stub swapped or written): that season, validated once for all the paths in it;</item>
+/// <item>a season (an episode imported): that season, validated once for all the paths in it;</item>
 /// <item>a series (a new season folder): the series is validated for the season, then the season for its files;</item>
 /// <item>the library's folder (a series or movie folder written or recreated), or no item at all (the folder item itself is
 /// missing: Jellyfin's top library folders are validated once, which is shallow): the library folder is validated for the new
@@ -107,7 +107,7 @@ public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSyste
             while (await queue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 // Everything that arrived while the last batch ran, and within the window after the first, is one batch: a
-                // pack's files, a season's stubs, a series.
+                // pack's files, a series.
                 await Task.Delay(Window, cancellationToken).ConfigureAwait(false);
                 var batch = new List<Request>();
                 while (queue.Reader.TryRead(out var request)) batch.Add(request);

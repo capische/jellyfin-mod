@@ -1,7 +1,7 @@
 namespace JellyfinMod.Services.Placeholders;
 
 /// <summary>
-/// The per-library switch "Show missing episodes as Jellyfin items" (P1.FU24): on for every TV library unless an administrator
+/// The per-library switch "Show missing episodes as Jellyfin items" (P1.FU24, P1.FU30): on for every TV and movie library unless an administrator
 /// turned it off (<see cref="PluginConfiguration.PlaceholderDisabledLibraryIds"/>; user, 2026-10-15: "should be enabled by
 /// default. That's the point."). Kept in the XML configuration (a list of ids, no new table).
 /// </summary>
@@ -15,6 +15,18 @@ public static class PlaceholderSettings
 
     /// <summary>Whether a library's switch is on: every library not turned off.</summary>
     public static bool IsEnabled(Guid libraryId) => !DisabledLibraries().Contains(libraryId);
+
+    /// <summary>Turns every library's switch off at once (the uninstall clean-up) and saves the configuration.</summary>
+    public static void DisableAll(IEnumerable<Guid> libraryIds)
+    {
+        lock (Gate)
+        {
+            var plugin = Plugin.Instance ?? throw new InvalidOperationException("The plugin is not loaded.");
+            plugin.Configuration.PlaceholderDisabledLibraryIds =
+                plugin.Configuration.PlaceholderDisabledLibraryIds.Concat(libraryIds).Distinct().ToArray();
+            plugin.SaveConfiguration();
+        }
+    }
 
     /// <summary>Turns a library's switch on or off and saves the configuration.</summary>
     public static void Set(Guid libraryId, bool enabled)

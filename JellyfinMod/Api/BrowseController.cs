@@ -244,7 +244,7 @@ public sealed class BrowseController(ModDbContext database, DatabaseInitializer 
         foreach (var item in native)
         {
             if (boundEntries.ContainsKey(item.Id) ||
-                !(item is MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: true } movie && JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(movie.Path) ||
+                !(item is MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: true } movie && JellyfinMod.Services.Placeholders.PlaceholderItems.IsOwn(movie.Path) ||
                   item is MediaBrowser.Controller.Entities.TV.Series)) continue;
             if (!item.ProviderIds.TryGetValue("Tmdb", out var raw) || !int.TryParse(raw, out var tmdbId) ||
                 !waiting.TryGetValue(tmdbId, out var candidates)) continue;

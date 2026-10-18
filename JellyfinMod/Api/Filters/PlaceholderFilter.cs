@@ -24,26 +24,24 @@ namespace JellyfinMod.Api.Filters;
 /// </summary>
 /// <remarks>
 /// <para>Registered for every stock controller through <c>MvcOptions</c> from the plugin's service registrator (proven live
-/// by the plan's experiment X2). It touches only items that are the plugin's own stubs (a <c>.disc</c> placeholder with the
-/// marker line, <see cref="PlaceholderStub"/>), whatever the per-library switch says: stubs written before the switch was
-/// turned off still exist, and stay unplayable until an administrator removes them. A user's own <c>.disc</c> stub is left as
-/// Jellyfin answers it.</para>
+/// by the plan's experiment X2). It touches only the plugin's own placeholder items (<see cref="PlaceholderItems"/>), whatever
+/// the per-library switch says: placeholders made before the switch was turned off stay unplayable until they are removed.</para>
 /// <list type="table">
-/// <item><term><c>GET /Shows/NextUp</c></term><description>a stub episode's slot holds that series' next real episode after the
+/// <item><term><c>GET /Shows/NextUp</c></term><description>a placeholder episode's slot holds that series' next real episode after the
 /// gap, or is left out when none follows (P1.FU28, see <see cref="ShapeNextUp"/>).</description></item>
-/// <item><term><c>GET /UserItems/Resume</c></term><description>stub items are left out (a stub cannot be resumed; it can only
+/// <item><term><c>GET /UserItems/Resume</c></term><description>placeholder items are left out (a placeholder cannot be resumed; it can only
 /// carry a position from the file it stands in for).</description></item>
-/// <item><term><c>GET /Shows/{id}/Episodes</c> with <c>startItemId</c></term><description>stubs after the start item are left out
+/// <item><term><c>GET /Shows/{id}/Episodes</c> with <c>startItemId</c></term><description>placeholders after the start item are left out
 /// (P1.FU28): <c>startItemId</c> is what play-queue builders send ("play from this episode": upstream web, Jellyfin for Android
-/// TV), and no known client sends it for a listing, so season and series listings keep their stubs.</description></item>
+/// TV), and no known client sends it for a listing, so season and series listings keep their placeholders.</description></item>
 /// <item><term><c>/Items/{id}/PlaybackInfo</c></term><description><c>ErrorCode: NotAllowed</c> and no media source, so no
 /// client starts a stream or a transcode.</description></item>
 /// <item><term><c>/Items/{id}/Download</c>, <c>/Videos/{id}/stream*</c>, the HLS playlists and segments</term><description>404.</description></item>
 /// <item><term>playback reports (<c>/Sessions/Playing*</c>, <c>/PlayingItems/{id}*</c>)</term><description>answered 204 and
-/// dropped, so no report can mark a stub played; marking it played by hand works as for any item.</description></item>
-/// <item><term><c>/Items/Latest</c></term><description>stub episodes are left out: a placeholder is not newly added media (its
-/// date added is also its air date, see <see cref="PlaceholderService.StampAsync(BaseItem, CancellationToken)"/>).</description></item>
-/// <item><term>item answers</term><description><c>CanDownload</c> false on a stub.</description></item>
+/// dropped, so no report can mark a placeholder played; marking it played by hand works as for any item.</description></item>
+/// <item><term><c>/Items/Latest</c></term><description>placeholder episodes are left out: a placeholder is not newly added media (its
+/// date added is also its air date, see <see cref="PlaceholderItems"/>).</description></item>
+/// <item><term>item answers</term><description><c>CanDownload</c> false on a placeholder.</description></item>
 /// </list>
 /// <para>Fail-safe: any error while deciding lets the original request and answer through unchanged and is logged once.
 /// Per request it costs a dictionary lookup on the action name; items are read only for the few that are placeholders.</para>
@@ -109,7 +107,7 @@ public sealed class PlaceholderFilter(
             // The list shapes below need the request's own bound values (fields, images, user, start item) in the result phase.
             if (kind is Kind.NextUp or Kind.Episodes)
                 context.HttpContext.Items[ArgumentsKey] = new Dictionary<string, object?>(context.ActionArguments, StringComparer.OrdinalIgnoreCase);
-            else if (kind is not (null or Kind.Latest or Kind.Resume) && ItemIdOf(context) is { } itemId && IsStub(itemId))
+            else if (kind is not (null or Kind.Latest or Kind.Resume) && ItemIdOf(context) is { } itemId && IsPlaceholder(itemId))
             {
                 replacement = kind switch
                 {
@@ -152,14 +150,14 @@ public sealed class PlaceholderFilter(
                 if (kind == Kind.NextUp && result.Value is QueryResult<BaseItemDto> page && arguments is not null)
                     result.Value = ShapeNextUp(page, arguments, context.HttpContext.User);
                 else if (kind == Kind.Latest && result.Value is IEnumerable<BaseItemDto> latest)
-                    result.Value = latest.Where(item => item.IsPlaceHolder != true || !IsStub(item.Id)).ToArray();
+                    result.Value = latest.Where(item => item.IsPlaceHolder != true || !IsPlaceholder(item.Id)).ToArray();
                 else if (kind == Kind.Resume && result.Value is QueryResult<BaseItemDto> resume)
-                    result.Value = WithoutStubs(resume, keep: null);
+                    result.Value = WithoutPlaceholders(resume, keep: null);
                 else if (kind == Kind.Episodes && result.Value is QueryResult<BaseItemDto> episodes
                     && arguments?.GetValueOrDefault("startItemId") is Guid startItemId && startItemId != Guid.Empty)
-                    // The start item itself stays even when it is a stub: the client asked for it, and its playback is refused
-                    // with NotAllowed as before; only the stubs the queue would run into after it are left out.
-                    result.Value = WithoutStubs(episodes, keep: startItemId);
+                    // The start item itself stays even when it is a placeholder: the client asked for it, and its playback is refused
+                    // with NotAllowed as before; only the placeholders the queue would run into after it are left out.
+                    result.Value = WithoutPlaceholders(episodes, keep: startItemId);
 
                 if (result.Value is not null && kind is not Kind.Latest) ClearDownload(result.Value);
             }
@@ -175,8 +173,8 @@ public sealed class PlaceholderFilter(
     /// <summary>
     /// Next Up shows the next real episode after a gap (P1.FU28; the user's answer to the plan's question 2): Jellyfin's Next Up
     /// takes, per series, the first unplayed, not virtual episode after the last played one, and a placeholder is not virtual.
-    /// Each stub in the page is replaced, in its own slot, by the first episode of the same series after it that is neither a
-    /// placeholder nor virtual and has the stub's played state (unplayed, or played for a rewatching slot), specials left out
+    /// Each placeholder in the page is replaced, in its own slot, by the first episode of the same series after it that is neither a
+    /// placeholder nor virtual and has the placeholder's played state (unplayed, or played for a rewatching slot), specials left out
     /// as Jellyfin's Next Up leaves them out; the slot is dropped (and the total lowered) when none follows, when that episode is
     /// already in the page, or when it has a resume position and the request asked for no resumable episodes. Asked in process
     /// through the library with a user-scoped query (parental rating and tags) and kept only when the user may open the item
@@ -196,7 +194,7 @@ public sealed class PlaceholderFilter(
         var removed = 0;
         foreach (var item in page.Items)
         {
-            if (item.IsPlaceHolder != true || !IsStub(item.Id))
+            if (item.IsPlaceHolder != true || !IsPlaceholder(item.Id))
             {
                 items.Add(item);
                 continue;
@@ -217,19 +215,19 @@ public sealed class PlaceholderFilter(
             : new QueryResult<BaseItemDto>(page.StartIndex, Math.Max(0, page.TotalRecordCount - removed), items);
     }
 
-    /// <summary>The first real episode of the stub's series after it, with the stub's played state, for this user.</summary>
-    private BaseItem? NextRealEpisode(Guid stubId, User user, IReadOnlyDictionary<string, object?> arguments)
+    /// <summary>The first real episode of the placeholder's series after it, with the placeholder's played state, for this user.</summary>
+    private BaseItem? NextRealEpisode(Guid placeholderId, User user, IReadOnlyDictionary<string, object?> arguments)
     {
-        if (library.GetItemById(stubId) is not MediaBrowser.Controller.Entities.TV.Episode stub
-            || stub.ParentIndexNumber is not { } season || stub.IndexNumber is not { } number
-            || string.IsNullOrEmpty(stub.SeriesPresentationUniqueKey))
+        if (library.GetItemById(placeholderId) is not MediaBrowser.Controller.Entities.TV.Episode placeholder
+            || placeholder.ParentIndexNumber is not { } season || placeholder.IndexNumber is not { } number
+            || string.IsNullOrEmpty(placeholder.SeriesPresentationUniqueKey))
             return null;
-        // A stub in a rewatching slot is played (marked by hand); the next one to rewatch is the next played real episode.
-        var played = userData.GetUserData(user, stub)?.Played == true;
-        var after = Math.Max(number, stub.IndexNumberEnd ?? number) + 1;
+        // A placeholder in a rewatching slot is played (marked by hand); the next one to rewatch is the next played real episode.
+        var played = userData.GetUserData(user, placeholder)?.Played == true;
+        var after = Math.Max(number, placeholder.IndexNumberEnd ?? number) + 1;
         var next = library.GetItemList(new InternalItemsQuery(user)
         {
-            SeriesPresentationUniqueKey = stub.SeriesPresentationUniqueKey,
+            SeriesPresentationUniqueKey = placeholder.SeriesPresentationUniqueKey,
             IncludeItemTypes = [BaseItemKind.Episode],
             IsVirtualItem = false,
             IsPlaceHolder = false,
@@ -268,16 +266,16 @@ public sealed class PlaceholderFilter(
         return options;
     }
 
-    /// <summary>A list without the plugin's stubs (one may be kept), its total lowered by as many.</summary>
-    private QueryResult<BaseItemDto> WithoutStubs(QueryResult<BaseItemDto> page, Guid? keep)
+    /// <summary>A list without the plugin's placeholders (one may be kept), its total lowered by as many.</summary>
+    private QueryResult<BaseItemDto> WithoutPlaceholders(QueryResult<BaseItemDto> page, Guid? keep)
     {
         if (page.Items.All(item => item.IsPlaceHolder != true)) return page;
-        var kept = page.Items.Where(item => item.IsPlaceHolder != true || item.Id == keep || !IsStub(item.Id)).ToArray();
+        var kept = page.Items.Where(item => item.IsPlaceHolder != true || item.Id == keep || !IsPlaceholder(item.Id)).ToArray();
         var removed = page.Items.Count - kept.Length;
         return removed == 0 ? page : new QueryResult<BaseItemDto>(page.StartIndex, Math.Max(0, page.TotalRecordCount - removed), kept);
     }
 
-    /// <summary>A stub's item answer says it cannot be downloaded, so apps hide their download button.</summary>
+    /// <summary>A placeholder's item answer says it cannot be downloaded, so apps hide their download button.</summary>
     private void ClearDownload(object? value)
     {
         switch (value)
@@ -295,7 +293,7 @@ public sealed class PlaceholderFilter(
 
         void Clear(BaseItemDto item)
         {
-            if (item.IsPlaceHolder == true && item.CanDownload == true && IsStub(item.Id)) item.CanDownload = false;
+            if (item.IsPlaceHolder == true && item.CanDownload == true && IsPlaceholder(item.Id)) item.CanDownload = false;
         }
     }
 
@@ -321,8 +319,8 @@ public sealed class PlaceholderFilter(
         return context.ActionArguments.TryGetValue("itemId", out var raw) && raw is Guid id && id != Guid.Empty ? id : null;
     }
 
-    private bool IsStub(Guid itemId) =>
-        library.GetItemById(itemId) is Video { IsPlaceHolder: true } video && PlaceholderStub.IsStubFile(video.Path);
+    private bool IsPlaceholder(Guid itemId) =>
+        library.GetItemById(itemId) is Video { IsPlaceHolder: true } video && PlaceholderItems.IsOwn(video.Path);
 
     private void Failed(Exception error)
     {

@@ -171,7 +171,7 @@ internal static class NativeReadiness
     {
         why = string.Empty;
         if (library.GetItemById(itemId) is not Video item) { why = "no item"; return false; }
-        if (item.IsPlaceHolder && Placeholders.PlaceholderStub.HasStubExtension(item.Path)) { why = "a placeholder"; return false; }
+        if (Placeholders.PlaceholderItems.IsOwn(item)) { why = "a placeholder"; return false; }
         if (ownerId is { } owner && library.GetItemById(owner) is not Video { IsPlaceHolder: false }) { why = "no real owner"; return false; }
         if (item.DateLastRefreshed == DateTime.MinValue) { why = "not refreshed yet"; return false; }
         if (mediaSources is null) return true;

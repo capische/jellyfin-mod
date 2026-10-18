@@ -27,8 +27,6 @@ public sealed class LibraryEventListener(
         SingleWriter = false
     });
     private readonly ConcurrentDictionary<Guid, long> pending = new();
-    // Titles whose placeholder item Jellyfin has just given a real file as a further source (see ProcessAsync).
-    private readonly ConcurrentDictionary<Guid, byte> stubBeside = new();
     private CancellationTokenSource? stopping;
     private Task? worker;
 
@@ -76,14 +74,15 @@ public sealed class LibraryEventListener(
 
     private void OnItemChanged(object? sender, ItemChangeEventArgs eventArgs)
     {
-        if (eventArgs.Item is not (Movie or Series or Episode)) return;
+        // The plugin's own items with no file (P1.FU30) are never bound, so they never start a reconciliation.
+        if (eventArgs.Item is not (Movie or Series or Episode) || Placeholders.PlaceholderItems.IsOwn(eventArgs.Item)) return;
         fingerprints[eventArgs.Item.Id] = Fingerprint(eventArgs.Item);
         Enqueue(eventArgs.Item);
     }
 
     private void OnItemUpdated(object? sender, ItemChangeEventArgs eventArgs)
     {
-        if (eventArgs.Item is not (Movie or Series or Episode)) return;
+        if (eventArgs.Item is not (Movie or Series or Episode) || Placeholders.PlaceholderItems.IsOwn(eventArgs.Item)) return;
         var fingerprint = Fingerprint(eventArgs.Item);
         if (fingerprints.TryGetValue(eventArgs.Item.Id, out var previous) && previous == fingerprint) return;
         fingerprints[eventArgs.Item.Id] = fingerprint;
@@ -97,9 +96,6 @@ public sealed class LibraryEventListener(
     private void Enqueue(MediaBrowser.Controller.Entities.BaseItem item)
     {
         var key = item is Episode { SeriesId: var seriesId } && seriesId != Guid.Empty ? seriesId : item.Id;
-        if (item is MediaBrowser.Controller.Entities.Video { IsPlaceHolder: true } video &&
-            (video.LocalAlternateVersions ?? []).Any(path => !path.EndsWith(".disc", StringComparison.OrdinalIgnoreCase)))
-            stubBeside[key] = 1;
         var now = Environment.TickCount64;
         if (pending.TryAdd(key, now)) queue.Writer.TryWrite(key);
         else pending[key] = now;
@@ -140,16 +136,13 @@ public sealed class LibraryEventListener(
                     var reconciled = await scope.ServiceProvider.GetRequiredService<JellyfinItemReconciliationRunner>()
                         .ReconcileAsync(itemId, cancellationToken).ConfigureAwait(false);
                     if (reconciled.Changed.Count > 0) scope.ServiceProvider.GetService<Import.ImportMonitor>()?.WakeLocal();
-                    // A real file that just gained a binding (a copy, another tool's import), or that Jellyfin took for a further
-                    // version of the title's placeholder item (it is then no binding at all), leaves the title's placeholder beside
-                    // it for the next sync otherwise, and Jellyfin offers the stub as a version meanwhile: the title's placeholders
-                    // are synced now (P4.FU12).
-                    var besideStub = stubBeside.TryRemove(itemId, out _);
-                    if (reconciled.Changed.Count > 0 || besideStub)
+                    // A real file that just gained a binding (a copy, another tool's import) leaves the title's placeholder beside
+                    // it for the next sync otherwise: the title's placeholders are synced now (P4.FU12).
+                    if (reconciled.Changed.Count > 0)
                     {
                         var syncQueue = scope.ServiceProvider.GetService<Placeholders.PlaceholderSyncQueue>();
                         if (syncQueue is not null)
-                            foreach (var (libraryId, entryId) in besideStub ? reconciled.Titles : reconciled.Changed) syncQueue.Enqueue(libraryId, entryId);
+                            foreach (var (libraryId, entryId) in reconciled.Changed) syncQueue.Enqueue(libraryId, entryId);
                     }
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

@@ -1281,11 +1281,10 @@ static async Task VerifyDuplicateGraceAsync(
     }
 }
 
-// P1.FU25: a placeholder is never reclaimed, and a reclaim leaves one. A watched episode's file and a multi-episode file are
-// reclaimed through the real executor: each leaves the plugin's marked stub for every episode it held, in the same folder under
-// the import's name, says so in its history and asks Jellyfin to look at the folder; nothing else in the folder changes. A stub
-// that something bound (reconciliation never binds one) is blocked in the preview and refused by the executor, and stays. A
-// file directly in a library folder gets none (a movie in a folder of its own does, P1.FU26, below).
+// P1.FU25, P1.FU30: a reclaim leaves a placeholder item, never a file. A watched episode's file and a multi-episode file are
+// reclaimed through the real executor; the preview says each leaves a placeholder, and nothing is written to the folder (the
+// placeholder is a Jellyfin item with no file, made on a real Jellyfin; this host's library is a fixture, so the live runner
+// placeholder-items.mjs proves the item itself).
 static async Task VerifyReclaimLeavesPlaceholderAsync(
     IServiceProvider services,
     HttpClient http,
@@ -1333,20 +1332,17 @@ static async Task VerifyReclaimLeavesPlaceholderAsync(
     var episodes = new List<JellyfinMod.Data.Episode>();
     var bindings = new Dictionary<int, EpisodeBinding>();
     var natives = new List<Guid>();
-    // S01E02 a file of its own; S01E03 the plugin's stub, bound as nothing should ever bind one; S01E04-E05 one multi-episode file.
-    var stubE3 = Path.Combine(season, "Stub Series (2020) S01E03.disc");
-    await File.WriteAllBytesAsync(stubE3, JellyfinMod.Services.Placeholders.PlaceholderStub.Body("Stub Series", 1, 3, "Three"));
-    var stubE3Bytes = await File.ReadAllBytesAsync(stubE3);
+    // S01E02 a file of its own; S01E04-E05 one multi-episode file.
     var fileE2 = Path.Combine(season, "Stub Series S01E02.mkv");
     var fileE45 = Path.Combine(season, "Stub Series S01E04-E05.mkv");
     await File.WriteAllBytesAsync(fileE2, Enumerable.Repeat((byte)9, 2048).ToArray());
     await File.WriteAllBytesAsync(fileE45, Enumerable.Repeat((byte)10, 2048).ToArray());
-    foreach (var (number, path, end) in new[] { (2, fileE2, (int?)null), (3, stubE3, null), (4, fileE45, 5) })
+    foreach (var (number, path, end) in new[] { (2, fileE2, (int?)null), (4, fileE45, 5) })
     {
         var native = new MediaBrowser.Controller.Entities.TV.Episode
         {
             Id = Guid.NewGuid(), Name = "Stub " + number, Path = path, SeriesId = series.Id, ParentIndexNumber = 1, IndexNumber = number,
-            IndexNumberEnd = end, IsPlaceHolder = path.EndsWith(".disc", StringComparison.Ordinal)
+            IndexNumberEnd = end
         };
         series.Items.Add(native);
         nativeItems[native.Id] = native;
@@ -1395,48 +1391,25 @@ static async Task VerifyReclaimLeavesPlaceholderAsync(
                 Row(4).GetProperty("state").GetString() == "due" && Row(4).GetProperty("leavesPlaceholder").GetBoolean() &&
                 preview!.RootElement.GetProperty("placeholders").GetInt32() >= 2,
                 "The preview says which due episode files leave a placeholder: " + Row(2) + " " + Row(4));
-            Assert(Row(3).GetProperty("state").GetString() == "blocked" && Row(3).GetProperty("reason").GetString() == "placeholder" &&
-                !Row(3).GetProperty("leavesPlaceholder").GetBoolean(),
-                "A bound stub is never due: the preview blocks it as a placeholder: " + Row(3));
         }
 
-        var refused = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(bindings[3].Id, default);
-        Assert(refused.State != "completed" && refused.Reason == "placeholder" && (await File.ReadAllBytesAsync(stubE3)).SequenceEqual(stubE3Bytes),
-            $"Retention never reclaims a stub: {refused.State}/{refused.Reason}, the stub is untouched");
-
-        reported.Clear();
         var reclaimed = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(bindings[2].Id, default);
-        var stubE2 = Path.Combine(season, "Stub Series (2020) S01E02.disc");
-        Assert(reclaimed.State == "completed" && !File.Exists(fileE2) && JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stubE2) &&
-            (await File.ReadAllTextAsync(stubE2)).Contains("<title>Stub Series S01E02 - Stub 2</title>", StringComparison.Ordinal) &&
-            reported.Contains(season),
-            $"A reclaim leaves the episode's stub in the same folder under the import's name and asks Jellyfin to look: {reclaimed.State}/{reclaimed.Reason}, " +
-            $"stub {File.Exists(stubE2)}, reported {string.Join(", ", reported)}");
+        Assert(reclaimed.State == "completed" && !File.Exists(fileE2), $"A watched episode's file is reclaimed: {reclaimed.State}/{reclaimed.Reason}");
         var multi = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(bindings[4].Id, default);
-        var stubE4 = Path.Combine(season, "Stub Series (2020) S01E04.disc");
-        var stubE5 = Path.Combine(season, "Stub Series (2020) S01E05.disc");
-        Assert(multi.State == "completed" && !File.Exists(fileE45) && JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stubE4) &&
-            JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stubE5),
-            $"A multi-episode file's reclaim leaves a stub for each episode it held: {multi.State}/{multi.Reason}");
-        var folder = Directory.EnumerateFiles(season).Select(Path.GetFileName).Order(StringComparer.Ordinal).ToArray();
-        Assert(folder.SequenceEqual(["Stub Series (2020) S01E02.disc", "Stub Series (2020) S01E03.disc", "Stub Series (2020) S01E04.disc",
-                "Stub Series (2020) S01E05.disc"]) && (await File.ReadAllBytesAsync(stubE3)).SequenceEqual(stubE3Bytes),
-            "Only the reclaimed files went; the stubs are all that was added, and the earlier stub is untouched: " + string.Join(", ", folder));
+        Assert(multi.State == "completed" && !File.Exists(fileE45), $"A multi-episode file is reclaimed: {multi.State}/{multi.Reason}");
+        Assert(!Directory.EnumerateFiles(season).Any(), "Only the reclaimed files went, and no file was written in their place");
         await using (var database = new ModDbContext(databasePath))
         {
             var history = await database.History.AsNoTracking().Where(item => item.EntryId == entry.Id).ToListAsync();
-            var states = await database.Episodes.AsNoTracking().Where(row => row.EntryId == entry.Id && row.EpisodeNumber != 3)
+            var states = await database.Episodes.AsNoTracking().Where(row => row.EntryId == entry.Id)
                 .Select(row => new { row.State, row.JellyfinItemId }).ToListAsync();
-            Assert(history.Count == 2 && history.All(item => item.EventType == "reclaimed" &&
-                    item.Summary.EndsWith(RetentionExecutor.PlaceholderLeft, StringComparison.Ordinal)) &&
+            Assert(history.Count == 2 && history.All(item => item.EventType == "reclaimed") &&
                 states.All(row => row.State == FileState.Reclaimed && row.JellyfinItemId is null) &&
-                !nativeItems.ContainsKey(natives[0]) && !nativeItems.ContainsKey(natives[2]),
-                "Each reclaim's history says a placeholder was left; the episodes are reclaimed and their old items removed: " +
+                !nativeItems.ContainsKey(natives[0]) && !nativeItems.ContainsKey(natives[1]),
+                "Each reclaim is recorded; the episodes are reclaimed and their old items removed: " +
                 string.Join(" | ", history.Select(item => item.EventType + ": " + item.Summary)));
         }
 
-        Assert(!Directory.EnumerateFiles(libraryPath, "*.disc").Any(),
-            "Files directly in a library folder never get a placeholder");
     }
     finally
     {
@@ -1467,8 +1440,8 @@ static async Task VerifyReclaimLeavesPlaceholderAsync(
     }
 }
 
-// P1.FU26: a reclaim of a movie's last file in a folder of its own leaves the movie's marked stub in that folder, named after
-// the folder, says so in its history and in the preview, and asks Jellyfin to look at the folder; nothing else changes.
+// P1.FU26, P1.FU30: a reclaim of a movie's last file says in the preview that it leaves a placeholder (an item with no file) and
+// writes nothing to the folder; the sidecar stays.
 static async Task VerifyMovieReclaimLeavesPlaceholderAsync(
     IServiceProvider services,
     HttpClient http,
@@ -1535,7 +1508,6 @@ static async Task VerifyMovieReclaimLeavesPlaceholderAsync(
         await database.SaveChangesAsync();
     }
 
-    var stub = Path.Combine(folder, "Stub Film (2019) [tmdbid-900901].disc");
     try
     {
         await services.GetRequiredService<RetentionEvaluator>().EvaluateEntriesAsync([entry.Id], default);
@@ -1546,22 +1518,15 @@ static async Task VerifyMovieReclaimLeavesPlaceholderAsync(
                 "The preview says the due movie's reclaim leaves a placeholder: " + row);
         }
 
-        reported.Clear();
         var reclaimed = await services.GetRequiredService<RetentionExecutor>().ReclaimAsync(binding.Id, default);
-        Assert(reclaimed.State == "completed" && !File.Exists(file) && JellyfinMod.Services.Placeholders.PlaceholderStub.IsStubFile(stub) &&
-            (await File.ReadAllTextAsync(stub)).Contains("<title>Stub Film (2019)</title>", StringComparison.Ordinal) && reported.Contains(folder),
-            $"A movie's reclaim leaves its stub in its folder, named after the folder, and asks Jellyfin to look: {reclaimed.State}/{reclaimed.Reason}, " +
-            $"stub {File.Exists(stub)}, reported {string.Join(", ", reported)}");
-        Assert(Directory.EnumerateFiles(folder).Select(Path.GetFileName).Order(StringComparer.Ordinal)
-                .SequenceEqual(["Stub Film (2019) [tmdbid-900901].disc", "movie.nfo"]) && await File.ReadAllTextAsync(sidecar) == "sidecar stays",
-            "Only the movie's file went and only its stub was added; the sidecar stays");
+        Assert(reclaimed.State == "completed" && !File.Exists(file), $"The movie's file is reclaimed: {reclaimed.State}/{reclaimed.Reason}");
+        Assert(Directory.EnumerateFiles(folder).Select(Path.GetFileName).SequenceEqual(["movie.nfo"]) && await File.ReadAllTextAsync(sidecar) == "sidecar stays",
+            "Only the movie's file went and nothing was written in its place; the sidecar stays");
         await using var database = new ModDbContext(databasePath);
         var history = await database.History.AsNoTracking().Where(item => item.EntryId == entry.Id).ToListAsync();
         var state = (await database.Entries.AsNoTracking().SingleAsync(item => item.Id == entry.Id)).State;
-        Assert(history.Count == 1 && history[0].EventType == "reclaimed" &&
-            history[0].Summary.EndsWith(RetentionExecutor.MoviePlaceholderLeft, StringComparison.Ordinal) && state == FileState.Reclaimed &&
-            !nativeItems.ContainsKey(native.Id),
-            "The movie's reclaim history says a placeholder was left; the movie is reclaimed and its old item removed: " +
+        Assert(history.Count == 1 && history[0].EventType == "reclaimed" && state == FileState.Reclaimed && !nativeItems.ContainsKey(native.Id),
+            "The movie's reclaim is recorded; the movie is reclaimed and its old item removed: " +
             string.Join(" | ", history.Select(item => item.EventType + ": " + item.Summary)));
     }
     finally

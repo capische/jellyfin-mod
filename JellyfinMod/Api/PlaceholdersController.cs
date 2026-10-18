@@ -19,14 +19,13 @@ public sealed record PlaceholderLibraryProgress(
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("mediaType")] string MediaType,
     [property: JsonPropertyName("enabled")] bool Enabled,
-    [property: JsonPropertyName("writable")] bool Writable,
     [property: JsonPropertyName("titles")] int Titles,
     [property: JsonPropertyName("titlesDone")] int TitlesDone,
     [property: JsonPropertyName("pending")] int Pending);
 
 /// <summary>
 /// The backfill's progress (P1.FU27): titles that have all their placeholders out of those that need some, placeholders still
-/// to write, whether a batch runs now, when the last ended and when the scheduled sync runs the next.
+/// to make, whether a batch runs now, when the last ended and when the scheduled sync runs the next.
 /// </summary>
 public sealed record PlaceholderProgress(
     [property: JsonPropertyName("titles")] int Titles,
@@ -39,15 +38,21 @@ public sealed record PlaceholderProgress(
     [property: JsonPropertyName("nextRunMinutes")] int NextRunMinutes,
     [property: JsonPropertyName("libraries")] IReadOnlyList<PlaceholderLibraryProgress> Libraries);
 
+/// <summary>How many placeholder items with no file the plugin has (P1.FU30), and what a removal of them all did.</summary>
+public sealed record PlaceholderItemsState(
+    [property: JsonPropertyName("items")] int Items,
+    [property: JsonPropertyName("removed")] int Removed = 0,
+    [property: JsonPropertyName("seconds")] double Seconds = 0);
+
 /// <summary>
-/// Placeholders for missing episodes (P1.FU24), administrators only: each TV library's switch "Show missing episodes as
-/// Jellyfin items" (on by default, turned off per library), the dry run that lists exactly the files a sync would write and remove, the sync itself,
-/// and <i>Remove placeholders</i> with its own dry run. See <c>API.md</c>, <i>Placeholders</i>.
+/// Placeholders for missing episodes and movies (P1.FU24, P1.FU30), administrators only: each library's switch "Show missing
+/// episodes as Jellyfin items" (on by default, turned off per library), the dry run that lists exactly the items a sync would
+/// make and remove, the sync itself, and <i>Remove placeholders</i> with its own dry run. See <c>API.md</c>, <i>Placeholders</i>.
 /// </summary>
 [ApiController, Authorize(Policy = Policies.RequiresElevation), Route("JellyfinMod/Placeholders")]
 public sealed class PlaceholdersController(DatabaseInitializer readiness, PlaceholderService placeholders) : ControllerBase
 {
-    /// <summary>The TV libraries with their switch and how many placeholders Jellyfin holds in each.</summary>
+    /// <summary>The TV and movie libraries with their switch and how many placeholders Jellyfin holds in each.</summary>
     [HttpGet]
     public ActionResult<IReadOnlyList<PlaceholderLibrary>> Libraries()
     {
@@ -55,13 +60,13 @@ public sealed class PlaceholdersController(DatabaseInitializer readiness, Placeh
         return Ok(placeholders.Libraries());
     }
 
-    /// <summary>The dry run: every file a sync of the library would write or remove, and every missing episode it would leave
+    /// <summary>The dry run: every item a sync of the library would make or remove, and every missing episode it would leave
     /// without a placeholder with the reason. Nothing is changed.</summary>
     [HttpGet("{libraryId:guid}/Plan")]
     public Task<ActionResult<PlaceholderPlan>> Plan(Guid libraryId, CancellationToken cancellationToken) =>
         Run(() => placeholders.PlanAsync(libraryId, cancellationToken));
 
-    /// <summary>Turns the library's switch on (and syncs at once) or off (writes nothing more; existing placeholders stay).</summary>
+    /// <summary>Turns the library's switch on (and syncs at once) or off (makes nothing more; existing placeholders stay).</summary>
     [HttpPut("{libraryId:guid}")]
     public async Task<ActionResult<PlaceholderPlan>> Switch(Guid libraryId, PlaceholderSwitchRequest request, CancellationToken cancellationToken)
     {
@@ -74,7 +79,7 @@ public sealed class PlaceholdersController(DatabaseInitializer readiness, Placeh
             : await Run(() => placeholders.PlanAsync(libraryId, cancellationToken)).ConfigureAwait(false);
     }
 
-    /// <summary>Syncs the library now: writes (when the switch is on) and removes as the dry run lists.</summary>
+    /// <summary>Syncs the library now: makes (when the switch is on) and removes as the dry run lists.</summary>
     [HttpPost("{libraryId:guid}/Sync")]
     public Task<ActionResult<PlaceholderPlan>> Sync(Guid libraryId, CancellationToken cancellationToken) =>
         Run(() => placeholders.SyncAsync(libraryId, cancellationToken));
@@ -85,9 +90,8 @@ public sealed class PlaceholdersController(DatabaseInitializer readiness, Placeh
         Run(() => placeholders.RemovalPlanAsync(libraryId, cancellationToken));
 
     /// <summary>
-    /// <i>Remove placeholders</i>: deletes every placeholder of the plugin's in the library (each checked for the marker again just
-    /// before) and the season folders that left empty; nothing else. The switch is not changed, so turn it off first to keep
-    /// them from coming back at the next sync.
+    /// <i>Remove placeholders</i>: removes every placeholder item of the plugin's in the library; nothing else. The switch is not
+    /// changed, so turn it off first to keep them from coming back at the next sync.
     /// </summary>
     [HttpPost("{libraryId:guid}/Remove")]
     public Task<ActionResult<PlaceholderPlan>> Remove(Guid libraryId, CancellationToken cancellationToken) =>
@@ -143,22 +147,48 @@ public sealed class PlaceholdersController(DatabaseInitializer readiness, Placeh
         return Ok(await restore.ApplyAsync(cancellationToken).ConfigureAwait(false));
     }
 
+    /// <summary>The dry run of <i>Remove All Virtual Items</i> (P1.FU30): how many placeholder items with no file the plugin has.</summary>
+    [HttpGet("Items")]
+    public ActionResult<PlaceholderItemsState> Items()
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        return Ok(new PlaceholderItemsState(placeholders.ItemCount()));
+    }
+
+    /// <summary>
+    /// <i>Remove All Virtual Items</i> (P1.FU30), the clean-up before an uninstall: turns placeholders off in every library, so
+    /// nothing makes them again, and removes every placeholder item with no file the plugin has. Nothing else is touched.
+    /// </summary>
+    [HttpPost("Items/Remove")]
+    public async Task<ActionResult<PlaceholderItemsState>> RemoveItems([FromServices] ILibraryManager library, [FromServices] TimeProvider time,
+        [FromServices] ILogger<PlaceholdersController> logger, CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var started = time.GetTimestamp();
+        await using (await SettingsMutationGate.AcquireAsync(cancellationToken).ConfigureAwait(false))
+            PlaceholderSettings.DisableAll(placeholders.Libraries().Select(item => item.LibraryId));
+        var removed = PlaceholderItems.RemoveEverywhere(library, logger);
+        var left = placeholders.ItemCount();
+        logger.LogInformation("JellyfinMod removed all of its placeholder items ({Removed}, {Left} left) and turned placeholders off", removed, left);
+        return Ok(new PlaceholderItemsState(left, removed, time.GetElapsedTime(started).TotalSeconds));
+    }
+
     private async Task<PlaceholderProgress> ProgressAsync(ILibraryManager library, TimeProvider time, CancellationToken cancellationToken)
     {
         var rows = new List<PlaceholderLibraryProgress>();
         foreach (var item in placeholders.Libraries())
         {
-            // A library that is off or cannot be written gets no placeholders: the mod's own surfaces stay its fallback.
-            if (!item.Enabled || !item.Writable)
+            // A library that is off gets no placeholders: the mod's own surfaces stay its fallback.
+            if (!item.Enabled)
             {
-                rows.Add(new(item.LibraryId, item.Name, item.MediaType, item.Enabled, item.Writable, 0, 0, 0));
+                rows.Add(new(item.LibraryId, item.Name, item.MediaType, false, 0, 0, 0));
                 continue;
             }
 
             try
             {
                 var plan = await placeholders.PlanAsync(item.LibraryId, cancellationToken).ConfigureAwait(false);
-                rows.Add(new(item.LibraryId, item.Name, item.MediaType, true, true, plan.Titles, plan.TitlesDone, plan.Pending));
+                rows.Add(new(item.LibraryId, item.Name, item.MediaType, true, plan.Titles, plan.TitlesDone, plan.Pending));
             }
             catch (KeyNotFoundException)
             {

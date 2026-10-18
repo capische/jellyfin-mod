@@ -118,7 +118,7 @@ public sealed class PlaceholderWatchedRestore(
                 continue;
             // The placeholder as stored, with its user data rows; one Jellyfin has not refreshed yet waits.
             if (stubId is not { } itemId || StoredUserData.TryItem(library, itemId, out var item, out _) != StoredRead.Found || item is null ||
-                item is not Video { IsPlaceHolder: true } || !PlaceholderStub.IsStubFile(item.Path) || item.DateLastRefreshed == DateTime.MinValue)
+                item is not Video { IsPlaceHolder: true } || !PlaceholderItems.IsOwn(item.Path) || item.DateLastRefreshed == DateTime.MinValue)
             {
                 waiting++;
                 continue;
@@ -193,7 +193,7 @@ public sealed class PlaceholderWatchedRestore(
     /// <summary>The plugin's placeholder episode Jellyfin holds for a reclaimed episode, by its numbers.</summary>
     private Guid? EpisodeStub(Entry entry, Data.Episode episode, Dictionary<Guid, IReadOnlyList<JellyfinEpisode>> cache)
     {
-        if (!cache.TryGetValue(entry.Id, out var stubs)) cache[entry.Id] = stubs = placeholders.StubEpisodesOf(entry);
+        if (!cache.TryGetValue(entry.Id, out var stubs)) cache[entry.Id] = stubs = placeholders.PlaceholderEpisodesOf(entry);
         return stubs.FirstOrDefault(item => item.ParentIndexNumber == episode.SeasonNumber && item.IndexNumber == episode.EpisodeNumber)?.Id;
     }
 }

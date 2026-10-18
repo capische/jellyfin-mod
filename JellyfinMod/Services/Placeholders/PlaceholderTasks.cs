@@ -10,13 +10,11 @@ using JellyfinEpisode = MediaBrowser.Controller.Entities.TV.Episode;
 namespace JellyfinMod.Services.Placeholders;
 
 /// <summary>
-/// Stamps a stub episode as soon as Jellyfin creates or saves its item (P1.FU24): its date added becomes its air date and its
-/// runtime TMDB's, so the new placeholder never heads Latest. Jellyfin's first metadata refresh saves the item it loaded before
-/// the stamp, so a save is stamped again; the stamp's own save changes nothing and ends it. Done off Jellyfin's event thread.
-/// Also refreshes Jellyfin's cached user data of an item that took a placeholder's place, or a placeholder that took a file's
-/// place, once its first refresh has re-attached the data (<see cref="PlaceholderUserData"/>, P1.FU25 follow-up).
+/// Refreshes Jellyfin's cached user data of an item that took a placeholder's place, or a placeholder that took a file's place,
+/// once its first refresh has re-attached the data (<see cref="PlaceholderUserData"/>, P1.FU25 follow-up, P1.FU30). Done off
+/// Jellyfin's event thread.
 /// </summary>
-public sealed class PlaceholderItemListener(ILibraryManager library, IServiceScopeFactory scopeFactory,
+public sealed class PlaceholderItemListener(ILibraryManager library,
     ILogger<PlaceholderItemListener> logger, IUserDataManager? userData = null, IUserManager? users = null) : IHostedService
 {
     private readonly Channel<Guid> queue = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions { SingleReader = true });
@@ -62,7 +60,9 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
     {
         try
         {
-            if (eventArgs.Item is { } item && PlaceholderUserData.IsCandidate(item))
+            // The plugin's own items with no file too (P1.FU30): made before their metadata, they take back their parked marks
+            // again once the first refresh gave them every provider id (a series' TVDB id is in its episodes' keys).
+            if (eventArgs.Item is { } item && (PlaceholderUserData.IsCandidate(item) || PlaceholderItems.IsOwn(item)))
             {
                 var now = DateTime.UtcNow;
                 if (fresh.Count > 1000)
@@ -81,12 +81,12 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
 
     private void OnItemUpdated(object? sender, ItemChangeEventArgs eventArgs)
     {
-        // Cheap: only a placeholder whose file is a .disc (the marker is read later), or an item created in place of another
-        // whose first metadata refresh has now saved it (Jellyfin re-attaches the user data right after that save), is queued.
+        // Cheap: only an item created in place of another whose first metadata refresh has now saved it (Jellyfin re-attaches
+        // the user data right after that save), or a real item that just took a placeholder's marks, is queued.
         if (eventArgs.Item is not { } item) return;
-        var stub = item is Video { IsPlaceHolder: true } && PlaceholderStub.HasStubExtension(item.Path);
         var refreshed = fresh.ContainsKey(item.Id) && item.DateLastRefreshed != DateTime.MinValue;
-        if ((stub || refreshed) && queued.TryAdd(item.Id, 0))
+        var twin = PlaceholderItems.IsRecentTwin(item.Id);
+        if ((refreshed || twin) && queued.TryAdd(item.Id, 0))
             queue.Writer.TryWrite(item.Id);
     }
 
@@ -97,7 +97,7 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
             while (await queue.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 // Jellyfin saves the item, then refreshes its metadata: a short pause lets those saves land, then the whole
-                // batch that arrived meanwhile is stamped.
+                // batch that arrived meanwhile is handled.
                 await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
                 var batch = new List<Guid>();
                 while (queue.Reader.TryRead(out var id))
@@ -106,21 +106,23 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
                     batch.Add(id);
                 }
 
-                using var scope = scopeFactory.CreateScope();
-                var service = scope.ServiceProvider.GetRequiredService<PlaceholderService>();
                 foreach (var id in batch)
                 {
                     try
                     {
                         if (library.GetItemById(id) is not { } item) continue;
-                        await service.StampAsync(item, cancellationToken).ConfigureAwait(false);
+                        // A real item that took a placeholder's marks: reload the rows of the instance Jellyfin now caches.
+                        if (PlaceholderItems.IsRecentTwin(id)) await item.ReattachUserDataAsync(cancellationToken).ConfigureAwait(false);
                         // The first refresh has re-attached the user data by now (the pause above): put it in Jellyfin's cache.
-                        if (item.DateLastRefreshed != DateTime.MinValue && fresh.TryRemove(id, out _) && userData is not null && users is not null)
-                            PlaceholderUserData.Resave(userData, users, item, logger);
+                        if (item.DateLastRefreshed != DateTime.MinValue && fresh.TryRemove(id, out _))
+                        {
+                            if (PlaceholderItems.IsOwn(item)) await item.ReattachUserDataAsync(cancellationToken).ConfigureAwait(false);
+                            if (userData is not null && users is not null) PlaceholderUserData.Resave(userData, users, item, logger);
+                        }
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
                     {
-                        logger.LogWarning("JellyfinMod could not stamp a placeholder item: {Error}", error.Message);
+                        logger.LogWarning("JellyfinMod could not refresh the user data of an item: {Error}", error.Message);
                     }
                 }
             }
@@ -133,9 +135,9 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
 
 /// <summary>
 /// The backfill (P1.FU27): one batch over every TV and movie library, never two at once. The scheduled sync and an administrator's
-/// <i>Sync Now</i> both run it. Each library writes at most <see cref="PlaceholderService.SeriesPerRun"/> titles with
-/// <see cref="PlaceholderService.PauseBetweenSeries"/> between them, gives way to Jellyfin's own library scans, and asks Jellyfin
-/// to look at the folders it changed once, at the end. While a batch leaves placeholders pending the scheduled sync runs every
+/// <i>Sync Now</i> both run it. Each library makes at most <see cref="PlaceholderService.SeriesPerRun"/> titles with
+/// <see cref="PlaceholderService.PauseBetweenSeries"/> between them and gives way to Jellyfin's own library scans. While a batch
+/// leaves placeholders pending the scheduled sync runs every
 /// <see cref="BusyInterval"/>; once nothing is pending, every <see cref="IdleInterval"/>.
 /// </summary>
 public static class PlaceholderBackfill
@@ -186,7 +188,7 @@ public static class PlaceholderBackfill
 
     /// <summary>
     /// Runs one batch over every TV and movie library that needs it, unless one already runs (then null: never two at once).
-    /// Libraries with the switch off only remove stale placeholders and stamp items, as before.
+    /// Libraries with the switch off only remove stale placeholders.
     /// </summary>
     public static async Task<IReadOnlyList<PlaceholderPlan>?> TryRunAsync(IServiceScopeFactory scopeFactory, ILibraryManager library,
         TimeProvider time, ILogger logger, IProgress<double>? progress, CancellationToken cancellationToken)
@@ -242,9 +244,9 @@ public static class PlaceholderBackfill
 }
 
 /// <summary>
-/// Keeps every library's placeholders up to date (P1.FU24, P1.FU27): writes stubs for missing aired episodes and released movies
+/// Keeps every library's placeholders up to date (P1.FU24, P1.FU27): makes items for missing aired episodes and released movies
 /// where the switch is on (every library unless turned off), at most <see cref="PlaceholderService.SeriesPerRun"/> titles per
-/// library and run, removes stubs whose title got a file, and stamps new stub items. Its trigger fires every 5 minutes; a run
+/// library and run, and removes the ones whose title got a file. Its trigger fires every 5 minutes; a run
 /// does the work only while placeholders are pending (a first backfill of a large catalogue) or every 15 minutes once nothing
 /// is (<see cref="PlaceholderBackfill"/>). The first run comes one trigger interval after the plugin starts, never in the start-up
 /// rush. An administrator's <i>Sync Now</i> runs the same batch at once; the two never run together.
@@ -273,8 +275,8 @@ public sealed class PlaceholderSyncTask(IServiceScopeFactory scopeFactory, ILibr
     /// <inheritdoc />
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
     {
-        // Every library with a switch on, and every other one too: stale stubs go and stub items are stamped even after the
-        // switch is turned off (stubs written before stay until an administrator removes them). Nothing pending: the idle pace.
+        // Every library with a switch on, and every other one too: stale placeholders go even after the switch is turned off.
+        // Nothing pending: the idle pace.
         if (PlaceholderBackfill.Due(time.GetUtcNow().UtcDateTime))
             await PlaceholderBackfill.TryRunAsync(scopeFactory, library, time, logger, progress, cancellationToken).ConfigureAwait(false);
         progress.Report(100);
@@ -342,7 +344,7 @@ public sealed class PlaceholderBackfillStarter(ITaskManager taskManager, ILogger
 }
 
 /// <summary>
-/// Writes a title's placeholders right after it is added from TMDb or its episode list loads (P1.FU26), so it becomes a Jellyfin
+/// Makes a title's placeholders right after it is added from TMDb or its episode list loads (P1.FU26), so it becomes a Jellyfin
 /// item within seconds instead of at the next scheduled sync. One entry per request, off the request, one at a time.
 /// </summary>
 public sealed class PlaceholderSyncQueue(IServiceScopeFactory scopeFactory, ILogger<PlaceholderSyncQueue> logger) : IHostedService
@@ -352,7 +354,7 @@ public sealed class PlaceholderSyncQueue(IServiceScopeFactory scopeFactory, ILog
     private CancellationTokenSource? stopping;
     private Task? worker;
 
-    /// <summary>Asks for one entry's placeholders to be written now.</summary>
+    /// <summary>Asks for one entry's placeholders to be made now.</summary>
     public void Enqueue(Guid? libraryId, Guid entryId)
     {
         if (libraryId is { } id && id != Guid.Empty) queue.Writer.TryWrite((id, entryId));
@@ -404,17 +406,244 @@ public sealed class PlaceholderSyncQueue(IServiceScopeFactory scopeFactory, ILog
                     }
                     catch (KeyNotFoundException)
                     {
-                        // Not a TV or movie library: nothing to write.
+                        // Not a TV or movie library: nothing to make.
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
                     {
-                        logger.LogWarning("JellyfinMod could not write the placeholders of a new title; the next sync does: {Error}", error.Message);
+                        logger.LogWarning("JellyfinMod could not make the placeholders of a new title; the next sync does: {Error}", error.Message);
                     }
                 }
             }
         }
         catch (OperationCanceledException)
         {
+        }
+    }
+}
+
+/// <summary>
+/// Takes a placeholder's place as soon as a real item arrives for it (P1.FU30): a movie, series, season or episode Jellyfin adds
+/// (an import, a file copied in by hand, a library added again), or a real episode or movie saved by its first refresh while one of
+/// the plugin's items still stands for it, starts that title's items' sync about a second after the last such change, once no
+/// library scan runs; the placeholder goes and its user data moves to the real item. A removal is the delete repair's
+/// (<see cref="DeleteRepair"/>). The plugin's own items never start it, so its own work never loops.
+/// </summary>
+public sealed class PlaceholderItemRepair(ILibraryManager library, IServiceScopeFactory scopeFactory, TimeProvider time,
+    ILogger<PlaceholderItemRepair> logger) : IHostedService
+{
+    /// <summary>How long Jellyfin's changes must have been quiet before the sync runs (a season's removal is a burst of events).</summary>
+    public static readonly TimeSpan Quiet = TimeSpan.FromSeconds(1);
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string MediaType, int TmdbId), byte> titles = new();
+    private readonly Channel<bool> signal = Channel.CreateBounded<bool>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
+    private int everyLibrary;
+    private long lastChange;
+    private CancellationTokenSource? stopping;
+    private Task? worker;
+
+    /// <inheritdoc />
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        library.ItemAdded += OnItemAdded;
+        library.ItemUpdated += OnItemUpdated;
+        worker = Task.Run(() => ProcessAsync(stopping.Token), CancellationToken.None);
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        library.ItemAdded -= OnItemAdded;
+        library.ItemUpdated -= OnItemUpdated;
+        signal.Writer.TryComplete();
+        var source = Interlocked.Exchange(ref stopping, null);
+        if (source is null) return;
+        await source.CancelAsync().ConfigureAwait(false);
+        try
+        {
+            if (worker is not null) await worker.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            source.Dispose();
+        }
+    }
+
+    private void OnItemAdded(object? sender, ItemChangeEventArgs eventArgs) => Note(eventArgs.Item);
+
+    /// <summary>
+    /// A real episode or movie saved by its first refresh (its series id and numbers are only certain then) for which one of the
+    /// plugin's items still stands: the sync swaps them. Cheap: one item read by id, only when a twin can exist.
+    /// </summary>
+    private void OnItemUpdated(object? sender, ItemChangeEventArgs eventArgs)
+    {
+        try
+        {
+            if (eventArgs.Item is not { } item || PlaceholderItems.IsOwn(item) || item.IsVirtualItem) return;
+            var twin = item switch
+            {
+                JellyfinEpisode { IsPlaceHolder: false, ParentIndexNumber: { } season, IndexNumber: { } number } episode when episode.SeriesId != Guid.Empty =>
+                    library.GetItemById(library.GetNewItemId(PlaceholderItems.EpisodePath(episode.SeriesId, season, number), typeof(JellyfinEpisode)))
+                    ?? OwnSeriesOf(SafeSeries(episode.SeriesId)),
+                MediaBrowser.Controller.Entities.TV.Series series => OwnSeriesOf(series),
+                MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: false } movie when PlaceholderItems.TmdbIdOf(movie) is { } tmdb =>
+                    library.GetCollectionFolders(movie).Select(folder => library.GetItemById(library.GetNewItemId(
+                        PlaceholderItems.MoviePath(folder.Id, tmdb), typeof(MediaBrowser.Controller.Entities.Movies.Movie)))).FirstOrDefault(found => found is not null),
+                _ => null
+            };
+            if (twin is not null) Note(item);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogDebug(error, "JellyfinMod could not look for a placeholder twin");
+        }
+    }
+
+    private void Note(BaseItem? item)
+    {
+        try
+        {
+            // Cheap, on Jellyfin's thread: real titles, seasons and episodes only, never the plugin's own items or Jellyfin's
+            // virtual ones.
+            if (item is not (MediaBrowser.Controller.Entities.Movies.Movie or MediaBrowser.Controller.Entities.TV.Series or
+                    MediaBrowser.Controller.Entities.TV.Season or JellyfinEpisode) || item.IsVirtualItem || PlaceholderItems.IsOwn(item)) return;
+            var key = item switch
+            {
+                MediaBrowser.Controller.Entities.Movies.Movie movie => PlaceholderItems.TmdbIdOf(movie) is { } id ? ("movie", id) : default,
+                MediaBrowser.Controller.Entities.TV.Series series => PlaceholderItems.TmdbIdOf(series) is { } id ? ("series", id) : default,
+                MediaBrowser.Controller.Entities.TV.Season season => PlaceholderItems.TmdbIdOf(SafeSeries(season.SeriesId)) is { } id ? ("series", id) : default,
+                JellyfinEpisode episode => PlaceholderItems.TmdbIdOf(SafeSeries(episode.SeriesId)) is { } id ? ("series", id) : default,
+                _ => default((string, int))
+            };
+            if (key.Item1 is null) Interlocked.Exchange(ref everyLibrary, 1);
+            else titles.TryAdd(key, 0);
+            Interlocked.Exchange(ref lastChange, time.GetTimestamp());
+            signal.Writer.TryWrite(true);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogDebug(error, "JellyfinMod could not note a library change for its placeholder items");
+        }
+    }
+
+    /// <summary>The plugin's file-less item of a real series' title in its library, if there is one (the real series takes over).</summary>
+    private BaseItem? OwnSeriesOf(BaseItem? series)
+    {
+        if (series is null || PlaceholderItems.TmdbIdOf(series) is not { } tmdb) return null;
+        return library.GetCollectionFolders(series).Select(folder => library.GetItemById(library.GetNewItemId(
+            PlaceholderItems.SeriesPath(folder.Id, tmdb), typeof(MediaBrowser.Controller.Entities.TV.Series)))).FirstOrDefault(found => found is not null);
+    }
+
+    private BaseItem? SafeSeries(Guid seriesId)
+    {
+        try
+        {
+            return seriesId == Guid.Empty ? null : library.GetItemById(seriesId);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            _ = error;
+            return null;
+        }
+    }
+
+    private async Task ProcessAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (await signal.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                signal.Reader.TryRead(out _);
+                while (time.GetElapsedTime(Interlocked.Read(ref lastChange)) < Quiet)
+                    await Task.Delay(TimeSpan.FromMilliseconds(100), time, cancellationToken).ConfigureAwait(false);
+                // A library scan adds and removes many items; the sync follows it, never runs beside it.
+                for (var waited = 0; waited < 1800 && ScanRunning(); waited++)
+                    await Task.Delay(TimeSpan.FromSeconds(1), time, cancellationToken).ConfigureAwait(false);
+                signal.Reader.TryRead(out _);
+                var all = Interlocked.Exchange(ref everyLibrary, 0) == 1;
+                var keys = titles.Keys.ToArray();
+                foreach (var key in keys) titles.TryRemove(key, out _);
+                try
+                {
+                    await RunAsync(all, keys, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
+                {
+                    logger.LogWarning("JellyfinMod could not bring its placeholder items up to date after a library change; the next sync does: {Error}",
+                        error.Message);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task RunAsync(bool all, IReadOnlyList<(string MediaType, int TmdbId)> keys, CancellationToken cancellationToken)
+    {
+        var started = time.GetTimestamp();
+        using var scope = scopeFactory.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<PlaceholderService>();
+        var made = 0;
+        var removed = 0;
+        if (all)
+        {
+            foreach (var item in service.Libraries())
+            {
+                try
+                {
+                    var plan = await service.SyncAsync(item.LibraryId, cancellationToken).ConfigureAwait(false);
+                    made += plan.Writes.Count;
+                    removed += plan.Removals.Count;
+                }
+                catch (KeyNotFoundException)
+                {
+                    // The library went meanwhile.
+                }
+            }
+        }
+        else
+        {
+            var database = scope.ServiceProvider.GetRequiredService<JellyfinMod.Data.ModDbContext>();
+            var tmdbIds = keys.Select(key => key.TmdbId).Distinct().ToArray();
+            var entries = (await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync(
+                    database.Entries.Where(entry => tmdbIds.Contains(entry.TmdbId) && entry.TargetLibraryId != null)
+                        .Select(entry => new { entry.Id, entry.MediaType, entry.TmdbId, LibraryId = entry.TargetLibraryId!.Value }), cancellationToken)
+                .ConfigureAwait(false)).Where(entry => keys.Contains((entry.MediaType, entry.TmdbId))).ToArray();
+            foreach (var entry in entries)
+            {
+                try
+                {
+                    var plan = await service.SyncEntryAsync(entry.LibraryId, entry.Id, cancellationToken).ConfigureAwait(false);
+                    made += plan.Writes.Count;
+                    removed += plan.Removals.Count;
+                }
+                catch (KeyNotFoundException)
+                {
+                    // Not a TV or movie library any more.
+                }
+            }
+        }
+
+        if (made > 0 || removed > 0)
+            logger.LogInformation("JellyfinMod brought its placeholder items up to date after a real item arrived: made {Made}, removed {Removed} in {Ms} ms",
+                made, removed, (int)time.GetElapsedTime(started).TotalMilliseconds);
+    }
+
+    private bool ScanRunning()
+    {
+        try
+        {
+            return library.IsScanRunning;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            _ = error;
+            return false;
         }
     }
 }
