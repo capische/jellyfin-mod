@@ -275,6 +275,187 @@ public sealed class ReconciliationService(
     }
 
     /// <summary>
+    /// Clears the bindings of what Jellyfin removed (P1.FU29 / P4.FU12) while the caller holds the library lease: only the bindings
+    /// the scope names (by native item id, by path or by a folder the path lies under), each only when its file is provably gone
+    /// on the very mount it was seen on. A binding whose file is still there is left alone, a binding that cannot be proved gone
+    /// (the mount changed or cannot be read) keeps its whole title unchanged, and a title that keeps another copy stays on disk.
+    /// Retention and history follow the library-wide absence confirmation (<see cref="ConfirmAbsenceUnderLeaseAsync"/>) exactly.
+    /// Season and series deletions that Jellyfin reports for the root only clear every binding under it, once.
+    /// </summary>
+    public async Task<ScopeAbsenceResult> ConfirmAbsenceInScopeUnderLeaseAsync(
+        Guid libraryId,
+        IReadOnlyList<string> libraryLocations,
+        RemovedScope scope,
+        CancellationToken cancellationToken)
+    {
+        using var operation = SqliteWriteDiagnostics.Operation("scoped absence");
+        var ids = scope.ItemIds.Distinct().ToList();
+        var prefixes = scope.Paths.Where(path => !string.IsNullOrWhiteSpace(path)).Select(Path.TrimEndingDirectorySeparator)
+            .Distinct(StringComparer.Ordinal).ToList();
+        var entryBindings = new Dictionary<Guid, EntryBinding>();
+        var episodeBindings = new Dictionary<Guid, EpisodeBinding>();
+        foreach (var binding in await database.EntryBindings.Where(binding => binding.TargetLibraryId == libraryId &&
+                         ids.Contains(binding.JellyfinItemId)).ToListAsync(cancellationToken).ConfigureAwait(false))
+            entryBindings[binding.Id] = binding;
+        foreach (var binding in await database.EpisodeBindings.Where(binding => binding.TargetLibraryId == libraryId &&
+                         (ids.Contains(binding.JellyfinItemId) || ids.Contains(binding.SeriesItemId)))
+                     .ToListAsync(cancellationToken).ConfigureAwait(false))
+            episodeBindings[binding.Id] = binding;
+        foreach (var prefix in prefixes)
+        {
+            var below = prefix + Path.DirectorySeparatorChar;
+            foreach (var binding in await database.EntryBindings.Where(binding => binding.TargetLibraryId == libraryId &&
+                             binding.MediaPath != null && (binding.MediaPath == prefix || binding.MediaPath.StartsWith(below)))
+                         .ToListAsync(cancellationToken).ConfigureAwait(false))
+                entryBindings[binding.Id] = binding;
+            foreach (var binding in await database.EpisodeBindings.Where(binding => binding.TargetLibraryId == libraryId &&
+                             binding.MediaPath != null && (binding.MediaPath == prefix || binding.MediaPath.StartsWith(below)))
+                         .ToListAsync(cancellationToken).ConfigureAwait(false))
+                episodeBindings[binding.Id] = binding;
+        }
+
+        if (entryBindings.Count == 0 && episodeBindings.Count == 0) return new(new HashSet<Guid>(), 0, 0, []);
+
+        // Which of them are gone: the file is not there and the mount is the one it was seen on. A file that is still there is
+        // simply not removed; one that cannot be proved gone leaves its whole title as it was.
+        var entryIds = entryBindings.Values.Select(binding => binding.EntryId).ToHashSet();
+        var episodeIds = episodeBindings.Values.Select(binding => binding.EpisodeId).ToList();
+        var episodes = await database.Episodes.Where(episode => episodeIds.Contains(episode.Id)).ToDictionaryAsync(episode => episode.Id,
+            cancellationToken).ConfigureAwait(false);
+        entryIds.UnionWith(episodes.Values.Select(episode => episode.EntryId));
+        var entries = await database.Entries.Where(entry => entryIds.Contains(entry.Id)).ToDictionaryAsync(entry => entry.Id, cancellationToken)
+            .ConfigureAwait(false);
+        var unverified = new List<ExcludedTitle>();
+        var excluded = new HashSet<Guid>();
+        var goneEntryBindings = new List<EntryBinding>();
+        var goneEpisodeBindings = new List<EpisodeBinding>();
+        foreach (var binding in entryBindings.Values)
+        {
+            if (PathIsThere(binding.MediaPath)) continue;
+            if (IsProvenAbsent(binding.MediaPath, binding.StorageIdentity, libraryLocations, out var detail)) goneEntryBindings.Add(binding);
+            else if (excluded.Add(binding.EntryId)) unverified.Add(new(binding.EntryId, entries[binding.EntryId].Title, detail));
+        }
+
+        foreach (var binding in episodeBindings.Values)
+        {
+            if (PathIsThere(binding.MediaPath)) continue;
+            var ownerId = episodes[binding.EpisodeId].EntryId;
+            if (IsProvenAbsent(binding.MediaPath, binding.StorageIdentity, libraryLocations, out var detail)) goneEpisodeBindings.Add(binding);
+            else if (excluded.Add(ownerId)) unverified.Add(new(ownerId, entries[ownerId].Title, detail));
+        }
+
+        goneEntryBindings.RemoveAll(binding => excluded.Contains(binding.EntryId));
+        goneEpisodeBindings.RemoveAll(binding => excluded.Contains(episodes[binding.EpisodeId].EntryId));
+        if (goneEntryBindings.Count == 0 && goneEpisodeBindings.Count == 0) return new(new HashSet<Guid>(), 0, 0, unverified);
+
+        var touched = goneEntryBindings.Select(binding => binding.EntryId)
+            .Concat(goneEpisodeBindings.Select(binding => episodes[binding.EpisodeId].EntryId)).ToHashSet();
+        database.EntryBindings.RemoveRange(goneEntryBindings);
+        database.EpisodeBindings.RemoveRange(goneEpisodeBindings);
+        // What each touched title still holds, with the removed rows left out.
+        var touchedList = touched.ToList();
+        var survivingEntryBindings = (await database.EntryBindings.Where(binding => touchedList.Contains(binding.EntryId))
+            .ToListAsync(cancellationToken).ConfigureAwait(false)).Where(binding => goneEntryBindings.All(gone => gone.Id != binding.Id)).ToList();
+        var allEpisodes = await database.Episodes.Where(episode => touchedList.Contains(episode.EntryId)).ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var allEpisodeIds = allEpisodes.Select(episode => episode.Id).ToList();
+        var survivingEpisodeBindings = (await database.EpisodeBindings.Where(binding => allEpisodeIds.Contains(binding.EpisodeId))
+            .ToListAsync(cancellationToken).ConfigureAwait(false)).Where(binding => goneEpisodeBindings.All(gone => gone.Id != binding.Id)).ToList();
+
+        var now = _clock.GetUtcNow().UtcDateTime;
+        foreach (var gone in goneEntryBindings.Where(gone => survivingEntryBindings.Any(other => other.EntryId == gone.EntryId)))
+            await ForgetRepresentationEvidenceAsync(database, gone.EntryId, gone.JellyfinItemId, cancellationToken).ConfigureAwait(false);
+        foreach (var gone in goneEpisodeBindings.Where(gone => survivingEpisodeBindings.Any(other => other.EpisodeId == gone.EpisodeId)))
+            await ForgetRepresentationEvidenceAsync(database, gone.EpisodeId, gone.JellyfinItemId, cancellationToken).ConfigureAwait(false);
+        foreach (var episodeId in goneEpisodeBindings.Select(binding => binding.EpisodeId).Distinct())
+        {
+            if (survivingEpisodeBindings.Any(binding => binding.EpisodeId == episodeId)) continue;
+            var owner = episodes[episodeId].EntryId;
+            await RetentionTargetReset.ResetAsync(database, owner, episodeId, now, cancellationToken).ConfigureAwait(false);
+            RecordRetentionReset(owner, episodeId, goneEpisodeBindings.Where(binding => binding.EpisodeId == episodeId).Select(binding => binding.MediaPath));
+        }
+
+        var missingItems = 0;
+        foreach (var entryId in touched)
+        {
+            var entry = entries[entryId];
+            var held = survivingEntryBindings.Where(binding => binding.EntryId == entryId).ToArray();
+            if (entry.MediaType == "movie" && held.Length == 0 && goneEntryBindings.Any(binding => binding.EntryId == entryId))
+            {
+                await RetentionTargetReset.ResetAsync(database, entryId, null, now, cancellationToken).ConfigureAwait(false);
+                RecordRetentionReset(entryId, null, goneEntryBindings.Where(binding => binding.EntryId == entryId).Select(binding => binding.MediaPath));
+            }
+
+            // A movie copy is playable while its binding stands. A series copy is playable while one of its episodes has a file.
+            var playable = held.Where(binding => entry.MediaType == "movie" ||
+                    survivingEpisodeBindings.Any(episodeBinding => episodeBinding.SeriesItemId == binding.JellyfinItemId))
+                .OrderBy(binding => binding.OwnerItemId is null ? 0 : 1)
+                .ThenBy(binding => binding.JellyfinItemId == binding.VersionGroupId ? 0 : 1)
+                .ThenBy(binding => binding.VersionGroupId).ThenBy(binding => binding.JellyfinItemId).ToArray();
+            var selected = playable.FirstOrDefault(binding => (binding.OwnerItemId ?? binding.JellyfinItemId) == entry.JellyfinItemId) ??
+                playable.FirstOrDefault();
+            if (selected is not null)
+            {
+                entry.JellyfinItemId = selected.OwnerItemId ?? selected.JellyfinItemId;
+                entry.State = FileState.OnDisk;
+            }
+            else
+            {
+                var becameMissing = entry.State != FileState.Reclaimed && (entry.State == FileState.OnDisk || entry.JellyfinItemId.HasValue);
+                entry.JellyfinItemId = null;
+                if (entry.State == FileState.OnDisk) entry.State = FileState.None;
+                if (becameMissing)
+                {
+                    missingItems++;
+                    database.History.Add(new HistoryRecord
+                    {
+                        EntryId = entry.Id, EventType = "media_missing", Summary = "Playable media is no longer present in Jellyfin"
+                    });
+                }
+            }
+
+            foreach (var episode in allEpisodes.Where(episode => episode.EntryId == entryId &&
+                         goneEpisodeBindings.Any(gone => gone.EpisodeId == episode.Id)))
+            {
+                var left = survivingEpisodeBindings.Where(binding => binding.EpisodeId == episode.Id).OrderBy(binding => binding.JellyfinItemId).ToArray();
+                var chosen = left.FirstOrDefault(binding => binding.JellyfinItemId == episode.JellyfinItemId) ?? left.FirstOrDefault();
+                var becameMissing = chosen is null && (episode.State == FileState.OnDisk || episode.JellyfinItemId.HasValue);
+                episode.JellyfinItemId = chosen?.JellyfinItemId;
+                if (chosen is not null) episode.State = FileState.OnDisk;
+                else if (episode.State == FileState.OnDisk) episode.State = FileState.None;
+                if (becameMissing)
+                {
+                    missingItems++;
+                    database.History.Add(new HistoryRecord
+                    {
+                        EntryId = entry.Id,
+                        EventType = "episode_media_missing",
+                        Summary = $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00} is no longer present in Jellyfin",
+                        Data = JsonSerializer.Serialize(new { episodeId = episode.Id, tmdbId = episode.TmdbId,
+                            episode.SeasonNumber, episode.EpisodeNumber })
+                    });
+                }
+            }
+        }
+
+        await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await DetachOrphanVersionKeepsAsync(touched, cancellationToken).ConfigureAwait(false);
+        return new(touched, goneEntryBindings.Count + goneEpisodeBindings.Count, missingItems, unverified);
+    }
+
+    private static bool PathIsThere(string? path)
+    {
+        try
+        {
+            return !string.IsNullOrWhiteSpace(path) && (File.Exists(path) || Directory.Exists(path));
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Removes a per-file Keep that no longer matches any file of its title, by path or by physical identity, once its file
     /// is provably gone or replaced at its path, and says so in History (RET3-R7, RET4-R6). Left in place it would keep protecting its old path forever, so a different file that lands
     /// there later would be kept without anyone having kept it. The file it kept went (a move to another filesystem, a
@@ -432,7 +613,7 @@ public sealed class ReconciliationService(
         // file that is still there (an extra version it re-identified, a hidden merged copy), and absence decided by the
         // observation alone deleted such bindings and reset their clocks (V1, analysis C5).
         return _mediaStorage.IsCurrent(path, identity, locations, out detail) &&
-            MediaStorageIdentity.IsProvablyAbsent(path, out detail);
+            MediaStorageIdentity.IsProvablyAbsent(path, out detail, mountVerified: true);
     }
 
     private async Task<ReconciliationResult> ReconcileAsync(
@@ -1579,8 +1760,19 @@ internal sealed record ConfirmedLibrarySnapshot(Guid LibraryId, IReadOnlyList<st
 internal sealed record AbsenceConfirmationResult(int MissingItems, bool IsComplete, string? Detail,
     int ExcludedTitles = 0, IReadOnlyList<ExcludedTitle>? UnverifiedTitles = null);
 
+/// <summary>
+/// What Jellyfin removed, as the plugin captured it when the removal was announced: native item ids (a movie, a series, an
+/// episode) and paths (a file, or a season or series folder whose every binding below it is meant). The ids and the paths
+/// name bindings; the files decide.
+/// </summary>
+public sealed record RemovedScope(IReadOnlyList<Guid> ItemIds, IReadOnlyList<string> Paths);
+
+/// <summary>The titles a scoped absence confirmation changed, how many bindings it cleared and titles it could not prove.</summary>
+public sealed record ScopeAbsenceResult(IReadOnlySet<Guid> EntryIds, int RemovedBindings, int MissingItems,
+    IReadOnlyList<ExcludedTitle> Unverified);
+
 /// <summary>A title whose absent media could not be proven gone, so it kept its bindings and state.</summary>
-internal sealed record ExcludedTitle(Guid EntryId, string Title, string Detail);
+public sealed record ExcludedTitle(Guid EntryId, string Title, string Detail);
 
 /// <summary>The durable effect of one reconciliation operation.</summary>
 public sealed record ReconciliationResult(ReconciliationOutcome Outcome, Guid? EntryId, int ChangedEpisodes, string? Detail)

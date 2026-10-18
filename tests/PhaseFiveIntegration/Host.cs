@@ -15,6 +15,7 @@ using JellyfinMod.Data;
 using JellyfinMod.Services;
 using JellyfinMod.Services.Acquisition;
 using JellyfinMod.Services.Import;
+using JellyfinMod.Services.Placeholders;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
@@ -25,6 +26,7 @@ using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
+using MediaBrowser.Model.Session;
 using MediaBrowser.Model.Tasks;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
@@ -41,6 +43,28 @@ internal sealed class ShiftedTimeProvider : TimeProvider
 {
     public TimeSpan Offset { get; set; }
     public override DateTimeOffset GetUtcNow() => base.GetUtcNow() + Offset;
+}
+
+/// <summary>
+/// The one simulated discovery: when the world lets it (<see cref="NativeWorld.Discovery"/>, else as the watcher does:
+/// <see cref="NativeWorld.AutoScan"/>), the library looks at each path the plugin asks about, as a folder validation would.
+/// Every request is kept, so a test can say what was asked and how often (P4.FU12).
+/// </summary>
+internal sealed class SimulatedDiscovery(NativeWorld world) : IMediaDiscovery
+{
+    // The simulated discovery is done when it returns.
+    public Task IdleAsync(Guid libraryId) => Task.CompletedTask;
+
+    public Task DiscoverAsync(Guid libraryId, IReadOnlyCollection<string> paths, CancellationToken cancellationToken = default)
+    {
+        foreach (var path in paths)
+        {
+            world.DiscoveryRequests.Enqueue(path);
+            if (world.Discovery ?? world.AutoScan) world.Scan(path);
+        }
+
+        return Task.CompletedTask;
+    }
 }
 
 /// <summary>Collects every formatted log line so tests can prove secrets never reach logs.</summary>
@@ -85,6 +109,18 @@ internal sealed partial class NativeWorld
     public required Func<Guid, BaseItem[]> UserLibraries { get; init; }
     public ConcurrentQueue<string> ScanRequests { get; } = new();
     public bool AutoScan { get; set; } = true;
+
+    /// <summary>The users with a session open, as Jellyfin lists them (the early LibraryChanged goes only to these, P4.FU12).</summary>
+    public ConcurrentDictionary<Guid, byte> Connected { get; } = new();
+
+    /// <summary>Every message the plugin sent to user sessions: who, which kind and what.</summary>
+    public ConcurrentQueue<(Guid[] Users, SessionMessageType Type, object Data)> SessionMessages { get; } = new();
+
+    /// <summary>Every path the plugin asked Jellyfin to pick up now (P4.FU12), in order.</summary>
+    public ConcurrentQueue<string> DiscoveryRequests { get; } = new();
+
+    /// <summary>Whether a discovery request looks at the path: null follows <see cref="AutoScan"/> (the watcher and the discovery act together).</summary>
+    public bool? Discovery { get; set; }
 
     /// <summary>Whether Jellyfin reports a library scan running (<c>ILibraryManager.IsScanRunning</c>; the backfill gives way, P1.FU27).</summary>
     public bool ScanRunning { get; set; }
@@ -155,6 +191,23 @@ internal sealed partial class NativeWorld
     });
 
     /// <summary>
+    /// While set, an item Jellyfin lists is not refreshed or probed yet (P4.FU12: an import is complete when its file is playable,
+    /// not when it is listed). <see cref="RefreshAll"/> refreshes what was listed meanwhile, as Jellyfin does a moment later.
+    /// </summary>
+    public bool HoldRefresh { get; set; }
+
+    private DateTime RefreshedAt(string file) =>
+        HoldRefresh || file.EndsWith(".disc", StringComparison.OrdinalIgnoreCase) ? DateTime.MinValue : DateTime.UtcNow.AddMinutes(-1);
+
+    /// <summary>Every listed item that is not refreshed yet has been refreshed and probed now.</summary>
+    public void RefreshAll()
+    {
+        foreach (var item in _items.Values.Where(item => item is Video && item.DateLastRefreshed == DateTime.MinValue &&
+                     item.Path is { } path && !path.EndsWith(".disc", StringComparison.OrdinalIgnoreCase)))
+            item.DateLastRefreshed = DateTime.UtcNow.AddMinutes(-1);
+    }
+
+    /// <summary>
     /// Adds a native item for every file under <paramref name="path"/> that Jellyfin does not know yet. A placeholder item whose
     /// file is gone from the refreshed folder (a reported file refreshes its folder) is dropped, as Jellyfin's refresh drops a
     /// missing child; the fixtures rely on that only for placeholders (P1.FU25), so other items keep their earlier behaviour.
@@ -205,7 +258,7 @@ internal sealed partial class NativeWorld
         var movie = new Movie
         {
             Id = NewItemId(file, typeof(Movie)), Name = TitlePattern().Match(Path.GetFileName(folder)).Groups[1].Value.Trim(),
-            Path = file, DateCreated = DateTime.UtcNow,
+            Path = file, DateCreated = DateTime.UtcNow, DateLastRefreshed = RefreshedAt(file),
             // A media stub (.disc) is a placeholder movie, as Jellyfin 12 resolves it (P1.FU26).
             IsPlaceHolder = file.EndsWith(".disc", StringComparison.OrdinalIgnoreCase)
         };
@@ -224,7 +277,7 @@ internal sealed partial class NativeWorld
         var source = new Movie
         {
             Id = NewItemId(file, owner.GetType()), Name = Path.GetFileNameWithoutExtension(file), Path = file,
-            DateCreated = DateTime.UtcNow, OwnerId = owner.Id, PrimaryVersionId = owner.Id
+            DateCreated = DateTime.UtcNow, DateLastRefreshed = RefreshedAt(file), OwnerId = owner.Id, PrimaryVersionId = owner.Id
         };
         owner.LocalAlternateVersions = [.. owner.LocalAlternateVersions, file];
         _items[source.Id] = source;
@@ -243,7 +296,7 @@ internal sealed partial class NativeWorld
         {
             Id = NewItemId(file, main.GetType()), Name = Path.GetFileNameWithoutExtension(file), Path = file, SeriesId = main.SeriesId,
             ParentIndexNumber = main.ParentIndexNumber, IndexNumber = main.IndexNumber, DateCreated = DateTime.UtcNow,
-            OwnerId = main.Id, PrimaryVersionId = main.Id
+            DateLastRefreshed = RefreshedAt(file), OwnerId = main.Id, PrimaryVersionId = main.Id
         };
         main.LocalAlternateVersions = [.. main.LocalAlternateVersions, file];
         _items[version.Id] = version;
@@ -274,7 +327,7 @@ internal sealed partial class NativeWorld
             IsPlaceHolder = file.EndsWith(".disc", StringComparison.OrdinalIgnoreCase),
             SeriesPresentationUniqueKey = series.PresentationUniqueKey, ParentIndexNumber = numbering.Success ? int.Parse(numbering.Groups[1].Value, CultureInfo.InvariantCulture) : null,
             IndexNumber = numbering.Success ? int.Parse(numbering.Groups[2].Value, CultureInfo.InvariantCulture) : null,
-            DateCreated = DateTime.UtcNow
+            DateCreated = DateTime.UtcNow, DateLastRefreshed = RefreshedAt(file)
         };
         if (EpisodeTmdbId?.Invoke(file) is { } tmdb) episode.ProviderIds["Tmdb"] = tmdb.ToString(CultureInfo.InvariantCulture);
         lock (series.Items) series.Items.Add(episode);
@@ -287,6 +340,17 @@ internal sealed partial class NativeWorld
         lock (library.Items) library.Items.Add(item);
         _items[item.Id] = item;
         _added?.Invoke(this, new ItemChangeEventArgs { Item = item });
+    }
+
+    /// <summary>Raises Jellyfin's removal event for an item the fixtures do not keep (a season), as the host announces it.</summary>
+    public void Announce(BaseItem item) => _removed?.Invoke(this, new ItemChangeEventArgs { Item = item });
+
+    /// <summary>The files under a folder, gone from disk and from the library, as Jellyfin's Delete media leaves them (no event).</summary>
+    public void Forget(BaseItem item)
+    {
+        _items.TryRemove(item.Id, out _);
+        foreach (var library in Libraries) lock (library.Items) library.Items.Remove(item);
+        foreach (var series in _items.Values.OfType<TestSeries>()) lock (series.Items) series.Items.Remove(item);
     }
 
     public void Remove(BaseItem item)
@@ -374,6 +438,8 @@ internal sealed partial class NativeWorld
     {
         switch (method.Name)
         {
+            // A file's item, as Jellyfin's index answers by path (P4.FU12); the fixtures keep no folder items for seasons.
+            case "FindByPath": return arguments![1] is true ? null : _items.Values.FirstOrDefault(item => string.Equals(item.Path, (string)arguments![0]!, StringComparison.Ordinal));
             case "GetUserRootFolder": return new TestRoot(UserLibraries);
             case "get_IsScanRunning": return ScanRunning;
             case "GetVirtualFolders":
@@ -488,16 +554,30 @@ internal sealed class PluginHost : IAsyncDisposable
         });
         // A session plays an item while the run says so: its media source names the item, as a client's play state does.
         ISessionManager? sessionManager = null;
-        var sessions = sessionManager = Stub<ISessionManager>.Create((method, _) => method.Name == "get_Sessions"
-            ? ReadSessions()
-            : null);
+        var sessions = sessionManager = Stub<ISessionManager>.Create((method, args) =>
+        {
+            if (method.Name == "get_Sessions") return ReadSessions();
+            // The early LibraryChanged message (P4.FU12) is kept, with who it went to.
+            if (method.Name == "SendMessageToUserSessions" && args is [List<Guid> recipients, SessionMessageType type, object data, ..])
+            {
+                world.Native.SessionMessages.Enqueue((recipients.ToArray(), type, data));
+                return Task.CompletedTask;
+            }
+
+            return null;
+        });
         SessionInfo[] ReadSessions()
         {
             world.Native.SessionsRead?.Invoke();
-            return world.Native.Playing.Keys.Select(id => new SessionInfo(sessionManager!, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance)
+            var playing = world.Native.Playing.Keys.Select(id => new SessionInfo(sessionManager!, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance)
             {
                 PlayState = new MediaBrowser.Model.Session.PlayerStateInfo { MediaSourceId = id.ToString("N") }
-            }).ToArray();
+            });
+            var connected = world.Native.Connected.Keys.Select(user => new SessionInfo(sessionManager!, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance)
+            {
+                UserId = user
+            });
+            return playing.Concat(connected).ToArray();
         }
 
         var builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions
@@ -530,6 +610,13 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Services.AddSingleton(users);
         builder.Services.AddSingleton(world.Native.Library);
         builder.Services.AddSingleton(world.Native.Monitor);
+        // The discovery Jellyfin is made to do after the plugin writes files: the simulated library looks at the folders (P4.FU12).
+        builder.Services.AddSingleton<IMediaDiscovery>(_ => new SimulatedDiscovery(world.Native));
+        builder.Services.AddSingleton<LibraryNotifications>();
+        builder.Services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<LibraryNotifications>());
+        // The suite runs its placeholder syncs itself (Sync Now, the entry's sync); start-up does not add one.
+        DeleteRepair.SyncAtStart = false;
+        builder.Services.AddSingleton<IHostedService, DeleteRepair>();
         builder.Services.AddSingleton(world.Native.MediaSources);
         builder.Services.AddSingleton(userData);
         builder.Services.AddSingleton(sessions);

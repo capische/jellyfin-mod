@@ -116,9 +116,12 @@ public sealed class MediaStorageIdentity(string mountInfoPath = "/proc/self/moun
 
     /// <summary>
     /// Proves absence without a trusted mount identity (P2.R6): the file is gone and its nearest existing
-    /// ancestor directory is readable and not empty, so an empty unmounted mount point cannot pass.
+    /// ancestor directory is readable and not empty, so an empty unmounted mount point cannot pass. With
+    /// <paramref name="mountVerified"/> (the caller has proved the path is on the very mount it was seen on) an empty
+    /// ancestor is proof too: an unmounted mount point would have changed the path's mount (P1.FU29: Jellyfin's
+    /// <i>Delete media</i> on a series' only season leaves the series folder empty).
     /// </summary>
-    public static bool IsProvablyAbsent(string? path, out string detail)
+    public static bool IsProvablyAbsent(string? path, out string detail, bool mountVerified = false)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
@@ -145,7 +148,7 @@ public sealed class MediaStorageIdentity(string mountInfoPath = "/proc/self/moun
             }
 
             using var entries = Directory.EnumerateFileSystemEntries(ancestor).GetEnumerator();
-            if (!entries.MoveNext())
+            if (!entries.MoveNext() && !mountVerified)
             {
                 detail = $"The nearest parent directory is empty and may be an unmounted mount point: {path}";
                 return false;

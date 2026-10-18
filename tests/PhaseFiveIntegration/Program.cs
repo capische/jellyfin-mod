@@ -36,6 +36,10 @@ try
         foreach (var line in logs.Lines.Where(line => line.StartsWith("Warning", StringComparison.Ordinal) ||
                      line.StartsWith("Error", StringComparison.Ordinal)).TakeLast(40))
             Console.Error.WriteLine(line.Length > 600 ? line[..600] : line);
+        // What the delete repair did (P4.FU12) explains a placeholder that appeared where a step did not expect one.
+        foreach (var line in logs.Lines.Where(line => line.Contains("repaired a delete", StringComparison.Ordinal) || line.Contains("repair batch", StringComparison.Ordinal) || line.Contains("noted the removal", StringComparison.Ordinal) || line.Contains("expected the removal", StringComparison.Ordinal) || line.Contains("leaves a removal alone", StringComparison.Ordinal) || line.Contains("cannot play the file", StringComparison.Ordinal) ||
+                     line.Contains("delete repair", StringComparison.Ordinal) || line.Contains("bound file", StringComparison.Ordinal)).TakeLast(40))
+            Console.Error.WriteLine(line.Length > 600 ? line[..600] : line);
         throw;
     }
 
@@ -1970,6 +1974,8 @@ internal static partial class Phase5
         await PlaceholderSwapScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, logs);
         // The backfill of an existing catalogue and the watched restore (P1.FU27).
         await BackfillScenarios.RunAsync(admin, host.Client(world.Ordinary, false), world, dbPath);
+        // Jellyfin removes a season or a series: its placeholders come back at once (P1.FU29, P4.FU12).
+        await DeleteRepairScenarios.RunAsync(admin, world, dbPath, ids);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))

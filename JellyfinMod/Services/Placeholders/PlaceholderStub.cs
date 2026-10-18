@@ -91,4 +91,52 @@ public static class PlaceholderStub
 
     /// <summary>Forgets what is known about a path (it was written or removed).</summary>
     public static void Forget(string path) => Seen.TryRemove(path, out _);
+
+    private static readonly ConcurrentDictionary<string, DateTime> ExpectedRemovals = new(StringComparer.Ordinal);
+
+    /// <summary>How long an expected removal that Jellyfin never announced is kept before it is forgotten (memory only).</summary>
+    private static readonly TimeSpan ExpectedMemory = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Notes a stub, or a folder emptied by removing stubs, that the plugin itself is about to remove (the import's swap, a stale
+    /// stub, Remove Placeholders, Remove Entry): Jellyfin's announcement of that removal is taken once by
+    /// <see cref="ConsumeExpectedRemoval"/> and is not a delete to repair (P1.FU29, P4.FU12). It is one identity consumed when
+    /// observed, never a time window over a folder: a genuine deletion of the same path later is announced again and repaired.
+    /// </summary>
+    public static void ExpectRemoval(string path)
+    {
+        var now = DateTime.UtcNow;
+        if (ExpectedRemovals.Count > 1000)
+            foreach (var stale in ExpectedRemovals.Where(pair => now - pair.Value > ExpectedMemory).Select(pair => pair.Key).ToArray())
+                ExpectedRemovals.TryRemove(stale, out _);
+        ExpectedRemovals[Path.TrimEndingDirectorySeparator(path)] = now;
+    }
+
+    /// <summary>Takes the expected removal of exactly this path, if one was noted: true once, so the announcement is ignored.</summary>
+    public static bool ConsumeExpectedRemoval(string? path) =>
+        !string.IsNullOrEmpty(path) && ExpectedRemovals.TryRemove(Path.TrimEndingDirectorySeparator(path), out var noted) &&
+        DateTime.UtcNow - noted <= ExpectedMemory;
+
+    private static readonly ConcurrentDictionary<Guid, DateTime> ExpectedItems = new();
+
+    /// <summary>
+    /// Notes the Jellyfin items the plugin is about to delete itself (the stubs it removed, and the folders that left empty): their
+    /// announcement is taken once by <see cref="ConsumeExpectedItem"/> and is not a delete to repair (P4.FU12). Named by item id, so
+    /// it holds however late or early Jellyfin announces: the plugin deletes these items itself and Jellyfin announces them at once.
+    /// </summary>
+    public static void ExpectItemRemoval(Guid id)
+    {
+        var now = DateTime.UtcNow;
+        // Only to bound memory: an id whose announcement never came (the delete failed) is forgotten after an hour.
+        if (ExpectedItems.Count > 2000)
+            foreach (var stale in ExpectedItems.Where(pair => now - pair.Value > TimeSpan.FromHours(1)).Select(pair => pair.Key).ToArray())
+                ExpectedItems.TryRemove(stale, out _);
+        ExpectedItems[id] = now;
+    }
+
+    /// <summary>Takes the expected removal of exactly this item, if one was noted: true once, so the announcement is ignored.</summary>
+    public static bool ConsumeExpectedItem(Guid id) => ExpectedItems.TryRemove(id, out _);
+
+    /// <summary>Forgets an expected item whose delete failed.</summary>
+    public static void ForgetExpectedItem(Guid id) => ExpectedItems.TryRemove(id, out _);
 }

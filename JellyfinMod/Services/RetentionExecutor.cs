@@ -22,7 +22,8 @@ public sealed class RetentionExecutor(
     TimeProvider clock,
     ILogger<RetentionExecutor> logger,
     RetentionLiveCheck liveCheck,
-    ILibraryMonitor? libraryMonitor = null)
+    ILibraryMonitor? libraryMonitor = null,
+    LibraryNotifications? notifications = null)
 {
     /// <summary>Revalidates and reclaims one binding selected by the shared retention preview.</summary>
     public async Task<RetentionExecutionResult> ReclaimAsync(Guid bindingId, CancellationToken cancellationToken)
@@ -1041,11 +1042,16 @@ public sealed class RetentionExecutor(
                     return false;
             }
 
+            var (rating, tags) = (native.CustomRating ?? native.OfficialRating, native.Tags);
+            var parentId = native.ParentId;
             library.DeleteItem(native, new DeleteOptions
             {
                 DeleteFileLocation = false,
                 DeleteFromExternalProvider = false
             }, notifyParentItem: true);
+            // The clients are told at once that the item is gone (P4.FU12), not with Jellyfin's 30 s batch.
+            notifications?.Notify(new(operation.TargetLibraryId, notifications.IsMovieLibrary(operation.TargetLibraryId), [], [native.Id],
+                parentId == Guid.Empty ? [operation.TargetLibraryId] : [operation.TargetLibraryId, parentId], rating, tags));
             return true;
         }
         catch (Exception error)

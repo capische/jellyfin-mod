@@ -382,6 +382,7 @@ try
 
     await BackfillIntegration.RunAsync(folder);
     await AbsenceIntegration.RunAsync(folder);
+    await ScopedAbsenceIntegration.RunAsync(folder);
     Console.WriteLine("PASS: deterministic Phase 2 reconciliation persists across real SQLite transactions and restart");
 }
 finally

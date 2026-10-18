@@ -103,6 +103,15 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<PlaceholderWatchedRestore>();
         services.AddSingleton<IHostedService, PlaceholderItemListener>();
         services.AddSingleton<IHostedService, PlaceholderBackfillStarter>();
+        // A delete in Jellyfin brings the title's placeholders back at once (P1.FU29, P4.FU12).
+        services.AddSingleton<IHostedService, DeleteRepair>();
+        // The clients hear of a plugin change at once, through Jellyfin's own LibraryChanged message (P4.FU12).
+        services.AddSingleton<LibraryNotifications>();
+        services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<LibraryNotifications>());
+        // Jellyfin holds the files the plugin writes at once, by its own folder validation (P4.FU12).
+        services.AddSingleton<FolderRefresh>();
+        services.AddSingleton<IMediaDiscovery>(provider => provider.GetRequiredService<FolderRefresh>());
+        services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<FolderRefresh>());
         services.AddSingleton<PlaceholderSyncQueue>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<PlaceholderSyncQueue>());
         services.AddSingleton<PlaceholderFilter>();

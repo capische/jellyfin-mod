@@ -90,6 +90,10 @@ public sealed record PlaceholderPlan(
     public string? Deferred { get; init; }
 }
 
+/// <summary>What the delete repair's sync of one title did: the stubs written, how many were removed, what failed, the folders changed.</summary>
+public sealed record EntryPlaceholders(IReadOnlyList<PlaceholderWrite> Written, int Removed, IReadOnlyList<PlaceholderRemoval> Failures,
+    IReadOnlyCollection<string> ChangedFolders);
+
 /// <summary>A TV or movie library and its placeholder switch.</summary>
 public sealed record PlaceholderLibrary(
     [property: JsonPropertyName("libraryId")] Guid LibraryId,
@@ -123,7 +127,9 @@ public sealed class PlaceholderService(
     UnixFileInspector files,
     ReconciliationLibraryLock libraryLock,
     TimeProvider time,
-    ILogger<PlaceholderService> logger)
+    ILogger<PlaceholderService> logger,
+    IMediaDiscovery? discovery = null,
+    LibraryNotifications? notifications = null)
 {
     private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -159,7 +165,7 @@ public sealed class PlaceholderService(
     public async Task<PlaceholderPlan> PlanAsync(Guid libraryId, CancellationToken cancellationToken)
     {
         var (name, _) = LibraryOf(libraryId);
-        var plan = await ComputeAsync(libraryId, null, cancellationToken).ConfigureAwait(false);
+        var plan = await ComputeAsync(libraryId, null, null, cancellationToken).ConfigureAwait(false);
         var waiting = plan.Writes.Select(write => write.EntryId).ToHashSet();
         var titles = plan.Covered.Union(waiting).Count();
         return new(libraryId, name, PlaceholderSettings.IsEnabled(libraryId), true, plan.Existing, plan.Writes, plan.Removals, plan.Skipped)
@@ -212,101 +218,161 @@ public sealed class PlaceholderService(
     {
         var (name, _) = LibraryOf(libraryId);
         var enabled = PlaceholderSettings.IsEnabled(libraryId);
-        await using var lease = await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
-        var plan = await ComputeAsync(libraryId, entryId, cancellationToken).ConfigureAwait(false);
-        var (writes, removals, skipped, existing) = (plan.Writes, plan.Removals, plan.Skipped, plan.Existing);
-        // With the switch off nothing is written, so only the titles that have placeholders count.
-        var titleIds = enabled ? plan.Covered.Union(writes.Select(write => write.EntryId)).ToHashSet() : plan.Covered.ToHashSet();
-        if (yieldToScans && ScanRunning())
+        // The library lease is held for the plan and the removals, and for each title's writes; never across the pause between
+        // titles, so a delete's repair or an import is never made to wait for a batch's three seconds (P4.FU12).
+        IAsyncDisposable? lease = await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
+        try
         {
-            // Jellyfin is scanning: nothing is written or removed now (each would ask for another scan); the next run does it.
-            var waiting = writes.Select(write => write.EntryId).ToHashSet();
-            logger.LogInformation("JellyfinMod placeholders in library {Library}: a library scan is running, so this batch waits for the next run ({Pending} placeholder(s) pending)",
-                libraryId, writes.Count);
-            return new(libraryId, name, enabled, false, existing, [], [], skipped)
+            var plan = await ComputeAsync(libraryId, entryId, null, cancellationToken).ConfigureAwait(false);
+            var (writes, removals, skipped, existing) = (plan.Writes, plan.Removals, plan.Skipped, plan.Existing);
+            // With the switch off nothing is written, so only the titles that have placeholders count.
+            var titleIds = enabled ? plan.Covered.Union(writes.Select(write => write.EntryId)).ToHashSet() : plan.Covered.ToHashSet();
+            if (yieldToScans && ScanRunning())
             {
-                Pending = enabled ? writes.Count : 0, Titles = titleIds.Count, TitlesDone = titleIds.Count - (enabled ? waiting.Count : 0),
-                Deferred = "library_scan"
+                // Jellyfin is scanning: nothing is written or removed now (each would ask for another scan); the next run does it.
+                var waiting = writes.Select(write => write.EntryId).ToHashSet();
+                logger.LogInformation("JellyfinMod placeholders in library {Library}: a library scan is running, so this batch waits for the next run ({Pending} placeholder(s) pending)",
+                    libraryId, writes.Count);
+                return new(libraryId, name, enabled, false, existing, [], [], skipped)
+                {
+                    Pending = enabled ? writes.Count : 0, Titles = titleIds.Count, TitlesDone = titleIds.Count - (enabled ? waiting.Count : 0),
+                    Deferred = "library_scan"
+                };
+            }
+
+            var failures = new List<PlaceholderRemoval>();
+            // Every folder the run changed, asked of Jellyfin once at its end (P1.FU27): one look per folder, never one per file.
+            var changed = new HashSet<string>(StringComparer.Ordinal);
+            var done = new List<PlaceholderWrite>();
+            string? deferred = null;
+            var removedStubs = new List<string>();
+            foreach (var removal in removals)
+            {
+                var error = RemoveOne(removal.Path, changed);
+                if (error is not null) failures.Add(new(removal.Path, error));
+                else removedStubs.Add(removal.Path);
+            }
+
+            // The stub items go from Jellyfin now, before this run's writes ask it to look at the same folders.
+            if (removedStubs.Count > 0) DropItems(libraryId, removedStubs, changed);
+
+            var pending = 0;
+            if (enabled)
+            {
+                var series = writes.GroupBy(write => write.EntryId).ToArray();
+                var batch = series.Take(SeriesPerRun).ToArray();
+                pending = series.Skip(SeriesPerRun).Sum(group => group.Count());
+                for (var index = 0; index < batch.Length; index++)
+                {
+                    var group = batch[index];
+                    var titleWrites = group.ToList();
+                    if (index > 0)
+                    {
+                        // A pause between series, so the disk and Jellyfin's file monitor take one series at a time, outside the lease.
+                        await lease.DisposeAsync().ConfigureAwait(false);
+                        lease = null;
+                        await Task.Delay(PauseBetweenSeries, time, cancellationToken).ConfigureAwait(false);
+                        // A scan that started meanwhile ends the batch: the series not written yet wait for the next run.
+                        if (yieldToScans && ScanRunning())
+                        {
+                            deferred = "library_scan";
+                            pending += batch.Skip(index).Sum(rest => rest.Count());
+                            logger.LogInformation("JellyfinMod placeholders in library {Library}: a library scan started, so the rest of this batch waits for the next run",
+                                libraryId);
+                            break;
+                        }
+
+                        lease = await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
+                        // What the title needs is read again under the lease: it may have left the catalog, gained a file or been
+                        // turned off while the lease was free.
+                        if (!PlaceholderSettings.IsEnabled(libraryId)) { pending += titleWrites.Count; continue; }
+                        titleWrites = (await ComputeAsync(libraryId, group.Key, null, cancellationToken).ConfigureAwait(false)).Writes;
+                    }
+
+                    var written = await WriteTitleAsync(titleWrites, done, failures, changed, cancellationToken).ConfigureAwait(false);
+                    logger.LogInformation(
+                        "JellyfinMod placeholders in library {Library}: wrote {Written} for {Title} (series {Index} of {Count} this run, {Pending} placeholder(s) left for the next run)",
+                        libraryId, written, group.First().Title, index + 1, batch.Length, pending);
+                }
+            }
+
+            var reported = ReportOnce(libraryId, changed, done.Select(write => write.Path));
+            await StampAsync(libraryId, cancellationToken).ConfigureAwait(false);
+            if (done.Count > 0 || removals.Count > 0)
+                logger.LogInformation("JellyfinMod placeholders in library {Library}: wrote {Written}, removed {Removed}, {Failed} failed, {Pending} left for the next run; asked Jellyfin to look at {Folders} folder(s) once",
+                    libraryId, done.Count, removals.Count - failures.Count(failure => removals.Any(removal => removal.Path == failure.Path)),
+                    failures.Count, pending, reported);
+            // A title is waiting while a write of it is pending or failed.
+            var writtenPaths = done.Select(write => write.Path).ToHashSet(StringComparer.Ordinal);
+            var waitingTitles = enabled ? writes.Where(write => !writtenPaths.Contains(write.Path)).Select(write => write.EntryId).ToHashSet() : [];
+            return new(libraryId, name, enabled, false, existing, enabled ? done : [], removals, skipped)
+            {
+                Failures = failures, Pending = pending, Titles = titleIds.Count, TitlesDone = titleIds.Count - waitingTitles.Count, Deferred = deferred
             };
         }
+        finally
+        {
+            if (lease is not null) await lease.DisposeAsync().ConfigureAwait(false);
+        }
+    }
 
-        var failures = new List<PlaceholderRemoval>();
-        // Every folder the run changed, asked of Jellyfin once at its end (P1.FU27): one look per folder, never one per file.
+    /// <summary>
+    /// One title's placeholders at once, for the delete repair (P4.FU12), while the caller holds the library lease: its plan is read
+    /// afresh, its stale stubs removed and its missing ones written, in the folder the title had before when that is still free
+    /// (<paramref name="preferredFolder"/>). Nothing is reported to Jellyfin: the caller discovers the returned folders once its
+    /// lease is released. A title that left the catalog, a library turned off, a read-only folder or a file already in place gets
+    /// nothing, as in every sync.
+    /// </summary>
+    public async Task<EntryPlaceholders> SyncEntryUnderLeaseAsync(Guid libraryId, Guid entryId, string? preferredFolder,
+        CancellationToken cancellationToken)
+    {
+        _ = LibraryOf(libraryId);
+        var plan = await ComputeAsync(libraryId, entryId, preferredFolder, cancellationToken).ConfigureAwait(false);
         var changed = new HashSet<string>(StringComparer.Ordinal);
+        var failures = new List<PlaceholderRemoval>();
         var done = new List<PlaceholderWrite>();
-        string? deferred = null;
-        foreach (var removal in removals)
+        foreach (var removal in plan.Removals)
         {
             var error = RemoveOne(removal.Path, changed);
             if (error is not null) failures.Add(new(removal.Path, error));
         }
 
-        var pending = 0;
-        if (enabled)
+        if (PlaceholderSettings.IsEnabled(libraryId))
+            await WriteTitleAsync(plan.Writes, done, failures, changed, cancellationToken).ConfigureAwait(false);
+        return new(done, plan.Removals.Count - failures.Count(failure => plan.Removals.Any(removal => removal.Path == failure.Path)),
+            failures, changed);
+    }
+
+    /// <summary>Writes the stubs of one title (an entry's writes), recording what was written, what failed and the folders changed.</summary>
+    private async Task<int> WriteTitleAsync(IReadOnlyList<PlaceholderWrite> writes, List<PlaceholderWrite> done,
+        List<PlaceholderRemoval> failures, HashSet<string> changed, CancellationToken cancellationToken)
+    {
+        if (writes.Count == 0) return 0;
+        var entryId = writes[0].EntryId;
+        var titles = await database.Episodes.AsNoTracking().Where(episode => episode.EntryId == entryId)
+            .Select(episode => new { episode.SeasonNumber, episode.EpisodeNumber, episode.Title }).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var year = await database.Entries.AsNoTracking().Where(entry => entry.Id == entryId).Select(entry => entry.Year)
+            .SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        var written = 0;
+        foreach (var write in writes)
         {
-            var series = writes.GroupBy(write => write.EntryId).ToArray();
-            var batch = series.Take(SeriesPerRun).ToArray();
-            pending = series.Skip(SeriesPerRun).Sum(group => group.Count());
-            var entryIds = batch.Select(group => group.Key).ToArray();
-            var titles = await database.Episodes.AsNoTracking().Where(episode => entryIds.Contains(episode.EntryId))
-                .Select(episode => new { episode.EntryId, episode.SeasonNumber, episode.EpisodeNumber, episode.Title })
-                .ToListAsync(cancellationToken).ConfigureAwait(false);
-            var years = await database.Entries.AsNoTracking().Where(entry => entryIds.Contains(entry.Id))
-                .Select(entry => new { entry.Id, entry.Year }).ToDictionaryAsync(entry => entry.Id, entry => entry.Year, cancellationToken)
-                .ConfigureAwait(false);
-            for (var index = 0; index < batch.Length; index++)
+            var title = titles.FirstOrDefault(row => row.SeasonNumber == write.SeasonNumber && row.EpisodeNumber == write.EpisodeNumber)?.Title;
+            var body = write.Kind == PlaceholderKinds.Movie
+                ? PlaceholderStub.MovieBody(write.Title, year)
+                : PlaceholderStub.Body(write.Title, write.SeasonNumber, write.EpisodeNumber, title);
+            var error = WriteOne(write, body, changed);
+            if (error is null)
             {
-                // A pause between series, so the disk and Jellyfin's file monitor take one series at a time.
-                if (index > 0) await Task.Delay(PauseBetweenSeries, time, cancellationToken).ConfigureAwait(false);
-                // A scan that started meanwhile ends the batch: the series not written yet wait for the next run.
-                if (index > 0 && yieldToScans && ScanRunning())
-                {
-                    deferred = "library_scan";
-                    pending += batch.Skip(index).Sum(group => group.Count());
-                    logger.LogInformation("JellyfinMod placeholders in library {Library}: a library scan started, so the rest of this batch waits for the next run",
-                        libraryId);
-                    break;
-                }
-
-                var written = 0;
-                foreach (var write in batch[index])
-                {
-                    var title = titles.FirstOrDefault(row => row.EntryId == write.EntryId && row.SeasonNumber == write.SeasonNumber &&
-                        row.EpisodeNumber == write.EpisodeNumber)?.Title;
-                    var body = write.Kind == PlaceholderKinds.Movie
-                        ? PlaceholderStub.MovieBody(write.Title, years.GetValueOrDefault(write.EntryId))
-                        : PlaceholderStub.Body(write.Title, write.SeasonNumber, write.EpisodeNumber, title);
-                    var error = WriteOne(write, body, changed);
-                    if (error is null)
-                    {
-                        done.Add(write);
-                        written++;
-                    }
-                    else
-                    {
-                        failures.Add(new(write.Path, error));
-                    }
-                }
-
-                logger.LogInformation(
-                    "JellyfinMod placeholders in library {Library}: wrote {Written} for {Title} (series {Index} of {Count} this run, {Pending} placeholder(s) left for the next run)",
-                    libraryId, written, batch[index].First().Title, index + 1, batch.Length, pending);
+                done.Add(write);
+                written++;
+            }
+            else
+            {
+                failures.Add(new(write.Path, error));
             }
         }
 
-        var reported = ReportOnce(libraryId, changed);
-        await StampAsync(libraryId, cancellationToken).ConfigureAwait(false);
-        if (done.Count > 0 || removals.Count > 0)
-            logger.LogInformation("JellyfinMod placeholders in library {Library}: wrote {Written}, removed {Removed}, {Failed} failed, {Pending} left for the next run; asked Jellyfin to look at {Folders} folder(s) once",
-                libraryId, done.Count, removals.Count - failures.Count(failure => removals.Any(removal => removal.Path == failure.Path)),
-                failures.Count, pending, reported);
-        // A title is waiting while a write of it is pending or failed.
-        var writtenPaths = done.Select(write => write.Path).ToHashSet(StringComparer.Ordinal);
-        var waitingTitles = enabled ? writes.Where(write => !writtenPaths.Contains(write.Path)).Select(write => write.EntryId).ToHashSet() : [];
-        return new(libraryId, name, enabled, false, existing, enabled ? done : [], removals, skipped)
-        {
-            Failures = failures, Pending = pending, Titles = titleIds.Count, TitlesDone = titleIds.Count - waitingTitles.Count, Deferred = deferred
-        };
+        return written;
     }
 
     /// <summary>
@@ -314,56 +380,109 @@ public sealed class PlaceholderService(
     /// series folder is left out): Jellyfin's file monitor waits its library monitor delay, merges folders that sit side by side
     /// into one look at their parent, and refreshes each item found once. Returns how many folders were reported.
     /// </summary>
-    private int ReportOnce(Guid libraryId, IEnumerable<string> folders)
+    private int ReportOnce(Guid libraryId, IEnumerable<string> folders, IEnumerable<string> writtenFiles)
     {
         var sorted = folders.Select(Path.TrimEndingDirectorySeparator).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
         var outermost = new List<string>();
         foreach (var folder in sorted)
             if (!outermost.Any(parent => folder.StartsWith(parent + "/", StringComparison.Ordinal))) outermost.Add(folder);
-        var roots = outermost.Count == 0 ? [] : SeriesFolders.LibraryRoots(library, files, libraryId);
-        var unknownRoot = false;
-        foreach (var folder in outermost)
+        // And at once (P4.FU12): Jellyfin picks the changed folders and the files written in them up now, not after its library
+        // monitor delay (a library folder it holds no item for is made by its discovery); the report below stays as the fallback.
+        // The discovery never faults and nothing here waits for it.
+        // The clients are told once Jellyfin holds them (P4.FU12), at once and not with Jellyfin's own 30 s batch.
+        if (outermost.Count > 0 && discovery is not null)
         {
-            Report(folder);
-            // A library folder Jellyfin holds no item for (it was empty at its last scan): a look at it finds nothing to refresh,
-            // so its new title folders would wait for the next library scan: one is asked for.
-            if (roots.Any(root => string.Equals(Path.TrimEndingDirectorySeparator(root), folder, StringComparison.Ordinal)) && FindsNothing(folder))
-                unknownRoot = true;
+            var files = writtenFiles.ToArray();
+            _ = discovery.DiscoverAsync(libraryId, outermost.Concat(files).ToArray())
+                .ContinueWith(_ => notifications?.NotifyAdded(libraryId, files, outermost), TaskScheduler.Default);
         }
 
-        if (unknownRoot) AskForLibraryScan(libraryId);
+        foreach (var folder in outermost) Report(folder);
         return outermost.Count;
     }
 
-    private bool FindsNothing(string folder)
+    /// <summary>
+    /// Deletes the Jellyfin items of the stubs the plugin has just removed, and of the season and series folders that left empty,
+    /// itself and at once (P4.FU12), instead of waiting for Jellyfin's library monitor (60 s, and never for the last folder of an
+    /// emptied library folder, which Jellyfin skips). Each item is marked by its id first, so the delete repair knows exactly these
+    /// removals are the plugin's own however late Jellyfin announces them. Only a placeholder item at a removed stub's path, and a
+    /// series or season whose folder is gone, is deleted (files are never touched). What cannot be deleted is reported to the
+    /// library monitor as before. The clients are told at once.
+    /// </summary>
+    private void DropItems(Guid libraryId, IReadOnlyCollection<string> removedStubs, IReadOnlyCollection<string> changedFolders)
     {
+        var doomed = new List<BaseItem>();
         try
         {
-            return library.FindByPath(folder, true) is null;
+            foreach (var path in removedStubs)
+                if (library.FindByPath(path, false) is Video { IsPlaceHolder: true } stub) doomed.Add(stub);
+            // Folders that left empty, deepest first, so a season goes before its series.
+            foreach (var folder in changedFolders.Where(path => !Directory.Exists(path)).OrderByDescending(path => path.Length))
+                if (library.FindByPath(folder, true) is Folder and (Series or Season) and var item) doomed.Add(item);
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
-            _ = error;
-            return false;
+            logger.LogDebug(error, "JellyfinMod could not look up the Jellyfin items of removed placeholders");
         }
+
+        var removedIds = new List<Guid>();
+        var folderIds = new List<Guid> { libraryId };
+        string? rating = null;
+        IReadOnlyList<string>? tags = null;
+        var failed = new List<string>();
+        foreach (var item in doomed)
+        {
+            var below = new List<Guid>();
+            try
+            {
+                if (item is Folder folder) below.AddRange(folder.GetRecursiveChildren().Select(child => child.Id));
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                logger.LogDebug(error, "JellyfinMod could not list what lies below a removed folder item");
+            }
+
+            var ids = below.Append(item.Id).Distinct().ToArray();
+            foreach (var id in ids) PlaceholderStub.ExpectItemRemoval(id);
+            try
+            {
+                rating ??= item.CustomRating ?? item.OfficialRating;
+                tags ??= item.Tags;
+                if (item.ParentId != Guid.Empty) folderIds.Add(item.ParentId);
+                library.DeleteItem(item, new DeleteOptions { DeleteFileLocation = false, DeleteFromExternalProvider = false }, notifyParentItem: true);
+                removedIds.AddRange(ids);
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                foreach (var id in ids) PlaceholderStub.ForgetExpectedItem(id);
+                failed.Add(item.Path ?? string.Empty);
+                logger.LogWarning("JellyfinMod could not delete the Jellyfin item of a removed placeholder; its library monitor still will: {Error}", error.Message);
+            }
+        }
+
+        // What could not be deleted is left to Jellyfin's library monitor, as before.
+        foreach (var path in failed.Where(path => path.Length > 0).Select(path => Directory.Exists(path) ? path : Path.GetDirectoryName(path) ?? path).Distinct())
+            Report(path);
+        if (removedIds.Count > 0)
+            notifications?.Notify(new(libraryId, notifications.IsMovieLibrary(libraryId), [], removedIds.Distinct().ToArray(), folderIds.Distinct().ToArray(), rating, tags));
     }
 
     /// <summary>
-    /// Asks Jellyfin for a library scan (its own task, queued): a library folder it holds no item for (one that was empty at its
-    /// last scan) is found only by a scan, and then has its item, so this happens once per such folder. Checked live on Jellyfin
-    /// 12.0.0: neither a look at the folder nor validating the library's own folder made the items; a scan made all of them.
+    /// Waits, under the caller's library lease, for the discoveries of the library asked for before it (P4.FU12): a sync's discovery
+    /// still running could otherwise make Jellyfin items for stubs after the removal looked for them, and those items, gone with
+    /// their stubs later, would read as a user's deletes and bring the placeholders back. No sync can ask for another while the
+    /// lease is held. Bounded, so a stuck discovery delays a removal and never blocks it.
     /// </summary>
-    private void AskForLibraryScan(Guid libraryId)
+    private async Task DiscoveryIdleAsync(Guid libraryId, CancellationToken cancellationToken)
     {
+        if (discovery is null) return;
         try
         {
-            logger.LogInformation("JellyfinMod asks Jellyfin for a library scan: a folder of library {Library} has no Jellyfin item yet, so its new placeholders are found only by a scan",
-                libraryId);
-            library.QueueLibraryScan();
+            await discovery.IdleAsync(libraryId).WaitAsync(TimeSpan.FromSeconds(60), cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception error) when (error is not OutOfMemoryException)
+        catch (TimeoutException)
         {
-            logger.LogWarning("JellyfinMod could not ask for a library scan; the next scan finds the placeholders: {Error}", error.Message);
+            logger.LogWarning("JellyfinMod removes placeholders of library {Library} while a discovery is still running", libraryId);
         }
     }
 
@@ -384,6 +503,7 @@ public sealed class PlaceholderService(
     {
         var (name, _) = LibraryOf(libraryId);
         await using var lease = await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
+        await DiscoveryIdleAsync(libraryId, cancellationToken).ConfigureAwait(false);
         var paths = await AllStubPathsAsync(libraryId, cancellationToken).ConfigureAwait(false);
         var changed = new HashSet<string>(StringComparer.Ordinal);
         var removed = new List<PlaceholderRemoval>();
@@ -395,7 +515,7 @@ public sealed class PlaceholderService(
             else failures.Add(new(path, error));
         }
 
-        foreach (var folder in changed) Report(folder);
+        DropItems(libraryId, removed.Select(removal => removal.Path).ToArray(), changed);
         logger.LogInformation("JellyfinMod removed {Removed} placeholder(s) from library {Library}, {Failed} failed", removed.Count,
             libraryId, failures.Count);
         return new(libraryId, name, PlaceholderSettings.IsEnabled(libraryId), false, paths.Count, [], removed, []) { Failures = failures };
@@ -492,6 +612,7 @@ public sealed class PlaceholderService(
         var removed = new List<string>();
         var failures = new List<PlaceholderRemoval>();
         if (entry.TargetLibraryId is not { } libraryId) return (removed, failures);
+        await DiscoveryIdleAsync(libraryId, cancellationToken).ConfigureAwait(false);
         var roots = SeriesFolders.LibraryRoots(library, files, libraryId);
         var paths = new SortedSet<string>(StringComparer.Ordinal);
         if (entry.MediaType == "movie")
@@ -516,7 +637,7 @@ public sealed class PlaceholderService(
             else failures.Add(new(path, error));
         }
 
-        foreach (var folder in changed) Report(folder);
+        DropItems(libraryId, removed, changed);
         if (paths.Count > 0)
             logger.LogInformation("JellyfinMod removed {Removed} placeholder(s) of a title removed from the catalog, {Failed} failed", removed.Count,
                 failures.Count);
@@ -879,9 +1000,9 @@ public sealed class PlaceholderService(
     /// The plan: stubs to write for missing aired episodes (and released movies), stale stubs to remove, and what is left
     /// without one. <paramref name="entryId"/> limits it to one entry.
     /// </summary>
-    private async Task<Computed> ComputeAsync(Guid libraryId, Guid? entryId, CancellationToken cancellationToken)
+    private async Task<Computed> ComputeAsync(Guid libraryId, Guid? entryId, string? preferredFolder, CancellationToken cancellationToken)
     {
-        if (LibraryOf(libraryId).IsMovies) return await ComputeMoviesAsync(libraryId, entryId, cancellationToken).ConfigureAwait(false);
+        if (LibraryOf(libraryId).IsMovies) return await ComputeMoviesAsync(libraryId, entryId, preferredFolder, cancellationToken).ConfigureAwait(false);
         var writes = new List<PlaceholderWrite>();
         var removals = new List<PlaceholderRemoval>();
         var skipped = new List<PlaceholderSkip>();
@@ -942,14 +1063,17 @@ public sealed class PlaceholderService(
                     continue;
                 }
 
-                if (roots.FirstOrDefault(files.CanCreateIn) is not { } writableRoot)
+                // The folder a deleted title had, when it is still free (P4.FU12): the title returns where it was, not under a new name.
+                var preferredRoot = PreferredRoot(roots, preferredFolder);
+                if ((preferredRoot ?? roots.FirstOrDefault(files.CanCreateIn)) is not { } writableRoot)
                 {
                     skipped.Add(new(entry.Id, entry.Title, null, wanted.Length, "read_only",
                         "No folder of the library can be written (a read-only folder or mount)."));
                     continue;
                 }
 
-                var folderName = ImportNaming.TitleFolder(entry.Title, entry.Year, entry.TmdbId);
+                var folderName = preferredRoot is not null ? Path.GetFileName(Path.TrimEndingDirectorySeparator(preferredFolder!))
+                    : ImportNaming.TitleFolder(entry.Title, entry.Year, entry.TmdbId);
                 seriesFolder = Path.Combine(writableRoot, folderName);
                 newSeries = true;
                 if (!ImportNaming.FitsFileName(folderName) || files.Probe(seriesFolder) != PathPresence.Absent)
@@ -1069,6 +1193,20 @@ public sealed class PlaceholderService(
         return new(writes, removals, skipped, existing, covered);
     }
 
+    /// <summary>
+    /// The library folder that holds <paramref name="preferredFolder"/> when that folder is directly in a writable one, is free and
+    /// has a name that fits: the place a deleted title goes back to (P4.FU12). Null otherwise (the title takes the import's name).
+    /// </summary>
+    private string? PreferredRoot(IReadOnlyList<string> roots, string? preferredFolder)
+    {
+        if (string.IsNullOrEmpty(preferredFolder) || Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(preferredFolder)) is not { } parent)
+            return null;
+        var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(preferredFolder));
+        var root = roots.FirstOrDefault(candidate => string.Equals(Path.TrimEndingDirectorySeparator(candidate), parent, StringComparison.Ordinal));
+        return root is not null && files.CanCreateIn(root) && ImportNaming.FitsFileName(name) &&
+            files.Probe(Path.Combine(root, name)) == PathPresence.Absent ? root : null;
+    }
+
     /// <summary>What a plan found: the writes, removals and skips, and the titles that already have a placeholder.</summary>
     private sealed record Computed(List<PlaceholderWrite> Writes, List<PlaceholderRemoval> Removals, List<PlaceholderSkip> Skipped, int Existing,
         HashSet<Guid> Covered);
@@ -1079,7 +1217,7 @@ public sealed class PlaceholderService(
     /// folder, or the title folder already there), and the stale stubs (the movie has a file, is not released, or left the
     /// catalog) to remove. An unreleased movie keeps the mod's own card with its date.
     /// </summary>
-    private async Task<Computed> ComputeMoviesAsync(Guid libraryId, Guid? entryId, CancellationToken cancellationToken)
+    private async Task<Computed> ComputeMoviesAsync(Guid libraryId, Guid? entryId, string? preferredFolder, CancellationToken cancellationToken)
     {
         var writes = new List<PlaceholderWrite>();
         var removals = new List<PlaceholderRemoval>();
@@ -1154,14 +1292,16 @@ public sealed class PlaceholderService(
             var newFolder = folder is null;
             if (folder is null)
             {
-                if (roots.FirstOrDefault(files.CanCreateIn) is not { } writableRoot)
+                var preferredRoot = PreferredRoot(roots, preferredFolder);
+                if ((preferredRoot ?? roots.FirstOrDefault(files.CanCreateIn)) is not { } writableRoot)
                 {
                     skipped.Add(new(entry.Id, entry.Title, null, 1, "read_only",
                         "No folder of the library can be written (a read-only folder or mount)."));
                     continue;
                 }
 
-                folder = Path.Combine(writableRoot, ImportNaming.TitleFolder(entry.Title, entry.Year, entry.TmdbId));
+                folder = Path.Combine(writableRoot, preferredRoot is not null ? Path.GetFileName(Path.TrimEndingDirectorySeparator(preferredFolder!))
+                    : ImportNaming.TitleFolder(entry.Title, entry.Year, entry.TmdbId));
             }
             else if (!files.CanCreateIn(folder))
             {
@@ -1338,16 +1478,26 @@ public sealed class PlaceholderService(
         PlaceholderStub.Forget(path);
         if (!PlaceholderStub.IsStubFile(path)) return "Not a JellyfinMod placeholder any more; left untouched.";
         if (!files.TryInspect(path, out var stub)) return "The placeholder could not be read.";
+        // Jellyfin's removal of the stub's item (and of a folder's, below) is the plugin's own, never a delete to repair (P1.FU29).
+        PlaceholderStub.ExpectRemoval(path);
+        PlaceholderStub.ExpectRemoval(stub.CanonicalPath);
         var result = files.UnlinkPinned(stub.CanonicalPath, stub.PhysicalIdentity);
         PlaceholderStub.Forget(path);
         if (!result.Removed) return result.Detail ?? "The placeholder could not be removed.";
         var folder = Path.GetDirectoryName(stub.CanonicalPath)!;
-        if (IsSeasonFolderName(Path.GetFileName(folder)) && IsEmpty(folder) && files.RemoveEmptyDirectory(folder))
-            folder = Path.GetDirectoryName(folder)!;
+        if (IsSeasonFolderName(Path.GetFileName(folder)) && IsEmpty(folder))
+        {
+            PlaceholderStub.ExpectRemoval(folder);
+            if (files.RemoveEmptyDirectory(folder)) folder = Path.GetDirectoryName(folder)!;
+        }
+
         // A title folder (the import's or the placeholders' own shape, [tmdbid-N]) that removing the stub left empty goes too
         // (P1.FU26): a movie's folder, or a series' folder with no season left. Anything else in it keeps it.
-        if (SeriesFolders.IsTitleFolderName(Path.GetFileName(folder)) && IsEmpty(folder) && files.RemoveEmptyDirectory(folder))
-            folder = Path.GetDirectoryName(folder)!;
+        if (SeriesFolders.IsTitleFolderName(Path.GetFileName(folder)) && IsEmpty(folder))
+        {
+            PlaceholderStub.ExpectRemoval(folder);
+            if (files.RemoveEmptyDirectory(folder)) folder = Path.GetDirectoryName(folder)!;
+        }
         changed.Add(folder);
         return null;
     }
