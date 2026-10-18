@@ -56,7 +56,10 @@ public sealed class ImportService(
     SeedReleaseService seedReleases,
     ImportHostSession session,
     TimeProvider time,
-    ILogger<ImportService> logger)
+    ILogger<ImportService> logger,
+    IMediaDiscovery? discovery = null,
+    MediaBrowser.Controller.Library.IMediaSourceManager? mediaSources = null,
+    LibraryNotifications? notifications = null)
 {
     private DateTime Now => time.GetUtcNow().UtcDateTime;
 
@@ -111,6 +114,56 @@ public sealed class ImportService(
 
         return new(operations.Count, seeds.Count, (int)(snapshots.Reads - reads), clientSnapshots.Values.All(value => value.Reachable));
     }
+
+    /// <summary>
+    /// A local pass (P4.FU12): advances only the imports that wait for Jellyfin to bind and ready the file they linked, from the
+    /// plugin's own database and Jellyfin's library. It never reads a download client, so a burst of bindings (a pack's episodes)
+    /// costs the client nothing. Returns how many imports it looked at.
+    /// </summary>
+    public async Task<int> ObserveBindingsAsync(CancellationToken cancellationToken)
+    {
+        database.ChangeTracker.Clear();
+        var ids = await database.ImportOperations.AsNoTracking().Where(operation => operation.State == ImportStates.Scanning ||
+                operation.State == ImportStates.Blocked && (operation.Reason == ImportReasons.BindingNotObserved || operation.Reason == ImportReasons.ScanTimeout))
+            .OrderBy(operation => operation.CreatedAt).Select(operation => new { operation.Id, operation.DownloadClientId }).ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (ids.Count == 0) return 0;
+        var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken).ConfigureAwait(false);
+        foreach (var operation in ids)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                // Nothing a binding wait reads comes from the client: an empty reading stands in for it.
+                await AdvanceAsync(operation.Id, new ClientSnapshot(operation.DownloadClientId, true, Now, null, new Dictionary<string, ClientTorrentStatus>()),
+                    settings, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is not OperationCanceledException)
+            {
+                logger.LogError(error, "Import {Operation} could not advance; it is retried on the next pass", operation.Id);
+            }
+        }
+
+        return ids.Count;
+    }
+
+    /// <summary>
+    /// Whether the local pass has work: an import waiting for Jellyfin to bind and ready its file, or a replacement or upgrade whose
+    /// new version is imported and waits only for the old one to go (P4.FU12, so it goes when the new one plays, not at the next poll).
+    /// </summary>
+    public async Task<bool> HasBindingWorkAsync(CancellationToken cancellationToken) =>
+        await database.ImportOperations.AnyAsync(operation => operation.State == ImportStates.Scanning ||
+            operation.State == ImportStates.Blocked && (operation.Reason == ImportReasons.BindingNotObserved || operation.Reason == ImportReasons.ScanTimeout),
+            cancellationToken).ConfigureAwait(false) ||
+        await PackReplaceService.AnyPendingAsync(database, cancellationToken).ConfigureAwait(false) ||
+        await database.UpgradeOperations.AnyAsync(upgrade => upgrade.State == UpgradeStates.Imported || upgrade.State == UpgradeStates.Replacing,
+            cancellationToken).ConfigureAwait(false);
+
+    /// <summary>Whether any import awaits its download (the monitor then reads the client every few seconds, not every poll).</summary>
+    public async Task<bool> HasWaitingDownloadAsync(CancellationToken cancellationToken) =>
+        await database.ImportOperations.AnyAsync(operation => operation.State == ImportStates.Waiting, cancellationToken).ConfigureAwait(false) ||
+        await database.GrabOperations.AnyAsync(grab => grab.State == GrabStates.Accepted && grab.ActiveTarget != null &&
+            !database.ImportOperations.Any(operation => operation.GrabId == grab.Id), cancellationToken).ConfigureAwait(false);
 
     /// <summary>Returns whether any import or seed release is open, so an idle monitor never reads the client.</summary>
     public async Task<bool> HasOpenWorkAsync(CancellationToken cancellationToken) =>
@@ -797,6 +850,39 @@ public sealed class ImportService(
         operation.Reason = null;
         operation.UpdatedAt = Now;
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        DiscoverNow(operation);
+    }
+
+    /// <summary>
+    /// Makes Jellyfin hold the imported file now (P4.FU11, P4.FU12): one discovery request per file, which Jellyfin's folder
+    /// validation takes together with the other files of the same moment (a pack is one look at its season). The reported change
+    /// stays: if this finds nothing or fails, the monitor and the scan escalation still apply. Nothing waits for it.
+    /// </summary>
+    private void DiscoverNow(ImportOperation operation)
+    {
+        if (discovery is null || operation.DestinationPath is not { } destination) return;
+        _ = discovery.DiscoverAsync(operation.TargetLibraryId, [destination]);
+    }
+
+    /// <summary>
+    /// Tells the clients at once that the imported file's item is there (P4.FU12), after the import is committed: the item, and the
+    /// folders it is in. Sent only to who may see the item (<see cref="LibraryNotifications"/>); never throws.
+    /// </summary>
+    private void TellClients(ImportOperation operation, Guid nativeItemId)
+    {
+        if (notifications is null) return;
+        try
+        {
+            var item = library.GetItemById(nativeItemId);
+            var folders = new List<Guid> { operation.TargetLibraryId };
+            if (item is not null && item.ParentId != Guid.Empty) folders.Add(item.ParentId);
+            if (item is MediaBrowser.Controller.Entities.TV.Episode { SeriesId: var seriesId } && seriesId != Guid.Empty) folders.Add(seriesId);
+            notifications.Notify(new(operation.TargetLibraryId, operation.EpisodeId is null, [nativeItemId], [], folders.Distinct().ToArray()));
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogDebug(error, "Import {Operation} could not tell the clients; Jellyfin's own message still follows", operation.Id);
+        }
     }
 
     /// <summary>
@@ -808,6 +894,17 @@ public sealed class ImportService(
         var binding = await FindBindingAsync(operation, cancellationToken).ConfigureAwait(false);
         if (binding is not null)
         {
+            // The import is complete when Jellyfin can play the file, not when it only lists it (P4.FU12): the item is no placeholder,
+            // has been refreshed and shows a video stream (a probe that finds none stops being waited for, as does a refresh that
+            // does not happen within the scan timeout). The link stays; the next local pass looks again.
+            var waited = operation.ScanRequestedAt is { } requestedAt ? Now - requestedAt : TimeSpan.Zero;
+            if (!NativeReadiness.IsReady(library, mediaSources, binding.Value.NativeItemId, binding.Value.OwnerItemId, Now, out var why) &&
+                waited < TimeSpan.FromMinutes(Math.Max(1, settings.ScanTimeoutMinutes)))
+            {
+                logger.LogDebug("Import {Operation} is bound but Jellyfin cannot play the file yet: {Why}", operation.Id, why);
+                return;
+            }
+
             await CompleteAsync(operation.Id, binding.Value.BindingId, binding.Value.NativeItemId, cancellationToken)
                 .ConfigureAwait(false);
             return;
@@ -914,7 +1011,7 @@ public sealed class ImportService(
         return string.Equals(parentA, parentB, StringComparison.Ordinal) || Contains(parentA, b) || Contains(parentB, a);
     }
 
-    private async Task<(Guid BindingId, Guid NativeItemId)?> FindBindingAsync(ImportOperation operation, CancellationToken cancellationToken)
+    private async Task<(Guid BindingId, Guid NativeItemId, Guid? OwnerItemId)?> FindBindingAsync(ImportOperation operation, CancellationToken cancellationToken)
     {
         if (operation.DestinationPath is not { } destination) return null;
         if (operation.EpisodeId is { } episodeId)
@@ -922,13 +1019,13 @@ public sealed class ImportService(
             var bindings = await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == episodeId)
                 .ToListAsync(cancellationToken).ConfigureAwait(false);
             return bindings.Where(binding => SamePath(binding.MediaPath, destination))
-                .Select(binding => ((Guid, Guid)?)(binding.Id, binding.JellyfinItemId)).FirstOrDefault();
+                .Select(binding => ((Guid, Guid, Guid?)?)(binding.Id, binding.JellyfinItemId, binding.OwnerItemId)).FirstOrDefault();
         }
 
         var movieBindings = await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == operation.EntryId)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         return movieBindings.Where(binding => SamePath(binding.MediaPath, destination))
-            .Select(binding => ((Guid, Guid)?)(binding.Id, binding.JellyfinItemId)).FirstOrDefault();
+            .Select(binding => ((Guid, Guid, Guid?)?)(binding.Id, binding.JellyfinItemId, binding.OwnerItemId)).FirstOrDefault();
     }
 
     private bool SamePath(string? mediaPath, string destination) =>
@@ -1045,6 +1142,7 @@ public sealed class ImportService(
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
         logger.LogInformation("Import {Operation} completed: bound as native item {Item}", operation.Id, nativeItemId);
+        TellClients(operation, nativeItemId);
     }
 
     private sealed record DestinationPlan(string? Path, string? Root, string? Label, IReadOnlyList<string> MissingDirectories,

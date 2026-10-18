@@ -4,6 +4,8 @@ using JellyfinMod.Data;
 using JellyfinMod.Services;
 using JellyfinMod.Services.Import;
 using JellyfinMod.Services.Placeholders;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Session;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -360,7 +362,32 @@ internal static class PlaceholderSwapScenarios
         var grabId = grab.GetProperty("id").AsGuid();
         await WaitAsync(async () => Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Grabs/{grabId}")).GetProperty("state").GetString() ==
             "accepted" ? true : (bool?)null, "The movie's grab is accepted");
+        // P4.FU11, P4.FU12: the movie directory has no Folder item. Hold the library watcher: only the import's own discovery
+        // request can make Jellyfin see this file.
+        world.Native.AutoScan = false;
+        world.Native.Discovery = true;
+        var asked = world.Native.DiscoveryRequests.Count;
+        // Jellyfin lists the file and the plugin binds it, but the item is not refreshed or probed yet: the import stays importing
+        // until it can be played (P4.FU12), never completed on the binding alone.
+        world.Native.HoldRefresh = true;
         transmission.Progress(fixture.InfoHash, 1.0);
+        await WaitAsync(async () =>
+        {
+            await tick();
+            await using var database = new ModDbContext(dbPath);
+            return await database.EntryBindings.AnyAsync(binding => binding.EntryId == ids["stubMovie"] && binding.MediaPath != null &&
+                binding.MediaPath.EndsWith(".mkv")) ? true : (bool?)null;
+        }, "The movie's file is bound before Jellyfin has refreshed it");
+        await Task.Delay(2500);
+        await tick();
+        await using (var database = new ModDbContext(dbPath))
+            Assert((await database.ImportOperations.AsNoTracking().SingleAsync(value => value.GrabId == grabId)).State == ImportStates.Scanning,
+                "A bound file that Jellyfin has not refreshed yet leaves the import importing");
+        // The entry names a playable item only once Jellyfin can play the file, from Jellyfin's state and not the stored flag (P4.FU12).
+        var listedOnly = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["stubMovie"]}")).GetProperty("entry");
+        Assert(!listedOnly.TryGetProperty("playableItemId", out _), "A listed but not yet refreshed file names no playable item: " + listedOnly.GetRawText());
+        world.Native.HoldRefresh = false;
+        world.Native.RefreshAll();
         var imported = await WaitAsync(async () =>
         {
             await tick();
@@ -369,6 +396,13 @@ internal static class PlaceholderSwapScenarios
             Assert(operation?.State is not (ImportStates.Blocked or ImportStates.Failed), $"The movie's import stopped: {operation?.State} {operation?.Reason}");
             return operation?.State == ImportStates.Completed ? operation : null;
         }, "The movie's import completes", 60);
+        Assert(world.Native.DiscoveryRequests.Skip(asked).SequenceEqual([imported.DestinationPath!]) && imported.ScanAttempts == 1,
+            "The movie imports through one discovery request for its file while the watcher is held, without escalation");
+        var playable = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["stubMovie"]}")).GetProperty("entry");
+        Assert(playable.TryGetProperty("playableItemId", out var playableId) && world.Native.Items.Single(item => item.Path == imported.DestinationPath).Id == playableId.AsGuid(),
+            "Once Jellyfin can play the file the entry names its item as playable: " + playable.GetRawText());
+        world.Native.Discovery = null;
+        world.Native.AutoScan = true;
         var files = Directory.EnumerateFiles(movieFolder).ToArray();
         Assert(Path.GetDirectoryName(imported.DestinationPath) == movieFolder && !File.Exists(movieStub) && files.Length == 1 &&
             files[0] == imported.DestinationPath,
@@ -383,7 +417,21 @@ internal static class PlaceholderSwapScenarios
         }, "The movie is on disk, bound to its file's item, and the placeholder item is gone");
 
         // Removing the series that was never imported removes its placeholders and the folders made for them.
+        // P4.FU12 (B1): the plugin deletes the Jellyfin items of the stubs it removes itself, at once, tells the clients, and the delete
+        // repair does not write them back.
+        var filelessStubs = world.Native.Items.OfType<MediaBrowser.Controller.Entities.TV.Episode>().Where(item => item.Path!.StartsWith(showFolder + "/", StringComparison.Ordinal))
+            .Select(item => item.Id).ToArray();
+        Assert(filelessStubs.Length == 2, "Jellyfin holds the two placeholders of the series that was never imported");
+        var messagesBefore = world.Native.SessionMessages.Count;
+        world.Native.Connected[world.Admin.Id] = 0;
         var removed = await admin.DeleteAsync($"/JellyfinMod/Entries/{ids["fileless"]}");
+        Assert(world.Native.Items.OfType<MediaBrowser.Controller.Entities.TV.Episode>().All(item => !filelessStubs.Contains(item.Id)),
+            "Remove Entry deletes the Jellyfin items of the removed placeholders itself, without waiting for the library monitor");
+        await WaitAsync(() => Task.FromResult(world.Native.SessionMessages.Skip(messagesBefore).Any(message => message.Users.Contains(world.Admin.Id) &&
+            message.Data is LibraryUpdateInfo info && filelessStubs.All(id => info.ItemsRemoved.Contains(id.ToString("N")))) ? true : (bool?)null),
+            "The administrator is told at once that the removed placeholders are gone", 10);
+        await Task.Delay(3000);
+        Assert(!Directory.Exists(showFolder) && !File.Exists(ShowStub(1)), "The delete repair writes nothing back after Remove Entry deleted the items");
         Assert(removed.StatusCode == System.Net.HttpStatusCode.NoContent && !Directory.Exists(showFolder),
             $"Removing a series that has only placeholders removes it, its placeholders and its folders ({(int)removed.StatusCode})");
         var removedMovie = await admin.DeleteAsync($"/JellyfinMod/Entries/{ids["futureMovie"]}");

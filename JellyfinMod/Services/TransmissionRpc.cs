@@ -8,24 +8,30 @@ namespace JellyfinMod.Services;
 /// <summary>
 /// The legacy Transmission RPC transport shared by Phase 3 seed protection and the Phase 4 acquisition driver:
 /// one POST per method, HTTP Basic credentials when configured, and a single retry with the session id that a
-/// 409 answer supplies.
+/// 409 answer supplies. The last session id per endpoint is sent with the next call (P4.FU12), so a read every 2 s costs one
+/// request, not a 409 and a retry each time.
 /// </summary>
 public static class TransmissionRpc
 {
     /// <summary>The CSRF session header.</summary>
     public const string SessionHeader = "X-Transmission-Session-Id";
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> Sessions = new(StringComparer.Ordinal);
+
     /// <summary>Sends one RPC call, completing the session-id handshake once.</summary>
     public static async Task<HttpResponseMessage> SendAsync(HttpClient client, Uri endpoint, string method, object arguments,
         string? username, string? password, CancellationToken cancellationToken)
     {
+        var key = endpoint.AbsoluteUri;
         using var request = Request(endpoint, method, arguments, username, password);
+        if (Sessions.TryGetValue(key, out var known)) request.Headers.TryAddWithoutValidation(SessionHeader, known);
         var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode != HttpStatusCode.Conflict ||
             !response.Headers.TryGetValues(SessionHeader, out var values) || values.FirstOrDefault() is not { } sessionId)
             return response;
 
         response.Dispose();
+        Sessions[key] = sessionId;
         using var retry = Request(endpoint, method, arguments, username, password);
         retry.Headers.TryAddWithoutValidation(SessionHeader, sessionId);
         return await client.SendAsync(retry, cancellationToken).ConfigureAwait(false);

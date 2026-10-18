@@ -144,3 +144,40 @@ internal static class NativeVersions
         return value;
     }
 }
+
+/// <summary>
+/// Whether the file an import linked is playable in Jellyfin (P4.FU12), asked of the item its binding names rather than of the
+/// binding alone: a binding says Jellyfin lists the file; this says it has been refreshed and probed. A further version of a movie
+/// or episode is judged on its own item and its owner's, so a correctly grouped alternate is ready when its own source is, whatever
+/// path the owner has.
+/// </summary>
+internal static class NativeReadiness
+{
+    /// <summary>How long after its refresh an item with no video stream stops being waited for: the probe found nothing.</summary>
+    public static readonly TimeSpan ProbeGrace = TimeSpan.FromSeconds(15);
+
+    /// <summary>Whether the bound item is no placeholder, was refreshed, has a video stream (or none within the grace) and has a real owner.</summary>
+    public static bool IsReady(ILibraryManager library, IMediaSourceManager? mediaSources, Guid itemId, Guid? ownerId, DateTime now) =>
+        IsReady(library, mediaSources, itemId, ownerId, now, out _);
+
+    /// <inheritdoc cref="IsReady(ILibraryManager, IMediaSourceManager?, Guid, Guid?, DateTime)"/>
+    /// <param name="library">Jellyfin's library.</param>
+    /// <param name="mediaSources">Jellyfin's media streams, or null to skip the stream check.</param>
+    /// <param name="itemId">The bound item.</param>
+    /// <param name="ownerId">The owner of a further version.</param>
+    /// <param name="now">The time now.</param>
+    /// <param name="why">Why the item is not ready, for the log; empty when it is.</param>
+    public static bool IsReady(ILibraryManager library, IMediaSourceManager? mediaSources, Guid itemId, Guid? ownerId, DateTime now, out string why)
+    {
+        why = string.Empty;
+        if (library.GetItemById(itemId) is not Video item) { why = "no item"; return false; }
+        if (item.IsPlaceHolder && Placeholders.PlaceholderStub.HasStubExtension(item.Path)) { why = "a placeholder"; return false; }
+        if (ownerId is { } owner && library.GetItemById(owner) is not Video { IsPlaceHolder: false }) { why = "no real owner"; return false; }
+        if (item.DateLastRefreshed == DateTime.MinValue) { why = "not refreshed yet"; return false; }
+        if (mediaSources is null) return true;
+        var video = mediaSources.GetMediaStreams(item.Id).Any(stream => stream.Type == MediaBrowser.Model.Entities.MediaStreamType.Video);
+        if (video || now - item.DateLastRefreshed.ToUniversalTime() >= ProbeGrace) return true;
+        why = "no video stream yet";
+        return false;
+    }
+}

@@ -78,6 +78,12 @@ public sealed class QueueController(
                     snapshot.Reachable ? null : snapshot.Reason ?? ImportReasons.ClientUnreachable);
         }
 
+        // A download this read finds complete is imported now, not at the monitor's next poll (P4.FU11); the read is the one the
+        // pages poll anyway, so this costs the client nothing more than the monitor's own tick.
+        if (settings.ImportEnabled && operations.Any(operation => operation.State == ImportStates.Waiting &&
+                clientSnapshots[operation.DownloadClientId].Find(operation.InfoHash) is { Complete: true }))
+            monitor.Wake();
+
         var entries = await LoadEntriesAsync(operations, cancellationToken);
         var episodes = await LoadEpisodesAsync(operations, cancellationToken);
         var clients = await database.AcquisitionDownloadClients.AsNoTracking().ToDictionaryAsync(client => client.Id, cancellationToken);
@@ -106,12 +112,13 @@ public sealed class QueueController(
                     .OrderBy(value => value.SeasonNumber).ThenBy(value => value.EpisodeNumber).ToArray();
                 if (!CanSee(user, administrator, entry, null) || claimed.Any(value => !CanSee(user, administrator, entry, value))) continue;
                 // The row stands for the pack as a whole (Codex review of the pack plugin, finding 9): an episode still
-                // importing first, then a failed one, and only then a seeding one, so the row's state and its Retry match
-                // what the pack still needs.
+                // downloading first, then one importing, then a failed one, and only then a seeding one, so the row's state and
+                // its Retry match what the pack still needs. Downloading comes before importing (P4.FU12): a pack episode imports
+                // as soon as its own file is in, so the row would otherwise say importing and then downloading again.
                 var representative = operations.Where(value => value.GrabId == pack.Id)
-                    .OrderBy(value => value.State == ImportStates.Blocked ? 1 : ImportStates.Open.Contains(value.State) ? 0
-                        : value.State == ImportStates.Failed ? 2 : 3)
-                    .ThenBy(value => value.CreatedAt).First();
+                    .OrderBy(value => value.State == ImportStates.Waiting ? 0 : value.State == ImportStates.Blocked ? 2
+                        : ImportStates.Open.Contains(value.State) ? 1 : value.State == ImportStates.Failed ? 3 : 4)
+                    .ThenBy(value => value.CreatedAt).ThenBy(value => value.Id).First();
                 var packSeed = representative.State == ImportStates.Completed
                     ? seeds.FirstOrDefault(value => value.ImportOperationId == representative.Id) ?? seeds.FirstOrDefault(value => value.GrabId == pack.Id)
                     : null;
