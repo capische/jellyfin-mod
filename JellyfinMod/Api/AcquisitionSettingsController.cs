@@ -302,14 +302,17 @@ public sealed partial class AcquisitionSettingsController(
         }
     }
 
-    /// <summary>Lists quality profiles.</summary>
+    /// <summary>Lists quality profiles, best first.</summary>
     [HttpGet("QualityProfiles")]
     public async Task<ActionResult<IReadOnlyList<QualityProfileDto>>> QualityProfiles(CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
         var defaultId = (await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken)).DefaultQualityProfileId;
-        var profiles = await database.AcquisitionQualityProfiles.AsNoTracking().OrderBy(value => value.Name).ToListAsync(cancellationToken);
-        return profiles.Select(profile => ToDto(profile, defaultId)).ToArray();
+        var profiles = await database.AcquisitionQualityProfiles.AsNoTracking().ToListAsync(cancellationToken);
+        // Best first (user, 2026-10-19): the one order every list of profiles shows, so no list sorts on its own. By the
+        // resolution of the profile's best quality (4K, 2K, 1080p, 720p, SD), then by name.
+        return profiles.OrderByDescending(profile => QualityCatalog.BestResolution(AcquisitionConfiguration.Qualities(profile)))
+            .ThenBy(profile => profile.Name, StringComparer.Ordinal).Select(profile => ToDto(profile, defaultId)).ToArray();
     }
 
     /// <summary>Lists the shipped quality profile presets and whether each is already a profile (P4.FU9).</summary>

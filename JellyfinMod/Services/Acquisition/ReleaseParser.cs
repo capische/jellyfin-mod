@@ -14,6 +14,16 @@ public static class QualityCatalog
     /// <summary>Returns true when the identifier is part of the implemented vocabulary.</summary>
     public static bool IsKnown(string id) => All.Any(quality => quality.Id == id);
 
+    /// <summary>
+    /// Gets the resolution of a profile's best quality, as a number to sort on (2160, 1440, 1080, 720, 576, 480), where the
+    /// best quality is the first one the profile lists. Zero when the profile lists nothing known. Profiles list best
+    /// resolution first (user, 2026-10-19: "4K, 2K"), so the catalog order itself cannot serve: it places remux-1080p above
+    /// bluray-1440p, which would put a 1080p profile above a 2K one.
+    /// </summary>
+    public static int BestResolution(IReadOnlyList<string> qualities) =>
+        qualities.Count > 0 && All.FirstOrDefault(quality => quality.Id == qualities[0]).Resolution is { } resolution &&
+        int.TryParse(resolution.TrimEnd('p'), out var pixels) ? pixels : 0;
+
     /// <summary>Returns the identifier for a parsed source and resolution, or null when either is unknown.</summary>
     public static string? Identify(string? source, string? resolution) =>
         source is null || resolution is null ? null : $"{source}-{resolution}";
