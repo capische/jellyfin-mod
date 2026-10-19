@@ -41,6 +41,55 @@ public static class PlaceholderItems
     /// <summary>The path scheme of every placeholder item the plugin makes; nothing else ever has it.</summary>
     public const string Scheme = "jellyfinmod://";
 
+    /// <summary>
+    /// The line a placeholder item's overview starts with, then a blank line and the title's own overview (user, 2026-10-19): native
+    /// apps show a placeholder as an ordinary item, and this is all they are told. The web app removes it (it shows its own marks).
+    /// </summary>
+    public const string Note = "Not downloaded yet. Request it from the JellyfinMod web app.";
+
+    /// <summary>An overview with the note in front, exactly once.</summary>
+    public static string WithNote(string? overview) =>
+        WithoutNote(overview) is { } body && !string.IsNullOrWhiteSpace(body) ? Note + "\n\n" + body : Note;
+
+    /// <summary>An overview without the note in front (as it is when it does not start with it).</summary>
+    public static string? WithoutNote(string? overview)
+    {
+        if (overview is null || !overview.StartsWith(Note, StringComparison.Ordinal)) return overview;
+        var text = overview;
+        while (text.StartsWith(Note, StringComparison.Ordinal)) text = text[Note.Length..].TrimStart();
+        return text.Length == 0 ? null : text;
+    }
+
+    /// <summary>
+    /// The overview an item should have: a placeholder's with the note, any other item's without it (it is never a real item's
+    /// overview). False when it has it already. A placeholder with no overview that Jellyfin has not refreshed yet gets no note
+    /// yet: Jellyfin's refresh fills only an empty overview, so a note alone would keep TMDb's text out.
+    /// </summary>
+    public static bool NoteChange(BaseItem? item, out string? overview)
+    {
+        overview = item?.Overview;
+        if (item is not (Movie or Series or Season or JellyfinEpisode)) return false;
+        if (IsOwn(item))
+        {
+            if (string.IsNullOrWhiteSpace(item.Overview) && item.DateLastRefreshed == DateTime.MinValue) return false;
+            overview = WithNote(item.Overview);
+        }
+        else
+        {
+            overview = WithoutNote(item.Overview);
+        }
+
+        return !string.Equals(overview, item.Overview, StringComparison.Ordinal);
+    }
+
+    /// <summary>Puts the note on a placeholder's overview, or takes it off any other item's; true when the overview changed.</summary>
+    public static bool ApplyNote(BaseItem item)
+    {
+        if (!NoteChange(item, out var overview)) return false;
+        item.Overview = overview;
+        return true;
+    }
+
     /// <summary>Whether a path is one of the plugin's placeholder items (no I/O).</summary>
     public static bool IsOwn(string? path) => path is not null && path.StartsWith(Scheme, StringComparison.Ordinal);
 
@@ -145,6 +194,7 @@ public static class PlaceholderItems
             Id = id, Path = path, Name = info.Title, ProductionYear = info.Year, Overview = info.Overview, PremiereDate = info.PremiereDate
         };
         SetIds(series, info);
+        ApplyNote(series);
         series.PresentationUniqueKey = series.CreatePresentationUniqueKey();
         parent.AddChild(series);
         await FinishAsync(series, cancellationToken).ConfigureAwait(false);
@@ -167,6 +217,7 @@ public static class PlaceholderItems
         // Its date added is its release date, so it never heads Recently Added as new media.
         if (info.PremiereDate is { } released) movie.DateCreated = DateTime.SpecifyKind(released.Date, DateTimeKind.Utc);
         SetIds(movie, info);
+        ApplyNote(movie);
         movie.PresentationUniqueKey = movie.CreatePresentationUniqueKey();
         parent.AddChild(movie);
         await FinishAsync(movie, cancellationToken).ConfigureAwait(false);
@@ -194,6 +245,7 @@ public static class PlaceholderItems
             Name = number == 0 ? "Specials" : "Season " + number.ToString(CultureInfo.InvariantCulture),
             SeriesId = series.Id, SeriesName = series.Name, SeriesPresentationUniqueKey = series.GetPresentationUniqueKey()
         };
+        ApplyNote(made);
         made.PresentationUniqueKey = made.CreatePresentationUniqueKey();
         series.AddChild(made);
         await FinishAsync(made, cancellationToken).ConfigureAwait(false);
@@ -220,6 +272,7 @@ public static class PlaceholderItems
         // Its date added is its air date, so a placeholder never heads Latest as newly added media.
         if (info.AirDate is { } aired) episode.DateCreated = DateTime.SpecifyKind(aired.Date, DateTimeKind.Utc);
         if (info.TmdbId > 0) episode.SetProviderId(MetadataProvider.Tmdb, info.TmdbId.ToString(CultureInfo.InvariantCulture));
+        ApplyNote(episode);
         episode.PresentationUniqueKey = episode.CreatePresentationUniqueKey();
         season.AddChild(episode);
         await FinishAsync(episode, cancellationToken).ConfigureAwait(false);

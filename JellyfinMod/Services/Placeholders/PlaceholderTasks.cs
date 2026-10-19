@@ -11,8 +11,9 @@ namespace JellyfinMod.Services.Placeholders;
 
 /// <summary>
 /// Refreshes Jellyfin's cached user data of an item that took a placeholder's place, or a placeholder that took a file's place,
-/// once its first refresh has re-attached the data (<see cref="PlaceholderUserData"/>, P1.FU25 follow-up, P1.FU30). Done off
-/// Jellyfin's event thread.
+/// once its first refresh has re-attached the data (<see cref="PlaceholderUserData"/>, P1.FU25 follow-up, P1.FU30), and puts the
+/// note back on a placeholder's overview after a metadata refresh replaced it (<see cref="PlaceholderItems.Note"/>, P1.FU31),
+/// or takes it off any other item. Done off Jellyfin's event thread.
 /// </summary>
 public sealed class PlaceholderItemListener(ILibraryManager library,
     ILogger<PlaceholderItemListener> logger, IUserDataManager? userData = null, IUserManager? users = null) : IHostedService
@@ -82,11 +83,13 @@ public sealed class PlaceholderItemListener(ILibraryManager library,
     private void OnItemUpdated(object? sender, ItemChangeEventArgs eventArgs)
     {
         // Cheap: only an item created in place of another whose first metadata refresh has now saved it (Jellyfin re-attaches
-        // the user data right after that save), or a real item that just took a placeholder's marks, is queued.
+        // the user data right after that save), a real item that just took a placeholder's marks, or an item whose overview
+        // lacks or wrongly has the placeholder note (a refresh replaced a placeholder's overview), is queued.
         if (eventArgs.Item is not { } item) return;
         var refreshed = fresh.ContainsKey(item.Id) && item.DateLastRefreshed != DateTime.MinValue;
         var twin = PlaceholderItems.IsRecentTwin(item.Id);
-        if ((refreshed || twin) && queued.TryAdd(item.Id, 0))
+        var note = PlaceholderItems.NoteChange(item, out _);
+        if ((refreshed || twin || note) && queued.TryAdd(item.Id, 0))
             queue.Writer.TryWrite(item.Id);
     }
 
@@ -119,6 +122,10 @@ public sealed class PlaceholderItemListener(ILibraryManager library,
                             if (PlaceholderItems.IsOwn(item)) await item.ReattachUserDataAsync(cancellationToken).ConfigureAwait(false);
                             if (userData is not null && users is not null) PlaceholderUserData.Resave(userData, users, item, logger);
                         }
+
+                        // Saving fires this listener again, which then finds the overview right and queues nothing.
+                        if (PlaceholderItems.ApplyNote(item))
+                            await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
                     {
