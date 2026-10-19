@@ -34,21 +34,28 @@ public sealed class EntriesController(
     JellyfinMod.Services.Placeholders.PlaceholderService? placeholderService = null) : ControllerBase
 {
     /// <summary>
-    /// The catalog entries a placeholder movie of the plugin's stands for (P1.FU26): a placeholder is never bound, so a lookup
-    /// by its id finds the movie entry of its TMDB id in its library.
+    /// The catalog entries a placeholder movie or series of the plugin's stands for (P1.FU26, P1.FU30): a placeholder is never
+    /// bound, so a lookup by its id finds the movie or series entry of its TMDB id in its library. A file-less series is the
+    /// plugin's own series item (and is made again with a new id after a delete in Jellyfin), so its cards, seasons and
+    /// episodes find their entry through it.
     /// </summary>
-    private async Task<Guid[]> PlaceholderMovieEntriesAsync(Guid itemId, CancellationToken cancellationToken)
+    private async Task<Guid[]> PlaceholderTitleEntriesAsync(Guid itemId, CancellationToken cancellationToken)
     {
         try
         {
-            if (library?.GetItemById(itemId) is not MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: true } stub ||
-                !JellyfinMod.Services.Placeholders.PlaceholderItems.IsOwn(stub.Path) ||
-                !int.TryParse(stub.ProviderIds.FirstOrDefault(pair => pair.Key.Equals("Tmdb", StringComparison.OrdinalIgnoreCase)).Value,
-                    System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var tmdbId))
+            var stub = library?.GetItemById(itemId);
+            var mediaType = stub switch
+            {
+                MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: true } => "movie",
+                MediaBrowser.Controller.Entities.TV.Series => "series",
+                _ => null
+            };
+            if (mediaType is null || !JellyfinMod.Services.Placeholders.PlaceholderItems.IsOwn(stub!.Path) ||
+                JellyfinMod.Services.Placeholders.PlaceholderItems.TmdbIdOfPath(stub.Path) is not { } tmdbId)
                 return [];
-            var libraries = library.GetCollectionFolders(stub).Select(folder => (Guid?)folder.Id).ToArray();
+            var libraries = library!.GetCollectionFolders(stub).Select(folder => (Guid?)folder.Id).ToArray();
             return await database.Entries.AsNoTracking()
-                .Where(entry => entry.MediaType == "movie" && entry.TmdbId == tmdbId && libraries.Contains(entry.TargetLibraryId))
+                .Where(entry => entry.MediaType == mediaType && entry.TmdbId == tmdbId && libraries.Contains(entry.TargetLibraryId))
                 .Select(entry => entry.Id).ToArrayAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception error) when (error is not OutOfMemoryException and not OperationCanceledException)
@@ -115,10 +122,11 @@ public sealed class EntriesController(
         // of its main item, whether or not the version itself is bound yet (V1, analysis C13).
         if (jellyfinItemId is { } itemId)
         {
-            var ids = new[] { itemId, MainVersionOf(itemId) ?? itemId, PlaceholderSeriesOf(itemId) ?? itemId }.Distinct().ToArray();
-            var placeholderMovieEntries = await PlaceholderMovieEntriesAsync(itemId, cancellationToken);
+            var titleId = PlaceholderSeriesOf(itemId) ?? itemId;
+            var ids = new[] { itemId, MainVersionOf(itemId) ?? itemId, titleId }.Distinct().ToArray();
+            var placeholderTitleEntries = await PlaceholderTitleEntriesAsync(titleId, cancellationToken);
             candidates = candidates.Where(entry => entry.JellyfinItemId != null && ids.Contains(entry.JellyfinItemId.Value) ||
-                placeholderMovieEntries.Contains(entry.Id) ||
+                placeholderTitleEntries.Contains(entry.Id) ||
                 database.EntryBindings.Any(binding => binding.EntryId == entry.Id && ids.Contains(binding.JellyfinItemId)) ||
                 database.Episodes.Any(episode => episode.EntryId == entry.Id && (episode.JellyfinItemId != null && ids.Contains(episode.JellyfinItemId.Value) ||
                     database.EpisodeBindings.Any(binding => binding.EpisodeId == episode.Id && ids.Contains(binding.JellyfinItemId)))) ||
