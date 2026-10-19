@@ -68,10 +68,16 @@ internal static class PresetScenarios
             Assert(Strings(fourK.GetProperty("qualities")).SequenceEqual(["remux-2160p", "bluray-2160p", "webdl-2160p", "webrip-2160p", "hdtv-2160p",
                     "bluray-1440p", "webdl-1440p", "webrip-1440p", "remux-1080p", "bluray-1080p", "webdl-1080p", "webrip-1080p", "hdtv-1080p",
                     "bluray-720p", "webdl-720p", "webrip-720p", "hdtv-720p"]) &&
-                fourK.GetProperty("maximumBytesPerHour").GetInt64() == 20_000_000_000 && fourK.GetProperty("minimumBytesPerHour").ValueKind == JsonValueKind.Null &&
+                fourK.GetProperty("maximumBytesPerHour").ValueKind == JsonValueKind.Null && fourK.GetProperty("minimumBytesPerHour").ValueKind == JsonValueKind.Null &&
                 fourK.GetProperty("cutoff").GetString() == "remux-2160p" && !fourK.GetProperty("upgradeAllowed").GetBoolean() &&
                 fourK.GetProperty("upgradeMode").GetString() == "replace" && fourK.GetProperty("minimumSeeders").GetInt32() == 2,
-                "The default preset lists 4K, 2K, 1080p then 720p by source, caps size at 20 GB per hour, sets no minimum and no upgrades: " + fourK.GetRawText());
+                "The default preset lists 4K, 2K, 1080p then 720p by source, sets no size limit, no minimum and no upgrades: " + fourK.GetRawText());
+            // The other presets keep their caps per runtime hour: 2K 10 GB, 1080p 6, 720p 1, SD 0.5, Any Quality none.
+            var caps = profiles.Values.ToDictionary(Name, profile => profile.GetProperty("maximumBytesPerHour").ValueKind == JsonValueKind.Null
+                ? (long?)null : profile.GetProperty("maximumBytesPerHour").GetInt64());
+            Assert(caps["2K"] == 10_000_000_000 && caps["1080p"] == 6_000_000_000 && caps["720p"] == 1_000_000_000 && caps["SD"] == 500_000_000 &&
+                caps["Any Quality"] == null && caps["4K"] == null,
+                "Only 4K and Any Quality have no size limit; 2K, 1080p, 720p and SD keep theirs: " + string.Join(", ", caps.Select(pair => pair.Key + "=" + pair.Value)));
             var acquisition = await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/Acquisition"), 200, "Acquisition settings read");
             Assert(acquisition.GetProperty("defaultQualityProfileId").AsGuid() == FourK && !acquisition.GetProperty("enabled").GetBoolean() &&
                 acquisition.GetProperty("qualities").EnumerateArray().Any(quality => quality.GetProperty("id").GetString() == "webdl-1440p" &&
@@ -148,10 +154,10 @@ internal static class PresetScenarios
             Assert(tested.GetProperty("ok").GetBoolean(), "The preset scenario's indexer answers its capabilities");
 
             Dictionary<string, string> Id() => new() { ["imdbid"] = "0000700" };
-            // A two-hour film: the 4K preset allows up to 20 GB per hour, 40 GB in all.
+            // A two-hour film: the 4K preset has no size limit, so an 80 GB remux is as acceptable as a 20 GB WEB-DL.
             FeedItem Row(string title, long size, int seeders) => new(title, title, new Uri(torznab.Address, "/dl/none").ToString(), size, seeders, Id());
             var fourKWeb = Row("Preset.Movie.2025.2160p.WEB-DL.DDP5.1.HDR.H.265-GRP", 20_000_000_000, 15);
-            var fourKOversized = Row("Preset.Movie.2025.2160p.BluRay.x265.TrueHD.Atmos-HUGE", 70_000_000_000, 90);
+            var fourKBluray = Row("Preset.Movie.2025.2160p.BluRay.x265.TrueHD.Atmos-HUGE", 70_000_000_000, 90);
             var fourKRemux = Row("Preset.Movie.2025.2160p.BluRay.REMUX.HEVC.TrueHD-DISC", 80_000_000_000, 60);
             var twoK = Row("Preset.Movie.2025.1440p.WEB-DL.DDP5.1.H.264-GRP", 9_000_000_000, 8);
             var fullHd = Row("Preset.Movie.2025.1080p.BluRay.x264-GRP", 12_000_000_000, 200);
@@ -175,23 +181,23 @@ internal static class PresetScenarios
                     row.GetProperty("rejections").EnumerateArray().Any(rejection => rejection.GetProperty("code").GetString() == code)),
                 $"{item.Title} is rejected as {code}");
 
-            var (top, all) = await SearchAsync("Every tier on offer", hd, fullHd, twoK, fourKOversized, fourKRemux, cam, fourKWeb);
-            Assert(top == fourKWeb.Title, "With a 4K copy on offer, the 4K copy ranks first even against better-seeded lower tiers: " + top);
-            Rejected(all, fourKOversized, "size_above_maximum");
-            Rejected(all, fourKRemux, "size_above_maximum");
+            var (top, all) = await SearchAsync("Every tier on offer", hd, fullHd, twoK, fourKBluray, fourKWeb, cam, fourKRemux);
+            Assert(top == fourKRemux.Title, "With 4K copies on offer, the best 4K source ranks first even against better-seeded lower tiers: " + top);
+            Assert(all.All(row => row.GetProperty("rejections").EnumerateArray().All(rejection => rejection.GetProperty("code").GetString() != "size_above_maximum")),
+                "The 4K preset refuses no file for its size, not even an 80 GB remux");
             Rejected(all, cam, "quality_forbidden");
             var parsedTwoK = all.Single(row => row.GetProperty("rawTitle").GetString() == twoK.Title).GetProperty("parsed");
             Assert(parsedTwoK.GetProperty("resolution").GetString() == "1440p" && parsedTwoK.GetProperty("quality").GetString() == "webdl-1440p",
                 "A 1440p release title parses to the 1440p tier: " + parsedTwoK.GetRawText());
             var eligible = all.Where(row => row.GetProperty("eligible").GetBoolean()).Select(row => row.GetProperty("rawTitle").GetString()).ToArray();
-            Assert(eligible.SequenceEqual([fourKWeb.Title, twoK.Title, fullHd.Title, hd.Title]),
-                "Eligible rows run best resolution first: 2160p, 1440p, 1080p, 720p: " + string.Join(", ", eligible));
+            Assert(eligible.SequenceEqual([fourKRemux.Title, fourKBluray.Title, fourKWeb.Title, twoK.Title, fullHd.Title, hd.Title]),
+                "Eligible rows run best resolution first: 2160p by source, 1440p, 1080p, 720p: " + string.Join(", ", eligible));
 
-            (top, _) = await SearchAsync("No acceptable 4K copy", hd, fullHd, fourKOversized, fourKRemux);
-            Assert(top == fullHd.Title, "With no acceptable 4K copy (one too big, one a remux), 1080p is chosen: " + top);
+            (top, _) = await SearchAsync("No 4K or 2K copy", hd, fullHd, cam);
+            Assert(top == fullHd.Title, "With no 4K or 2K copy on offer (a cam copy is refused), 1080p is chosen: " + top);
             (top, _) = await SearchAsync("2K and lower", hd, fullHd, twoK);
             Assert(top == twoK.Title, "With no 4K copy, the 2K copy is chosen before 1080p: " + top);
-            (top, _) = await SearchAsync("Only 720p", hd, fourKOversized);
+            (top, _) = await SearchAsync("Only 720p", hd, cam);
             Assert(top == hd.Title, "With only 720p acceptable, 720p is chosen: " + top);
         }
 
