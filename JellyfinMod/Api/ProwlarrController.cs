@@ -22,6 +22,9 @@ public sealed class ProwlarrController(
     ProwlarrSync sync,
     ReleaseSearchCache cache) : ControllerBase
 {
+    /// <summary>The name of a source created without one; the settings form has no Name field (the one source is Prowlarr).</summary>
+    private const string DefaultName = "Prowlarr";
+
     /// <summary>Lists the sources.</summary>
     [HttpGet]
     public async Task<ActionResult<IReadOnlyList<ProwlarrSourceDto>>> List(CancellationToken cancellationToken)
@@ -43,7 +46,7 @@ public sealed class ProwlarrController(
             return Conflict(Problem("prowlarr_source_exists", "One Prowlarr source is supported; edit the existing one."));
         var source = new ProwlarrSource
         {
-            Name = request.Name.Trim(), BaseUrl = request.BaseUrl.Trim().TrimEnd('/'), Enabled = request.Enabled,
+            Name = string.IsNullOrWhiteSpace(request.Name) ? DefaultName : request.Name.Trim(), BaseUrl = request.BaseUrl.Trim().TrimEnd('/'), Enabled = request.Enabled,
             SyncIntervalMinutes = request.SyncIntervalMinutes,
             ApiKeySecretRef = await secrets.AddAsync(request.ApiKey.Value!, cancellationToken)
         };
@@ -71,7 +74,7 @@ public sealed class ProwlarrController(
             return Conflict(Problem("revision_conflict", "This configuration changed since it was loaded. Reload and try again."));
         var previous = source.ApiKeySecretRef;
         var previousBase = source.BaseUrl;
-        source.Name = request.Name.Trim();
+        if (!string.IsNullOrWhiteSpace(request.Name)) source.Name = request.Name.Trim();
         source.BaseUrl = request.BaseUrl.Trim().TrimEnd('/');
         source.Enabled = request.Enabled;
         source.SyncIntervalMinutes = request.SyncIntervalMinutes;
@@ -238,7 +241,6 @@ public sealed class ProwlarrController(
 
     private static string? Validate(ProwlarrSourceRequest request, bool creating)
     {
-        if (string.IsNullOrWhiteSpace(request.Name)) return "invalid_name";
         if (!Uri.TryCreate(request.BaseUrl.Trim(), UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||
             !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
             return "invalid_prowlarr_url";

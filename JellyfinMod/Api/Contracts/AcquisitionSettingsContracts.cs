@@ -371,9 +371,9 @@ public sealed record ProwlarrDownloadClientsDto(
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed class ProwlarrSourceRequest
 {
-    /// <summary>Gets or sets the unique name.</summary>
-    [Required, MaxLength(64), JsonPropertyName("name")]
-    public string Name { get; set; } = string.Empty;
+    /// <summary>Gets or sets the unique name; optional: a new source is called "Prowlarr", and an edit without one keeps its name.</summary>
+    [MaxLength(64), JsonPropertyName("name")]
+    public string? Name { get; set; }
 
     /// <summary>Gets or sets the base URL, without credentials or query.</summary>
     [Required, MaxLength(1024), JsonPropertyName("baseUrl")]

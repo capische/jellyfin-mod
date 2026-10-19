@@ -129,10 +129,12 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         }), 400, "A URL with credentials is refused"), "invalid_prowlarr_url");
         var wrong = "wrong-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(8));
         secrets.Add(wrong);
+        // The settings form has no Name field (user, 2026-10-19): a source added without one is called "Prowlarr".
         var source = await Read(admin.PostAsJsonAsync("/JellyfinMod/Settings/Prowlarr", new
         {
-            name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "replace", value = wrong }
-        }), 201, "Administrator adds the source");
+            baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "replace", value = wrong }
+        }), 201, "Administrator adds the source without a name");
+        Assert(source.GetProperty("name").GetString() == "Prowlarr", "A source added without a name is called Prowlarr");
         var sourceId = source.GetProperty("id").AsGuid();
         Assert(source.GetProperty("apiKeyConfigured").GetBoolean(), "The source reports its key as configured, never the value");
         var test = await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Test", null), 200, "Wrong-key test");
@@ -141,8 +143,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         Assert(sync.GetProperty("code").GetString() == "unauthorized" && (await Indexers()).Length == 1, "A refused sync changes nothing");
         source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
         {
-            name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "replace", value = prowlarr.ApiKey }, revision = 1
-        }), 200, "Administrator saves the right key");
+            baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "replace", value = prowlarr.ApiKey }, revision = 1
+        }), 200, "Administrator saves the right key without a name");
+        Assert(source.GetProperty("name").GetString() == "Prowlarr", "An edit without a name keeps the stored one");
         test = await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Test", null), 200, "Test");
         Assert(test.GetProperty("ok").GetBoolean() && test.GetProperty("version").GetString() == "1.99.0-boundary",
             "Test reads system status, health and one enabled torrent indexer");
