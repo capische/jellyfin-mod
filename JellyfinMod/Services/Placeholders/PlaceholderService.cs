@@ -246,15 +246,16 @@ public sealed class PlaceholderService(
             var done = new List<PlaceholderWrite>();
             string? deferred = null;
             var removedStubs = new List<string>();
+            var removedFolders = new HashSet<string>(StringComparer.Ordinal);
             foreach (var removal in removals)
             {
-                var error = RemoveOne(removal.Path, changed);
+                var error = RemoveOne(removal.Path, changed, removedFolders);
                 if (error is not null) failures.Add(new(removal.Path, error));
                 else removedStubs.Add(removal.Path);
             }
 
             // The stub items go from Jellyfin now, before this run's writes ask it to look at the same folders.
-            if (removedStubs.Count > 0) DropItems(libraryId, removedStubs, changed);
+            if (removedStubs.Count > 0) DropItems(libraryId, removedStubs, removedFolders);
 
             var pending = 0;
             if (enabled)
@@ -406,18 +407,18 @@ public sealed class PlaceholderService(
     /// itself and at once (P4.FU12), instead of waiting for Jellyfin's library monitor (60 s, and never for the last folder of an
     /// emptied library folder, which Jellyfin skips). Each item is marked by its id first, so the delete repair knows exactly these
     /// removals are the plugin's own however late Jellyfin announces them. Only a placeholder item at a removed stub's path, and a
-    /// series or season whose folder is gone, is deleted (files are never touched). What cannot be deleted is reported to the
-    /// library monitor as before. The clients are told at once.
+    /// series or season of a folder the plugin removed (<paramref name="removedFolders"/>) that is still gone, is deleted (files are
+    /// never touched). What cannot be deleted is reported to the library monitor as before. The clients are told at once.
     /// </summary>
-    private void DropItems(Guid libraryId, IReadOnlyCollection<string> removedStubs, IReadOnlyCollection<string> changedFolders)
+    private void DropItems(Guid libraryId, IReadOnlyCollection<string> removedStubs, IReadOnlyCollection<string> removedFolders)
     {
         var doomed = new List<BaseItem>();
         try
         {
             foreach (var path in removedStubs)
                 if (library.FindByPath(path, false) is Video { IsPlaceHolder: true } stub) doomed.Add(stub);
-            // Folders that left empty, deepest first, so a season goes before its series.
-            foreach (var folder in changedFolders.Where(path => !Directory.Exists(path)).OrderByDescending(path => path.Length))
+            // The folders the plugin removed, deepest first, so a season goes before its series.
+            foreach (var folder in removedFolders.Where(path => !Directory.Exists(path)).OrderByDescending(path => path.Length))
                 if (library.FindByPath(folder, true) is Folder and (Series or Season) and var item) doomed.Add(item);
         }
         catch (Exception error) when (error is not OutOfMemoryException)
@@ -506,16 +507,19 @@ public sealed class PlaceholderService(
         await DiscoveryIdleAsync(libraryId, cancellationToken).ConfigureAwait(false);
         var paths = await AllStubPathsAsync(libraryId, cancellationToken).ConfigureAwait(false);
         var changed = new HashSet<string>(StringComparer.Ordinal);
+        var removedFolders = new HashSet<string>(StringComparer.Ordinal);
         var removed = new List<PlaceholderRemoval>();
         var failures = new List<PlaceholderRemoval>();
         foreach (var path in paths)
         {
-            var error = RemoveOne(path, changed);
+            var error = RemoveOne(path, changed, removedFolders);
             if (error is null) removed.Add(new(path, "remove_all"));
             else failures.Add(new(path, error));
         }
 
-        DropItems(libraryId, removed.Select(removal => removal.Path).ToArray(), changed);
+        DropItems(libraryId, removed.Select(removal => removal.Path).ToArray(), removedFolders);
+        // The surviving parents still go to Jellyfin's library monitor, the fallback for whatever the drop above could not reach.
+        foreach (var folder in changed) Report(folder);
         logger.LogInformation("JellyfinMod removed {Removed} placeholder(s) from library {Library}, {Failed} failed", removed.Count,
             libraryId, failures.Count);
         return new(libraryId, name, PlaceholderSettings.IsEnabled(libraryId), false, paths.Count, [], removed, []) { Failures = failures };
@@ -630,14 +634,17 @@ public sealed class PlaceholderService(
         }
 
         var changed = new HashSet<string>(StringComparer.Ordinal);
+        var removedFolders = new HashSet<string>(StringComparer.Ordinal);
         foreach (var path in paths)
         {
-            var error = RemoveOne(path, changed);
+            var error = RemoveOne(path, changed, removedFolders);
             if (error is null) removed.Add(path);
             else failures.Add(new(path, error));
         }
 
-        DropItems(libraryId, removed, changed);
+        DropItems(libraryId, removed, removedFolders);
+        // The surviving parents still go to Jellyfin's library monitor, the fallback for whatever the drop above could not reach.
+        foreach (var folder in changed) Report(folder);
         if (paths.Count > 0)
             logger.LogInformation("JellyfinMod removed {Removed} placeholder(s) of a title removed from the catalog, {Failed} failed", removed.Count,
                 failures.Count);
@@ -1470,10 +1477,14 @@ public sealed class PlaceholderService(
     }
 
     /// <summary>Removes one stub after checking the marker again, and its season folder when that left it empty.</summary>
-    private string? RemoveOne(string path, HashSet<string> changed) => RemoveStub(files, path, changed);
+    private string? RemoveOne(string path, HashSet<string> changed, HashSet<string>? removedFolders = null) =>
+        RemoveStub(files, path, changed, removedFolders);
 
-    /// <summary>Removes one stub after checking the marker again, and its season folder when that left it empty.</summary>
-    private static string? RemoveStub(UnixFileInspector files, string path, HashSet<string> changed)
+    /// <summary>
+    /// Removes one stub after checking the marker again, and its season and title folders when that left them empty. The folder
+    /// that remains goes to <paramref name="changed"/>; the folders removed go to <paramref name="removedFolders"/>.
+    /// </summary>
+    private static string? RemoveStub(UnixFileInspector files, string path, HashSet<string> changed, HashSet<string>? removedFolders = null)
     {
         PlaceholderStub.Forget(path);
         if (!PlaceholderStub.IsStubFile(path)) return "Not a JellyfinMod placeholder any more; left untouched.";
@@ -1488,7 +1499,11 @@ public sealed class PlaceholderService(
         if (IsSeasonFolderName(Path.GetFileName(folder)) && IsEmpty(folder))
         {
             PlaceholderStub.ExpectRemoval(folder);
-            if (files.RemoveEmptyDirectory(folder)) folder = Path.GetDirectoryName(folder)!;
+            if (files.RemoveEmptyDirectory(folder))
+            {
+                removedFolders?.Add(folder);
+                folder = Path.GetDirectoryName(folder)!;
+            }
         }
 
         // A title folder (the import's or the placeholders' own shape, [tmdbid-N]) that removing the stub left empty goes too
@@ -1496,7 +1511,11 @@ public sealed class PlaceholderService(
         if (SeriesFolders.IsTitleFolderName(Path.GetFileName(folder)) && IsEmpty(folder))
         {
             PlaceholderStub.ExpectRemoval(folder);
-            if (files.RemoveEmptyDirectory(folder)) folder = Path.GetDirectoryName(folder)!;
+            if (files.RemoveEmptyDirectory(folder))
+            {
+                removedFolders?.Add(folder);
+                folder = Path.GetDirectoryName(folder)!;
+            }
         }
         changed.Add(folder);
         return null;
