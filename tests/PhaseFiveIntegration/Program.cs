@@ -1963,7 +1963,9 @@ internal static partial class Phase5
         // (next-up priority, 2026-10-12).
         await NextUpScenarios.RunAsync(Tick, admin, world, dbPath, ids, torznab, transmission, host, time);
         // The placeholder swap, backfill, watched restore and delete repair (P1.FU25, P1.FU27, P1.FU29) are Jellyfin items with no
-        // file (P1.FU30), which only a real Jellyfin makes: the live runner placeholder-items.mjs proves them.
+        // file (P1.FU30), which only a real Jellyfin makes: the live runner placeholder-items.mjs proves them. Their catalog side, and
+        // the clean-up of the stubs line's files, run here (review 2026-10-22).
+        await PlaceholderItemsScenarios.RunAsync(host, admin, world, dbPath);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))
