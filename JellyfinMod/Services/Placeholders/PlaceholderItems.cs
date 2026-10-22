@@ -427,16 +427,27 @@ public static class PlaceholderItems
 
     /// <summary>
     /// Removes every item of the plugin's in every library (the uninstall clean-up and <i>Remove All Virtual Items</i>): titles
-    /// first (with their seasons and episodes), then seasons, then episodes and movies left. Returns how many episodes and movies
-    /// went.
+    /// first (with their seasons and episodes), then seasons, then episodes and movies left, each library under its lease, so a
+    /// sync making a title at that moment finishes first and the next one finds the library off (review P2-1). A lease not had
+    /// within a minute does not stop the removal. Returns how many episodes and movies went.
     /// </summary>
-    public static int RemoveEverywhere(ILibraryManager library, ILogger logger)
+    public static async Task<int> RemoveEverywhereAsync(ILibraryManager library, ReconciliationLibraryLock? libraryLock, ILogger logger,
+        CancellationToken cancellationToken)
     {
         var removed = 0;
         foreach (var folder in library.GetVirtualFolders() ?? [])
         {
             if (!Guid.TryParse(folder.ItemId, out var libraryId)) continue;
-            removed += RemoveAllIn(library, libraryId, logger);
+            var lease = libraryLock is null ? null
+                : await libraryLock.TryAcquireAsync(libraryId, TimeSpan.FromMinutes(1), cancellationToken).ConfigureAwait(false);
+            try
+            {
+                removed += RemoveAllIn(library, libraryId, logger);
+            }
+            finally
+            {
+                if (lease is not null) await lease.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         return removed;

@@ -1816,6 +1816,12 @@ public sealed class ReconciliationLibraryLock
 {
     private readonly ConcurrentDictionary<Guid, SemaphoreSlim> _locks = new();
 
+    /// <summary>Creates the host's lock; the plugin's uninstall hook, which has no services, finds it as <see cref="Current"/>.</summary>
+    public ReconciliationLibraryLock() => Current = this;
+
+    /// <summary>The host's lock (its one singleton), for <c>Plugin.OnUninstalling</c>; null before the services are built.</summary>
+    public static ReconciliationLibraryLock? Current { get; private set; }
+
     /// <summary>Acquires exclusive reconciliation access for a library.</summary>
     public async ValueTask<IAsyncDisposable> AcquireAsync(Guid libraryId, CancellationToken cancellationToken)
     {

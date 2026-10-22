@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using JellyfinMod.Data;
+using JellyfinMod.Services;
 using JellyfinMod.Services.Placeholders;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Library;
@@ -161,13 +162,14 @@ public sealed class PlaceholdersController(DatabaseInitializer readiness, Placeh
     /// </summary>
     [HttpPost("Items/Remove")]
     public async Task<ActionResult<PlaceholderItemsState>> RemoveItems([FromServices] ILibraryManager library, [FromServices] TimeProvider time,
-        [FromServices] ILogger<PlaceholdersController> logger, CancellationToken cancellationToken)
+        [FromServices] ReconciliationLibraryLock libraryLock, [FromServices] ILogger<PlaceholdersController> logger, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
         var started = time.GetTimestamp();
         await using (await SettingsMutationGate.AcquireAsync(cancellationToken).ConfigureAwait(false))
             PlaceholderSettings.DisableAll(placeholders.Libraries().Select(item => item.LibraryId));
-        var removed = PlaceholderItems.RemoveEverywhere(library, logger);
+        // Each library under its lease: a sync making a title now finishes first, and its next title finds the library off.
+        var removed = await PlaceholderItems.RemoveEverywhereAsync(library, libraryLock, logger, cancellationToken).ConfigureAwait(false);
         var left = placeholders.ItemCount();
         logger.LogInformation("JellyfinMod removed all of its placeholder items ({Removed}, {Left} left) and turned placeholders off", removed, left);
         return Ok(new PlaceholderItemsState(left, removed, time.GetElapsedTime(started).TotalSeconds));

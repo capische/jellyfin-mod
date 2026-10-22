@@ -122,112 +122,144 @@ public sealed partial class PlaceholderService
         bool leased = false)
     {
         var (name, movies) = LibraryOf(libraryId);
-        var enabled = PlaceholderSettings.IsEnabled(libraryId);
         // The delete repair holds the library lease already (it cleared the bindings under it).
-        await using var lease = leased ? null : await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
-        var plan = await ComputeItemsAsync(libraryId, entryId, cancellationToken).ConfigureAwait(false);
-        var writes = plan.Writes(libraryId);
-        var titleIds = enabled ? plan.Covered.Union(writes.Select(write => write.EntryId)).ToHashSet() : plan.Covered.ToHashSet();
-        var removals = plan.Removals.Select(removal => new PlaceholderRemoval(removal.Item.Path, removal.Reason)).ToArray();
-        if (yieldToScans && ScanRunning())
+        var lease = leased ? null : await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
+        try
         {
-            logger.LogInformation("JellyfinMod placeholder items in library {Library}: a library scan is running, so this batch waits for the next run ({Pending} pending)",
-                libraryId, writes.Count);
-            return new(libraryId, name, enabled, false, plan.Existing, [], [], plan.Skipped)
+            var enabled = PlaceholderSettings.IsEnabled(libraryId);
+            var plan = await ComputeItemsAsync(libraryId, entryId, cancellationToken).ConfigureAwait(false);
+            var writes = plan.Writes(libraryId);
+            var titleIds = enabled ? plan.Covered.Union(writes.Select(write => write.EntryId)).ToHashSet() : plan.Covered.ToHashSet();
+            var removals = plan.Removals.Select(removal => new PlaceholderRemoval(removal.Item.Path, removal.Reason)).ToArray();
+            if (yieldToScans && ScanRunning())
             {
-                Pending = enabled ? writes.Count : 0, Titles = titleIds.Count,
-                TitlesDone = titleIds.Count - (enabled ? writes.Select(write => write.EntryId).Distinct().Count() : 0), Deferred = "library_scan"
-            };
-        }
-
-        var failures = new List<PlaceholderRemoval>();
-        // What the clients are told at once (P4.FU12), rather than at Jellyfin's 30 s LibraryChanged batch.
-        var added = new List<Guid>();
-        var gone = new List<Guid>();
-        var folders = new HashSet<Guid> { libraryId };
-        // Moves first (into a real season folder that arrived; the plugin's season then goes, empty), then removals: a
-        // placeholder leaves before anything reads the real item that takes its place.
-        foreach (var move in plan.Moves)
-        {
-            try
-            {
-                await PlaceholderItems.MoveAsync(move.Episode, move.Target, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
-            {
-                failures.Add(new(move.Episode.Path, "The placeholder could not be moved into its season: " + error.Message));
-            }
-        }
-
-        foreach (var removal in plan.Removals)
-        {
-            if (library.GetItemById(removal.Item.Id) is not { } still) continue;
-            // The placeholder's marks go to the real item that takes its place now, by user, whatever keys either has yet
-            // (a real series' TVDB id, which its episodes' keys carry, may arrive only with its first metadata refresh).
-            logger.LogInformation("JellyfinMod removes its placeholder item {Path} ({Reason}){Twin}", still.Path, removal.Reason,
-                removal.Twin is null ? string.Empty : ", for " + removal.Twin.Path);
-            // Through Jellyfin's cached instance of the twin: its user data is read from, and refreshed on, that instance.
-            var twin = removal.Twin is null ? null : library.GetItemById(removal.Twin.Id) ?? removal.Twin;
-            if (twin is not null) await CopyUserDataAsync(still, twin, cancellationToken).ConfigureAwait(false);
-            if (!PlaceholderItems.Remove(library, still, logger))
-            {
-                failures.Add(new(removal.Item.Path, "The placeholder item could not be removed."));
-                continue;
-            }
-
-            gone.Add(still.Id);
-            folders.Add(still.ParentId);
-            if (twin is not null) added.Add(twin.Id);
-
-            if (twin is not null) await TakeBackUserDataAsync(twin, cancellationToken).ConfigureAwait(false);
-        }
-
-        var done = new List<PlaceholderWrite>();
-        var pending = 0;
-        string? deferred = null;
-        if (enabled)
-        {
-            var batch = plan.Works.Take(limit).ToArray();
-            pending = plan.Works.Skip(limit).Sum(work => Math.Max(1, work.Episodes.Count));
-            for (var index = 0; index < batch.Length; index++)
-            {
-                if (index > 0) await Task.Delay(PauseBetweenSeries, time, cancellationToken).ConfigureAwait(false);
-                if (index > 0 && yieldToScans && ScanRunning())
+                logger.LogInformation("JellyfinMod placeholder items in library {Library}: a library scan is running, so this batch waits for the next run ({Pending} pending)",
+                    libraryId, writes.Count);
+                return new(libraryId, name, enabled, false, plan.Existing, [], [], plan.Skipped)
                 {
-                    deferred = "library_scan";
-                    pending += batch.Skip(index).Sum(work => Math.Max(1, work.Episodes.Count));
-                    break;
-                }
+                    Pending = enabled ? writes.Count : 0, Titles = titleIds.Count,
+                    TitlesDone = titleIds.Count - (enabled ? writes.Select(write => write.EntryId).Distinct().Count() : 0), Deferred = "library_scan"
+                };
+            }
 
-                var work = batch[index];
+            var failures = new List<PlaceholderRemoval>();
+            // What the clients are told at once (P4.FU12), rather than at Jellyfin's 30 s LibraryChanged batch.
+            var added = new List<Guid>();
+            var gone = new List<Guid>();
+            var folders = new HashSet<Guid> { libraryId };
+            // Moves first (into a real season folder that arrived; the plugin's season then goes, empty), then removals: a
+            // placeholder leaves before anything reads the real item that takes its place.
+            foreach (var move in plan.Moves)
+            {
                 try
                 {
-                    var made = await MakeAsync(libraryId, work, added, folders, cancellationToken).ConfigureAwait(false);
-                    done.AddRange(made);
-                    logger.LogInformation(
-                        "JellyfinMod placeholder items in library {Library}: made {Made} for {Title} (title {Index} of {Count} this run, {Pending} left for the next run)",
-                        libraryId, made.Count, work.Title, index + 1, batch.Length, pending);
+                    await PlaceholderItems.MoveAsync(move.Episode, move.Target, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
                 {
-                    failures.Add(new(work.Title, "The placeholder items could not be made: " + error.Message));
-                    logger.LogWarning("JellyfinMod could not make the placeholder items of {Title}: {Error}", work.Title, error.Message);
+                    failures.Add(new(move.Episode.Path, "The placeholder could not be moved into its season: " + error.Message));
                 }
             }
-        }
 
-        if (done.Count > 0 || removals.Length > 0 || plan.Moves.Count > 0)
-            logger.LogInformation("JellyfinMod placeholder items in library {Library}: made {Made}, removed {Removed}, moved {Moved}, {Failed} failed, {Pending} left for the next run",
-                libraryId, done.Count, removals.Length, plan.Moves.Count, failures.Count, pending);
-        if (added.Count > 0 || gone.Count > 0)
-            notifications?.Notify(new(libraryId, movies, added.Distinct().ToArray(), gone.Distinct().ToArray(), folders.Where(id => id != Guid.Empty).ToArray()));
-        var waitingTitles = enabled
-            ? plan.Works.Where(work => !done.Any(write => write.EntryId == work.EntryId)).Select(work => work.EntryId).ToHashSet()
-            : [];
-        return new(libraryId, name, enabled, false, plan.Existing, enabled ? done : [], removals, plan.Skipped)
+            foreach (var removal in plan.Removals)
+            {
+                if (library.GetItemById(removal.Item.Id) is not { } still) continue;
+                // The placeholder's marks go to the real item that takes its place now, by user, whatever keys either has yet
+                // (a real series' TVDB id, which its episodes' keys carry, may arrive only with its first metadata refresh).
+                logger.LogInformation("JellyfinMod removes its placeholder item {Path} ({Reason}){Twin}", still.Path, removal.Reason,
+                    removal.Twin is null ? string.Empty : ", for " + removal.Twin.Path);
+                // Through Jellyfin's cached instance of the twin: its user data is read from, and refreshed on, that instance.
+                var twin = removal.Twin is null ? null : library.GetItemById(removal.Twin.Id) ?? removal.Twin;
+                if (twin is not null) await CopyUserDataAsync(still, twin, cancellationToken).ConfigureAwait(false);
+                if (!PlaceholderItems.Remove(library, still, logger))
+                {
+                    failures.Add(new(removal.Item.Path, "The placeholder item could not be removed."));
+                    continue;
+                }
+
+                gone.Add(still.Id);
+                folders.Add(still.ParentId);
+                if (twin is not null) added.Add(twin.Id);
+
+                if (twin is not null) await TakeBackUserDataAsync(twin, cancellationToken).ConfigureAwait(false);
+            }
+
+            var done = new List<PlaceholderWrite>();
+            var pending = 0;
+            string? deferred = null;
+            if (enabled)
+            {
+                var batch = plan.Works.Take(limit).ToArray();
+                pending = plan.Works.Skip(limit).Sum(work => Math.Max(1, work.Episodes.Count));
+                for (var index = 0; index < batch.Length; index++)
+                {
+                    var work = batch[index];
+                    if (index > 0)
+                    {
+                        // The lease is never held across the pause between titles (review P2-2): an import's swap or a delete repair
+                        // takes it meanwhile, as on the stubs line.
+                        if (lease is not null)
+                        {
+                            await lease.DisposeAsync().ConfigureAwait(false);
+                            lease = null;
+                        }
+
+                        await Task.Delay(PauseBetweenSeries, time, cancellationToken).ConfigureAwait(false);
+                        if (yieldToScans && ScanRunning())
+                        {
+                            deferred = "library_scan";
+                            pending += batch.Skip(index).Sum(rest => Math.Max(1, rest.Episodes.Count));
+                            break;
+                        }
+
+                        if (!leased) lease = await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
+                        // Read again under the lease (review P2-1): Remove All Virtual Items or the switch may have turned the library
+                        // off meanwhile, and the title may have gained a file or left the catalog.
+                        if (!PlaceholderSettings.IsEnabled(libraryId))
+                        {
+                            pending = 0;
+                            break;
+                        }
+
+                        var again = (await ComputeItemsAsync(libraryId, work.EntryId, cancellationToken).ConfigureAwait(false)).Works
+                            .FirstOrDefault(fresh => fresh.EntryId == work.EntryId);
+                        if (again is null) continue;
+                        work = again;
+                    }
+
+                    try
+                    {
+                        var made = await MakeAsync(libraryId, work, added, folders, cancellationToken).ConfigureAwait(false);
+                        done.AddRange(made);
+                        logger.LogInformation(
+                            "JellyfinMod placeholder items in library {Library}: made {Made} for {Title} (title {Index} of {Count} this run, {Pending} left for the next run)",
+                            libraryId, made.Count, work.Title, index + 1, batch.Length, pending);
+                    }
+                    catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
+                    {
+                        failures.Add(new(work.Title, "The placeholder items could not be made: " + error.Message));
+                        logger.LogWarning("JellyfinMod could not make the placeholder items of {Title}: {Error}", work.Title, error.Message);
+                    }
+                }
+            }
+
+            if (done.Count > 0 || removals.Length > 0 || plan.Moves.Count > 0)
+                logger.LogInformation("JellyfinMod placeholder items in library {Library}: made {Made}, removed {Removed}, moved {Moved}, {Failed} failed, {Pending} left for the next run",
+                    libraryId, done.Count, removals.Length, plan.Moves.Count, failures.Count, pending);
+            if (added.Count > 0 || gone.Count > 0)
+                notifications?.Notify(new(libraryId, movies, added.Distinct().ToArray(), gone.Distinct().ToArray(), folders.Where(id => id != Guid.Empty).ToArray()));
+            var waitingTitles = enabled
+                ? plan.Works.Where(work => !done.Any(write => write.EntryId == work.EntryId)).Select(work => work.EntryId).ToHashSet()
+                : [];
+            return new(libraryId, name, enabled, false, plan.Existing, enabled ? done : [], removals, plan.Skipped)
+            {
+                Failures = failures, Pending = pending, Titles = titleIds.Count, TitlesDone = titleIds.Count - waitingTitles.Count, Deferred = deferred
+            };
+        }
+        finally
         {
-            Failures = failures, Pending = pending, Titles = titleIds.Count, TitlesDone = titleIds.Count - waitingTitles.Count, Deferred = deferred
-        };
+            if (lease is not null) await lease.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     /// <summary>How many of the plugin's episode and movie items with no file every library holds.</summary>

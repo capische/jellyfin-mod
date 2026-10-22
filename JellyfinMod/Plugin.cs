@@ -49,15 +49,23 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
 
     /// <summary>
     /// Removes the plugin's placeholder items with no file before the plugin goes (P1.FU30): nothing else in Jellyfin removes them,
-    /// and no user can, so an uninstall must not leave them behind as items nobody can play or delete.
+    /// and no user can, so an uninstall must not leave them behind as items nobody can play or delete. Placeholders are turned off
+    /// in every library first: Jellyfin keeps the plugin's services running until its restart, and nothing may make them again
+    /// meanwhile (review P2-1).
     /// </summary>
     public override void OnUninstalling()
     {
         try
         {
             if (MediaBrowser.Controller.Entities.BaseItem.LibraryManager is { } library)
-                JellyfinMod.Services.Placeholders.PlaceholderItems.RemoveEverywhere(library,
-                    Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance);
+            {
+                JellyfinMod.Services.Placeholders.PlaceholderSettings.DisableAll((library.GetVirtualFolders() ?? [])
+                    .Select(folder => Guid.TryParse(folder.ItemId, out var id) ? id : Guid.Empty).Where(id => id != Guid.Empty));
+                JellyfinMod.Services.Placeholders.PlaceholderItems.RemoveEverywhereAsync(library,
+                        JellyfinMod.Services.ReconciliationLibraryLock.Current, Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance,
+                        CancellationToken.None)
+                    .GetAwaiter().GetResult();
+            }
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
