@@ -150,11 +150,11 @@ public sealed class ImportService(
     /// <summary>
     /// Whether the local pass has work: an import waiting for Jellyfin to bind and ready its file, or a replacement or upgrade whose
     /// new version is imported and waits only for the old one to go (P4.FU12, so it goes when the new one plays, not at the next poll).
+    /// An import Blocked after its scans timed out is not counted: it waits for a later scan, which may never bind it, so it is looked
+    /// at when a binding changes (<see cref="ImportMonitor.WakeLocal"/>) and on the monitor's full ticks, never every second.
     /// </summary>
     public async Task<bool> HasBindingWorkAsync(CancellationToken cancellationToken) =>
-        await database.ImportOperations.AnyAsync(operation => operation.State == ImportStates.Scanning ||
-            operation.State == ImportStates.Blocked && (operation.Reason == ImportReasons.BindingNotObserved || operation.Reason == ImportReasons.ScanTimeout),
-            cancellationToken).ConfigureAwait(false) ||
+        await database.ImportOperations.AnyAsync(operation => operation.State == ImportStates.Scanning, cancellationToken).ConfigureAwait(false) ||
         await PackReplaceService.AnyPendingAsync(database, cancellationToken).ConfigureAwait(false) ||
         await database.UpgradeOperations.AnyAsync(upgrade => upgrade.State == UpgradeStates.Imported || upgrade.State == UpgradeStates.Replacing,
             cancellationToken).ConfigureAwait(false);
