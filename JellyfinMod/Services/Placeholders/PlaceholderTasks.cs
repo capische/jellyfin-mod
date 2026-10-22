@@ -480,7 +480,12 @@ public sealed class PlaceholderItemRepair(ILibraryManager library, IServiceScope
         }
     }
 
-    private void OnItemAdded(object? sender, ItemChangeEventArgs eventArgs) => Note(eventArgs.Item);
+    /// <summary>
+    /// A real item added: noted only when one of the plugin's items can be its twin, as on an update (review P2-3). A new episode
+    /// has no series id until its first refresh on 12.2, so it is never a reason to sync every library; that refresh's update
+    /// comes with the id.
+    /// </summary>
+    private void OnItemAdded(object? sender, ItemChangeEventArgs eventArgs) => OnItemUpdated(sender, eventArgs);
 
     /// <summary>
     /// A real episode or movie saved by its first refresh (its series id and numbers are only certain then) for which one of the
