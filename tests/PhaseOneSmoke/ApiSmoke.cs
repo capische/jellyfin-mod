@@ -91,6 +91,8 @@ internal static class ApiSmoke
         builder.Services.AddSingleton(TimeProvider.System);
         builder.Services.AddSingleton(Stub<ILibraryMonitor>.Create((_, _) => null));
         builder.Services.AddTransient<JellyfinMod.Services.Placeholders.PlaceholderService>();
+        // As production registers it: the stubs line's files go once at start, before any placeholder item is made (review P1-1).
+        builder.Services.AddSingleton<Microsoft.Extensions.Hosting.IHostedService, JellyfinMod.Services.Placeholders.PlaceholderStubCleanup>();
         builder.Services.AddTransient(provider => new JellyfinMod.Services.Placeholders.PlaceholderWatchedRestore(
             provider.GetRequiredService<ModDbContext>(), library, users, provider.GetRequiredService<IUserDataManager>(),
             provider.GetRequiredService<JellyfinMod.Services.Placeholders.PlaceholderService>(), TimeProvider.System,

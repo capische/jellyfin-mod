@@ -321,11 +321,12 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
     private static bool IsPlayable(BaseItem item) => !string.IsNullOrWhiteSpace(item.Path);
 
     /// <summary>
-    /// A series or movie that is one of the plugin's placeholder items with no file (P1.FU26, P1.FU30): not media, so
-    /// reconciliation never binds it, never calls its entry on disk and never backfills an entry from it. Its entry finds it by
-    /// TMDB id instead.
+    /// A series or movie that is one of the plugin's placeholder items with no file (P1.FU26, P1.FU30), or a marked stub the stubs
+    /// line left that its one-time clean-up has not removed yet (review P1-1): not media, so reconciliation never binds it, never
+    /// calls its entry on disk and never backfills an entry from it. Its entry finds it by TMDB id instead.
     /// </summary>
-    private static bool IsPlaceholderMovie(BaseItem item) => Placeholders.PlaceholderItems.IsOwn(item);
+    private static bool IsPlaceholderMovie(BaseItem item) =>
+        Placeholders.PlaceholderItems.IsOwn(item) || Placeholders.PlaceholderStubCleanup.IsStubFile(item.Path);
 
     private static int? ProviderTmdbId(BaseItem item) => ParseProviderId(item, "Tmdb");
 

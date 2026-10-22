@@ -85,6 +85,12 @@ public class PluginConfiguration : BasePluginConfiguration
     /// unknown element the XML reader skips.</remarks>
     public Guid[] PlaceholderDisabledLibraryIds { get; set; } = [];
 
+    /// <summary>
+    /// Gets or sets whether the one-time clean-up of the stubs line's <c>.disc</c> stubs has removed them all (P1.FU30, review
+    /// P1-1); until it has, it runs at every start before any placeholder item is made.
+    /// </summary>
+    public bool PlaceholderStubsRemoved { get; set; }
+
     /// <summary>Gets or sets the secret-store reference for the TMDB Read Access Token (user decision 3).</summary>
     public string? TmdbReadAccessTokenRef { get; set; }
 

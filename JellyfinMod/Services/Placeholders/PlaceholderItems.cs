@@ -371,7 +371,8 @@ public static class PlaceholderItems
         var made = 0;
         try
         {
-            if (!PlaceholderSettings.IsEnabled(libraryId) || library.GetItemById(libraryId) is not CollectionFolder { CollectionType: CollectionType.tvshows } folder)
+            if (!PlaceholderStubCleanup.IsDone || !PlaceholderSettings.IsEnabled(libraryId) ||
+                library.GetItemById(libraryId) is not CollectionFolder { CollectionType: CollectionType.tvshows } folder)
                 return 0;
             var fileFolder = Path.GetDirectoryName(mediaPath);
             var seriesFolder = fileFolder is not null && Path.GetFileName(fileFolder).StartsWith("Season ", StringComparison.OrdinalIgnoreCase)
@@ -410,7 +411,7 @@ public static class PlaceholderItems
     {
         try
         {
-            if (tmdbId <= 0 || !PlaceholderSettings.IsEnabled(libraryId) ||
+            if (tmdbId <= 0 || !PlaceholderStubCleanup.IsDone || !PlaceholderSettings.IsEnabled(libraryId) ||
                 library.GetItemById(libraryId) is not CollectionFolder { CollectionType: CollectionType.movies } ||
                 LibraryFolder(library, libraryId) is not { } parent) return false;
             await CreateMovieAsync(library, parent, libraryId, new(tmdbId, title, year, null, null, null, null, null), CancellationToken.None)

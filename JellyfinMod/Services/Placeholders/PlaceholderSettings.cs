@@ -28,6 +28,20 @@ public static class PlaceholderSettings
         }
     }
 
+    /// <summary>Whether the stubs line's stub files were all removed (<see cref="PlaceholderStubCleanup"/>).</summary>
+    public static bool StubsRemoved() => Plugin.Instance?.Configuration.PlaceholderStubsRemoved == true;
+
+    /// <summary>Records that the stubs line's stub files were all removed, so the clean-up never runs again.</summary>
+    public static void MarkStubsRemoved()
+    {
+        lock (Gate)
+        {
+            if (Plugin.Instance is not { } plugin) return;
+            plugin.Configuration.PlaceholderStubsRemoved = true;
+            plugin.SaveConfiguration();
+        }
+    }
+
     /// <summary>Turns a library's switch on or off and saves the configuration.</summary>
     public static void Set(Guid libraryId, bool enabled)
     {

@@ -644,6 +644,9 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Services.AddTransient<RetentionLiveCheck>();
         builder.Services.AddTransient<RetentionExecutor>();
         builder.Services.AddTransient<JellyfinMod.Services.Placeholders.PlaceholderService>();
+        // The stubs line's files go once at start, before any placeholder item is made (review P1-1); the suite also runs it itself.
+        builder.Services.AddSingleton<JellyfinMod.Services.Placeholders.PlaceholderStubCleanup>();
+        builder.Services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<JellyfinMod.Services.Placeholders.PlaceholderStubCleanup>());
         builder.Services.AddTransient<JellyfinMod.Services.Placeholders.PlaceholderWatchedRestore>();
         builder.Services.AddTransient<RetentionRunner>();
         if (taskManager is not null) builder.Services.AddSingleton(taskManager);

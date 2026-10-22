@@ -101,6 +101,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddTransient<PlaceholderService>();
         // The administrator's watched restore from retention history (P1.FU27).
         services.AddTransient<PlaceholderWatchedRestore>();
+        // The stubs line's .disc stubs go once, before any placeholder item is made (review P1-1).
+        services.AddSingleton<IHostedService, PlaceholderStubCleanup>();
         services.AddSingleton<IHostedService, PlaceholderItemListener>();
         services.AddSingleton<IHostedService, PlaceholderBackfillStarter>();
         // A delete in Jellyfin brings the title's placeholders back at once (P1.FU29, P4.FU12), and a real item that arrives

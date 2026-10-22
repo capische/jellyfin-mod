@@ -122,6 +122,8 @@ public sealed partial class PlaceholderService
         bool leased = false)
     {
         var (name, movies) = LibraryOf(libraryId);
+        // No item is made beside a stub of the stubs line (review P1-1): its clean-up runs first, once, at start.
+        var stubsGone = await PlaceholderStubCleanup.WaitAsync(cancellationToken).ConfigureAwait(false);
         // The delete repair holds the library lease already (it cleared the bindings under it).
         var lease = leased ? null : await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
         try
@@ -187,7 +189,12 @@ public sealed partial class PlaceholderService
             var done = new List<PlaceholderWrite>();
             var pending = 0;
             string? deferred = null;
-            if (enabled)
+            if (enabled && !stubsGone)
+            {
+                deferred = "stub_cleanup";
+                pending = plan.Works.Sum(work => Math.Max(1, work.Episodes.Count));
+            }
+            else if (enabled)
             {
                 var batch = plan.Works.Take(limit).ToArray();
                 pending = plan.Works.Skip(limit).Sum(work => Math.Max(1, work.Episodes.Count));
