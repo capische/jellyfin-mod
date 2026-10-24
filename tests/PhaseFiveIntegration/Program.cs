@@ -1966,6 +1966,8 @@ internal static partial class Phase5
         // file (P1.FU30), which only a real Jellyfin makes: the live runner placeholder-items.mjs proves them. Their catalog side, and
         // the clean-up of the stubs line's files, run here (review 2026-10-22).
         await PlaceholderItemsScenarios.RunAsync(host, admin, world, dbPath);
+        // A copy bound in a folder that is no longer a library root is not fallen back to after a delete (2026-10-24).
+        await StaleRootScenarios.RunAsync(admin, world, dbPath, host);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))
