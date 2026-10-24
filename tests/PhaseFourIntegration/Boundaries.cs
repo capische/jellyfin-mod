@@ -48,7 +48,7 @@ internal sealed record TorrentFixture(string Name, byte[] Bytes, string InfoHash
 
 /// <summary>One feed row served by the Torznab boundary.</summary>
 internal sealed record FeedItem(string Title, string Guid, string? Link, long? Size, int? Seeders,
-    Dictionary<string, string> Attributes, string? Comments = null);
+    Dictionary<string, string> Attributes, string? Comments = null, int[]? Categories = null);
 
 /// <summary>A scripted Torznab indexer.</summary>
 internal sealed class IndexerScript
@@ -152,6 +152,7 @@ internal sealed class TorznabBoundary : IAsyncDisposable
             builder.Append("<title>").Append(System.Security.SecurityElement.Escape(item.Title)).Append("</title>");
             builder.Append("<guid>").Append(System.Security.SecurityElement.Escape(item.Guid)).Append("</guid>");
             builder.Append("<pubDate>Fri, 18 Sep 2026 10:00:00 +0000</pubDate>");
+            foreach (var category in item.Categories ?? []) builder.Append("<category>").Append(category).Append("</category>");
             if (item.Comments is not null) builder.Append("<comments>").Append(System.Security.SecurityElement.Escape(item.Comments)).Append("</comments>");
             if (item.Link is not null)
                 builder.Append($"""<enclosure url="{System.Security.SecurityElement.Escape(item.Link)}" length="{item.Size ?? 0}" type="application/x-bittorrent"/>""");

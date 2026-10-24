@@ -81,7 +81,8 @@ public sealed record ReleaseFacts(
     int? EpisodeAttribute,
     bool HasLocator,
     bool LocatorHostAllowed,
-    string? UnsupportedHashReason);
+    string? UnsupportedHashReason,
+    IReadOnlyList<int> Categories);
 
 /// <summary>
 /// Applies hard constraints before scoring and exposes every rejection and score contribution (P4.A4).
@@ -188,14 +189,29 @@ public static class ReleaseEvaluator
                 rejections.Add(new("episode_mismatch", "The indexer reports a different season or episode."));
         }
 
+        // TMDB numbers movies and series apart (604 is both The Matrix Reloaded and Teen Titans), so a TMDB id means something only
+        // within one kind (2026-10-24). A release the indexer lists as the other kind is refused, whatever number it carries; one
+        // only its name calls a series is already refused for a movie above, and its ids are not used. A release whose kind
+        // cannot be decided keeps the rule from before: a movie compares TMDB ids, a series TVDB ids only.
+        var (kind, listed) = ReleaseKind(facts, episodic);
+        var targetKind = target.MediaType == "movie" ? "movie" : "series";
+        if (kind is not null && kind != targetKind && listed)
+        {
+            rejections.Add(new("identity_mismatch", kind == "movie"
+                ? "The indexer lists this release as a movie, not a series."
+                : "The indexer lists this release as a TV series, not a movie."));
+            return "mismatch";
+        }
+
+        var tmdbComparable = kind == targetKind || kind is null && targetKind == "movie";
+        var tmdbKnown = tmdbComparable && facts.TmdbId is > 0 && target.TmdbId > 0;
+
         // A reported provider id that disagrees is a hard mismatch, whatever the title says. An id counts only when both sides
         // know it: a title found in the library may know its TMDB id but not its IMDb one, and a release that reports both must
-        // not be refused for the one the title lacks (2026-10-24). TMDB numbers movies and series apart, so a series can carry a
-        // movie's TMDB id (Teen Titans and The Matrix Reloaded are both 604): a release the indexer gives a TVDB id is a series.
-        var idMismatch = target.MediaType == "movie"
-            ? facts.ImdbId is { } imdb && target.ImdbId is not null && !SameImdb(imdb, target.ImdbId) ||
-                facts.TmdbId is { } tmdb && target.TmdbId > 0 && tmdb != target.TmdbId || facts.TvdbId is not null
-            : facts.TvdbId is { } tvdb && target.TvdbId is not null && tvdb != target.TvdbId;
+        // not be refused for the one the title lacks (2026-10-24).
+        var idMismatch = tmdbKnown && facts.TmdbId != target.TmdbId || (targetKind == "movie"
+            ? facts.ImdbId is { } imdb && target.ImdbId is not null && !SameImdb(imdb, target.ImdbId)
+            : facts.TvdbId is { } tvdb && target.TvdbId is not null && tvdb != target.TvdbId);
         if (idMismatch)
         {
             rejections.Add(new("identity_mismatch", "The indexer reports a different title identity."));
@@ -206,9 +222,9 @@ public static class ReleaseEvaluator
         // offer. The parsed title and year must both agree; such a release is grabbable by hand and, unless the
         // indexer is trusted for it, never grabbed automatically (user decision 2026-09-20).
         var titleOnly = facts.Search == SearchIdentity.QueryOnly;
-        var idConfirmed = target.MediaType == "movie"
-            ? facts.ImdbId is not null && SameImdb(facts.ImdbId, target.ImdbId) || facts.TmdbId is > 0 && facts.TmdbId == target.TmdbId
-            : facts.TvdbId is not null && facts.TvdbId == target.TvdbId;
+        var idConfirmed = tmdbKnown || (targetKind == "movie"
+            ? facts.ImdbId is not null && SameImdb(facts.ImdbId, target.ImdbId)
+            : facts.TvdbId is not null && facts.TvdbId == target.TvdbId);
         var titleMatches = TitleMatches(target, parsed.Title);
         if (idConfirmed) return "verified";
         if (!titleMatches)
@@ -247,6 +263,25 @@ public static class ReleaseEvaluator
         }
 
         return titleOnly ? "title" : "verified";
+    }
+
+    /// <summary>
+    /// Decides whether a release is a <c>movie</c> or a <c>series</c>, and whether the indexer says so (<c>listed</c>) or only the
+    /// name does. A TVDB id makes it a series (TVDB is where indexers number series). A TV category (5000–5999) without a movie
+    /// one makes it a series, unless its name looks like a film: a year and no season or episode, which is how a film filed in
+    /// a TV category looks, so the kind stays undecided. A season, an episode or a pack marker in the name makes it a series.
+    /// A movie category (2000–2999) without a TV one makes it a movie. Anything else (no category, both, or only the indexer's
+    /// own numbers above 99999) is undecided.
+    /// </summary>
+    private static (string? Kind, bool Listed) ReleaseKind(ReleaseFacts facts, bool episodic)
+    {
+        var tvCategory = facts.Categories.Any(category => category is >= 5000 and <= 5999);
+        var movieCategory = facts.Categories.Any(category => category is >= 2000 and <= 2999);
+        if (facts.TvdbId is not null) return ("series", true);
+        if (tvCategory && !movieCategory && (episodic || facts.Parsed.Year is null)) return ("series", true);
+        if (episodic) return ("series", false);
+        if (movieCategory && !tvCategory) return ("movie", true);
+        return (null, false);
     }
 
     /// <summary>
