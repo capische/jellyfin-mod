@@ -131,10 +131,13 @@ public sealed class ReconciliationService(
                 observation.ProtectedNativeIds.Contains(binding.JellyfinItemId))
             .Select(binding => episodeOwners[binding.EpisodeId]));
 
+        // A binding outside every current location of the library is dropped with the absent ones even when its file is still
+        // there: the library no longer reads that folder (OutsideLibrary).
         var unverified = new List<ExcludedTitle>();
         foreach (var binding in bindings.Where(binding => !excluded.Contains(binding.EntryId) &&
                      !observation.TitleIds.Contains(binding.JellyfinItemId)))
         {
+            if (OutsideLibrary(binding.MediaPath, observation.LibraryLocations)) continue;
             if (excluded.Contains(binding.EntryId) ||
                 IsProvenAbsent(binding.MediaPath, binding.StorageIdentity, observation.LibraryLocations, out var detail))
                 continue;
@@ -145,6 +148,7 @@ public sealed class ReconciliationService(
         foreach (var binding in episodeBindings.Where(binding => !observation.EpisodeIds.Contains(binding.JellyfinItemId)))
         {
             var ownerId = episodeOwners[binding.EpisodeId];
+            if (OutsideLibrary(binding.MediaPath, observation.LibraryLocations)) continue;
             if (excluded.Contains(ownerId) ||
                 IsProvenAbsent(binding.MediaPath, binding.StorageIdentity, observation.LibraryLocations, out var detail))
                 continue;
@@ -350,17 +354,31 @@ public sealed class ReconciliationService(
 
         var touched = goneEntryBindings.Select(binding => binding.EntryId)
             .Concat(goneEpisodeBindings.Select(binding => episodes[binding.EpisodeId].EntryId)).ToHashSet();
+        var touchedList = touched.ToList();
+        var allEpisodes = await database.Episodes.Where(episode => touchedList.Contains(episode.EntryId)).ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var episode in allEpisodes) episodes.TryAdd(episode.Id, episode);
+        var allEpisodeIds = allEpisodes.Select(episode => episode.Id).ToList();
+        var titleEntryBindings = await database.EntryBindings.Where(binding => touchedList.Contains(binding.EntryId))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var titleEpisodeBindings = await database.EpisodeBindings.Where(binding => allEpisodeIds.Contains(binding.EpisodeId))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        // A touched title's bindings outside every current location of the library go with the removed ones, whatever their files
+        // do: the library no longer reads them, so the title must not fall back to them (2026-10-24, Peep Show on beta).
+        goneEntryBindings.AddRange(titleEntryBindings.Where(binding => OutsideLibrary(binding.MediaPath, libraryLocations) &&
+            goneEntryBindings.All(gone => gone.Id != binding.Id)));
+        goneEpisodeBindings.AddRange(titleEpisodeBindings.Where(binding => OutsideLibrary(binding.MediaPath, libraryLocations) &&
+            goneEpisodeBindings.All(gone => gone.Id != binding.Id)));
         database.EntryBindings.RemoveRange(goneEntryBindings);
         database.EpisodeBindings.RemoveRange(goneEpisodeBindings);
         // What each touched title still holds, with the removed rows left out.
-        var touchedList = touched.ToList();
-        var survivingEntryBindings = (await database.EntryBindings.Where(binding => touchedList.Contains(binding.EntryId))
-            .ToListAsync(cancellationToken).ConfigureAwait(false)).Where(binding => goneEntryBindings.All(gone => gone.Id != binding.Id)).ToList();
-        var allEpisodes = await database.Episodes.Where(episode => touchedList.Contains(episode.EntryId)).ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-        var allEpisodeIds = allEpisodes.Select(episode => episode.Id).ToList();
-        var survivingEpisodeBindings = (await database.EpisodeBindings.Where(binding => allEpisodeIds.Contains(binding.EpisodeId))
-            .ToListAsync(cancellationToken).ConfigureAwait(false)).Where(binding => goneEpisodeBindings.All(gone => gone.Id != binding.Id)).ToList();
+        var survivingEntryBindings = titleEntryBindings.Where(binding => goneEntryBindings.All(gone => gone.Id != binding.Id)).ToList();
+        var survivingEpisodeBindings = titleEpisodeBindings.Where(binding => goneEpisodeBindings.All(gone => gone.Id != binding.Id)).ToList();
+        // A copy whose item Jellyfin no longer has cannot be opened, so the title never falls back to it; its row stays for the
+        // library-wide absence check, which drops it once its file is provably gone (a file still in the library comes back under
+        // the same item id).
+        var openableEntryBindings = survivingEntryBindings.Where(binding => !ItemIsGone(binding.OwnerItemId ?? binding.JellyfinItemId)).ToList();
+        var openableEpisodeBindings = survivingEpisodeBindings.Where(binding => !ItemIsGone(binding.JellyfinItemId)).ToList();
 
         var now = _clock.GetUtcNow().UtcDateTime;
         foreach (var gone in goneEntryBindings.Where(gone => survivingEntryBindings.Any(other => other.EntryId == gone.EntryId)))
@@ -387,8 +405,8 @@ public sealed class ReconciliationService(
             }
 
             // A movie copy is playable while its binding stands. A series copy is playable while one of its episodes has a file.
-            var playable = held.Where(binding => entry.MediaType == "movie" ||
-                    survivingEpisodeBindings.Any(episodeBinding => episodeBinding.SeriesItemId == binding.JellyfinItemId))
+            var playable = openableEntryBindings.Where(binding => binding.EntryId == entryId && (entry.MediaType == "movie" ||
+                    openableEpisodeBindings.Any(episodeBinding => episodeBinding.SeriesItemId == binding.JellyfinItemId)))
                 .OrderBy(binding => binding.OwnerItemId is null ? 0 : 1)
                 .ThenBy(binding => binding.JellyfinItemId == binding.VersionGroupId ? 0 : 1)
                 .ThenBy(binding => binding.VersionGroupId).ThenBy(binding => binding.JellyfinItemId).ToArray();
@@ -417,7 +435,7 @@ public sealed class ReconciliationService(
             foreach (var episode in allEpisodes.Where(episode => episode.EntryId == entryId &&
                          goneEpisodeBindings.Any(gone => gone.EpisodeId == episode.Id)))
             {
-                var left = survivingEpisodeBindings.Where(binding => binding.EpisodeId == episode.Id).OrderBy(binding => binding.JellyfinItemId).ToArray();
+                var left = openableEpisodeBindings.Where(binding => binding.EpisodeId == episode.Id).OrderBy(binding => binding.JellyfinItemId).ToArray();
                 var chosen = left.FirstOrDefault(binding => binding.JellyfinItemId == episode.JellyfinItemId) ?? left.FirstOrDefault();
                 var becameMissing = chosen is null && (episode.State == FileState.OnDisk || episode.JellyfinItemId.HasValue);
                 episode.JellyfinItemId = chosen?.JellyfinItemId;
@@ -644,6 +662,17 @@ public sealed class ReconciliationService(
         };
         if (filled != stored) entry.MetadataJson = JsonSerializer.Serialize(filled);
     }
+
+    /// <summary>
+    /// Whether a bound path lies outside every current location of its library (2026-10-24, Peep Show on beta: a root removed
+    /// as a library path only, its files left on the mount). The library no longer reads that folder, so Jellyfin never lists the
+    /// file there again and the file still being on disk proves nothing: the binding is dropped (only the row; the file is never
+    /// touched) and the title never falls back to it. A path that is not recorded, or a library with no known location, says
+    /// nothing.
+    /// </summary>
+    private static bool OutsideLibrary(string? path, IReadOnlyList<string> locations) =>
+        !string.IsNullOrWhiteSpace(path) && locations.Any(location => !string.IsNullOrWhiteSpace(location)) &&
+        !MediaStorageIdentity.IsWithin(path, locations);
 
     private bool IsProvenAbsent(string? path, string? identity, IReadOnlyList<string> locations, out string detail)
     {
@@ -1082,12 +1111,12 @@ public sealed class ReconciliationService(
         return removed;
     }
 
-    /// <summary>Whether Jellyfin has no item with this id; a failed read says nothing, so it is not gone.</summary>
+    /// <summary>Whether Jellyfin has no item with this id; a failed read, or no library to ask, says nothing, so it is not gone.</summary>
     private bool ItemIsGone(Guid itemId)
     {
         try
         {
-            return library!.GetItemById(itemId) is null;
+            return library is not null && library.GetItemById(itemId) is null;
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {

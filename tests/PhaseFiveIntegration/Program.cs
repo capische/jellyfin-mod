@@ -1976,6 +1976,8 @@ internal static partial class Phase5
         await BackfillScenarios.RunAsync(admin, host.Client(world.Ordinary, false), world, dbPath);
         // Jellyfin removes a season or a series: its placeholders come back at once (P1.FU29, P4.FU12).
         await DeleteRepairScenarios.RunAsync(admin, world, dbPath, ids);
+        // A copy bound in a folder that is no longer a library root is not fallen back to after a delete (2026-10-24).
+        await StaleRootScenarios.RunAsync(admin, world, dbPath, host);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))

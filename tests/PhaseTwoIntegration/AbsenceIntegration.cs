@@ -346,24 +346,30 @@ internal static class AbsenceIntegration
                 (history.EventType == "media_missing" || history.EventType == "episode_media_missing")),
             "A bound series that loses its TMDB identity keeps its bindings and state with no missing events");
 
-        // A binding recorded without a storage identity, or from a retired location, is resolved by a direct
-        // existence check; an existing file Jellyfin no longer lists is kept.
+        // A binding recorded without a storage identity is resolved by a direct existence check; one in a location the library no
+        // longer has (a root removed as a library path only, its files left on the mount: Peep Show on beta, 2026-10-24) is dropped
+        // even though its file is still there, and that file is not touched; an existing file Jellyfin no longer lists inside a
+        // current location is kept.
         var keptOneBinding = await database.EpisodeBindings.SingleAsync(binding => binding.JellyfinItemId == keptOne.Id);
         keptOneBinding.StorageIdentity = null;
         var retiredLocation = Path.Combine(folder, "retired-location");
         Directory.CreateDirectory(retiredLocation);
         await File.WriteAllTextAsync(Path.Combine(retiredLocation, "still-mounted"), "present");
+        var retiredEpisodeFile = Path.Combine(retiredLocation, "Daily numbered.mkv");
+        await File.WriteAllTextAsync(retiredEpisodeFile, "still here");
         var dailyBinding = await database.EpisodeBindings.SingleAsync(binding => binding.JellyfinItemId == dailyNumbered.Id);
-        dailyBinding.MediaPath = Path.Combine(retiredLocation, "Daily numbered.mkv");
+        dailyBinding.MediaPath = retiredEpisodeFile;
+        var retiredMovie = pagedMovies[2];
+        var retiredMovieBinding = await database.EntryBindings.SingleAsync(binding => binding.JellyfinItemId == retiredMovie.Id);
+        retiredMovieBinding.MediaPath = Path.Combine(retiredLocation, "still-mounted");
         var unlistedMovie = pagedMovies[0];
-        var unlistedBinding = await database.EntryBindings.SingleAsync(binding => binding.JellyfinItemId == unlistedMovie.Id);
-        unlistedBinding.MediaPath = Path.Combine(retiredLocation, "still-mounted");
         await database.SaveChangesAsync();
         episodes.Remove(keptOne);
         File.Delete(keptOne.Path);
         episodes.Remove(dailyNumbered);
         File.Delete(dailyNumbered.Path);
         movies.Remove(unlistedMovie);
+        movies.Remove(retiredMovie);
         database.ChangeTracker.Clear();
         await task.Run(new InlineProgress(), default);
         database.ChangeTracker.Clear();
@@ -374,12 +380,20 @@ internal static class AbsenceIntegration
             await database.Episodes.AnyAsync(episode => episode.TmdbId == 9701 && episode.State == FileState.None) &&
             !await database.EpisodeBindings.AnyAsync(binding =>
                 binding.JellyfinItemId == keptOne.Id || binding.JellyfinItemId == dailyNumbered.Id),
-            "Bindings with no storage identity or outside current locations are confirmed absent by a direct existence check");
+            "A binding with no storage identity is confirmed absent by a direct existence check, and an episode binding outside " +
+            "every current location is dropped although its file is still there");
+        var retiredEntry = await database.Entries.SingleAsync(entry => entry.TmdbId == 9602);
+        Assert(retiredEntry.State == FileState.None && retiredEntry.JellyfinItemId is null &&
+            !await database.EntryBindings.AnyAsync(binding => binding.EntryId == retiredEntry.Id) &&
+            File.Exists(retiredEpisodeFile) && File.Exists(Path.Combine(retiredLocation, "still-mounted")),
+            "A movie bound only outside every current location ends not on disk, and the files there are not touched");
         Assert(unlistedEntry.State == FileState.OnDisk &&
             await database.EntryBindings.AnyAsync(binding => binding.EntryId == unlistedEntry.Id) &&
-            r6Run.DiagnosticsJson?.Contains("still exists although Jellyfin no longer lists it", StringComparison.Ordinal) == true,
-            "A media file that still exists is not treated as absent, and only that title is excluded");
+            r6Run.DiagnosticsJson?.Contains("still exists although Jellyfin no longer lists it", StringComparison.Ordinal) == true &&
+            r6Run.DiagnosticsJson?.Contains("retired-location", StringComparison.Ordinal) != true,
+            "A media file in a current location that still exists is not treated as absent, and only that title is excluded");
         movies.Add(unlistedMovie);
+        movies.Add(retiredMovie);
 
         // A reboot or USB re-enumeration changes only the device number and source of the same mount.
         await WriteMountInfoAsync(mountInfoPath, folder, moviePath, tvPath, true, true, "3:9", "/dev/sdb1");
