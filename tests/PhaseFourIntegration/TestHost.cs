@@ -37,6 +37,9 @@ internal sealed class World
     public required TestLibrary Tv { get; init; }
     public required TestLibrary Far { get; init; }
     public required string Folder { get; init; }
+
+    /// <summary>Items Jellyfin still has, by id, for <c>GetItemById</c>; every other id is an item Jellyfin no longer has.</summary>
+    public Dictionary<Guid, BaseItem> Items { get; } = [];
 }
 
 /// <summary>A test time source: the system clock plus an adjustable offset. Timers still run on real time.</summary>
@@ -97,7 +100,8 @@ internal sealed class PluginHost : IAsyncDisposable
             "GetLocalAlternateVersionIds" => Array.Empty<Guid>(),
             "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
             "GetUserRootFolder" => root,
-            "GetItemById" => null,
+            "GetItemById" => args is [Guid id, ..] && world.Items.TryGetValue(id, out var item) && method.ReturnType.IsInstanceOfType(item)
+                ? item : null,
             "GetVirtualFolders" => libraries.Select(folder => new VirtualFolderInfo
             {
                 ItemId = folder.Id.ToString(), Name = folder.Id.ToString("N"), Locations = [folder.Location],

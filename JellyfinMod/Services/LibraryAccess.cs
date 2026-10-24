@@ -338,6 +338,9 @@ public sealed class LibraryAccess(IUserManager users, ILibraryManager library, I
     public bool CanReadEpisode(User user, Episode episode)
     {
         if (episode.JellyfinItemId is not { } id) return true;
+        // A binding to an item Jellyfin no longer has is stale, not a restriction: the episode follows its series, as an entry
+        // does (P2.R7). A delete can leave one behind when the file stays on a path no library reads.
+        if (library.GetItemById(id) is null) return true;
         // An episode can point at a further version of another episode (S01E02 covered by S01E01-E02, grouped under
         // S01E01): Jellyfin's queries list only the main episode, so the version is readable through it (V1, review P2-6).
         var main = MainVersionOf(id);

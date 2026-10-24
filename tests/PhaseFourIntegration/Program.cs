@@ -1395,6 +1395,32 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         Assert((await viewer.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1")).StatusCode ==
             HttpStatusCode.Forbidden, "Ordinary users cannot search packs");
 
+        // A delete that leaves the file on a path no library reads keeps an episode bound to an item Jellyfin no longer has (beta,
+        // 2026-10-24): the episode follows its series, so a pack search still covers it, while an item Jellyfin still has but does
+        // not show this administrator keeps the pack search refused.
+        var goneItemId = Guid.NewGuid();
+        var hiddenItemId = Guid.NewGuid();
+        world.Items[hiddenItemId] = new MediaBrowser.Controller.Entities.TV.Episode { Id = hiddenItemId };
+        async Task BindFirstEpisodeAsync(Guid? itemId)
+        {
+            await using var database = new ModDbContext(dbPath);
+            await database.Database.ExecuteSqlInterpolatedAsync($"UPDATE Episodes SET JellyfinItemId = {itemId} WHERE Id = {episodeIds[0]}");
+        }
+        await BindFirstEpisodeAsync(goneItemId);
+        foreach (var scope in new[] { "season&seasonNumber=1", "series" })
+        {
+            var stale = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope={scope}"), 200,
+                "Pack search over an episode bound to an item Jellyfin no longer has, scope " + scope);
+            Assert(stale.GetProperty("target").GetProperty("covered").EnumerateArray()
+                    .Any(value => value.GetProperty("episodeId").AsGuid() == episodeIds[0]),
+                "A pack search covers an episode whose bound item is gone, scope " + scope);
+        }
+        await BindFirstEpisodeAsync(hiddenItemId);
+        Assert((await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1")).StatusCode ==
+            HttpStatusCode.Forbidden, "A pack search is refused when a covered episode's item exists but is hidden from the requester");
+        await BindFirstEpisodeAsync(null);
+        world.Items.Remove(hiddenItemId);
+
         var packQueriesBefore = packs.Queries.Count;
         var seasonSearch = await ReadAsync(await restarted.GetAsync($"/JellyfinMod/Releases?entryId={seriesId}&scope=season&seasonNumber=1"), 200,
             "Season search");
