@@ -13,8 +13,12 @@ namespace JellyfinMod.Services.Acquisition;
 /// <summary>Bounds for one indexer during a search.</summary>
 public sealed record TorznabOptions(TimeSpan Timeout, int MaxPages, int MaxParallel)
 {
-    /// <summary>The production bounds.</summary>
-    public static TorznabOptions Default { get; } = new(TimeSpan.FromSeconds(20), 3, 4);
+    /// <summary>
+    /// The production bounds. An indexer's time covers all its queries and pages: 1337x behind Prowlarr and FlareSolverr takes
+    /// 10 to 22 seconds a query, since Prowlarr reads it in four paced pages and queues every client's query behind the one before,
+    /// so a title that needs its fallback query takes two of them (2026-10-25).
+    /// </summary>
+    public static TorznabOptions Default { get; } = new(TimeSpan.FromSeconds(60), 3, 4);
 }
 
 /// <summary>
