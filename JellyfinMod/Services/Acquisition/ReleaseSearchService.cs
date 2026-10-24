@@ -628,7 +628,7 @@ public sealed class ReleaseSearchService(
             var freeleech = item.DownloadVolumeFactor is { } factor ? factor == 0 : (bool?)null;
             var facts = new ReleaseFacts(parsed, identity, item.Size, item.Seeders, freeleech, item.ImdbId, item.TmdbId,
                 item.TvdbId, item.Season, item.Episode, item.DownloadUrl is not null || item.MagnetUrl is not null, hostAllowed,
-                unsupported);
+                unsupported, item.Categories ?? []);
             var evaluation = ReleaseEvaluator.Evaluate(target, profile, facts);
             var ratio = Max(indexer.MinimumSeedRatio, item.MinimumRatio);
             int? itemMinutes = item.MinimumSeedSeconds is { } seconds ? (int)Math.Min(int.MaxValue, (seconds + 59) / 60) : null;

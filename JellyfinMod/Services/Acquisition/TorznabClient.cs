@@ -47,7 +47,8 @@ public sealed record TorznabItem(
     int? Episode,
     string? Language = null,
     string? Subs = null,
-    string? Comments = null);
+    string? Comments = null,
+    IReadOnlyList<int>? Categories = null);
 
 /// <summary>One fetched feed page.</summary>
 public sealed record TorznabPage(IReadOnlyList<TorznabItem> Items, int? Offset, int? Total);
@@ -121,6 +122,12 @@ public sealed class TorznabClient(IHttpClientFactory clients, ILogger<TorznabCli
                 .GroupBy(element => ((string?)element.Attribute("name"))?.ToLowerInvariant() ?? string.Empty)
                 .ToDictionary(group => group.Key, group => (string?)group.First().Attribute("value"));
             string? Attribute(string name) => attributes.GetValueOrDefault(name);
+            // A row may name several categories, as RSS category elements and as repeated category attributes.
+            var categories = item.Elements("category").Select(element => (string?)element)
+                .Concat(item.Elements().Where(element => element.Name.LocalName == "attr" &&
+                    string.Equals((string?)element.Attribute("name"), "category", StringComparison.OrdinalIgnoreCase))
+                    .Select(element => (string?)element.Attribute("value")))
+                .Select(Int).OfType<int>().Distinct().ToArray();
             var enclosure = item.Element("enclosure");
             var link = ((string?)enclosure?.Attribute("url"))?.Trim() ?? ((string?)item.Element("link"))?.Trim();
             var magnet = Attribute("magneturl");
@@ -152,7 +159,8 @@ public sealed class TorznabClient(IHttpClientFactory clients, ILogger<TorznabCli
                 Attribute("language") ?? Attribute("languages"),
                 Attribute("subs") ?? Attribute("subtitles"),
                 // The release's page on the tracker (Torznab's RSS comments element); checked before anyone sees it.
-                ((string?)item.Element("comments"))?.Trim()));
+                ((string?)item.Element("comments"))?.Trim(),
+                categories));
         }
 
         return new TorznabPage(items, Int((string?)response?.Attribute("offset")), Int((string?)response?.Attribute("total")));

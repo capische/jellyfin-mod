@@ -186,6 +186,16 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
     queryTv.TvItems.Add(new("Example.Show.2023.S01E01.1080p.WEB-DL-QTV", "q-tv-a", dl("missing"), 1_500_000_000, 60, []));
     queryTv.TvItems.Add(new("Example.Show.2019.S01E01.1080p.WEB-DL-QTVOLD", "q-tv-b", dl("missing"), 1_500_000_000, 60, []));
     queryTv.TvItems.Add(new("Example.Show.S01E01.1080p.WEB-DL-QTVNY", "q-tv-c", dl("missing"), 1_500_000_000, 60, []));
+    // TMDB numbers movies and series apart (2026-10-24): a TV row's TMDB id is compared with the series' own, and a row the
+    // indexer files as a movie is refused for a series even when its number is the series' TMDB id.
+    queryTv.TvItems.Add(new("Example.Show.S01E01.1080p.WEB-DL-QTVTMDB", "q-tv-d", dl("missing"), 1_500_000_000, 60,
+        Attributes(("tmdbid", "200"), ("category", "5000"))));
+    queryTv.TvItems.Add(new("Example.Show.S01E01.1080p.WEB-DL-QTVOTHER", "q-tv-e", dl("missing"), 1_500_000_000, 60,
+        Attributes(("tmdbid", "999"), ("category", "5000"))));
+    queryTv.TvItems.Add(new("Example.Show.S01E01.1080p.WEB-DL-QTVCAT", "q-tv-f", dl("missing"), 1_500_000_000, 60,
+        Attributes(("tmdbid", "200")), Categories: [2040]));
+    queryTv.TvItems.Add(new("Example.Show.The.Movie.2023.1080p.WEB-DL-QTVFILM", "q-tv-g", dl("missing"), 1_500_000_000, 60,
+        Attributes(("tmdbid", "200"), ("category", "2000"))));
     torznab.Indexers["qtv"] = queryTv;
     // Whole-review chunk 2a, P2 4: an indexer that finds nothing, so every search falls back through all its queries.
     var sparse = new IndexerScript { ApiKey = "sparse-key", Caps = TorznabBoundary.Caps("q,imdbid", "q") };
@@ -650,6 +660,12 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
                 INSERT INTO Entries (Id, MediaType, TmdbId, Title, Year, State, Monitored, AddedAt, TargetLibraryId, RetentionPolicy, NativeTagsJson)
                 VALUES ({native}, 'movie', 101, 'Native Film', 1999, 0, 0, {DateTime.UtcNow}, {world.Movies.Id}, 0, '[]')
                 """);
+        var reloaded = Guid.NewGuid();
+        await using (var database = new ModDbContext(dbPath))
+            await database.Database.ExecuteSqlInterpolatedAsync($"""
+                INSERT INTO Entries (Id, MediaType, TmdbId, Title, Year, State, Monitored, AddedAt, TargetLibraryId, RetentionPolicy, NativeTagsJson)
+                VALUES ({reloaded}, 'movie', 604, 'The Matrix Reloaded', 2003, 0, 0, {DateTime.UtcNow}, {world.Movies.Id}, 0, '[]')
+                """);
         var idsScript = new IndexerScript { ApiKey = "ids-key", Caps = TorznabBoundary.Caps("q,imdbid,tmdbid", "q") };
         idsScript.MovieItems.AddRange([
             new("Native.Film.1999.1080p.WEB-DL-NIDS", "ids-a", dl("missing"), 4_000_000_000, 30,
@@ -661,7 +677,19 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             // TMDB numbers movies and series apart, so a series can carry the movie's number (live: Teen Titans and The Matrix
             // Reloaded are both 604); its TVDB id gives it away.
             new("Other.Show.2003.1080p.WEB-DL-NTV", "ids-d", dl("missing"), 4_000_000_000, 30,
-                Attributes(("imdbid", "0343314"), ("tmdbid", "101"), ("tvdbid", "71503")))
+                Attributes(("imdbid", "0343314"), ("tmdbid", "101"), ("tvdbid", "71503"))),
+            // A TMDB id counts only within the release's kind (2026-10-24), decided from its categories and name: the series
+            // pack filed under TV, and a row filed under TV with no year or season, are refused for the movie with the same
+            // number; the film filed under Movies (an RSS category element, plus a tracker's own number that is ignored) is it;
+            // a film filed under TV but named like a film (a year, no season) is undecided and compared by id as before.
+            new("Teen.Titans.S01.1080p.WEB-DL-TTPACK", "ids-e", dl("missing"), 4_000_000_000, 30,
+                Attributes(("tmdbid", "604"), ("category", "5000"))),
+            new("The.Matrix.Reloaded.1080p.WEB-DL-MRNOYEAR", "ids-f", dl("missing"), 4_000_000_000, 30,
+                Attributes(("tmdbid", "604"), ("category", "5040"))),
+            new("The.Matrix.Reloaded.2003.1080p.WEB-DL-MRFILM", "ids-g", dl("missing"), 4_000_000_000, 30,
+                Attributes(("tmdbid", "604")), Categories: [2040, 100045]),
+            new("The.Matrix.Reloaded.2003.1080p.WEB-DL-MRTV", "ids-h", dl("missing"), 4_000_000_000, 30,
+                Attributes(("tmdbid", "604"), ("category", "5000")))
         ]);
         torznab.Indexers["ids"] = idsScript;
         var idsId = await AddIndexerAsync("ids");
@@ -682,7 +710,22 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             .Single(row => row.GetProperty("rawTitle").GetString() == "Example.Movie.2024.1080p.WEB-DL-WIMDB");
         Assert(!wrongImdb.GetProperty("eligible").GetBoolean() && Codes2(wrongImdb).Contains("identity_mismatch"),
             "A title that knows its IMDb id refuses a release reporting another IMDb id, even with the title's TMDB id: " + Codes2(wrongImdb));
+        var reloadedSearch = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={reloaded}"), 200, "Movie sharing a series' TMDB id");
+        var reloadedRows = reloadedSearch.GetProperty("candidates").EnumerateArray().ToDictionary(row => row.GetProperty("rawTitle").GetString()!);
+        bool ListedAsSeries(JsonElement row) => row.GetProperty("match").GetProperty("identity").GetString() == "mismatch" &&
+            row.GetProperty("rejections").EnumerateArray().Any(item => item.GetProperty("code").GetString() == "identity_mismatch" &&
+                item.GetProperty("message").GetString() == "The indexer lists this release as a TV series, not a movie.");
+        var titansPack = reloadedRows["Teen.Titans.S01.1080p.WEB-DL-TTPACK"];
+        Assert(ListedAsSeries(titansPack) && Codes2(titansPack).Contains("media_type_mismatch") &&
+            ListedAsSeries(reloadedRows["The.Matrix.Reloaded.1080p.WEB-DL-MRNOYEAR"]) &&
+            ListedAsSeries(nativeRows["Other.Show.2003.1080p.WEB-DL-NTV"]),
+            "A release the indexer files as a series is refused for a movie with the same TMDB number: " + titansPack.GetRawText());
+        foreach (var film in new[] { "The.Matrix.Reloaded.2003.1080p.WEB-DL-MRFILM", "The.Matrix.Reloaded.2003.1080p.WEB-DL-MRTV" })
+            Assert(reloadedRows[film].GetProperty("match").GetProperty("identity").GetString() == "verified" && Codes2(reloadedRows[film]) == "runtime_unknown",
+                "A film filed under Movies, or under TV but named like a film, is the movie with its TMDB id: " + reloadedRows[film].GetRawText());
         await DisableIndexerAsync(idsId);
+        var removedReloaded = await admin.DeleteAsync($"/JellyfinMod/Entries/{reloaded}");
+        Assert(removedReloaded.IsSuccessStatusCode, $"The TMDB 604 test title is removed: {(int)removedReloaded.StatusCode}");
         var removedNative = await admin.DeleteAsync($"/JellyfinMod/Entries/{native}");
         Assert(removedNative.IsSuccessStatusCode, $"The native test title is removed: {(int)removedNative.StatusCode}");
 
@@ -1110,6 +1153,20 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         Assert(byTitle["Example.Show.S01E01.1080p.WEB-DL-QTVNY"].GetProperty("eligible").GetBoolean() &&
             Identity("Example.Show.S01E01.1080p.WEB-DL-QTVNY") == "title_without_year",
             "A text-only episode release without a year stays grabbable by hand but is marked as unconfirmed by year");
+        // The release's kind decides whether its TMDB id is the series' (2026-10-24): a TV row with the series' TMDB id is the
+        // series even from a text search; one with another TMDB id is another series; an episode name filed under a movie
+        // category is still an episode, so its TMDB id counts; a row the indexer files as a movie is refused for the series
+        // although its TMDB id is the series' number.
+        Assert(Identity("Example.Show.S01E01.1080p.WEB-DL-QTVTMDB") == "verified" &&
+            byTitle["Example.Show.S01E01.1080p.WEB-DL-QTVTMDB"].GetProperty("eligible").GetBoolean() &&
+            Identity("Example.Show.S01E01.1080p.WEB-DL-QTVCAT") == "verified",
+            "A TV release with the series' TMDB id is the series: " + byTitle["Example.Show.S01E01.1080p.WEB-DL-QTVTMDB"].GetRawText());
+        Rejected("Example.Show.S01E01.1080p.WEB-DL-QTVOTHER", "identity_mismatch");
+        var filmForSeries = byTitle["Example.Show.The.Movie.2023.1080p.WEB-DL-QTVFILM"];
+        Assert(Identity("Example.Show.The.Movie.2023.1080p.WEB-DL-QTVFILM") == "mismatch" && filmForSeries.GetProperty("rejections")
+                .EnumerateArray().Any(item => item.GetProperty("code").GetString() == "identity_mismatch" &&
+                    item.GetProperty("message").GetString() == "The indexer lists this release as a movie, not a series."),
+            "A release the indexer files as a movie is refused for a series with the series' TMDB number: " + filmForSeries.GetRawText());
         await DisableIndexerAsync(queryTvId);
         Rejected("Example.Show.S01.1080p.WEB-DL-GRP", "season_pack");
         Rejected("Example.Show.S01E03.1080p.WEB-DL.DDP5.1.H.264-GRP", "episode_mismatch");
