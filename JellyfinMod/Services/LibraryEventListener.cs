@@ -106,9 +106,11 @@ public sealed class LibraryEventListener(
     }
 
     // Gaining or losing a further media source changes nothing else about the item, so the files behind those
-    // sources are part of what makes an update worth reconciling (P6.M6).
+    // sources are part of what makes an update worth reconciling (P6.M6). So is Jellyfin's first read of a title's
+    // metadata, its name, IMDb id and release date, which an entry made from the bare folder lacks (2026-10-24).
     private static string Fingerprint(MediaBrowser.Controller.Entities.BaseItem item) => string.Join('|',
         item.Path, item.IsVirtualItem, item.ProviderIds.GetValueOrDefault("Tmdb"), item.ParentIndexNumber,
+        item.Name, item.ProviderIds.GetValueOrDefault("Imdb"), item.PremiereDate?.ToString("O"),
         item.IndexNumber, (item as Episode)?.IndexNumberEnd, (item as Episode)?.SeriesId,
         item is MediaBrowser.Controller.Entities.Video video
             ? string.Join(',', video.LocalAlternateVersions ?? []) + ";" +

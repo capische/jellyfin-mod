@@ -1261,7 +1261,10 @@ public sealed class PlaceholderService(
             var stubs = listing.Where(file => file.IsStub).Select(file => file.Path).Distinct(StringComparer.Ordinal).ToArray();
             var hasFile = entry.State == FileState.OnDisk || bound.Contains(entry.Id);
             var release = Metadata(entry.MetadataJson)?.PremiereDate;
-            var released = entry.State == FileState.Reclaimed || release is { } date && date.Date <= today;
+            // A movie with no known release date but a year before this one has come out: an entry made from a library file
+            // before Jellyfin read its metadata knows only the folder's year (2026-10-24).
+            var released = entry.State == FileState.Reclaimed || release is { } date && date.Date <= today ||
+                release is null && entry.Year is { } year && year < today.Year;
             if (hasFile || !released)
             {
                 removals.AddRange(stubs.Select(path => new PlaceholderRemoval(path, hasFile ? "on_disk" : "not_released")));
