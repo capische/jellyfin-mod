@@ -82,7 +82,8 @@ public sealed record ReleaseFacts(
     bool HasLocator,
     bool LocatorHostAllowed,
     string? UnsupportedHashReason,
-    IReadOnlyList<int> Categories);
+    IReadOnlyList<int> Categories,
+    string? RawTitle = null);
 
 /// <summary>
 /// Applies hard constraints before scoring and exposes every rejection and score contribution (P4.A4).
@@ -120,6 +121,8 @@ public static class ReleaseEvaluator
 
         if (parsed.Source == "cam")
             rejections.Add(new("quality_forbidden", "Camera, telesync and screener copies are never acquired."));
+        else if (parsed.Source == "disc")
+            rejections.Add(new("full_disc", "Full disc releases cannot be imported."));
         else if (parsed.Quality is null)
             rejections.Add(new("quality_unknown", parsed.Resolution is null
                 ? "The resolution could not be read from the release title."
@@ -226,6 +229,16 @@ public static class ReleaseEvaluator
             ? facts.ImdbId is not null && SameImdb(facts.ImdbId, target.ImdbId)
             : facts.TvdbId is not null && facts.TvdbId == target.TvdbId);
         var titleMatches = TitleMatches(target, parsed.Title);
+        var year = parsed.Year;
+        int? yearLast = null;
+        // Russian and Ukrainian trackers put a local title first ("Начало / Inception [2010, США, …]"), so a name whose parsed
+        // title differs may still carry the title as whole words; a movie's year is then the first one after it (P4.FU22).
+        if (!titleMatches && TitleInName(target, facts.RawTitle) is { } titleEnd)
+        {
+            titleMatches = true;
+            if (target.MediaType == "movie") (year, yearLast) = ReleaseParser.YearAfter(facts.RawTitle!, titleEnd);
+        }
+
         if (idConfirmed) return "verified";
         if (!titleMatches)
         {
@@ -235,15 +248,21 @@ public static class ReleaseEvaluator
 
         if (target.MediaType == "movie")
         {
-            if (parsed.Year is null)
+            if (year is null)
             {
                 rejections.Add(new("year_missing", "The release has no year and the indexer did not confirm the title."));
                 return "unverified";
             }
 
-            if (target.Year is { } year && parsed.Year.Value != year)
+            if (yearLast is { } last)
             {
-                rejections.Add(new("year_mismatch", $"The release is from {parsed.Year}, not {year}."));
+                rejections.Add(new("year_mismatch", $"The release spans {year}–{last}, a collection, not one film."));
+                return "unverified";
+            }
+
+            if (target.Year is { } expected && year.Value != expected)
+            {
+                rejections.Add(new("year_mismatch", $"The release is from {year}, not {expected}."));
                 return "unverified";
             }
         }
@@ -340,6 +359,9 @@ public static class ReleaseEvaluator
         return release == ReleaseParser.NormalizeTitle(target.Title) ||
             release == ReleaseParser.NormalizeTitle(target.OriginalTitle);
     }
+
+    private static int? TitleInName(ReleaseTarget target, string? rawTitle) =>
+        ReleaseParser.FindTitle(rawTitle, target.Title) ?? ReleaseParser.FindTitle(rawTitle, target.OriginalTitle);
 
     private static bool SameImdb(string reported, string? target)
     {

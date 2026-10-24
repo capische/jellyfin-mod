@@ -65,7 +65,8 @@ public sealed record ParsedRelease(
     [property: JsonPropertyName("seriesPack")] bool SeriesPack = false,
     [property: JsonPropertyName("languages")] IReadOnlyList<string>? Languages = null,
     [property: JsonPropertyName("subtitles")] IReadOnlyList<string>? Subtitles = null,
-    [property: JsonPropertyName("audioChannels"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? AudioChannels = null)
+    [property: JsonPropertyName("audioChannels"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? AudioChannels = null,
+    [property: JsonPropertyName("rip"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Rip = null)
 {
     /// <summary>
     /// The seasons a pack names: a single season, a range <c>first..last</c>, or empty for a complete-series pack that names
@@ -88,7 +89,7 @@ public static partial class ReleaseParser
 {
     private static readonly HashSet<string> NotGroups = new(StringComparer.OrdinalIgnoreCase)
     {
-        "dl", "rip", "web", "hd", "x264", "x265", "h264", "h265", "hevc", "avc", "1080p", "720p", "2160p", "1440p",
+        "dl", "rip", "web", "hd", "disk", "x264", "x265", "h264", "h265", "hevc", "avc", "1080p", "720p", "2160p", "1440p",
         "480p", "576p", "remux", "bluray", "hdtv", "atmos", "dts", "aac", "ac3", "ddp", "truehd", "proper",
         "repack", "internal", "multi", "subs"
     };
@@ -128,6 +129,15 @@ public static partial class ReleaseParser
                 episodes = Enumerable.Range(first, Math.Max(1, last - first + 1)).ToList();
             }
 
+            // Russian and Ukrainian trackers (through Prowlarr) name a whole season "S1E1-6 of 6" or "S1E1-6 (6)": a range
+            // from the first episode to the stated total is a pack of that season; a shorter one stays several episodes (P4.FU22).
+            if (OfTotalPattern().Match(title, episodeMatch.Index + episodeMatch.Length) is { Success: true } total &&
+                IsWholeSeason(episodes, Int(total.Groups["total"].Value)))
+            {
+                episodes.Clear();
+                seasonPack = true;
+            }
+
             markerIndex = episodeMatch.Index;
         }
         else if (CrossPattern().Match(title) is { Success: true } cross)
@@ -165,6 +175,19 @@ public static partial class ReleaseParser
             season = Int(seasonOnly.Groups["season"].Value);
             seasonPack = true;
             markerIndex = seasonOnly.Index;
+            // "Сезон: 1 / Серии: 1-8 из 8" is the whole season; "Серии: 1-5 из 8", "Серия: 3 из 6" or a range without its total
+            // names only those episodes (P4.FU22).
+            if (CyrillicEpisodesPattern().Match(title, seasonOnly.Index) is { Success: true } named)
+            {
+                var first = Int(named.Groups["first"].Value);
+                var last = named.Groups["last"].Success ? Int(named.Groups["last"].Value) : first;
+                var listed = Enumerable.Range(first, Math.Max(1, last - first + 1)).ToList();
+                if (!named.Groups["total"].Success || !IsWholeSeason(listed, Int(named.Groups["total"].Value)))
+                {
+                    episodes = listed;
+                    seasonPack = false;
+                }
+            }
         }
         else if (DailyPattern().Match(title) is { Success: true } date)
         {
@@ -214,12 +237,112 @@ public static partial class ReleaseParser
         var group = GroupPattern().Match(title) is { Success: true } groupMatch &&
             !NotGroups.Contains(groupMatch.Groups["group"].Value) && !DigitsOnly().IsMatch(groupMatch.Groups["group"].Value)
                 ? groupMatch.Groups["group"].Value : null;
+        // A Blu-ray encode keeps the rip word its name uses (BDRip, BRRip) for the picker's label; its tier is the Blu-ray
+        // one (P4.FU22). A full disc has no quality tier: it is refused, never ranked.
+        var rip = source == "bluray" && RipPattern().Match(tail) is { Success: true } ripMatch
+            ? ripMatch.Groups["kind"].Value.ToUpperInvariant() + "Rip"
+            : null;
         return new ParsedRelease(
             name.Length == 0 ? null : name, year, season, episodes, seasonPack, absolute, daily, resolution, source,
             Codec(tail), Audio(tail), Hdr(tail), group, ProperPattern().IsMatch(tail), RepackPattern().IsMatch(tail),
-            QualityCatalog.Identify(source, resolution), seasonLast, seriesPack, TitleLanguages(tail), TitleSubtitles(tail),
-            ChannelsPattern().Match(tail) is { Success: true } channels ? channels.Groups["count"].Value : null);
+            source == "disc" ? null : QualityCatalog.Identify(source, resolution), seasonLast, seriesPack, TitleLanguages(tail),
+            TitleSubtitles(tail), ChannelsPattern().Match(tail) is { Success: true } channels ? channels.Groups["count"].Value : null,
+            rip);
     }
+
+    /// <summary>
+    /// Finds a title in a release name as whole words, wherever the name puts it (P4.FU22): <c>Inception.2010.1080p</c>,
+    /// <c>Начало / Inception [2010, США, …]</c>, <c>Юнацтво / Adolescence (S1) (2025)</c>. Words compare as
+    /// <see cref="NormalizeTitle"/> does (case, accents, punctuation). The title must stand on its own: before it only the start,
+    /// a bracket or slash, or a leading article; after it only the end, a bracket or slash, a year, or a season or episode
+    /// marker. So "The Matrix" is not found in "The Matrix Reloaded", "The Matrix: Trilogy", "The Matrix 4K UHD Collection" or
+    /// "Sounds From The Matrix", nor "Inception" in "Inception: The Cobol Job". Returns the index just after the title, or null.
+    /// </summary>
+    public static int? FindTitle(string? rawTitle, string? title)
+    {
+        var wanted = NormalizeTitle(title).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (wanted.Length == 0 || string.IsNullOrWhiteSpace(rawTitle)) return null;
+        var raw = rawTitle.Length > 512 ? rawTitle[..512] : rawTitle;
+        var words = Words(raw);
+        for (var i = 0; i + wanted.Length <= words.Count; i++)
+        {
+            var last = words[i + wanted.Length - 1];
+            if (!wanted.Select((word, k) => words[i + k].Text == word).All(same => same) ||
+                raw[words[i].Start..last.End].IndexOfAny(HardBreaks) >= 0)
+                continue;
+            var opens = BreakBefore(raw, words[i].Start) || i > 0 && words[i - 1].Text is "the" or "a" or "an" &&
+                raw[words[i - 1].End..words[i].Start].Trim(SoftBreaks).Length == 0 && BreakBefore(raw, words[i - 1].Start);
+            if (opens && EndsName(raw[last.End..])) return last.End;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The first year after <paramref name="index"/> in a release name, and the last year when more follow it as a run
+    /// (<c>1999-2003</c>, <c>1999 2003</c>, <c>1999, 2003</c>: a collection). Both null when no year follows (P4.FU22).
+    /// </summary>
+    public static (int? Year, int? Last) YearAfter(string rawTitle, int index)
+    {
+        var raw = rawTitle.Length > 512 ? rawTitle[..512] : rawTitle;
+        if (index < 0 || index >= raw.Length || YearPattern().Match(raw, index) is not { Success: true } year) return (null, null);
+        var range = YearRangeEndPattern().Match(raw, year.Index + year.Length);
+        return (Int(year.Value), range.Success && range.Index == year.Index + year.Length ? Int(range.Groups["last"].Value) : null);
+    }
+
+    private static readonly char[] HardBreaks = ['/', '|', '[', ']', '(', ')', '{', '}'];
+    private static readonly char[] SoftBreaks = [' ', '\t', '.', '_', '-', '–', '—', ':', ',', ';', '"', '«', '»', '“', '”', '„'];
+
+    private static bool BreakBefore(string raw, int position)
+    {
+        var before = raw[..position].TrimEnd(SoftBreaks);
+        return before.Length == 0 || Array.IndexOf(HardBreaks, before[^1]) >= 0;
+    }
+
+    private static bool EndsName(string rest)
+    {
+        rest = rest.TrimStart(SoftBreaks);
+        if (rest.Length == 0 || Array.IndexOf(HardBreaks, rest[0]) >= 0) return true;
+        static bool At(Regex pattern, string text) => pattern.Match(text) is { Success: true, Index: 0 };
+        return At(YearPattern(), rest) || At(EpisodePattern(), rest) || At(CrossPattern(), rest) ||
+            At(SeasonRangePattern(), rest) || At(SeasonPattern(), rest) || At(CompletePattern(), rest);
+    }
+
+    /// <summary>The words of a name as <see cref="NormalizeTitle"/> forms them, each with its place in the name.</summary>
+    private static List<(string Text, int Start, int End)> Words(string raw)
+    {
+        var words = new List<(string, int, int)>();
+        var builder = new StringBuilder();
+        var start = -1;
+        void Close(int end)
+        {
+            if (builder.Length > 0) words.Add((builder.ToString(), start, end));
+            builder.Clear();
+            start = -1;
+        }
+
+        for (var index = 0; index < raw.Length; index++)
+        {
+            var character = raw[index];
+            if (character is '\'' or '’' && builder.Length > 0) continue;
+            if (char.IsLetterOrDigit(character) || CharUnicodeInfo.GetUnicodeCategory(character) == UnicodeCategory.NonSpacingMark)
+            {
+                if (start < 0) start = index;
+                foreach (var part in character.ToString().Normalize(NormalizationForm.FormD))
+                    if (CharUnicodeInfo.GetUnicodeCategory(part) != UnicodeCategory.NonSpacingMark) builder.Append(char.ToLowerInvariant(part));
+                continue;
+            }
+
+            Close(index);
+            if (character == '&') words.Add(("and", index, index + 1));
+        }
+
+        Close(raw.Length);
+        return words;
+    }
+
+    private static bool IsWholeSeason(IReadOnlyList<int> episodes, int total) =>
+        total > 0 && episodes.Count == total && episodes[0] == 1 && episodes[^1] == total;
 
     /// <summary>
     /// The languages and subtitles of a row for the picker (2026-10-10): what the indexer's <c>language</c> and <c>subs</c>
@@ -301,6 +424,8 @@ public static partial class ReleaseParser
         foreach (Match match in CompletePattern().Matches(title))
         {
             if (match.Index == 0) continue;
+            // "COMPLETE BLURAY" and "COMPLETE UHD BLURAY" name a full disc, not a pack (P4.FU22).
+            if (FullDiscPattern().Match(title, match.Index) is { Success: true } disc && disc.Index == match.Index) continue;
             if (match.Groups["kind"].Success) return match.Index;
             var rest = title[(match.Index + match.Length)..].TrimStart(' ', '.', '_', '-');
             if (rest.Length == 0 || rest[0] is '[' or '(' || YearPattern().Match(rest) is { Success: true, Index: 0 } ||
@@ -344,7 +469,9 @@ public static partial class ReleaseParser
 
     private static string? Resolution(string title)
     {
-        var match = ResolutionPattern().Match(title);
+        // A pixel count wins over the UHD and 4K labels: "UHD BDRip 1080p" is a 1080p encode of a UHD disc (P4.FU22).
+        var match = ResolutionPattern().Matches(title).FirstOrDefault(found => found.Value.EndsWith('p') || found.Value.EndsWith('i')) ??
+            ResolutionPattern().Match(title);
         if (!match.Success) return null;
         var value = match.Value.ToLowerInvariant();
         return value switch
@@ -358,7 +485,11 @@ public static partial class ReleaseParser
     private static string? Source(string title)
     {
         if (CamPattern().IsMatch(title)) return "cam";
-        if (RemuxPattern().IsMatch(title)) return "remux";
+        // Remux wins over the Blu-ray and UHD words around it ("UHD BluRay 2160p … HYBRID REMUX"). An indexer that cuts long
+        // names (Uindex keeps 65 characters and adds "...") can leave only "REMU..."; that is still a remux (P4.FU22).
+        if (RemuxPattern().IsMatch(title) || CutRemuxPattern().IsMatch(title)) return "remux";
+        // A whole Blu-ray disc (BD50, BDMV, BR-DISK, COMPLETE UHD BLURAY) is not a playable file and never the Blu-ray tier.
+        if (FullDiscPattern().IsMatch(title)) return "disc";
         if (BlurayPattern().IsMatch(title)) return "bluray";
         if (WebRipPattern().IsMatch(title)) return "webrip";
         if (WebDlPattern().IsMatch(title)) return "webdl";
@@ -422,8 +553,14 @@ public static partial class ReleaseParser
     private static partial Regex EpisodePattern();
     [GeneratedRegex(B + @"(?<season>\d{1,2})x(?<episode>\d{2,3})(?:(?<more>x\d{2,3})|(?<range>(?<more>-\d{2,3})))*" + E, RegexOptions.IgnoreCase)]
     private static partial Regex CrossPattern();
-    [GeneratedRegex(B + @"(?:S(?<season>\d{1,3})|Season[ ._-]?(?<season>\d{1,3}))" + E, RegexOptions.IgnoreCase)]
+    [GeneratedRegex(B + @"(?:S(?<season>\d{1,3})|Season[ ._-]?(?<season>\d{1,3})|Сезон[ ._:-]{0,3}(?<season>\d{1,3}))" + E, RegexOptions.IgnoreCase)]
     private static partial Regex SeasonPattern();
+    [GeneratedRegex(@"\G[ ._]*(?:of|из)[ ._]*(?<total>\d{1,4})(?!\d)|\G[ ._]*\((?<total>\d{1,4})\)", RegexOptions.IgnoreCase)]
+    private static partial Regex OfTotalPattern();
+    [GeneratedRegex(@"Сери[яи][ ._:]{0,3}(?<first>\d{1,4})(?:[ ]?-[ ]?(?<last>\d{1,4}))?(?:[ ._]*(?:из|of)[ ._]*(?<total>\d{1,4})|[ ._]*\((?<total>\d{1,4})\))?(?!\d)", RegexOptions.IgnoreCase)]
+    private static partial Regex CyrillicEpisodesPattern();
+    [GeneratedRegex(@"\G(?:[ ]?[-–,][ ]?|[ ])(?<last>(?:19|20)\d{2})(?![A-Za-z0-9])")]
+    private static partial Regex YearRangeEndPattern();
     [GeneratedRegex(B + @"complete(?:[ ._-](?<kind>series|seasons?|collection))?" + E, RegexOptions.IgnoreCase)]
     private static partial Regex CompletePattern();
     [GeneratedRegex(B + @"(?:S(?<first>\d{1,3})[ ._]?-[ ._]?S?(?<last>\d{1,3})|Seasons?[ ._-]?(?<first>\d{1,3})[ ._]?-[ ._]?(?<last>\d{1,3}))" + E, RegexOptions.IgnoreCase)]
@@ -442,14 +579,20 @@ public static partial class ReleaseParser
     private static partial Regex SeparatorPattern();
     [GeneratedRegex(B + @"(?:2160p|1440p|1080p|1080i|720p|576p|480p|4k|uhd)" + E, RegexOptions.IgnoreCase)]
     private static partial Regex ResolutionPattern();
-    [GeneratedRegex(B + @"(?:remux|blu[ .-]?ray|bdrip|brrip|web[ .-]?dl|web[ .-]?rip|web|hdtv|pdtv|dvdrip|dvd|hdcam|telesync|hdts)" + E, RegexOptions.IgnoreCase)]
+    [GeneratedRegex(B + @"(?:remux|blu[ .-]?ray|bdrip|brrip|bd(?:25|50|66|100)|bdmv|br[ .-]?disk|web[ .-]?dl|web[ .-]?rip|web|hdtv|pdtv|dvdrip|dvd|hdcam|telesync|hdts)" + E, RegexOptions.IgnoreCase)]
     private static partial Regex SourcePattern();
     [GeneratedRegex(B + @"(?:cam|hdcam|camrip|ts|hdts|telesync|tc|telecine|scr|screener|dvdscr|workprint)" + E, RegexOptions.IgnoreCase)]
     private static partial Regex CamPattern();
     [GeneratedRegex(B + @"(?:remux|bdremux)" + E, RegexOptions.IgnoreCase)]
     private static partial Regex RemuxPattern();
-    [GeneratedRegex(B + @"(?:blu[ .-]?ray|bdrip|brrip|bd25|bd50|bd)" + E, RegexOptions.IgnoreCase)]
+    [GeneratedRegex(B + @"(?:blu[ .-]?ray|bdrip|brrip|bd)" + E, RegexOptions.IgnoreCase)]
     private static partial Regex BlurayPattern();
+    [GeneratedRegex(B + @"(?:(?:uhd[ .-]?)?bd[ .-]?(?:25|50|66|100)|full[ .-]?bd|bdmv|iso|br[ .-]?disk|bd[ .-]?disk|(?:uhd[ .-]?)?blu[ .-]?ray[ .-]?dis[ck]|complete[ .-](?:uhd[ .-])?blu[ .-]?ray)" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex FullDiscPattern();
+    [GeneratedRegex(B + @"(?:bd[ .-]?)?remu(?:\.{3}|…)$", RegexOptions.IgnoreCase)]
+    private static partial Regex CutRemuxPattern();
+    [GeneratedRegex(B + @"(?<kind>bd|br)[ .-]?rip" + E, RegexOptions.IgnoreCase)]
+    private static partial Regex RipPattern();
     [GeneratedRegex(B + @"web[ .-]?rip" + E, RegexOptions.IgnoreCase)]
     private static partial Regex WebRipPattern();
     [GeneratedRegex(B + @"(?:web[ .-]?dl|web)" + E, RegexOptions.IgnoreCase)]
