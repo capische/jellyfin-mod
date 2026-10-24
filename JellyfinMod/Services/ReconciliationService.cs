@@ -603,6 +603,48 @@ public sealed class ReconciliationService(
             database.CompletionObservations.Remove(stale);
     }
 
+    /// <summary>
+    /// Fills what an entry lacks from the library's item, never what it already has (2026-10-24). An entry made the moment
+    /// Jellyfin found a file carries what Jellyfin knew then: the folder name as its title and no IMDb id or release date.
+    /// Without them a release reporting the title's IMDb id was refused as another title, and a movie with no release date
+    /// counted as unreleased, so deleting it never brought its placeholder back. The title is replaced only while it is still
+    /// the name of the title's folder or file and Jellyfin has since named it otherwise.
+    /// </summary>
+    private static void FillFromNative(Entry entry, NativeTitleSnapshot snapshot)
+    {
+        var rawNames = snapshot.Representations.Select(representation => representation.MediaPath)
+            .OfType<string>().Select(Path.TrimEndingDirectorySeparator)
+            .SelectMany(path => new[] { Path.GetFileName(path), Path.GetFileNameWithoutExtension(path),
+                Path.GetFileName(Path.GetDirectoryName(path)) })
+            .Where(name => !string.IsNullOrEmpty(name)).ToHashSet(StringComparer.Ordinal);
+        var renamed = !string.IsNullOrWhiteSpace(snapshot.Title) && entry.Title != snapshot.Title &&
+            rawNames.Contains(entry.Title) && !rawNames.Contains(snapshot.Title);
+        if (renamed) entry.Title = snapshot.Title;
+        entry.ImdbId ??= snapshot.ImdbId;
+        entry.Year ??= snapshot.Year;
+        entry.Overview ??= snapshot.Overview;
+        if (snapshot.MetadataJson is not { } observedJson) return;
+        if (entry.MetadataJson is not { } storedJson)
+        {
+            entry.MetadataJson = observedJson;
+            return;
+        }
+
+        var stored = JsonSerializer.Deserialize<TmdbMetadata>(storedJson);
+        var observed = JsonSerializer.Deserialize<TmdbMetadata>(observedJson);
+        if (stored is null || observed is null) return;
+        var filled = stored with
+        {
+            Title = renamed ? observed.Title : stored.Title,
+            PremiereDate = stored.PremiereDate ?? observed.PremiereDate,
+            Overview = stored.Overview ?? observed.Overview,
+            ImdbId = stored.ImdbId ?? observed.ImdbId,
+            TvdbId = stored.TvdbId ?? observed.TvdbId,
+            RuntimeMinutes = stored.RuntimeMinutes ?? observed.RuntimeMinutes
+        };
+        if (filled != stored) entry.MetadataJson = JsonSerializer.Serialize(filled);
+    }
+
     private bool IsProvenAbsent(string? path, string? identity, IReadOnlyList<string> locations, out string detail)
     {
         // A binding recorded before identities existed, or from a library location that was since removed,
@@ -754,6 +796,10 @@ public sealed class ReconciliationService(
             if (snapshot.DateCreated is { } nativeCreated && nativeCreated > DateTime.MinValue)
                 entry.AddedAt = DateTime.SpecifyKind(nativeCreated, DateTimeKind.Utc);
             database.Entries.Add(entry);
+        }
+        else
+        {
+            FillFromNative(entry, snapshot);
         }
 
         // Remember what Jellyfin's own visibility rules saw, for when the file is gone (P3.T15).

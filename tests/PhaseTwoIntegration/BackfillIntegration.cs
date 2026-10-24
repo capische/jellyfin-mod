@@ -316,6 +316,50 @@ internal static class BackfillIntegration
             raise("updated", new ItemChangeEventArgs { Item = corrected, Parent = movieLibrary });
             await WaitForEntryAsync(dbPath, 8201);
 
+            // 2026-10-24: Jellyfin adds a file before it reads the title's metadata, so the entry starts with the folder's
+            // name, no IMDb id and no release date. Jellyfin's first metadata read fills them; a later rename in Jellyfin does
+            // not overwrite what the entry then has.
+            const string folderName = "The Matrix (1999) [tmdbid-8204]";
+            var bare = new Movie
+            {
+                Id = Guid.NewGuid(), Name = folderName, Path = $"/media/{folderName}/{folderName}.mkv", ProductionYear = 1999
+            };
+            bare.ProviderIds["Tmdb"] = "8204";
+            movies.Add(bare);
+            raise("added", new ItemChangeEventArgs { Item = bare, Parent = movieLibrary });
+            var bareId = await WaitForEntryAsync(dbPath, 8204);
+            await using (var before = new ModDbContext(dbPath))
+            {
+                var made = await before.Entries.SingleAsync(entry => entry.Id == bareId);
+                Assert(made.Title == folderName && made.ImdbId is null, $"The entry starts as Jellyfin first saw the file: {made.Title}");
+            }
+
+            bare.Name = "The Matrix";
+            bare.ProviderIds["Imdb"] = "tt0133093";
+            bare.PremiereDate = new DateTime(1999, 3, 31, 0, 0, 0, DateTimeKind.Utc);
+            raise("updated", new ItemChangeEventArgs { Item = bare, Parent = movieLibrary });
+            await WaitForAsync(async database => (await database.Entries.SingleAsync(entry => entry.Id == bareId)).ImdbId == "tt0133093",
+                dbPath, "Jellyfin's metadata read did not reach the entry");
+            await using (var filled = new ModDbContext(dbPath))
+            {
+                var entry = await filled.Entries.SingleAsync(candidate => candidate.Id == bareId);
+                var metadata = System.Text.Json.JsonSerializer.Deserialize<TmdbMetadata>(entry.MetadataJson!)!;
+                Assert(entry.Title == "The Matrix" && entry.Year == 1999 && metadata.Title == "The Matrix" &&
+                    metadata.ImdbId == "tt0133093" && metadata.PremiereDate?.Date == new DateTime(1999, 3, 31),
+                    $"The entry takes Jellyfin's name, IMDb id and release date: {entry.Title} {entry.MetadataJson}");
+            }
+
+            bare.Name = "Matrix, The";
+            bare.ProviderIds["Imdb"] = "tt9999999";
+            using (var scope = provider.CreateScope())
+                await scope.ServiceProvider.GetRequiredService<JellyfinItemReconciliationRunner>().ReconcileAsync(bare.Id, default);
+            await using (var kept = new ModDbContext(dbPath))
+            {
+                var entry = await kept.Entries.SingleAsync(candidate => candidate.Id == bareId);
+                Assert(entry.Title == "The Matrix" && entry.ImdbId == "tt0133093" && entry.MetadataJson!.Contains("tt0133093"),
+                    $"What the entry already has is never overwritten by the library item: {entry.Title} {entry.ImdbId}");
+            }
+
             var missed = Movie(8202, movieLibrary.Id);
             movies.Add(missed);
             await provider.GetRequiredService<CatalogPostScanTask>().Run(new InlineProgress(_ => { }), default);

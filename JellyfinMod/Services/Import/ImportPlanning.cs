@@ -313,8 +313,12 @@ public static partial class ImportNaming
     {
         var name = Sanitize(title);
         if (name.Length == 0) name = "Untitled";
+        var tag = " [tmdbid-" + tmdbId.ToString(CultureInfo.InvariantCulture) + "]";
+        // A title that is already such a folder name (an entry made from a library folder before Jellyfin named it) is used
+        // as it is, not tagged twice (2026-10-24).
+        if (name.EndsWith(tag, StringComparison.Ordinal)) return Trim(name);
         if (year is { } value) name += " (" + value.ToString(CultureInfo.InvariantCulture) + ")";
-        return Trim(name + " [tmdbid-" + tmdbId.ToString(CultureInfo.InvariantCulture) + "]");
+        return Trim(name + tag);
     }
 
     /// <summary>
