@@ -640,6 +640,52 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             }), 200, "Indexer disabled");
         }
 
+        // 2026-10-24: an id counts only when both sides know it. A title found in the library (here TMDB id 101, no IMDb id,
+        // no metadata, Jellyfin's visibility recorded) takes a release that reports an IMDb id and its own TMDB id; a release
+        // whose TMDB id is another title's stays refused; and a title that knows its IMDb id still refuses a release reporting
+        // another one with its TMDB id.
+        var native = Guid.NewGuid();
+        await using (var database = new ModDbContext(dbPath))
+            await database.Database.ExecuteSqlInterpolatedAsync($"""
+                INSERT INTO Entries (Id, MediaType, TmdbId, Title, Year, State, Monitored, AddedAt, TargetLibraryId, RetentionPolicy, NativeTagsJson)
+                VALUES ({native}, 'movie', 101, 'Native Film', 1999, 0, 0, {DateTime.UtcNow}, {world.Movies.Id}, 0, '[]')
+                """);
+        var idsScript = new IndexerScript { ApiKey = "ids-key", Caps = TorznabBoundary.Caps("q,imdbid,tmdbid", "q") };
+        idsScript.MovieItems.AddRange([
+            new("Native.Film.1999.1080p.WEB-DL-NIDS", "ids-a", dl("missing"), 4_000_000_000, 30,
+                Attributes(("imdbid", "0133093"), ("tmdbid", "101"))),
+            new("Native.Film.Resurrections.2021.1080p.WEB-DL-NRES", "ids-b", dl("missing"), 4_000_000_000, 30,
+                Attributes(("imdbid", "10838180"), ("tmdbid", "624860"))),
+            new("Example.Movie.2024.1080p.WEB-DL-WIMDB", "ids-c", dl("missing"), 4_000_000_000, 30,
+                Attributes(("imdbid", "7777777"), ("tmdbid", "100"))),
+            // TMDB numbers movies and series apart, so a series can carry the movie's number (live: Teen Titans and The Matrix
+            // Reloaded are both 604); its TVDB id gives it away.
+            new("Other.Show.2003.1080p.WEB-DL-NTV", "ids-d", dl("missing"), 4_000_000_000, 30,
+                Attributes(("imdbid", "0343314"), ("tmdbid", "101"), ("tvdbid", "71503")))
+        ]);
+        torznab.Indexers["ids"] = idsScript;
+        var idsId = await AddIndexerAsync("ids");
+        var nativeSearch = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={native}"), 200, "Native title search");
+        var nativeRows = nativeSearch.GetProperty("candidates").EnumerateArray().ToDictionary(row => row.GetProperty("rawTitle").GetString()!);
+        string Codes2(JsonElement row) => string.Join(",", row.GetProperty("rejections").EnumerateArray().Select(item => item.GetProperty("code").GetString()));
+        var sameTitle = nativeRows["Native.Film.1999.1080p.WEB-DL-NIDS"];
+        // The entry has no runtime, so the default profile's size limit refuses it for that alone (runtime_unknown).
+        Assert(sameTitle.GetProperty("match").GetProperty("identity").GetString() == "verified" &&
+            Codes2(sameTitle) == "runtime_unknown",
+            "A release reporting an IMDb id and the title's TMDB id is the title for one that knows only its TMDB id: " + sameTitle.GetRawText());
+        Assert(Codes2(nativeRows["Native.Film.Resurrections.2021.1080p.WEB-DL-NRES"]).Contains("identity_mismatch") &&
+            Codes2(nativeRows["Example.Movie.2024.1080p.WEB-DL-WIMDB"]).Contains("identity_mismatch") &&
+            Codes2(nativeRows["Other.Show.2003.1080p.WEB-DL-NTV"]).Contains("identity_mismatch"),
+            "A release whose TMDB id is another title's, or that the indexer names a TV series, is refused as a different title");
+        var knownImdb = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}"), 200, "Known IMDb search");
+        var wrongImdb = knownImdb.GetProperty("candidates").EnumerateArray()
+            .Single(row => row.GetProperty("rawTitle").GetString() == "Example.Movie.2024.1080p.WEB-DL-WIMDB");
+        Assert(!wrongImdb.GetProperty("eligible").GetBoolean() && Codes2(wrongImdb).Contains("identity_mismatch"),
+            "A title that knows its IMDb id refuses a release reporting another IMDb id, even with the title's TMDB id: " + Codes2(wrongImdb));
+        await DisableIndexerAsync(idsId);
+        var removedNative = await admin.DeleteAsync($"/JellyfinMod/Entries/{native}");
+        Assert(removedNative.IsSuccessStatusCode, $"The native test title is removed: {(int)removedNative.StatusCode}");
+
         // Whole-review chunk 2a, P2 4: two units of budget left. Two concurrent searches that each fall back through every
         // query the indexer allows may send two queries between them, not one batch each.
         var sparseId = await AddIndexerAsync("sparse", dailyQueryBudget: 2);

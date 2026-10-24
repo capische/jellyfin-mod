@@ -188,10 +188,14 @@ public static class ReleaseEvaluator
                 rejections.Add(new("episode_mismatch", "The indexer reports a different season or episode."));
         }
 
-        // A reported provider id that disagrees is a hard mismatch, whatever the title says.
+        // A reported provider id that disagrees is a hard mismatch, whatever the title says. An id counts only when both sides
+        // know it: a title found in the library may know its TMDB id but not its IMDb one, and a release that reports both must
+        // not be refused for the one the title lacks (2026-10-24). TMDB numbers movies and series apart, so a series can carry a
+        // movie's TMDB id (Teen Titans and The Matrix Reloaded are both 604): a release the indexer gives a TVDB id is a series.
         var idMismatch = target.MediaType == "movie"
-            ? facts.ImdbId is { } imdb && !SameImdb(imdb, target.ImdbId) || facts.TmdbId is { } tmdb && tmdb != target.TmdbId
-            : facts.TvdbId is { } tvdb && tvdb != target.TvdbId;
+            ? facts.ImdbId is { } imdb && target.ImdbId is not null && !SameImdb(imdb, target.ImdbId) ||
+                facts.TmdbId is { } tmdb && target.TmdbId > 0 && tmdb != target.TmdbId || facts.TvdbId is not null
+            : facts.TvdbId is { } tvdb && target.TvdbId is not null && tvdb != target.TvdbId;
         if (idMismatch)
         {
             rejections.Add(new("identity_mismatch", "The indexer reports a different title identity."));
@@ -203,7 +207,7 @@ public static class ReleaseEvaluator
         // indexer is trusted for it, never grabbed automatically (user decision 2026-09-20).
         var titleOnly = facts.Search == SearchIdentity.QueryOnly;
         var idConfirmed = target.MediaType == "movie"
-            ? facts.ImdbId is not null && SameImdb(facts.ImdbId, target.ImdbId) || facts.TmdbId == target.TmdbId
+            ? facts.ImdbId is not null && SameImdb(facts.ImdbId, target.ImdbId) || facts.TmdbId is > 0 && facts.TmdbId == target.TmdbId
             : facts.TvdbId is not null && facts.TvdbId == target.TvdbId;
         var titleMatches = TitleMatches(target, parsed.Title);
         if (idConfirmed) return "verified";
