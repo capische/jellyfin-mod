@@ -214,6 +214,14 @@
 .jfmod-brow-main .jfmod-sub{font-size:.88em;color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));display:block;margin-top:.15em;word-break:break-word}
 .jfmod-brow-err{background:rgba(198,40,40,.08)}
 .jfmod-indexerColour{display:inline-block;width:.75em;height:.75em;border-radius:50%;margin-right:.45em;vertical-align:-.04em}
+/* Prowlarr's slow default 1337x definition, on the name's line (P4.FU27; guides/buttons-and-row-actions.md): the group never
+   breaks inside and moves under the name as one piece when it does not fit. */
+.jfmod-indexerSlow{display:inline-block;margin-left:.5em;font-size:.85em;font-weight:400;white-space:nowrap;color:var(--jf-palette-text-secondary,rgba(255,255,255,.7))}
+.jfmod-indexerSlow a{color:var(--jf-palette-primary-main,#00a4dc);font-weight:600;text-decoration:none}
+.jfmod-indexerSlow a:hover,.jfmod-indexerSlow a:focus-visible{text-decoration:underline}
+.jfmod-slow{color:#f2b01e;font-weight:600;white-space:nowrap}
+:root[data-theme="light"] .jfmod-slow,:root[data-theme="appletv"] .jfmod-slow{color:#7a5000}
+.jfmod-slow svg{width:1.15em;height:1.15em;margin-right:.25em;vertical-align:-.2em;fill:currentColor}
 .jfmod-brow-errtext{grid-column:1/-1;font-size:.9em;margin-top:.3em}
 .jfmod-brow .jfmod-state{margin-right:.6em}
 @media (max-width:48em){.jfmod-brow{grid-template-columns:1fr}.jfmod-brow .jfmod-rowactions{justify-content:flex-end;margin-top:.4em}}
@@ -2020,6 +2028,26 @@
       // The release picker's indexer palette (P4.FU25), the same eight hues as the web's indexerColours.ts.
       var INDEXER_COLOURS = ['#4fc3f7', '#81c784', '#ffb74d', '#ba68c8', '#f06292', '#4db6ac', '#fff176', '#ff8a65'];
 
+      // "⚠ Slow setup · How to speed it up" after a synced indexer on Prowlarr's slow default 1337x definition (P4.FU27); the
+      // plugin sends the how-to's address only for that one.
+      function slowSetupLabel(href) {
+        var group = document.createElement('span');
+        group.className = 'jfmod-indexerSlow';
+        var label = document.createElement('span');
+        label.className = 'jfmod-slow';
+        label.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>';
+        label.appendChild(document.createTextNode('Slow setup'));
+        group.appendChild(label);
+        group.appendChild(document.createTextNode(' · '));
+        var link = document.createElement('a');
+        link.href = href;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = 'How to speed it up';
+        group.appendChild(link);
+        return group;
+      }
+
       function renderIndexers() {
         var container = $('#IndexerList');
         // A test reloads the list: the remote keeps its place on the same row's same action.
@@ -2050,6 +2078,7 @@
           colour.style.background = INDEXER_COLOURS[((indexer.colorIndex || 0) % 8 + 8) % 8];
           name.appendChild(colour);
           name.appendChild(document.createTextNode(indexer.name));
+          if (indexer.slowSetupHowTo) name.appendChild(slowSetupLabel(indexer.slowSetupHowTo));
           main.appendChild(name);
           var sub = document.createElement('span');
           sub.className = 'jfmod-sub';

@@ -176,6 +176,10 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<int>("Priority")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("ProwlarrDefinitionName")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
                     b.Property<int?>("ProwlarrIndexerId")
                         .HasColumnType("INTEGER");
 

@@ -68,14 +68,16 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
     secrets.Add(prowlarr.ApiKey);
     torznab.Indexers["alpha"] = new IndexerScript { ApiKey = prowlarr.ApiKey, Caps = TorznabBoundary.Caps("q,imdbid", "q,tvdbid,season,ep") };
     torznab.Indexers["beta"] = new IndexerScript { ApiKey = prowlarr.ApiKey, Caps = TorznabBoundary.Caps("q", "q") };
-    prowlarr.Indexers[1] = new() { ["id"] = 1, ["name"] = "Alpha", ["protocol"] = "torrent", ["enable"] = true, ["priority"] = 10,
+    // Alpha runs on Prowlarr's official 1337x definition, Beta on the one-page copy the P4.FU26 script installs.
+    prowlarr.Indexers[1] = new() { ["id"] = 1, ["name"] = "Alpha", ["protocol"] = "torrent", ["enable"] = true, ["priority"] = 10, ["definitionName"] = "1337x",
         ["supportsRedirect"] = true, ["indexerUrls"] = new JsonArray("https://alpha.example/"),
         ["capabilities"] = new JsonObject { ["categories"] = new JsonArray(
             new JsonObject { ["id"] = 2000, ["subCategories"] = new JsonArray(new JsonObject { ["id"] = 2040 }) },
             new JsonObject { ["id"] = 5000, ["subCategories"] = new JsonArray(new JsonObject { ["id"] = 5040 }) },
             new JsonObject { ["id"] = 8000 }) } };
     prowlarr.Feeds[1] = "alpha";
-    prowlarr.Indexers[2] = new() { ["id"] = 2, ["name"] = "Beta", ["protocol"] = "torrent", ["enable"] = false, ["priority"] = 30 };
+    prowlarr.Indexers[2] = new() { ["id"] = 2, ["name"] = "Beta", ["protocol"] = "torrent", ["enable"] = false, ["priority"] = 30,
+        ["definitionName"] = "1337x-fast" };
     prowlarr.Feeds[2] = "beta";
     prowlarr.Indexers[3] = new() { ["id"] = 3, ["name"] = "Gamma", ["protocol"] = "usenet", ["enable"] = true, ["priority"] = 5 };
 
@@ -261,6 +263,35 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         await Expect(Read(admin.DeleteAsync($"/JellyfinMod/Settings/Indexers/{alphaId}"), 409, "Deleting a synced indexer is refused"), "prowlarr_managed");
         for (var run = 0; run < 3; run++) await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Sync", null), 200, "Sync");
         Assert(Synced(await Indexers(), 1).GetProperty("dailyQueryBudget").GetInt32() == 7, "The budget override survives three syncs");
+
+        // ---- P4.FU27: an indexer on Prowlarr's slow default 1337x definition carries the how-to's address; the one-page copy,
+        //      other definitions and manual indexers carry none; every sync reads the definition again without counting an update.
+        const string howTo = "https://github.com/capische/jellyfin-mod/blob/main-stubs/docs/prowlarr-1337x-fast.md";
+        string? HowTo(JsonElement row) => row.GetProperty("slowSetupHowTo").ValueKind == JsonValueKind.Null ? null : row.GetProperty("slowSetupHowTo").GetString();
+        rows = await Indexers();
+        Assert(HowTo(Synced(rows, 1)) == howTo, "P4.FU27: an indexer synced on definition 1337x is marked slow, with the how-to's address");
+        Assert(HowTo(Synced(rows, 2)) is null, "P4.FU27: an indexer synced on definition 1337x-fast is not marked");
+        Assert(HowTo(rows.Single(row => row.GetProperty("managedBy").GetString() == "manual")) is null, "P4.FU27: a manual indexer is not marked");
+        var alphaRevision = Synced(rows, 1).GetProperty("revision").GetInt32();
+        prowlarr.Indexers[1]["definitionName"] = "1337x-fast";
+        prowlarr.Indexers[2]["definitionName"] = "1337x";
+        sync = await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Sync", null), 200, "Sync after the definitions changed");
+        rows = await Indexers();
+        Assert(sync.GetProperty("updated").GetInt32() == 0 && sync.GetProperty("verified").GetInt32() == 0 &&
+            Synced(rows, 1).GetProperty("revision").GetInt32() == alphaRevision && Synced(rows, 1).GetProperty("verified").GetBoolean(),
+            "P4.FU27: a changed definition is no feed change: no update, no new revision, no re-verification: " + sync.GetRawText());
+        Assert(HowTo(Synced(rows, 1)) is null && HowTo(Synced(rows, 2)) == howTo,
+            "P4.FU27: the next sync reads the definitions again: Alpha now on 1337x-fast is no longer marked, Beta now on 1337x is");
+        prowlarr.Indexers[1]["definitionName"] = "1337x";
+        prowlarr.Indexers[2].Remove("definitionName");
+        await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Sync", null), 200, "Sync after the definitions changed back");
+        rows = await Indexers();
+        Assert(HowTo(Synced(rows, 1)) == howTo && HowTo(Synced(rows, 2)) is null,
+            "P4.FU27: switched back, Alpha is marked again; an indexer whose answer names no definition is not marked");
+        await using (var database = new ModDbContext(dbPath))
+            Assert((await database.AcquisitionIndexers.SingleAsync(row => row.ProwlarrIndexerId == 1)).ProwlarrDefinitionName == "1337x" &&
+                (await database.AcquisitionIndexers.SingleAsync(row => row.ProwlarrIndexerId == 2)).ProwlarrDefinitionName == null,
+                "P4.FU27: the definition is stored in SQLite and cleared when Prowlarr stops naming one");
 
         // ---- Rotation: one key change reaches every feed.
         var rotated = "prowlarr-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
