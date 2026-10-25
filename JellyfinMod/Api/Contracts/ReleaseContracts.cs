@@ -90,15 +90,22 @@ public sealed record ReleaseProgressIndexerDto(
     [property: JsonPropertyName("retryAfterSeconds"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? RetryAfterSeconds);
 
 /// <summary>The response of <c>GET /JellyfinMod/Releases/Progress/{key}</c>.</summary>
+/// <param name="Indexers">One line per enabled indexer.</param>
+/// <param name="Finished">Whether the search is over.</param>
+/// <param name="Search">
+/// The rows of the indexers that have answered, ranked as the final list and grabbable by its <c>searchId</c> (the final
+/// response carries the same id); null until the first indexer has answered (P4.FU24).
+/// </param>
 public sealed record ReleaseProgressDto(
     [property: JsonPropertyName("indexers")] IReadOnlyList<ReleaseProgressIndexerDto> Indexers,
-    [property: JsonPropertyName("finished")] bool Finished)
+    [property: JsonPropertyName("finished")] bool Finished,
+    [property: JsonPropertyName("search"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] ReleaseSearchDto? Search = null)
 {
     /// <summary>Builds the public view of a search's progress.</summary>
-    public static ReleaseProgressDto From(SearchProgress progress) => new(
+    public static ReleaseProgressDto From(SearchProgress progress, ReleaseSearchDto? search = null) => new(
         progress.Indexers.Select(line => new ReleaseProgressIndexerDto(line.IndexerId, line.Name, line.State,
             line.StartedAt is { } started ? Utc(started) : null, line.ResultCount, line.RetryAfterSeconds)).ToArray(),
-        progress.Finished);
+        progress.Finished, search);
 
     private static DateTime Utc(DateTime value) => DateTime.SpecifyKind(value, DateTimeKind.Utc);
 }

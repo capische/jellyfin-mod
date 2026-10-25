@@ -82,20 +82,34 @@ public sealed class ReleasesController(
             new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
                 profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
             inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(intent, held, progressKey));
-        var targetKey = GrabService.TargetKey(entry.Id, episode?.Id) + (intent == GrabIntents.AddVersion ? "+add" : string.Empty);
+        return ReleaseSearchDto.From(snapshot, await AvailabilityAsync(snapshot, cancellationToken));
+    }
+
+    /// <summary>
+    /// Whether a grab can start from a search, the rows of a running one included (P4.FU24): grabbing on, acquisition ready, no
+    /// active grab holding the target, and the modes its rows may offer.
+    /// </summary>
+    private async Task<GrabAvailabilityDto> AvailabilityAsync(ReleaseSearchSnapshot snapshot, CancellationToken cancellationToken)
+    {
+        var target = snapshot.Target;
+        var pack = ReleaseScopes.IsPack(target.Scope);
+        var addVersion = snapshot.Intent == GrabIntents.AddVersion;
+        var state = await configuration.GetStateAsync(database, cancellationToken);
+        var targetKey = pack
+            ? GrabService.PackKey(target.EntryId, target.Scope == ReleaseScopes.Season ? target.SeasonNumber : null)
+            : GrabService.TargetKey(target.EntryId, target.EpisodeId) + (addVersion ? "+add" : string.Empty);
         var active = await database.GrabOperations.AsNoTracking()
             .FirstOrDefaultAsync(value => value.ActiveTarget == targetKey, cancellationToken);
         // A pack that claimed this episode holds it as well as a single-episode grab would.
-        if (active is null && episode is not null &&
+        if (active is null && !pack && target.EpisodeId is not null &&
             await database.GrabClaims.AsNoTracking().FirstOrDefaultAsync(claim => claim.ActiveKey == targetKey, cancellationToken) is { } claim)
             active = await database.GrabOperations.AsNoTracking().FirstOrDefaultAsync(value => value.Id == claim.GrabId, cancellationToken);
         var reason = !state.Settings.Enabled ? "acquisition_disabled"
             : !state.Ready ? state.Blockers[0]
             : active is not null ? "grab_active"
             : null;
-        return ReleaseSearchDto.From(snapshot,
-            new GrabAvailabilityDto(reason is null, reason, (int)Math.Ceiling(hold.Hold.TotalSeconds), active?.Id,
-                GrabService.ModesFor(false, intent == GrabIntents.AddVersion, episode is not null, state.Settings.EpisodeUpgradesEnabled)));
+        return new GrabAvailabilityDto(reason is null, reason, (int)Math.Ceiling(hold.Hold.TotalSeconds), active?.Id,
+            GrabService.ModesFor(pack, addVersion, pack || target.EpisodeId is not null, state.Settings.EpisodeUpgradesEnabled));
     }
 
     /// <summary>
@@ -132,30 +146,24 @@ public sealed class ReleasesController(
             new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
                 profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
             inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(ProgressKey: progressKey));
-        var packKey = GrabService.PackKey(entry.Id, scope == ReleaseScopes.Season ? seasonNumber : null);
-        var active = await database.GrabOperations.AsNoTracking()
-            .FirstOrDefaultAsync(value => value.ActiveTarget == packKey, cancellationToken);
-        var reason = !state.Settings.Enabled ? "acquisition_disabled"
-            : !state.Ready ? state.Blockers[0]
-            : active is not null ? "grab_active"
-            : null;
-        return ReleaseSearchDto.From(snapshot,
-            new GrabAvailabilityDto(reason is null, reason, (int)Math.Ceiling(hold.Hold.TotalSeconds), active?.Id,
-                GrabService.ModesFor(true, false, true, state.Settings.EpisodeUpgradesEnabled)));
+        return ReleaseSearchDto.From(snapshot, await AvailabilityAsync(snapshot, cancellationToken));
     }
 
     /// <summary>
-    /// What a running search has done so far, for the release picker's live view: one line per enabled indexer and whether the
-    /// search is over. 404 for an unknown key, one that is not the caller's, or one that finished more than a minute ago.
+    /// What a running search has done so far, for the release picker's live view: one line per enabled indexer, whether the
+    /// search is over, and the rows of the indexers that have answered as a search the page can grab from (P4.FU24; null until
+    /// one has). 404 for an unknown key, one that is not the caller's, or one that finished more than a minute ago.
     /// </summary>
     [HttpGet("Releases/Progress/{progressKey}")]
-    public ActionResult<ReleaseProgressDto> Progress(string progressKey)
+    public async Task<ActionResult<ReleaseProgressDto>> Progress(string progressKey, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
         var user = access.GetUser(User);
         if (user is null) return Unauthorized();
         if (!ReleaseProgressTable.IsValidKey(progressKey) || search.Progress(progressKey, user.Id) is not { } progress) return NotFound();
-        return ReleaseProgressDto.From(progress);
+        var rows = search.Snapshot(progress.SearchId, user.Id);
+        return ReleaseProgressDto.From(progress,
+            rows is null ? null : ReleaseSearchDto.From(rows, await AvailabilityAsync(rows, cancellationToken)));
     }
 
     /// <summary>

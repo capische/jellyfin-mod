@@ -583,20 +583,56 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         var running = admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}&progressKey={progressKey}");
         var seenStates = new HashSet<string>();
         var progressSeen = 0;
+        // P4.FU24: once the fast indexer has answered and the slow one still asks, its rows are readable from the progress and
+        // grabbable by the search id the final answer will carry.
+        JsonElement? early = null;
+        JsonElement? earlyGrab = null;
+        var grabbedWhileAsking = false;
         while (!running.IsCompleted)
         {
             var poll = await admin.GetAsync($"/JellyfinMod/Releases/Progress/{progressKey}");
             if (poll.StatusCode == System.Net.HttpStatusCode.OK)
             {
                 progressSeen++;
-                foreach (var line in Json.Parse(await poll.Content.ReadAsStringAsync()).GetProperty("indexers").EnumerateArray())
-                    seenStates.Add(line.GetProperty("state").GetString()!);
+                var read = Json.Parse(await poll.Content.ReadAsStringAsync());
+                var lines = read.GetProperty("indexers").EnumerateArray().ToDictionary(line => line.GetProperty("name").GetString()!);
+                foreach (var line in lines.Values) seenStates.Add(line.GetProperty("state").GetString()!);
+                if (early is null && lines["Good"].GetProperty("state").GetString() == "ok" &&
+                    lines["slow"].GetProperty("state").GetString() is "queued" or "verifying" or "asking")
+                {
+                    early = read;
+                    var rowsSoFar = read.GetProperty("search").GetProperty("candidates").EnumerateArray().ToArray();
+                    var bestSoFar = rowsSoFar.Single(row => row.GetProperty("rawTitle").GetString() == "Example.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP");
+                    var grabbed = await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+                    {
+                        searchId = read.GetProperty("search").GetProperty("searchId").AsGuid(),
+                        releaseId = bestSoFar.GetProperty("releaseId").GetString(), idempotencyKey = "progressive-0001"
+                    });
+                    grabbedWhileAsking = !running.IsCompleted;
+                    earlyGrab = await ReadAsync(grabbed, 202, "A row is grabbed while a slow indexer still asks");
+                    // Cancelled during its hold: nothing reaches Transmission, and the rest of the suite starts from no active grab.
+                    await ReadAsync(await admin.PostAsync($"/JellyfinMod/Grabs/{earlyGrab.Value.GetProperty("id").AsGuid()}/Cancel", null), 200,
+                        "The early grab is cancelled");
+                }
             }
 
             await Task.Delay(100);
         }
 
         var progressed = await ReadAsync(await running, 200, "Search with a progress key answers");
+        Assert(early is { } first && first.GetProperty("search") is var soFar &&
+            soFar.GetProperty("searchId").AsGuid() == progressed.GetProperty("searchId").AsGuid() &&
+            soFar.GetProperty("grab").GetProperty("available").GetBoolean() &&
+            soFar.GetProperty("candidates").EnumerateArray().Count(row => row.GetProperty("indexerName").GetString() == "Good") == 10 &&
+            !soFar.GetProperty("candidates").EnumerateArray().Any(row => row.GetProperty("indexerName").GetString() == "slow") &&
+            soFar.GetProperty("candidates").EnumerateArray().Where(row => row.GetProperty("indexerName").GetString() == "Good")
+                .Select(row => row.GetProperty("releaseId").GetString())
+                .SequenceEqual(progressed.GetProperty("candidates").EnumerateArray().Where(row => row.GetProperty("indexerName").GetString() == "Good")
+                    .Select(row => row.GetProperty("releaseId").GetString())),
+            "While the slow indexer asks, the fast one's rows are readable from the progress, ranked as in the final answer, under its search id: " +
+            (early?.GetRawText() ?? "no early progress"));
+        Assert(grabbedWhileAsking && earlyGrab?.GetProperty("state").GetString() == "pending" && transmission.AddCalls == 0,
+            "A row is grabbable while another indexer still asks, and the cancelled grab sends nothing");
         var finalProgress = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Releases/Progress/{progressKey}"));
         var finalLines = finalProgress.GetProperty("indexers").EnumerateArray().ToDictionary(line => line.GetProperty("name").GetString()!);
         Assert(progressSeen > 3 && seenStates.Contains("asking") && finalProgress.GetProperty("finished").GetBoolean() &&
@@ -1209,7 +1245,7 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
             "redirect_rejected", "A torrent link redirecting to another host is refused");
         Assert(canary.Hits == 0, "The redirect target was never contacted");
         await using (var database = new ModDbContext(dbPath))
-            Assert(!await database.GrabOperations.AnyAsync(), "No refused grab persisted an operation");
+            Assert(!await database.GrabOperations.AnyAsync(operation => operation.SearchId == searchId), "No refused grab persisted an operation");
 
         // ---- Decision 2: a held grab is cancellable, idempotently, and nothing reaches Transmission.
         var held = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", Grab(searchId, bestRelease, "cancel-0001")), 202,
@@ -1227,7 +1263,8 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
         await Task.Delay(hold + TimeSpan.FromSeconds(1.5));
         Assert(transmission.AddCalls == 0 && (await ReadAsync(await admin.GetAsync($"/JellyfinMod/Grabs/{heldId}"), 200, "Grab read"))
             .GetProperty("state").GetString() == "cancelled", "A cancelled grab is never sent after its hold");
-        Assert(await HistoryCountAsync(admin, movieId, "grab_cancelled") == 1, "Cancel writes exactly one history event");
+        // The other cancelled grab is the early one of the progress check (P4.FU24).
+        Assert(await HistoryCountAsync(admin, movieId, "grab_cancelled") == 2, "Cancel writes exactly one history event");
         var replay = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", Grab(searchId, bestRelease, "cancel-0001")), 200,
             "Same key and payload replays");
         Assert(replay.GetProperty("id").AsGuid() == heldId, "An idempotent replay returns the same operation");

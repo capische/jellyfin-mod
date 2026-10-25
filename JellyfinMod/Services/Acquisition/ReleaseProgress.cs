@@ -12,7 +12,14 @@ namespace JellyfinMod.Services.Acquisition;
 public sealed record IndexerProgress(Guid IndexerId, string Name, string State, DateTime? StartedAt, int ResultCount, int? RetryAfterSeconds);
 
 /// <summary>What a person's running search has done so far (the release picker's live progress, 2026-10-10).</summary>
-public sealed record SearchProgress(Guid UserId, IReadOnlyList<IndexerProgress> Indexers, bool Finished, DateTime? FinishedAt);
+/// <param name="UserId">Who started it.</param>
+/// <param name="SearchId">
+/// The id its snapshot is stored under: the rows of the indexers that have answered while it runs, then the final one (P4.FU24).
+/// </param>
+/// <param name="Indexers">One line per enabled indexer.</param>
+/// <param name="Finished">Whether the search is over.</param>
+/// <param name="FinishedAt">When it ended.</param>
+public sealed record SearchProgress(Guid UserId, Guid SearchId, IReadOnlyList<IndexerProgress> Indexers, bool Finished, DateTime? FinishedAt);
 
 /// <summary>
 /// A small in-memory side channel for the release picker: while <c>GET /Releases</c> runs, the page polls the snapshot a search
@@ -32,10 +39,10 @@ public sealed class ReleaseProgressTable(TimeProvider time)
         !string.IsNullOrEmpty(key) && key.Length <= 64 && key.All(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_');
 
     /// <summary>Starts a search's entry with every indexer waiting; blocked ones are final at once.</summary>
-    public void Start(string key, Guid userId, IEnumerable<IndexerProgress> indexers)
+    public void Start(string key, Guid userId, Guid searchId, IEnumerable<IndexerProgress> indexers)
     {
         Prune();
-        _entries[key] = new SearchProgress(userId, indexers.ToArray(), false, null);
+        _entries[key] = new SearchProgress(userId, searchId, indexers.ToArray(), false, null);
     }
 
     /// <summary>Sets one indexer's state.</summary>
