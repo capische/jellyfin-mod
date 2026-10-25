@@ -87,12 +87,34 @@ internal static class PlaceholderItemsScenarios
             "Jellyfin's items of the removed stubs go with them");
         Assert(host.Service<PlaceholderStubCleanup>().Run() == (0, 0), "A second run finds nothing more to remove");
 
-        // The scenario's own fixtures go.
+        // The real episode beside the stubs is a title the library holds, so the catalog backfills Old Stubs with it; waiting for
+        // that keeps the clean-up below the same on every run.
+        async Task<Entry?> OldStubsAsync()
+        {
+            await using var database = new ModDbContext(dbPath);
+            return await database.Entries.AsNoTracking().SingleOrDefaultAsync(entry => entry.MediaType == "series" && entry.TmdbId == 770 &&
+                entry.TargetLibraryId == world.Tv.Id);
+        }
+
+        await WaitAsync(async () => await OldStubsAsync() is { State: FileState.OnDisk } ? true : null,
+            "Old Stubs' real episode is backfilled as a title on disk");
+
+        // The scenario's own fixtures go: removing the series from Jellyfin records its media_missing, as any Delete media does, so
+        // once the delete repair has cleared its bindings the backfilled entry and that history go from SQLite.
         Directory.Delete(seriesFolder, true);
         foreach (var item in world.Native.Items.Where(item => item.Path is { } path && path.StartsWith(seriesFolder, StringComparison.Ordinal)).ToArray())
             world.Native.Remove(item);
+        var oldStubsId = (await OldStubsAsync())!.Id;
+        await WaitAsync(async () =>
+        {
+            await using var database = new ModDbContext(dbPath);
+            return !await database.EntryBindings.AnyAsync(binding => binding.EntryId == oldStubsId) &&
+                await database.History.AnyAsync(history => history.EntryId == oldStubsId && history.EventType == "media_missing") ? true : null;
+        }, "The delete repair clears Old Stubs' bindings and records it leaving the disk");
         await using (var database = new ModDbContext(dbPath))
         {
+            database.History.RemoveRange(database.History.Where(history => history.EntryId == oldStubsId));
+            database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == oldStubsId));
             database.Entries.Remove(await database.Entries.SingleAsync(entry => entry.Id == filmId));
             await database.SaveChangesAsync();
         }

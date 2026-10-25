@@ -1972,8 +1972,13 @@ internal static partial class Phase5
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))
         {
-            Assert(!await database.History.AnyAsync(history => history.EventType == "media_missing" || history.EventType == "episode_media_missing"),
-                "No media_missing was written during the whole run");
+            var missing = await database.History.AsNoTracking()
+                .Where(history => history.EventType == "media_missing" || history.EventType == "episode_media_missing")
+                .Select(history => new { history.EventType, history.Summary, Title = database.Entries.Where(entry => entry.Id == history.EntryId)
+                    .Select(entry => entry.Title).FirstOrDefault() })
+                .ToListAsync();
+            Assert(missing.Count == 0, "No media_missing was written during the whole run: " +
+                string.Join(" | ", missing.Select(history => $"{history.Title ?? "(entry gone)"}: {history.EventType} {history.Summary}")));
             Assert(await Scalar(database, "PRAGMA integrity_check") == "ok" && await Scalar(database, "PRAGMA foreign_key_check") is null,
                 "The database passes integrity and foreign-key checks after the run");
         }
