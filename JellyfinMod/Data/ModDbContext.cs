@@ -108,11 +108,29 @@ public class ModDbContext : DbContext
     /// </summary>
     public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
     {
-        await AssignIndexerColoursAsync(cancellationToken).ConfigureAwait(false);
-        return await (Database.CurrentTransaction is not null
-            ? base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken)
-            : SqliteBusy.RetryAsync(() => base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken), cancellationToken))
-            .ConfigureAwait(false);
+        // Inside the caller's transaction (a Prowlarr sync's, begun IMMEDIATE) the write lock is already held, so the colours are
+        // read and given under it.
+        if (Database.CurrentTransaction is not null)
+        {
+            await AssignIndexerColoursAsync(cancellationToken).ConfigureAwait(false);
+            return await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!ChangeTracker.Entries<AcquisitionIndexer>().Any(entry => entry.State == EntityState.Added))
+            return await SqliteBusy.RetryAsync(() => base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken), cancellationToken)
+                .ConfigureAwait(false);
+
+        // An indexer is added: its colour is read, given and inserted under one write lock, so two saves at once cannot both take
+        // the same free colour; a busy retry gives the colours again (P4.FU25 review).
+        return await SqliteBusy.RetryAsync(async () =>
+        {
+            await using var transaction = await Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            await AssignIndexerColoursAsync(cancellationToken).ConfigureAwait(false);
+            var saved = await base.SaveChangesAsync(false, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            if (acceptAllChangesOnSuccess) ChangeTracker.AcceptAllChanges();
+            return saved;
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>The number of indexer colours the web's palette has (P4.FU25).</summary>
@@ -120,17 +138,19 @@ public class ModDbContext : DbContext
 
     /// <summary>
     /// Gives each indexer being added its colour (P4.FU25), in the order they were added: the colour fewest indexers have, the
-    /// lowest first. The first eight indexers get eight colours, a ninth wraps to the first, and an indexer removed and added
-    /// again gets its old colour back when nothing was added meanwhile. An indexer's colour never changes afterwards.
+    /// lowest first, counting only the indexers that remain after this save. The first eight indexers get eight colours, a ninth
+    /// wraps to the first, and a removed indexer's colour is the first given again. An indexer keeps its colour for as long as it
+    /// exists; one removed and added again is a new indexer.
     /// </summary>
     private async Task AssignIndexerColoursAsync(CancellationToken cancellationToken)
     {
-        var added = ChangeTracker.Entries<AcquisitionIndexer>().Where(entry => entry.State == EntityState.Added)
-            .Select(entry => entry.Entity).ToList();
+        var tracked = ChangeTracker.Entries<AcquisitionIndexer>().ToList();
+        var added = tracked.Where(entry => entry.State == EntityState.Added).Select(entry => entry.Entity).ToList();
         if (added.Count == 0) return;
-        var addedIds = added.Select(indexer => indexer.Id).ToArray();
+        // Neither the indexers being added nor those being removed in this save count.
+        var skipped = tracked.Where(entry => entry.State is EntityState.Added or EntityState.Deleted).Select(entry => entry.Entity.Id).ToArray();
         var used = new int[IndexerColourCount];
-        foreach (var colour in await AcquisitionIndexers.AsNoTracking().Where(indexer => !addedIds.Contains(indexer.Id))
+        foreach (var colour in await AcquisitionIndexers.AsNoTracking().Where(indexer => !skipped.Contains(indexer.Id))
                      .Select(indexer => indexer.ColorIndex).ToListAsync(cancellationToken).ConfigureAwait(false))
             used[((colour % IndexerColourCount) + IndexerColourCount) % IndexerColourCount]++;
         foreach (var indexer in added)

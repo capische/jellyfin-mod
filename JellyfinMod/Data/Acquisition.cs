@@ -44,7 +44,7 @@ public sealed class AcquisitionIndexer
     /// <summary>
     /// Gets or sets the indexer's colour in the release picker, an index 0–7 into the web's eight-hue palette (P4.FU25). Given
     /// once, when the indexer is first saved (the least used colour, the lowest first, so the first eight differ and a ninth
-    /// wraps), and kept for the indexer's lifetime; never edited.
+    /// wraps), and kept for as long as the indexer exists; never edited.
     /// </summary>
     public int ColorIndex { get; set; }
 

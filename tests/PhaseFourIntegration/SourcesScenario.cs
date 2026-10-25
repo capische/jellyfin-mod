@@ -8,8 +8,8 @@ using Microsoft.EntityFrameworkCore;
 /// <summary>
 /// The release picker's Sources (P4.FU25): each indexer keeps one colour of eight from when it is first saved, through a restart,
 /// in the settings list, in a search's indexers, its progress lines and its rows; a removed indexer's colour goes to the next one
-/// added, and a ninth wraps. A search given <c>indexerIds</c> asks only those indexers. Real Kestrel host, HTTP, serializer,
-/// migrations, SQLite and a Torznab boundary over real HTTP.
+/// added, a ninth wraps, and indexers added at the same moment never share a free colour. A search given <c>indexerIds</c> asks
+/// only those indexers. Real Kestrel host, HTTP, serializer, migrations, SQLite and a Torznab boundary over real HTTP.
 /// </summary>
 internal static class SourcesScenario
 {
@@ -111,7 +111,7 @@ internal static class SourcesScenario
             var again = await AddAsync("Sources beta again", "beta", 2);
             ids["beta again"] = again.GetProperty("id").AsGuid();
             colours["beta again"] = again.GetProperty("colorIndex").GetInt32();
-            Assert(colours["beta again"] == 1, "An indexer removed and added again gets its colour back: " + colours["beta again"]);
+            Assert(colours["beta again"] == 1, "A removed indexer's colour is the first given to the next one added: " + colours["beta again"]);
             for (var extra = 3; extra <= 8; extra++)
             {
                 var created = await AddAsync("Sources extra " + extra, "none", 10 + extra);
@@ -132,6 +132,20 @@ internal static class SourcesScenario
                 .EnumerateArray().ToDictionary(indexer => indexer.GetProperty("id").AsGuid(), indexer => indexer.GetProperty("colorIndex").GetInt32());
             Assert(listed.Count == ids.Count && ids.All(pair => listed[pair.Value] == colours[pair.Key]),
                 "Every indexer keeps its colour across a restart: " + string.Join(", ", listed.Values));
+
+            // Seven indexers added at the same moment: each takes its own free colour (one of each is in use, the first twice), never
+            // the same one twice (P4.FU25 review).
+            var created = await Task.WhenAll(Enumerable.Range(1, 7).Select(async index =>
+            {
+                var response = await admin.PostAsJsonAsync("/JellyfinMod/Settings/Indexers", new
+                {
+                    name = "Sources together " + index, baseUrl = new Uri(torznab.Address, "/none/api").ToString(), enabled = false,
+                    categories = new[] { 2000 }, priority = 50 + index, minIntervalSeconds = 0, apiKey = new { action = "replace", value = "none" }
+                });
+                return (await ReadAsync(response, 201, "A concurrent indexer is created")).GetProperty("colorIndex").GetInt32();
+            }));
+            Assert(created.Order().SequenceEqual(Enumerable.Range(1, 7)),
+                "Indexers added together take the seven free colours, none twice: " + string.Join(", ", created));
         }
 
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
