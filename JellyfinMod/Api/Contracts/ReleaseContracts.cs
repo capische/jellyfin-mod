@@ -78,7 +78,8 @@ public sealed record IndexerOutcomeDto(
     [property: JsonPropertyName("message"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Message,
     [property: JsonPropertyName("resultCount")] int ResultCount,
     [property: JsonPropertyName("truncated")] bool Truncated,
-    [property: JsonPropertyName("retryAfterSeconds"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? RetryAfterSeconds);
+    [property: JsonPropertyName("retryAfterSeconds"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? RetryAfterSeconds,
+    [property: JsonPropertyName("colorIndex")] int ColorIndex = 0);
 
 /// <summary>One indexer's line of a running search.</summary>
 public sealed record ReleaseProgressIndexerDto(
@@ -87,7 +88,8 @@ public sealed record ReleaseProgressIndexerDto(
     [property: JsonPropertyName("state")] string State,
     [property: JsonPropertyName("startedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? StartedAt,
     [property: JsonPropertyName("resultCount")] int ResultCount,
-    [property: JsonPropertyName("retryAfterSeconds"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? RetryAfterSeconds);
+    [property: JsonPropertyName("retryAfterSeconds"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? RetryAfterSeconds,
+    [property: JsonPropertyName("colorIndex")] int ColorIndex = 0);
 
 /// <summary>The response of <c>GET /JellyfinMod/Releases/Progress/{key}</c>.</summary>
 /// <param name="Indexers">One line per enabled indexer.</param>
@@ -104,7 +106,7 @@ public sealed record ReleaseProgressDto(
     /// <summary>Builds the public view of a search's progress.</summary>
     public static ReleaseProgressDto From(SearchProgress progress, ReleaseSearchDto? search = null) => new(
         progress.Indexers.Select(line => new ReleaseProgressIndexerDto(line.IndexerId, line.Name, line.State,
-            line.StartedAt is { } started ? Utc(started) : null, line.ResultCount, line.RetryAfterSeconds)).ToArray(),
+            line.StartedAt is { } started ? Utc(started) : null, line.ResultCount, line.RetryAfterSeconds, line.ColorIndex)).ToArray(),
         progress.Finished, search);
 
     private static DateTime Utc(DateTime value) => DateTime.SpecifyKind(value, DateTimeKind.Utc);
@@ -140,7 +142,8 @@ public sealed record ReleaseCandidateDto(
     [property: JsonPropertyName("seedMinutes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? SeedMinutes,
     [property: JsonPropertyName("heldQuality")] bool HeldQuality = false,
     [property: JsonPropertyName("coverage"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] PackCoverageDto? Coverage = null,
-    [property: JsonPropertyName("detailsUrl"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? DetailsUrl = null);
+    [property: JsonPropertyName("detailsUrl"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? DetailsUrl = null,
+    [property: JsonPropertyName("indexerColorIndex")] int IndexerColorIndex = 0);
 
 /// <summary>The response of <c>GET /JellyfinMod/Releases</c>.</summary>
 public sealed record ReleaseSearchDto(
@@ -164,6 +167,7 @@ public sealed record ReleaseSearchDto(
         var byHash = snapshot.Candidates.Where(candidate => candidate.InfoHash is not null)
             .GroupBy(candidate => candidate.InfoHash!).ToDictionary(group => group.Key, group => group.Select(c => c.ReleaseId).ToArray());
         var target = snapshot.Target;
+        var colours = snapshot.Indexers.GroupBy(outcome => outcome.IndexerId).ToDictionary(group => group.Key, group => group.First().ColorIndex);
         return new ReleaseSearchDto(snapshot.SearchId, Utc(snapshot.CreatedAt), Utc(snapshot.ExpiresAt),
             new ReleaseTargetDto(target.EntryId, target.EpisodeId, target.MediaType, target.Title, target.Year, target.SeasonNumber,
                 target.EpisodeNumber, target.Scope,
@@ -180,11 +184,12 @@ public sealed record ReleaseSearchDto(
                 candidate.Evaluation.Score, candidate.Evaluation.Contributions, candidate.Evaluation.Eligible,
                 candidate.Evaluation.Rejections, candidate.SeedRatio, candidate.SeedMinutes,
                 candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality),
-                PackCoverageDto.For(target, candidate.Parsed), candidate.DetailsUrl)).ToArray(),
+                PackCoverageDto.For(target, candidate.Parsed), candidate.DetailsUrl,
+                colours.GetValueOrDefault(candidate.IndexerId))).ToArray(),
             snapshot.Candidates.Count(candidate => candidate.Evaluation.Eligible),
             snapshot.Candidates.Count(candidate => !candidate.Evaluation.Eligible),
             snapshot.Indexers.Select(outcome => new IndexerOutcomeDto(outcome.IndexerId, outcome.Name, outcome.Status,
-                outcome.Message, outcome.ResultCount, outcome.Truncated, outcome.RetryAfterSeconds)).ToArray(),
+                outcome.Message, outcome.ResultCount, outcome.Truncated, outcome.RetryAfterSeconds, outcome.ColorIndex)).ToArray(),
             snapshot.Indexers.Any(outcome => outcome.Status is not ("ok" or "no_results")),
             snapshot.Indexers.Any(outcome => outcome.Truncated), snapshot.Intent);
     }

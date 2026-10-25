@@ -213,6 +213,7 @@
 .jfmod-brow-main strong{display:block;font-weight:600}
 .jfmod-brow-main .jfmod-sub{font-size:.88em;color:var(--jf-palette-text-secondary,rgba(255,255,255,.7));display:block;margin-top:.15em;word-break:break-word}
 .jfmod-brow-err{background:rgba(198,40,40,.08)}
+.jfmod-indexerColour{display:inline-block;width:.75em;height:.75em;border-radius:50%;margin-right:.45em;vertical-align:-.04em}
 .jfmod-brow-errtext{grid-column:1/-1;font-size:.9em;margin-top:.3em}
 .jfmod-brow .jfmod-state{margin-right:.6em}
 @media (max-width:48em){.jfmod-brow{grid-template-columns:1fr}.jfmod-brow .jfmod-rowactions{justify-content:flex-end;margin-top:.4em}}
@@ -2016,6 +2017,9 @@
         return status.indexers.filter(function (entry) { return entry.id === indexer.id; })[0] || null;
       }
 
+      // The release picker's indexer palette (P4.FU25), the same eight hues as the web's indexerColours.ts.
+      var INDEXER_COLOURS = ['#4fc3f7', '#81c784', '#ffb74d', '#ba68c8', '#f06292', '#4db6ac', '#fff176', '#ff8a65'];
+
       function renderIndexers() {
         var container = $('#IndexerList');
         // A test reloads the list: the remote keeps its place on the same row's same action.
@@ -2039,7 +2043,13 @@
           var main = document.createElement('div');
           main.className = 'jfmod-brow-main';
           var name = document.createElement('strong');
-          name.textContent = indexer.name;
+          // The indexer's colour in the release picker, read-only (P4.FU25; guides/indexer-colour.md).
+          var colour = document.createElement('span');
+          colour.className = 'jfmod-indexerColour';
+          colour.title = 'Colour in the release picker';
+          colour.style.background = INDEXER_COLOURS[((indexer.colorIndex || 0) % 8 + 8) % 8];
+          name.appendChild(colour);
+          name.appendChild(document.createTextNode(indexer.name));
           main.appendChild(name);
           var sub = document.createElement('span');
           sub.className = 'jfmod-sub';

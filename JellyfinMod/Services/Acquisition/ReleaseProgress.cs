@@ -9,7 +9,9 @@ namespace JellyfinMod.Services.Acquisition;
 /// <param name="StartedAt">When its first query went out, while <c>asking</c>.</param>
 /// <param name="ResultCount">The rows it returned, once final.</param>
 /// <param name="RetryAfterSeconds">When to ask again, for a paused or rate-limited indexer.</param>
-public sealed record IndexerProgress(Guid IndexerId, string Name, string State, DateTime? StartedAt, int ResultCount, int? RetryAfterSeconds);
+/// <param name="ColorIndex">The indexer's colour in the release picker (P4.FU25).</param>
+public sealed record IndexerProgress(Guid IndexerId, string Name, string State, DateTime? StartedAt, int ResultCount, int? RetryAfterSeconds,
+    int ColorIndex = 0);
 
 /// <summary>What a person's running search has done so far (the release picker's live progress, 2026-10-10).</summary>
 /// <param name="UserId">Who started it.</param>
