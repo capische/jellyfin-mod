@@ -162,6 +162,9 @@ public sealed class ReleasesController(
         if (user is null) return Unauthorized();
         if (!ReleaseProgressTable.IsValidKey(progressKey) || search.Progress(progressKey, user.Id) is not { } progress) return NotFound();
         var rows = search.Snapshot(progress.SearchId, user.Id);
+        // Access is read again on every poll, as the final answer's was at the start: a target the requester can no longer read
+        // gets the concealed 404 (P4.FU24 review).
+        if (rows is not null && !await CanReadTargetAsync(user, rows.Target, cancellationToken)) return NotFound();
         return ReleaseProgressDto.From(progress,
             rows is null ? null : ReleaseSearchDto.From(rows, await AvailabilityAsync(rows, cancellationToken)));
     }
@@ -255,6 +258,20 @@ public sealed class ReleasesController(
 
     private bool CanAccess(User user, Entry entry, Episode? episode) =>
         access.CanRead(user, entry) && (episode is null || access.CanReadEpisode(user, episode));
+
+    /// <summary>Whether the requester may still read a search's target: its entry, its episode, and every episode a pack covers.</summary>
+    private async Task<bool> CanReadTargetAsync(User user, ReleaseTarget target, CancellationToken cancellationToken)
+    {
+        var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == target.EntryId, cancellationToken);
+        var episode = target.EpisodeId is { } episodeId
+            ? await database.Episodes.AsNoTracking().SingleOrDefaultAsync(value => value.Id == episodeId, cancellationToken)
+            : null;
+        if (entry is null || target.EpisodeId is not null && episode is null || !CanAccess(user, entry, episode)) return false;
+        var covered = target.Covered.Select(value => value.Id).ToArray();
+        if (covered.Length == 0) return true;
+        var episodes = await database.Episodes.AsNoTracking().Where(value => covered.Contains(value.Id)).ToListAsync(cancellationToken);
+        return episodes.Count == covered.Length && episodes.All(value => access.CanReadEpisode(user, value));
+    }
 
     private async Task<bool> CanAccessAsync(User user, GrabOperation operation, CancellationToken cancellationToken)
     {
