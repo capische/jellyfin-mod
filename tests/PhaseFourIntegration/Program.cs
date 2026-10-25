@@ -613,6 +613,20 @@ static async Task RunAsync(string folder, string far, string foreign, CapturingL
                     // Cancelled during its hold: nothing reaches Transmission, and the rest of the suite starts from no active grab.
                     await ReadAsync(await admin.PostAsync($"/JellyfinMod/Grabs/{earlyGrab.Value.GetProperty("id").AsGuid()}/Cancel", null), 200,
                         "The early grab is cancelled");
+                    // Access is read again on every poll: while the title is outside every library the requester can use, its
+                    // rows so far are concealed (P4.FU24 review), and they come back with access.
+                    Guid? library;
+                    await using (var database = new ModDbContext(dbPath))
+                    {
+                        library = (await database.Entries.AsNoTracking().SingleAsync(entry => entry.Id == movieId)).TargetLibraryId;
+                        await database.Database.ExecuteSqlInterpolatedAsync($"UPDATE Entries SET TargetLibraryId = {Guid.NewGuid()} WHERE Id = {movieId}");
+                    }
+                    var concealed = (await admin.GetAsync($"/JellyfinMod/Releases/Progress/{progressKey}")).StatusCode;
+                    await using (var database = new ModDbContext(dbPath))
+                        await database.Database.ExecuteSqlInterpolatedAsync($"UPDATE Entries SET TargetLibraryId = {library} WHERE Id = {movieId}");
+                    var restored = (await admin.GetAsync($"/JellyfinMod/Releases/Progress/{progressKey}")).StatusCode;
+                    Assert(concealed == System.Net.HttpStatusCode.NotFound && restored == System.Net.HttpStatusCode.OK,
+                        $"The rows so far are concealed while the requester cannot read the title: {concealed}, then {restored}");
                 }
             }
 
