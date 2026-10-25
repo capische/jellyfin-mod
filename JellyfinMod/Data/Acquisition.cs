@@ -41,6 +41,13 @@ public sealed class AcquisitionIndexer
     /// <summary>Gets or sets the lower-first priority used as a documented score tie-breaker.</summary>
     public int Priority { get; set; }
 
+    /// <summary>
+    /// Gets or sets the indexer's colour in the release picker, an index 0–7 into the web's eight-hue palette (P4.FU25). Given
+    /// once, when the indexer is first saved (the least used colour, the lowest first, so the first eight differ and a ninth
+    /// wraps), and kept for the indexer's lifetime; never edited.
+    /// </summary>
+    public int ColorIndex { get; set; }
+
     /// <summary>Gets or sets comma-separated extra hosts that may serve this indexer's torrent downloads.</summary>
     /// <remarks>The base endpoint's own host is always allowed; nothing else is fetched.</remarks>
     [MaxLength(1024)]

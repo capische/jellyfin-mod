@@ -34,6 +34,7 @@ try
     await PresetScenarios.RunAsync(folder, logs);
     await TrackerTitleScenarios.RunAsync(folder, logs);
     await SlowIndexerScenario.RunAsync(folder, logs);
+    await SourcesScenario.RunAsync(folder, logs);
     await RunAsync(folder, far, foreign, logs, secrets);
     // No credential, API key or tracker passkey may appear in any log line the plugin wrote.
     foreach (var secret in secrets)

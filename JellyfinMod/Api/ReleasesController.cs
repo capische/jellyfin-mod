@@ -27,12 +27,17 @@ public sealed class ReleasesController(
     GrabHoldOptions hold,
     MediaBrowser.Controller.Library.ILibraryManager? library = null) : ControllerBase
 {
-    /// <summary>Searches enabled indexers for one movie entry or one episode. Never submits anything.</summary>
+    /// <summary>
+    /// Searches enabled indexers for one movie entry or one episode. Never submits anything. <paramref name="indexerIds"/> (repeated)
+    /// asks only those of the enabled indexers, as the picker's Sources choose (P4.FU25); without it every enabled one is asked.
+    /// </summary>
     [HttpGet("Releases")]
     public async Task<ActionResult<ReleaseSearchDto>> Search([FromQuery] Guid entryId, [FromQuery] Guid? episodeId,
         [FromQuery] Guid? profileId, [FromQuery] string? intent, CancellationToken cancellationToken,
-        [FromQuery] string? scope = null, [FromQuery] int? seasonNumber = null, [FromQuery] string? progressKey = null)
+        [FromQuery] string? scope = null, [FromQuery] int? seasonNumber = null, [FromQuery] string? progressKey = null,
+        [FromQuery] Guid[]? indexerIds = null)
     {
+        var chosen = indexerIds is { Length: > 0 } ? indexerIds.Distinct().ToArray() : null;
         intent ??= GrabIntents.Acquire;
         if (progressKey is not null && !ReleaseProgressTable.IsValidKey(progressKey))
             return Error(400, "invalid_progress_key", "The progress key must be 1 to 64 letters, digits, dashes or underscores.");
@@ -46,7 +51,7 @@ public sealed class ReleasesController(
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken);
         if (entry is null || !access.CanRead(user, entry)) return NotFound();
         if (ReleaseScopes.IsPack(scope))
-            return await SearchPackAsync(user, entry, scope!, seasonNumber, episodeId, profileId, intent, progressKey, cancellationToken);
+            return await SearchPackAsync(user, entry, scope!, seasonNumber, episodeId, profileId, intent, progressKey, chosen, cancellationToken);
         if (seasonNumber is not null) return Error(400, "invalid_scope", "A season number belongs to a season search.");
         Episode? episode = null;
         if (entry.MediaType == "series")
@@ -75,13 +80,12 @@ public sealed class ReleasesController(
         if (chosenId is null) return Error(409, "no_quality_profile", "Choose a default quality profile in the plugin settings.");
         var profile = await database.AcquisitionQualityProfiles.AsNoTracking().SingleOrDefaultAsync(value => value.Id == chosenId, cancellationToken);
         if (profile is null) return Error(400, "invalid_quality_profile", "The quality profile does not exist.");
-        if (!await database.AcquisitionIndexers.AnyAsync(value => value.Enabled, cancellationToken))
-            return Error(409, "no_indexers", "No indexer is enabled in the plugin settings.");
+        if (await NoIndexerAsync(chosen, cancellationToken) is { } none) return none;
 
         var snapshot = await search.SearchAsync(user.Id, ReleaseTargets.For(entry, episode),
             new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
                 profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
-            inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(intent, held, progressKey));
+            inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(intent, held, progressKey, chosen));
         return ReleaseSearchDto.From(snapshot, await AvailabilityAsync(snapshot, cancellationToken));
     }
 
@@ -117,7 +121,7 @@ public sealed class ReleasesController(
     /// tracked episodes of that season, or of every season but specials, and the requester must be able to read each one.
     /// </summary>
     private async Task<ActionResult<ReleaseSearchDto>> SearchPackAsync(User user, Entry entry, string scope, int? seasonNumber,
-        Guid? episodeId, Guid? profileId, string intent, string? progressKey, CancellationToken cancellationToken)
+        Guid? episodeId, Guid? profileId, string intent, string? progressKey, Guid[]? indexerIds, CancellationToken cancellationToken)
     {
         if (entry.MediaType != "series") return Error(400, "scope_not_applicable", "Only a series has seasons.");
         if (episodeId is not null) return Error(400, "invalid_scope", "A season or All Seasons search takes no episode.");
@@ -139,13 +143,12 @@ public sealed class ReleasesController(
         if (chosenId is null) return Error(409, "no_quality_profile", "Choose a default quality profile in the plugin settings.");
         var profile = await database.AcquisitionQualityProfiles.AsNoTracking().SingleOrDefaultAsync(value => value.Id == chosenId, cancellationToken);
         if (profile is null) return Error(400, "invalid_quality_profile", "The quality profile does not exist.");
-        if (!await database.AcquisitionIndexers.AnyAsync(value => value.Enabled, cancellationToken))
-            return Error(409, "no_indexers", "No indexer is enabled in the plugin settings.");
+        if (await NoIndexerAsync(indexerIds, cancellationToken) is { } none) return none;
 
         var snapshot = await search.SearchAsync(user.Id, ReleaseTargets.ForPack(entry, scope, seasonNumber, covered, episodes),
             new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
                 profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
-            inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(ProgressKey: progressKey));
+            inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(ProgressKey: progressKey, IndexerIds: indexerIds));
         return ReleaseSearchDto.From(snapshot, await AvailabilityAsync(snapshot, cancellationToken));
     }
 
@@ -254,6 +257,16 @@ public sealed class ReleasesController(
         if (visible is null || !await CanAccessAsync(user, visible, cancellationToken)) return NotFound();
         var operation = await grabs.RecheckAsync(id, startup: false, cancellationToken);
         return operation is null ? NotFound() : GrabOperationDto.From(operation, await OpenUrlAsync(operation, cancellationToken));
+    }
+
+    /// <summary>The refusal when no indexer would be asked: none enabled, or none of the chosen ones (P4.FU25).</summary>
+    private async Task<ObjectResult?> NoIndexerAsync(Guid[]? chosen, CancellationToken cancellationToken)
+    {
+        if (chosen is null)
+            return await database.AcquisitionIndexers.AnyAsync(value => value.Enabled, cancellationToken)
+                ? null : Error(409, "no_indexers", "No indexer is enabled in the plugin settings.");
+        return await database.AcquisitionIndexers.AnyAsync(value => value.Enabled && chosen.Contains(value.Id), cancellationToken)
+            ? null : Error(409, "no_chosen_indexers", "None of the chosen indexers is enabled.");
     }
 
     private bool CanAccess(User user, Entry entry, Episode? episode) =>

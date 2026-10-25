@@ -40,7 +40,8 @@ public sealed record IndexerSettingsDto(
     [property: JsonPropertyName("prowlarrSourceId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? ProwlarrSourceId = null,
     [property: JsonPropertyName("prowlarrIndexerId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? ProwlarrIndexerId = null,
     [property: JsonPropertyName("prowlarrRemovedAt"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? ProwlarrRemovedAt = null,
-    [property: JsonPropertyName("breakerOpenUntil"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? BreakerOpenUntil = null);
+    [property: JsonPropertyName("breakerOpenUntil"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTime? BreakerOpenUntil = null,
+    [property: JsonPropertyName("colorIndex")] int ColorIndex = 0);
 
 /// <summary>The safe subset of a verified Torznab capability document.</summary>
 public sealed record IndexerCapabilitiesDto(

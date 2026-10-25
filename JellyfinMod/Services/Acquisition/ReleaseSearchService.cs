@@ -95,7 +95,8 @@ public sealed class ReleaseSearchService(
         bool profileInherited, int settingsRevision, CancellationToken cancellationToken, ReleaseSearchOptions searchOptions)
     {
         var progressKey = searchOptions.ProgressKey;
-        var indexers = await database.AcquisitionIndexers.Where(indexer => indexer.Enabled)
+        var chosen = searchOptions.IndexerIds is { Count: > 0 } ids ? ids.ToArray() : null;
+        var indexers = await database.AcquisitionIndexers.Where(indexer => indexer.Enabled && (chosen == null || chosen.Contains(indexer.Id)))
             .OrderBy(indexer => indexer.Priority).ThenBy(indexer => indexer.Name).ToListAsync(cancellationToken).ConfigureAwait(false);
         // Per-indexer budgets and breakers apply to every search, manual ones included (P6.M3).
         var now = cache.UtcNow;
@@ -108,15 +109,15 @@ public sealed class ReleaseSearchService(
             if (budget.BreakerOpenUntil is { } open && open > now)
                 blocked[indexer.Id] = new(indexer.Id, indexer.Name, "breaker_open",
                     "The indexer failed repeatedly; it is paused until " + open.ToString("u", CultureInfo.InvariantCulture) + ".", 0, false,
-                    (int)Math.Ceiling((open - now).TotalSeconds));
+                    (int)Math.Ceiling((open - now).TotalSeconds), indexer.ColorIndex);
         }
         // The id is fixed up front: while the search runs, the rows of the indexers that answered are stored under it, so the
         // picker can show them and grab from them before the slowest indexer is done; the final snapshot replaces them (P4.FU24).
         var searchId = Guid.NewGuid();
         if (progressKey is not null)
             cache.Progress.Start(progressKey, userId, searchId, indexers.Select(indexer => blocked.TryGetValue(indexer.Id, out var refused)
-                ? new IndexerProgress(indexer.Id, indexer.Name, refused.Status, null, 0, refused.RetryAfterSeconds)
-                : new IndexerProgress(indexer.Id, indexer.Name, "queued", null, 0, null)));
+                ? new IndexerProgress(indexer.Id, indexer.Name, refused.Status, null, 0, refused.RetryAfterSeconds, indexer.ColorIndex)
+                : new IndexerProgress(indexer.Id, indexer.Name, "queued", null, 0, null, indexer.ColorIndex)));
         // Capabilities first: anything unverified at its current revision is checked before it is searched.
         var capabilities = new Dictionary<Guid, (TorznabCapabilities? Value, string? Error)>();
         foreach (var indexer in indexers)
@@ -128,7 +129,7 @@ public sealed class ReleaseSearchService(
             }
 
             if (progressKey is not null && !blocked.ContainsKey(indexer.Id))
-                cache.Progress.Set(progressKey, new IndexerProgress(indexer.Id, indexer.Name, "verifying", null, 0, null));
+                cache.Progress.Set(progressKey, new IndexerProgress(indexer.Id, indexer.Name, "verifying", null, 0, null, indexer.ColorIndex));
             try
             {
                 capabilities[indexer.Id] = (await VerifyAsync(indexer, cancellationToken).ConfigureAwait(false), null);
@@ -215,7 +216,7 @@ public sealed class ReleaseSearchService(
                 if (!IndexerQueryLedger.HasBudget(indexer.Id, cache.UtcNow, indexer.DailyQueryBudget))
                 {
                     var exhausted = new IndexerOutcome(indexer.Id, indexer.Name, "budget_exhausted",
-                        "The indexer's daily query budget is used up.", 0, false, null);
+                        "The indexer's daily query budget is used up.", 0, false, null, indexer.ColorIndex);
                     Arrive([], exhausted);
                     ReportOutcome(progressKey, exhausted);
                     return (Candidates: (IReadOnlyList<ReleaseCandidate>)[], Outcome: exhausted, Queries: 0);
@@ -354,7 +355,7 @@ public sealed class ReleaseSearchService(
     {
         if (progressKey is not null)
             cache.Progress.Set(progressKey, new IndexerProgress(outcome.IndexerId, outcome.Name, outcome.Status, null, outcome.ResultCount,
-                outcome.RetryAfterSeconds));
+                outcome.RetryAfterSeconds, outcome.ColorIndex));
     }
 
     private async Task<(IReadOnlyList<ReleaseCandidate> Candidates, IndexerOutcome Outcome, int Queries)> SearchIndexerAsync(
@@ -362,7 +363,7 @@ public sealed class ReleaseSearchService(
         ReleaseTarget target, EvaluationProfile profile, CancellationToken cancellationToken, string? progressKey = null)
     {
         IndexerOutcome Outcome(string status, string? message, int count = 0, bool truncated = false, int? retry = null) =>
-            new(indexer.Id, indexer.Name, status, message, count, truncated, retry);
+            new(indexer.Id, indexer.Name, status, message, count, truncated, retry, indexer.ColorIndex);
         if (endpoint is null)
             return ([], Outcome("secret_unavailable", "The saved API key is no longer available; enter it again."), 0);
         if (capabilities.Value is not { } caps)
@@ -429,7 +430,7 @@ public sealed class ReleaseSearchService(
                     await IndexerQueryLedger.WaitAsync(first, token).ConfigureAwait(false);
                 timeout.CancelAfter(options.Timeout);
                 if (progressKey is not null)
-                    cache.Progress.Set(progressKey, new IndexerProgress(indexer.Id, indexer.Name, "asking", cache.UtcNow, 0, null));
+                    cache.Progress.Set(progressKey, new IndexerProgress(indexer.Id, indexer.Name, "asking", cache.UtcNow, 0, null, indexer.ColorIndex));
             }
             else if (further)
             {

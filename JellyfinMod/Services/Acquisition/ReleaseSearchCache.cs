@@ -37,7 +37,8 @@ public sealed record IndexerOutcome(
     string? Message,
     int ResultCount,
     bool Truncated,
-    int? RetryAfterSeconds);
+    int? RetryAfterSeconds,
+    int ColorIndex = 0);
 
 /// <summary>An immutable evaluated search, valid for one user and one target until it expires.</summary>
 public sealed record ReleaseSearchSnapshot(
@@ -69,7 +70,12 @@ public sealed record ReleaseSearchSnapshot(
 /// <param name="Intent"><c>acquire</c> or <c>addVersion</c>.</param>
 /// <param name="HeldQualities">Qualities already held, marked on candidates of an <c>addVersion</c> search.</param>
 /// <param name="ProgressKey">A key the caller polls <c>Releases/Progress</c> with while the search runs, or null.</param>
-public sealed record ReleaseSearchOptions(string Intent = "acquire", IReadOnlySet<string>? HeldQualities = null, string? ProgressKey = null)
+/// <param name="IndexerIds">
+/// The enabled indexers to ask, or null for all of them: the picker's Sources leave the unticked ones out, and ask one ticked in
+/// later on its own (P4.FU25).
+/// </param>
+public sealed record ReleaseSearchOptions(string Intent = "acquire", IReadOnlySet<string>? HeldQualities = null, string? ProgressKey = null,
+    IReadOnlyCollection<Guid>? IndexerIds = null)
 {
     /// <summary>A plain acquisition search.</summary>
     public static ReleaseSearchOptions Default { get; } = new();

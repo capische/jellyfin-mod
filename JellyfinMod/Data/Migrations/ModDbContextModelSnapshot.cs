@@ -136,6 +136,9 @@ namespace JellyfinMod.Data.Migrations
                         .HasMaxLength(512)
                         .HasColumnType("TEXT");
 
+                    b.Property<int>("ColorIndex")
+                        .HasColumnType("INTEGER");
+
                     b.Property<int>("DailyQueryBudget")
                         .HasColumnType("INTEGER");
 
