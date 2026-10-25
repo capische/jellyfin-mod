@@ -110,8 +110,11 @@ public sealed class ReleaseSearchService(
                     "The indexer failed repeatedly; it is paused until " + open.ToString("u", CultureInfo.InvariantCulture) + ".", 0, false,
                     (int)Math.Ceiling((open - now).TotalSeconds));
         }
+        // The id is fixed up front: while the search runs, the rows of the indexers that answered are stored under it, so the
+        // picker can show them and grab from them before the slowest indexer is done; the final snapshot replaces them (P4.FU24).
+        var searchId = Guid.NewGuid();
         if (progressKey is not null)
-            cache.Progress.Start(progressKey, userId, indexers.Select(indexer => blocked.TryGetValue(indexer.Id, out var refused)
+            cache.Progress.Start(progressKey, userId, searchId, indexers.Select(indexer => blocked.TryGetValue(indexer.Id, out var refused)
                 ? new IndexerProgress(indexer.Id, indexer.Name, refused.Status, null, 0, refused.RetryAfterSeconds)
                 : new IndexerProgress(indexer.Id, indexer.Name, "queued", null, 0, null)));
         // Capabilities first: anything unverified at its current revision is checked before it is searched.
@@ -150,6 +153,58 @@ public sealed class ReleaseSearchService(
             }
         }
 
+        // A release an administrator blocklisted from the queue is rejected with a visible reason (P5.I7). Read before the fan-out,
+        // so the rows shown while it runs carry it too; a grab reads the blocklist again.
+        var blocklist = await database.ReleaseBlocklist.AsNoTracking().ToListAsync(cancellationToken).ConfigureAwait(false);
+        var blockedHashes = blocklist.Where(entry => entry.InfoHash is not null).Select(entry => entry.InfoHash!).ToHashSet(StringComparer.Ordinal);
+        var blockedGuids = blocklist.Where(entry => entry.IndexerId is not null && entry.SourceGuid is not null)
+            .Select(entry => (entry.IndexerId!.Value, entry.SourceGuid!)).ToHashSet();
+        ReleaseCandidate[] Ranked(IEnumerable<ReleaseCandidate> found) => found
+            .Select(candidate => candidate.InfoHash is { } hash && blockedHashes.Contains(hash) ||
+                blockedGuids.Contains((candidate.IndexerId, candidate.SourceGuid))
+                    ? candidate with
+                    {
+                        Evaluation = candidate.Evaluation with
+                        {
+                            Eligible = false,
+                            Rejections = candidate.Evaluation.Rejections
+                                .Append(new ReleaseRejection("blocklisted", "An administrator removed this release from the queue and blocked it."))
+                                .ToArray()
+                        }
+                    }
+                    : candidate)
+            .OrderByDescending(candidate => candidate.Evaluation.Eligible)
+            .ThenByDescending(candidate => candidate.Evaluation.Score)
+            .ThenBy(candidate => candidate.Seeders is null)
+            .ThenByDescending(candidate => candidate.Seeders ?? 0)
+            .ThenBy(candidate => candidate.IndexerPriority)
+            .ThenByDescending(candidate => candidate.PublishedAt ?? DateTime.MinValue)
+            .ThenBy(candidate => candidate.ReleaseId, StringComparer.Ordinal)
+            .ToArray();
+        ReleaseSearchSnapshot Snapshot(IReadOnlyList<ReleaseCandidate> found, IReadOnlyList<IndexerOutcome> outcomes)
+        {
+            var created = cache.UtcNow;
+            return new ReleaseSearchSnapshot(searchId, userId, target, profile, profileInherited, settingsRevision, created,
+                created + ReleaseSearchCache.Lifetime, found, outcomes)
+            {
+                Intent = searchOptions.Intent,
+                HeldQualities = searchOptions.HeldQualities ?? new HashSet<string>(StringComparer.Ordinal)
+            };
+        }
+
+        // The rows so far, for a search the picker follows: stored before the indexer's line turns final, so a page that sees an
+        // indexer answer can read its rows.
+        var arrived = new List<(IReadOnlyList<ReleaseCandidate> Candidates, IndexerOutcome Outcome)>();
+        void Arrive(IReadOnlyList<ReleaseCandidate> found, IndexerOutcome outcome)
+        {
+            if (progressKey is null) return;
+            lock (arrived)
+            {
+                arrived.Add((found, outcome));
+                cache.Add(Snapshot(Ranked(arrived.SelectMany(item => item.Candidates)), arrived.Select(item => item.Outcome).ToArray()));
+            }
+        }
+
         using var gate = new SemaphoreSlim(options.MaxParallel);
         (IReadOnlyList<ReleaseCandidate> Candidates, IndexerOutcome Outcome, int Queries)[] results;
         try
@@ -161,6 +216,7 @@ public sealed class ReleaseSearchService(
                 {
                     var exhausted = new IndexerOutcome(indexer.Id, indexer.Name, "budget_exhausted",
                         "The indexer's daily query budget is used up.", 0, false, null);
+                    Arrive([], exhausted);
                     ReportOutcome(progressKey, exhausted);
                     return (Candidates: (IReadOnlyList<ReleaseCandidate>)[], Outcome: exhausted, Queries: 0);
                 }
@@ -170,6 +226,7 @@ public sealed class ReleaseSearchService(
                 {
                     var searched = await SearchIndexerAsync(indexer, capabilities[indexer.Id], endpoints[indexer.Id], target, profile,
                         cancellationToken, progressKey).ConfigureAwait(false);
+                    Arrive(searched.Candidates, searched.Outcome);
                     ReportOutcome(progressKey, searched.Outcome);
                     return searched;
                 }
@@ -208,39 +265,8 @@ public sealed class ReleaseSearchService(
 
         await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
 
-        // A release an administrator blocklisted from the queue is rejected with a visible reason (P5.I7).
-        var blocklist = await database.ReleaseBlocklist.AsNoTracking().ToListAsync(cancellationToken).ConfigureAwait(false);
-        var blockedHashes = blocklist.Where(entry => entry.InfoHash is not null).Select(entry => entry.InfoHash!).ToHashSet(StringComparer.Ordinal);
-        var blockedGuids = blocklist.Where(entry => entry.IndexerId is not null && entry.SourceGuid is not null)
-            .Select(entry => (entry.IndexerId!.Value, entry.SourceGuid!)).ToHashSet();
-        var candidates = results.SelectMany(result => result.Candidates)
-            .Select(candidate => candidate.InfoHash is { } hash && blockedHashes.Contains(hash) ||
-                blockedGuids.Contains((candidate.IndexerId, candidate.SourceGuid))
-                    ? candidate with
-                    {
-                        Evaluation = candidate.Evaluation with
-                        {
-                            Eligible = false,
-                            Rejections = candidate.Evaluation.Rejections
-                                .Append(new ReleaseRejection("blocklisted", "An administrator removed this release from the queue and blocked it."))
-                                .ToArray()
-                        }
-                    }
-                    : candidate)
-            .OrderByDescending(candidate => candidate.Evaluation.Eligible)
-            .ThenByDescending(candidate => candidate.Evaluation.Score)
-            .ThenBy(candidate => candidate.Seeders is null)
-            .ThenByDescending(candidate => candidate.Seeders ?? 0)
-            .ThenBy(candidate => candidate.IndexerPriority)
-            .ThenByDescending(candidate => candidate.PublishedAt ?? DateTime.MinValue)
-            .ThenBy(candidate => candidate.ReleaseId, StringComparer.Ordinal)
-            .ToArray();
-        var created = cache.UtcNow;
-        var snapshot = new ReleaseSearchSnapshot(Guid.NewGuid(), userId, target, profile, profileInherited, settingsRevision,
-            created, created + ReleaseSearchCache.Lifetime, candidates, results.Select(result => result.Outcome).ToArray())
+        var snapshot = Snapshot(Ranked(results.SelectMany(result => result.Candidates)), results.Select(result => result.Outcome).ToArray()) with
         {
-            Intent = searchOptions.Intent,
-            HeldQualities = searchOptions.HeldQualities ?? new HashSet<string>(StringComparer.Ordinal),
             QueriesByIndexer = queries,
             BreakersOpened = breakersOpened
         };
@@ -318,6 +344,10 @@ public sealed class ReleaseSearchService(
 
     /// <summary>Reads the progress a search with this key has written, for the user who started it.</summary>
     public SearchProgress? Progress(string key, Guid userId) => cache.Progress.Find(key, userId);
+
+    /// <summary>The user's stored search with this id, the rows so far of a running one included; null when gone or expired.</summary>
+    public ReleaseSearchSnapshot? Snapshot(Guid searchId, Guid userId) =>
+        cache.Find(searchId, userId) is ({ } snapshot, false) ? snapshot : null;
 
     /// <summary>Records an indexer's final outcome in the search's progress, when the caller asked to follow it.</summary>
     private void ReportOutcome(string? progressKey, IndexerOutcome outcome)
