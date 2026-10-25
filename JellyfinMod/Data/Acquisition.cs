@@ -95,6 +95,13 @@ public sealed class AcquisitionIndexer
     public DateTime? ProwlarrRemovedAt { get; set; }
 
     /// <summary>
+    /// Gets or sets the Prowlarr definition a synced indexer runs on (Prowlarr's <c>definitionName</c>, for example <c>1337x</c>
+    /// or <c>1337x-fast</c>), read again on every sync; null for a manual indexer (P4.FU27).
+    /// </summary>
+    [MaxLength(128)]
+    public string? ProwlarrDefinitionName { get; set; }
+
+    /// <summary>
     /// Gets or sets the fields an administrator changed on a synced indexer, as JSON (for example
     /// <c>{"enabled":false}</c>); a sync never overwrites them.
     /// </summary>

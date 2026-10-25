@@ -48,6 +48,21 @@ public sealed class ProwlarrSync(
 
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(20);
 
+    /// <summary>
+    /// The how-to that switches Prowlarr's 1337x to the one-page definition (P4.FU26), linked from Settings and the release
+    /// picker (P4.FU27). The one place the address is kept: it names the working branch until this line is released, then
+    /// <c>master</c>.
+    /// </summary>
+    public const string SlowSetupHowTo = "https://github.com/capische/jellyfin-mod/blob/main-stubs/docs/prowlarr-1337x-fast.md";
+
+    /// <summary>
+    /// The how-to's address when <paramref name="indexer"/> runs on Prowlarr's official 1337x definition, which reads four pages
+    /// three seconds apart for every search; null for <c>1337x-fast</c>, any other definition and manual indexers (P4.FU27).
+    /// </summary>
+    public static string? SlowSetupHowToFor(AcquisitionIndexer indexer) =>
+        indexer.ManagedBy == IndexerOwners.Prowlarr && string.Equals(indexer.ProwlarrDefinitionName, "1337x", StringComparison.OrdinalIgnoreCase)
+            ? SlowSetupHowTo : null;
+
     /// <summary>Checks the source answers, accepts the key and has enabled torrent indexers. Changes nothing.</summary>
     public async Task<(string Code, string Message, string? Version)> TestAsync(ProwlarrSource source, CancellationToken cancellationToken)
     {
@@ -138,7 +153,8 @@ public sealed class ProwlarrSync(
                 row = new AcquisitionIndexer
                 {
                     ManagedBy = IndexerOwners.Prowlarr, ProwlarrSourceId = source.Id, ProwlarrIndexerId = indexer.Id, Name = name, BaseUrl = baseUrl,
-                    Categories = categories, Priority = indexer.Priority, DownloadHosts = hosts, Enabled = wanted
+                    Categories = categories, Priority = indexer.Priority, DownloadHosts = hosts, Enabled = wanted,
+                    ProwlarrDefinitionName = indexer.DefinitionName
                 };
                 database.AcquisitionIndexers.Add(row);
                 rows.Add(row);
@@ -157,6 +173,9 @@ public sealed class ProwlarrSync(
                 row.CapabilitiesJson = null;
                 updated++;
             }
+
+            // Which definition it runs on is read again on every sync; it changes nothing about the feed, so it is no update.
+            row.ProwlarrDefinitionName = indexer.DefinitionName;
 
             if (row.ProwlarrRemovedAt is not null)
             {
@@ -313,8 +332,10 @@ public sealed class ProwlarrSync(
                 item.TryGetProperty("indexerUrls", out var urls) && urls.ValueKind == JsonValueKind.Array)
                 hosts.AddRange(urls.EnumerateArray().Select(url => Uri.TryCreate(url.GetString(), UriKind.Absolute, out var uri) ? uri.IdnHost.ToLowerInvariant() : null)
                     .OfType<string>());
+            var definition = item.TryGetProperty("definitionName", out var definitionValue) && definitionValue.ValueKind == JsonValueKind.String &&
+                definitionValue.GetString()?.Trim() is { Length: > 0 and <= 128 } definitionText ? definitionText : null;
             result.Add(new RemoteIndexer(idValue, name.GetString()!.Trim(), protocol.GetString()!, enable.GetBoolean(), priority,
-                Categories(item), hosts.Distinct(StringComparer.Ordinal).ToArray()));
+                Categories(item), hosts.Distinct(StringComparer.Ordinal).ToArray(), definition));
         }
 
         return result;
@@ -458,7 +479,8 @@ public sealed class ProwlarrSync(
         }
     }
 
-    private sealed record RemoteIndexer(int Id, string Name, string Protocol, bool Enable, int Priority, int[] Categories, string[] DownloadHosts);
+    private sealed record RemoteIndexer(int Id, string Name, string Protocol, bool Enable, int Priority, int[] Categories, string[] DownloadHosts,
+        string? DefinitionName);
 }
 
 /// <summary>

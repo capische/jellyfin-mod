@@ -627,7 +627,8 @@ public sealed partial class AcquisitionSettingsController(
                 capabilities.Categories, capabilities.LimitMax, capabilities.LimitDefault),
             indexer.CapabilitiesFetchedAt is { } fetched ? DateTime.SpecifyKind(fetched, DateTimeKind.Utc) : null, indexer.LastError,
             indexer.MinIntervalSeconds, indexer.DailyQueryBudget, indexer.ManagedBy, indexer.ProwlarrSourceId, indexer.ProwlarrIndexerId,
-            indexer.ProwlarrRemovedAt is { } removed ? DateTime.SpecifyKind(removed, DateTimeKind.Utc) : null, ColorIndex: indexer.ColorIndex);
+            indexer.ProwlarrRemovedAt is { } removed ? DateTime.SpecifyKind(removed, DateTimeKind.Utc) : null, ColorIndex: indexer.ColorIndex,
+            SlowSetupHowTo: ProwlarrSync.SlowSetupHowToFor(indexer));
     }
 
     private static DownloadClientSettingsDto ToDto(AcquisitionDownloadClient client, IEnumerable<DownloadClientPathMapping> mappings) =>
