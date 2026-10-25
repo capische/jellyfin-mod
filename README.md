@@ -222,6 +222,13 @@ completes the server answers every request, its own repository included, with 50
 daily update check read the repository with 200 afterwards. A 503 **after** `Core startup complete`, or any other
 status, is a real error.
 
+### Troubleshooting: slow 1337x searches through Prowlarr
+
+Prowlarr's official 1337x definition reads four results pages, three seconds apart, for every
+search, so the release picker waits 10 seconds or more for 1337x. [docs/prowlarr-1337x-fast.md](docs/prowlarr-1337x-fast.md)
+explains the one-page "1337x Fast" definition, with a script that sets it up
+([scripts/prowlarr-1337x-fast.sh](scripts/prowlarr-1337x-fast.sh)) and the steps to undo it.
+
 ## Downloaded files: detach and keep
 
 JellyfinMod 0.1.0.0 never deletes a downloaded file automatically. When a torrent's seed goal is met (seed release) or an
