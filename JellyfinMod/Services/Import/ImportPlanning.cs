@@ -322,6 +322,20 @@ public static partial class ImportNaming
     }
 
     /// <summary>
+    /// A title without what a library folder name adds to it: provider tags such as <c>[tmdbid-603]</c>,
+    /// <c>[imdbid-tt0133093]</c> or <c>{tmdb-603}</c>, then a trailing <c>(1999)</c> unless <paramref name="keepYear"/>.
+    /// Jellyfin names a title after its folder until it reads the metadata (2026-10-26). A provider tag is the only sign of a
+    /// folder name: a title without one, such as <c>Dune (2021)</c>, is returned as it is.
+    /// </summary>
+    public static string TitleOf(string title, bool keepYear = false)
+    {
+        if (!FolderTagPattern().IsMatch(title)) return title;
+        var untagged = FolderTagPattern().Replace(title, string.Empty).Trim();
+        var clean = keepYear ? untagged : TrailingYearPattern().Replace(untagged, string.Empty).Trim();
+        return clean.Length == 0 ? title : clean;
+    }
+
+    /// <summary>
     /// A movie file inside <paramref name="folderName"/>. Jellyfin groups versions only when every file name starts with
     /// the folder name character for character, followed by <c> - Label</c>.
     /// </summary>
@@ -492,4 +506,10 @@ public static partial class ImportNaming
 
     [GeneratedRegex(@"\s*\[(tmdbid|imdbid|tvdbid)-[^\]]*\]", RegexOptions.IgnoreCase)]
     private static partial Regex ProviderTagPattern();
+
+    [GeneratedRegex(@"\s*[\[{](?:tmdb|imdb|tvdb)(?:id)?[-=][^\]}]*[\]}]", RegexOptions.IgnoreCase)]
+    private static partial Regex FolderTagPattern();
+
+    [GeneratedRegex(@"\s*\(\d{4}\)$")]
+    private static partial Regex TrailingYearPattern();
 }
