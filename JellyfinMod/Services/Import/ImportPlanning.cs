@@ -336,6 +336,17 @@ public static partial class ImportNaming
     }
 
     /// <summary>
+    /// The trailing year of a folder-named title (<c>Dune (1984) [tmdbid-841]</c> gives 1984), or null when the title carries
+    /// no provider tag or no year. It stands in for the entry's year until Jellyfin reads the metadata (2026-10-26).
+    /// </summary>
+    public static int? FolderYearOf(string title)
+    {
+        if (!FolderTagPattern().IsMatch(title)) return null;
+        var match = TrailingYearPattern().Match(FolderTagPattern().Replace(title, string.Empty).Trim());
+        return match.Success ? int.Parse(match.Value.Trim()[1..5], CultureInfo.InvariantCulture) : null;
+    }
+
+    /// <summary>
     /// A movie file inside <paramref name="folderName"/>. Jellyfin groups versions only when every file name starts with
     /// the folder name character for character, followed by <c> - Label</c>.
     /// </summary>
@@ -510,6 +521,7 @@ public static partial class ImportNaming
     [GeneratedRegex(@"\s*[\[{](?:tmdb|imdb|tvdb)(?:id)?[-=][^\]}]*[\]}]", RegexOptions.IgnoreCase)]
     private static partial Regex FolderTagPattern();
 
-    [GeneratedRegex(@"\s*\(\d{4}\)$")]
+    // ASCII digits only: \d also matches other scripts' digits, which int.Parse rejects.
+    [GeneratedRegex(@"\s*\([0-9]{4}\)$")]
     private static partial Regex TrailingYearPattern();
 }
