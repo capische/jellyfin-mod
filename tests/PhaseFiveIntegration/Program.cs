@@ -1978,6 +1978,8 @@ internal static partial class Phase5
         await DeleteRepairScenarios.RunAsync(admin, world, dbPath, ids);
         // A copy bound in a folder that is no longer a library root is not fallen back to after a delete (2026-10-24).
         await StaleRootScenarios.RunAsync(admin, world, dbPath, host);
+        // Remove from Queue deletes the downloaded files only while nothing of them was imported (user, 2026-10-26).
+        await RemoveDeleteAsync(Tick, admin, world, dbPath, ids, torznab, transmission, inspector);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))

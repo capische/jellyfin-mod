@@ -265,9 +265,10 @@ public sealed class QueueController(
     }
 
     /// <summary>
-    /// Removes a row. Never deletes a file. With <c>removeFromClient</c>, has the client forget the torrent, only when this
-    /// plugin added it, and keeps its files for the manual cleanup; with <c>blocklist</c>, Phase 4 scoring rejects the
-    /// release afterwards.
+    /// Removes a row. Never touches a library file. With <c>removeFromClient</c>, has the client forget the torrent, only when
+    /// this plugin added it, and keeps its files for the manual cleanup; with <c>deleteFiles</c> as well, the client deletes
+    /// what the torrent downloaded instead, only while no file of it was ever imported (user, 2026-10-26), and otherwise the
+    /// removal is refused with nothing changed; with <c>blocklist</c>, Phase 4 scoring rejects the release afterwards.
     /// </summary>
     [HttpDelete("Queue/{id:guid}"), Authorize(Policy = Policies.RequiresElevation)]
     public async Task<ActionResult<ImportOperationDto>> Remove(Guid id, [FromBody] QueueRemoveRequest? request,
@@ -300,8 +301,18 @@ public sealed class QueueController(
         if (removed.Count == 0 && removedSeeds.Count == 0) return Refuse(409, "not_in_queue", "This import is no longer in the queue.");
         if (removedSeeds.Any(value => value.State == SeedReleaseStates.Removing))
             return Refuse(409, "seed_release_in_progress", "The seeding copy is being released; try again shortly.");
+        // Deleting the downloaded files (user, 2026-10-26) is the client's delete-with-data, so it needs the client removal, and
+        // only a download none of whose files reached the library: no import of this grab or of this torrent ever recorded a
+        // destination, linked or bound, and no seed release exists for either (for a pack, none of its episodes). Refused, never
+        // quietly downgraded to keeping the files.
+        if (request.DeleteFiles && !request.RemoveFromClient)
+            return Refuse(409, DeleteNotAllowed, "Deleting the downloaded files also removes the torrent from the client.");
+        if (request.DeleteFiles && (removedSeeds.Count > 0 || await AnyImportedAsync(operation, cancellationToken)))
+            return Refuse(409, DeleteNotAllowed,
+                "Part of this download is already in your library, so its files cannot be deleted; remove it without deleting them.");
 
         var removedFromClient = false;
+        var deletedFiles = false;
         if (request.RemoveFromClient)
         {
             var client = await database.AcquisitionDownloadClients.AsNoTracking()
@@ -325,16 +336,21 @@ public sealed class QueueController(
                 if (dataPaths is null || verified is null || dataPaths.Any(InsideLibrary) || verified.Any(file => InsideLibrary(file.Path)))
                     return Refuse(409, SeedReleaseReasons.SeedingInsideLibrary,
                         "The torrent's data is not in a mapped download folder outside every library; remove it in the client.");
-                // The client only forgets the torrent and nothing is deleted: the checked files are recorded on the
-                // operation first, so a restart keeps them, and stay on disk for the administrator to remove (Codex delta
-                // reviews 1 and 5; user decisions 2026-10-02: 0.1.0.0 never deletes a download; a cleanup tool is planned for a later version).
+                // A downloaded file with a second name somewhere (a hardlink the records do not know of) is never deleted.
+                if (request.DeleteFiles && verified.Any(file => !files.TryInspect(file.Path, out var current) || current.HardlinkCount > 1))
+                    return Refuse(409, DeleteNotAllowed,
+                        "A downloaded file is also linked elsewhere, so its files cannot be deleted; remove it without deleting them.");
+                // Without deleteFiles the client only forgets the torrent and nothing is deleted: the checked files are recorded
+                // on the operation first, so a restart keeps them, and stay on disk for the administrator to remove (Codex delta
+                // reviews 1 and 5; user decisions 2026-10-02). With it, the same record names what the client was asked to delete.
                 operation.CleanupManifest = TorrentDataRemoval.Serialize(verified);
                 await database.SaveChangesAsync(CancellationToken.None);
                 try
                 {
                     var connection = await configuration.ConnectAsync(client, cancellationToken);
-                    await driver.RemoveAsync(connection, operation.InfoHash, deleteData: false, cancellationToken);
+                    await driver.RemoveAsync(connection, operation.InfoHash, deleteData: request.DeleteFiles, cancellationToken);
                     removedFromClient = true;
+                    deletedFiles = request.DeleteFiles;
                 }
                 catch (Exception error) when (error is DownloadClientRejectedException or DownloadClientUnavailableException or
                     HttpRequestException)
@@ -373,11 +389,14 @@ public sealed class QueueController(
             database.History.Add(new HistoryRecord
             {
                 EntryId = entryId, EventType = "queue_removed", CreatedAt = now,
-                Summary = ImportService.Bound("Removed from the queue" + (removedFromClient ? " and from the download client; its files are kept on disk: " : ": ") +
+                Summary = ImportService.Bound("Removed from the queue" + (deletedFiles
+                        ? " and from the download client, and its downloaded files were deleted: "
+                        : removedFromClient ? " and from the download client; its files are kept on disk: "
+                        : request.DeleteFiles ? "; the download client no longer had the torrent, so nothing was deleted: " : ": ") +
                     operation.ReleaseTitle),
                 Data = JsonSerializer.Serialize(new
                 {
-                    operationId = operation.Id, operation.EpisodeId, removeFromClient = removedFromClient, request.Blocklist,
+                    operationId = operation.Id, operation.EpisodeId, removeFromClient = removedFromClient, deleteFiles = deletedFiles, request.Blocklist,
                     grabId = pack ? grab!.Id : (Guid?)null, removedImports = removed.Select(child => child.Id).ToArray()
                 })
             });
@@ -534,6 +553,23 @@ public sealed class QueueController(
     }
 
     private async Task<bool> IsAdministratorAsync() => (await authorization.AuthorizeAsync(User, Policies.RequiresElevation)).Succeeded;
+
+    /// <summary>Why a removal that would delete the downloaded files was refused, with nothing changed.</summary>
+    private const string DeleteNotAllowed = "delete_not_allowed";
+
+    /// <summary>
+    /// Whether any file of this download may be in a library: an import of its grab or of its torrent that recorded a
+    /// destination (recorded before the link is made), linked, bound or reached a linking state, or a seed release of either.
+    /// </summary>
+    private async Task<bool> AnyImportedAsync(ImportOperation operation, CancellationToken cancellationToken)
+    {
+        string[] linkedStates = [ImportStates.Linking, ImportStates.Linked, ImportStates.Scanning, ImportStates.Completed];
+        return await database.ImportOperations.AnyAsync(value => (value.GrabId == operation.GrabId || value.InfoHash == operation.InfoHash) &&
+                (value.DestinationPath != null || value.LinkedAt != null || value.BindingId != null || linkedStates.Contains(value.State)),
+                cancellationToken) ||
+            await database.SeedReleaseOperations.AnyAsync(value => value.GrabId == operation.GrabId || value.InfoHash == operation.InfoHash,
+                cancellationToken);
+    }
 
     private ObjectResult Refuse(int status, string code, string title) =>
         StatusCode(status, new ProblemDetails { Status = status, Type = code, Title = title });

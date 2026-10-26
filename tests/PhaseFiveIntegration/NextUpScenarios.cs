@@ -317,6 +317,18 @@ internal static class NextUpScenarios
 
         // ---------------- 8. The pack is removed mid-download and from the client: the early episode's library file stays.
         var viewerE2 = (await ChildrenAsync(viewerId))[ids["nxviewe2"]];
+        // Its files cannot be deleted from any of its rows while one episode is in the library (user, 2026-10-26).
+        var viewerE4 = (await ChildrenAsync(viewerId))[ids["nxviewe4"]];
+        using (var refused = await admin.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"/JellyfinMod/Queue/{viewerE4.Id}")
+               { Content = JsonContent.Create(new { removeFromClient = true, deleteFiles = true }) }))
+        {
+            var body = await refused.Content.ReadAsStringAsync();
+            Assert((int)refused.StatusCode == 409 && body.Contains("\"delete_not_allowed\"", StringComparison.Ordinal) &&
+                viewerE4.State == ImportStates.Waiting && transmission.Torrents.ContainsKey(viewerHash) && File.Exists(viewerE2.DestinationPath) &&
+                File.Exists(viewerE2.SourceLocalPath) && (await ChildrenAsync(viewerId))[ids["nxviewe4"]].State == ImportStates.Waiting,
+                $"A pack with an imported episode is never deleted, from a waiting episode's row either: {(int)refused.StatusCode} {body}");
+        }
+
         await ReadAsync(await admin.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"/JellyfinMod/Queue/{viewerE2.Id}")
             { Content = JsonContent.Create(new { removeFromClient = true }) }), 200, "Administrator removes the viewer pack from the client");
         await using (var database = new ModDbContext(dbPath))

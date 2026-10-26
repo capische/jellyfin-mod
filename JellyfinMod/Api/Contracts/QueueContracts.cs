@@ -144,9 +144,16 @@ public sealed record QueueResultDto(
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed class QueueRemoveRequest
 {
-    /// <summary>Gets or sets a value indicating whether the torrent and its data are removed from the client.</summary>
+    /// <summary>Gets or sets a value indicating whether the client forgets the torrent (only one this plugin added).</summary>
     [JsonPropertyName("removeFromClient")]
     public bool RemoveFromClient { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the client also deletes what the torrent downloaded (user, 2026-10-26). Only with
+    /// <see cref="RemoveFromClient"/>, and only while no file of the torrent has been imported; otherwise the removal is refused.
+    /// </summary>
+    [JsonPropertyName("deleteFiles")]
+    public bool DeleteFiles { get; set; }
 
     /// <summary>Gets or sets a value indicating whether the release is blocklisted.</summary>
     [JsonPropertyName("blocklist")]
