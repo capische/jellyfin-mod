@@ -290,6 +290,38 @@ internal static class TrackerTitleScenarios
                 doctorQueries.All(query => !query.Contains("tvdbid", StringComparison.OrdinalIgnoreCase) && !query.Contains('[')) &&
                 doctorSearch.GetProperty("candidates").EnumerateArray().Any(row => row.GetProperty("rawTitle").GetString() == doctorRelease),
                 "A folder-named series' text query keeps its year and drops its tvdbid tag: " + string.Join(" | ", doctorQueries));
+
+            // A folder-named movie has no year until Jellyfin reads its metadata; the folder's year is searched and keeps a
+            // same-named remake out (final review 2026-10-26, finding 5).
+            var dune = Guid.NewGuid();
+            await using (var database = new ModDbContext(dbPath))
+            {
+                var folderNamed = "Dune (1984) [tmdbid-841]";
+                var metadata = JsonSerializer.Serialize(new TmdbMetadata("movie", 841, folderNamed, null, null, null, null, null, null, false,
+                    null, null, [], [], []));
+                var added = new DateTime(2026, 9, 1, 0, 0, 0, DateTimeKind.Utc);
+                await database.Database.ExecuteSqlInterpolatedAsync($"""
+                    INSERT INTO Entries (Id, MediaType, TmdbId, Title, Year, MetadataJson, State, Monitored, AddedAt, TargetLibraryId, RetentionPolicy)
+                    VALUES ({dune}, 'movie', 841, {folderNamed}, NULL, {metadata}, 0, 1, {added}, {world.Movies.Id}, 0)
+                    """);
+            }
+
+            const string duneRemake = "Dune.2021.1080p.WEB-DL.DDP5.1.Atmos.H.264";
+            const string duneOriginal = "Dune.1984.1080p.BluRay.x264";
+            feed.MovieItems.Clear();
+            feed.MovieItems.Add(Row(duneRemake, 2040));
+            feed.MovieItems.Add(Row(duneOriginal, 2040));
+            sentBefore = feed.Queries.Count;
+            var duneSearch = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={dune}"), 200, "A folder-named entry without a year is searched");
+            var duneQueries = feed.Queries.Skip(sentBefore).Select(Uri.UnescapeDataString)
+                .Where(query => !query.Contains("t=caps", StringComparison.Ordinal)).ToArray();
+            var duneRows = duneSearch.GetProperty("candidates").EnumerateArray().ToDictionary(row => row.GetProperty("rawTitle").GetString()!);
+            Assert(duneQueries.Length > 0 && duneQueries[0].Contains("q=Dune 1984", StringComparison.Ordinal) &&
+                duneSearch.GetProperty("target").GetProperty("title").GetString() == "Dune",
+                "A folder-named entry without a year searches the folder's year: " + string.Join(" | ", duneQueries));
+            Rejected(duneRows, duneRemake, "year_mismatch");
+            Assert(duneRows[duneOriginal].GetProperty("rejections").EnumerateArray().All(item => item.GetProperty("code").GetString() != "year_mismatch"),
+                "The folder's own year is not a mismatch: " + Codes(duneRows[duneOriginal]));
         }
 
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();

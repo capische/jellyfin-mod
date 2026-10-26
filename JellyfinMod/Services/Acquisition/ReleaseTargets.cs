@@ -35,7 +35,7 @@ public static class ReleaseTargets
         // A folder's provider tags are never searched for: no text-only indexer finds "The Matrix (1999) [tmdbid-603]"
         // (2026-10-26). A movie's year is added to its query anyway; a series keeps it in the title.
         return new ReleaseTarget(entry.Id, episode?.Id, entry.MediaType, SearchTitle(entry),
-            metadata?.OriginalTitle, entry.Year,
+            metadata?.OriginalTitle, TargetYear(entry),
             episode?.SeasonNumber, episode?.EpisodeNumber,
             // An episode's own runtime only: a series average would be a guessed duration (P4.A4).
             entry.MediaType == "series" ? episode?.RuntimeMinutes : metadata?.RuntimeMinutes,
@@ -46,6 +46,10 @@ public static class ReleaseTargets
     }
 
     private static string SearchTitle(Entry entry) => Import.ImportNaming.TitleOf(entry.Title, keepYear: entry.MediaType == "series");
+
+    // A folder-named entry has no year until Jellyfin reads its metadata; the folder's year then keeps "Dune (1984)" from
+    // admitting a text-only Dune 2021 (final review 2026-10-26, finding 5).
+    private static int? TargetYear(Entry entry) => entry.Year ?? Import.ImportNaming.FolderYearOf(entry.Title);
 
     /// <summary>
     /// The episodes a pack scope covers: the series' aired, tracked episodes of that season (season scope) or of every season
@@ -76,7 +80,7 @@ public static class ReleaseTargets
         }
 
         return new ReleaseTarget(entry.Id, null, entry.MediaType, SearchTitle(entry), metadata?.OriginalTitle,
-            entry.Year,
+            TargetYear(entry),
             scope == ReleaseScopes.Season ? seasonNumber : null, null, runtime, entry.ImdbId ?? metadata?.ImdbId, entry.TmdbId,
             metadata?.TvdbId)
         {
