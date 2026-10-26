@@ -626,7 +626,8 @@ public sealed class ReconciliationService(
     /// Jellyfin found a file carries what Jellyfin knew then: the folder name as its title and no IMDb id or release date.
     /// Without them a release reporting the title's IMDb id was refused as another title, and a movie with no release date
     /// counted as unreleased, so deleting it never brought its placeholder back. The title is replaced only while it is still
-    /// the name of the title's folder or file and Jellyfin has since named it otherwise.
+    /// the name of the title's folder or file, or still carries a folder's provider tag (2026-10-26), and Jellyfin has since
+    /// named it otherwise.
     /// </summary>
     private static void FillFromNative(Entry entry, NativeTitleSnapshot snapshot)
     {
@@ -635,8 +636,10 @@ public sealed class ReconciliationService(
             .SelectMany(path => new[] { Path.GetFileName(path), Path.GetFileNameWithoutExtension(path),
                 Path.GetFileName(Path.GetDirectoryName(path)) })
             .Where(name => !string.IsNullOrEmpty(name)).ToHashSet(StringComparer.Ordinal);
+        // A provider tag in the title is a folder's name too, wherever the file now is (2026-10-26).
+        var folderNamed = rawNames.Contains(entry.Title) || Import.ImportNaming.TitleOf(entry.Title) != entry.Title;
         var renamed = !string.IsNullOrWhiteSpace(snapshot.Title) && entry.Title != snapshot.Title &&
-            rawNames.Contains(entry.Title) && !rawNames.Contains(snapshot.Title);
+            folderNamed && !rawNames.Contains(snapshot.Title);
         if (renamed) entry.Title = snapshot.Title;
         entry.ImdbId ??= snapshot.ImdbId;
         entry.Year ??= snapshot.Year;

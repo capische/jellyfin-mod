@@ -360,12 +360,50 @@ internal static class BackfillIntegration
                     $"What the entry already has is never overwritten by the library item: {entry.Title} {entry.ImdbId}");
             }
 
+            // A folder whose title part is not the name Jellyfin later reads still follows Jellyfin's first metadata read.
+            const string sortedFolder = "Matrix Reloaded, The (2003) [tmdbid-8205]";
+            var sorted = new Movie
+            {
+                Id = Guid.NewGuid(), Name = sortedFolder, Path = $"/media/{sortedFolder}/{sortedFolder}.mkv", ProductionYear = 2003
+            };
+            sorted.ProviderIds["Tmdb"] = "8205";
+            movies.Add(sorted);
+            raise("added", new ItemChangeEventArgs { Item = sorted, Parent = movieLibrary });
+            var sortedId = await WaitForEntryAsync(dbPath, 8205);
+            sorted.Name = "The Matrix Reloaded";
+            sorted.ProviderIds["Imdb"] = "tt0234215";
+            raise("updated", new ItemChangeEventArgs { Item = sorted, Parent = movieLibrary });
+            await WaitForAsync(async database => (await database.Entries.SingleAsync(entry => entry.Id == sortedId)).ImdbId == "tt0234215",
+                dbPath, "Jellyfin's metadata read did not reach the sorted-folder entry");
+            await using (var renamed = new ModDbContext(dbPath))
+            {
+                var entry = await renamed.Entries.SingleAsync(candidate => candidate.Id == sortedId);
+                Assert(entry.Title == "The Matrix Reloaded", $"A sorted folder's title gives way to Jellyfin's name: {entry.Title}");
+            }
+
+            // A title without a provider tag is never a folder's name (2026-10-26): "Dune (2021)" keeps its year through its
+            // creation, Jellyfin's metadata read and a full run, whose post-scan check follows below.
+            const string dune = "Dune (2021)";
+            var duneItem = new Movie { Id = Guid.NewGuid(), Name = dune, Path = $"/media/{dune}/{dune}.mkv", ProductionYear = 2021 };
+            duneItem.ProviderIds["Tmdb"] = "8207";
+            movies.Add(duneItem);
+            raise("added", new ItemChangeEventArgs { Item = duneItem, Parent = movieLibrary });
+            var duneId = await WaitForEntryAsync(dbPath, 8207);
+            duneItem.ProviderIds["Imdb"] = "tt1160419";
+            raise("updated", new ItemChangeEventArgs { Item = duneItem, Parent = movieLibrary });
+            await WaitForAsync(async database => (await database.Entries.SingleAsync(entry => entry.Id == duneId)).ImdbId == "tt1160419",
+                dbPath, "Jellyfin's metadata read did not reach the Dune entry");
+
             var missed = Movie(8202, movieLibrary.Id);
             movies.Add(missed);
             await provider.GetRequiredService<CatalogPostScanTask>().Run(new InlineProgress(_ => { }), default);
             await using (var repaired = new ModDbContext(dbPath))
+            {
                 Assert(await repaired.Entries.AnyAsync(entry => entry.TmdbId == 8202),
                     "Successful post-scan repair picks up a title whose event was missed");
+                var duneTitle = await repaired.Entries.Where(entry => entry.Id == duneId).Select(entry => entry.Title).SingleAsync();
+                Assert(duneTitle == dune, $"A year-qualified title without a tag is never renamed: {duneTitle}");
+            }
 
             movies.Remove(replacement);
             var sentinel = Movie(8203, movieLibrary.Id);
