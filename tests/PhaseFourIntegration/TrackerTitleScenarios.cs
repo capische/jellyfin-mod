@@ -228,6 +228,68 @@ internal static class TrackerTitleScenarios
             Assert(rows[psEpisode].GetProperty("parsed").GetProperty("seasonNumber").GetInt32() == 3 &&
                 rows[psEpisode].GetProperty("parsed").GetProperty("episodeNumbers").EnumerateArray().Single().GetInt32() == 3,
                 "S3 / Серия: 3 из 6 is episode 3 of season 3");
+
+            // ---- 2026-10-26 (beta, The Matrix): an entry still named after its library folder is searched by its title alone.
+            // Every text-only tracker answered "The Matrix (1999) [tmdbid-603]" with nothing.
+            var heat = Guid.NewGuid();
+            await using (var database = new ModDbContext(dbPath))
+            {
+                var folderNamed = "Heat (1995) [tmdbid-949]";
+                var metadata = JsonSerializer.Serialize(new TmdbMetadata("movie", 949, folderNamed, null, null, null, null, null, null, false,
+                    null, null, [], [], []));
+                var added = new DateTime(2026, 9, 1, 0, 0, 0, DateTimeKind.Utc);
+                await database.Database.ExecuteSqlInterpolatedAsync($"""
+                    INSERT INTO Entries (Id, MediaType, TmdbId, Title, Year, MetadataJson, State, Monitored, AddedAt, TargetLibraryId, RetentionPolicy)
+                    VALUES ({heat}, 'movie', 949, {folderNamed}, 1995, {metadata}, 0, 1, {added}, {world.Movies.Id}, 0)
+                    """);
+            }
+
+            const string heatRelease = "Схватка / Heat (1995) BDRip 1080p";
+            feed.MovieItems.Clear();
+            feed.MovieItems.Add(Row(heatRelease, 2040));
+            var sentBefore = feed.Queries.Count;
+            var heatSearch = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={heat}"), 200, "A folder-named entry is searched");
+            var heatQueries = feed.Queries.Skip(sentBefore).Select(Uri.UnescapeDataString)
+                .Where(query => !query.Contains("t=caps", StringComparison.Ordinal)).ToArray();
+            Assert(heatQueries.Length > 0 && heatQueries[0].Contains("q=Heat 1995", StringComparison.Ordinal) &&
+                heatQueries.All(query => !query.Contains("tmdbid", StringComparison.OrdinalIgnoreCase) && !query.Contains('[') &&
+                    !query.Contains("(1995)", StringComparison.Ordinal)) &&
+                heatSearch.GetProperty("target").GetProperty("title").GetString() == "Heat" &&
+                heatSearch.GetProperty("candidates").EnumerateArray().Any(row => row.GetProperty("rawTitle").GetString() == heatRelease),
+                "A folder-named entry's text query carries neither its year in brackets nor its tmdbid tag: " + string.Join(" | ", heatQueries));
+
+            // A folder-named series keeps its year, which tells it from an older series of the same name, and drops its tag.
+            var doctor = Guid.NewGuid();
+            var doctorEpisode = Guid.NewGuid();
+            await using (var database = new ModDbContext(dbPath))
+            {
+                var folderNamed = "Doctor Who (2005) [tvdbid-78804]";
+                var metadata = JsonSerializer.Serialize(new TmdbMetadata("series", 57243, folderNamed, null, null, null, null, null, null, false,
+                    null, null, [], [], []));
+                var added = new DateTime(2026, 9, 1, 0, 0, 0, DateTimeKind.Utc);
+                await database.Database.ExecuteSqlInterpolatedAsync($"""
+                    INSERT INTO Entries (Id, MediaType, TmdbId, Title, Year, MetadataJson, State, Monitored, AddedAt, TargetLibraryId, RetentionPolicy)
+                    VALUES ({doctor}, 'series', 57243, {folderNamed}, 2005, {metadata}, 0, 1, {added}, {world.Tv.Id}, 0)
+                    """);
+                var aired = new DateTime(2005, 3, 26, 0, 0, 0, DateTimeKind.Utc);
+                await database.Database.ExecuteSqlInterpolatedAsync($"""
+                    INSERT INTO Episodes (Id, EntryId, TmdbId, SeasonNumber, EpisodeNumber, Title, RuntimeMinutes, Monitored, State, AirDate)
+                    VALUES ({doctorEpisode}, {doctor}, 1001, 1, 1, 'Rose', 45, 1, 0, {aired})
+                    """);
+            }
+
+            const string doctorRelease = "Doctor Who 2005 S01E01 1080p WEB-DL";
+            feed.TvItems.Clear();
+            feed.TvItems.Add(Row(doctorRelease, 5040));
+            sentBefore = feed.Queries.Count;
+            var doctorSearch = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={doctor}&episodeId={doctorEpisode}"), 200,
+                "A folder-named series episode is searched");
+            var doctorQueries = feed.Queries.Skip(sentBefore).Select(Uri.UnescapeDataString)
+                .Where(query => !query.Contains("t=caps", StringComparison.Ordinal)).ToArray();
+            Assert(doctorQueries.Length > 0 && doctorQueries[0].Contains("q=Doctor Who (2005) S01E01", StringComparison.Ordinal) &&
+                doctorQueries.All(query => !query.Contains("tvdbid", StringComparison.OrdinalIgnoreCase) && !query.Contains('[')) &&
+                doctorSearch.GetProperty("candidates").EnumerateArray().Any(row => row.GetProperty("rawTitle").GetString() == doctorRelease),
+                "A folder-named series' text query keeps its year and drops its tvdbid tag: " + string.Join(" | ", doctorQueries));
         }
 
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
