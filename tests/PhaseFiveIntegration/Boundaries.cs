@@ -229,6 +229,8 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
     public ConcurrentDictionary<string, string> Roots { get; } = new(StringComparer.Ordinal);
     public int GetCalls;
     public int RemoveCalls;
+    /// <summary>Every torrent-add asked, a duplicate's included.</summary>
+    public int AddCalls;
     /// <summary>Runs after a torrent-get answer is built and before it is sent, with the hashes it asked for (null for all).</summary>
     public Func<IReadOnlySet<string>?, Task>? AfterGet { get; set; }
     /// <summary>While above zero, each torrent-remove is refused and this is decremented.</summary>
@@ -384,6 +386,7 @@ internal sealed class TransmissionBoundary : IAsyncDisposable
                 if (AfterGet is { } afterGet) await afterGet(ids);
                 break;
             case "torrent-add":
+                Interlocked.Increment(ref AddCalls);
                 var metainfo = arguments["metainfo"]!.GetValue<string>();
                 var fixture = Fixtures[metainfo];
                 if (Torrents.TryGetValue(fixture.InfoHash, out var existing))
