@@ -1148,6 +1148,41 @@ namespace JellyfinMod.Data.Migrations
                         });
                 });
 
+            modelBuilder.Entity("JellyfinMod.Data.GrabRequestKey", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<Guid>("GrabId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("IdempotencyKey")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RequestFingerprint")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<Guid>("RequestedBy")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("GrabId");
+
+                    b.HasIndex("RequestedBy", "IdempotencyKey")
+                        .IsUnique();
+
+                    b.ToTable("GrabRequestKeys");
+                });
+
             modelBuilder.Entity("JellyfinMod.Data.HistoryRecord", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1214,12 +1249,12 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("TEXT");
 
-                    b.Property<string>("DestinationPath")
-                        .HasMaxLength(4096)
-                        .HasColumnType("TEXT");
-
                     b.Property<string>("DestinationFingerprint")
                         .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DestinationPath")
+                        .HasMaxLength(4096)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("DestinationPhysicalIdentity")
@@ -2224,6 +2259,15 @@ namespace JellyfinMod.Data.Migrations
                         .WithMany()
                         .HasForeignKey("EpisodeId")
                         .OnDelete(DeleteBehavior.SetNull);
+                });
+
+            modelBuilder.Entity("JellyfinMod.Data.GrabRequestKey", b =>
+                {
+                    b.HasOne("JellyfinMod.Data.GrabOperation", null)
+                        .WithMany()
+                        .HasForeignKey("GrabId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
                 });
 
             modelBuilder.Entity("JellyfinMod.Data.ImportOperation", b =>
