@@ -177,10 +177,15 @@ public sealed class ImportService(
             .ConfigureAwait(false) ||
         await PackReplaceService.AnyPendingAsync(database, cancellationToken).ConfigureAwait(false);
 
-    /// <summary>Reads one client for every hash the plugin tracks there, through the shared cache.</summary>
-    public async Task<ClientSnapshot> SnapshotAsync(Guid clientId, TimeSpan maxAge, CancellationToken cancellationToken)
+    /// <summary>
+    /// Reads one client for every hash the plugin tracks there, and <paramref name="alsoHash"/> when given (a row that is no
+    /// longer open, such as a failed one being removed), through the shared cache.
+    /// </summary>
+    public async Task<ClientSnapshot> SnapshotAsync(Guid clientId, TimeSpan maxAge, CancellationToken cancellationToken,
+        string? alsoHash = null)
     {
         var hashes = await ClientSnapshotReader.TrackedHashesAsync(database, clientId, cancellationToken).ConfigureAwait(false);
+        if (alsoHash is not null && !hashes.Contains(alsoHash, StringComparer.Ordinal)) hashes = [.. hashes, alsoHash];
         var client = await database.AcquisitionDownloadClients.AsNoTracking()
             .SingleOrDefaultAsync(value => value.Id == clientId, cancellationToken).ConfigureAwait(false);
         return await snapshots.GetAsync(clientId, hashes, maxAge,
