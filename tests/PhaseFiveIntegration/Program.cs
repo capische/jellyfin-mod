@@ -1982,6 +1982,7 @@ internal static partial class Phase5
         await RemoveDeleteAsync(Tick, admin, world, dbPath, ids, torznab, transmission, inspector);
         // A seeding release whose library file was deleted is imported again from its seeding copy when added again (user, 2026-10-28).
         await ReimportAsync(Tick, admin, world, dbPath, ids, torznab, transmission, inspector);
+        await ReimportEpisodeAsync(Tick, admin, world, dbPath, ids, torznab, transmission, inspector);
 
         await RestartAsync();
         await using (var database = new ModDbContext(dbPath))

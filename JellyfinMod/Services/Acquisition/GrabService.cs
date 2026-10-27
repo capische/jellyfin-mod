@@ -103,7 +103,8 @@ public sealed class GrabService(
     ReconciliationLibraryLock libraryLock,
     TimeProvider time,
     ILogger<GrabService> logger,
-    Import.ImportMonitor? importMonitor = null)
+    Import.ImportMonitor? importMonitor = null,
+    Import.ImportTickGate? importGate = null)
 {
     /// <summary>How long after submission an absent torrent still counts as possibly in flight.</summary>
     public static readonly TimeSpan AbsentGrace = TimeSpan.FromMinutes(2);
@@ -120,11 +121,8 @@ public sealed class GrabService(
     {
         var fingerprint = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(
             request.SearchId.ToString("N") + "\n" + request.ReleaseId)));
-        if (await FindByKeyAsync(userId, request.IdempotencyKey, cancellationToken).ConfigureAwait(false) is { } replay)
-        {
-            await AuthorizeReplayAsync(replay, canAccess, cancellationToken).ConfigureAwait(false);
-            return (Replay(replay, fingerprint), false);
-        }
+        if (await KeyedAsync(userId, request.IdempotencyKey, fingerprint, canAccess, cancellationToken).ConfigureAwait(false) is { } replay)
+            return (replay, false);
 
         var (snapshot, expired) = searches.Find(request.SearchId, userId);
         if (snapshot is null) throw new GrabException(404, "search_not_found", "This search is not available. Search again.");
@@ -229,7 +227,8 @@ public sealed class GrabService(
         // The torrent this plugin still seeds for this title, whose library file was deleted since, is imported again from the
         // seeding copy instead of being downloaded twice (user, 2026-10-28).
         if (!pack && !addVersion && !request.Automatic &&
-            await ReimportAsync(entry, episode, libraryId, client.Id, locator.InfoHash, cancellationToken).ConfigureAwait(false) is { } reimported)
+            await ReimportAsync(userId, request, fingerprint, entry, episode, libraryId, client.Id, locator.InfoHash, canAccess, cancellationToken)
+                .ConfigureAwait(false) is { } reimported)
             return (reimported, false);
 
         var now = Now;
@@ -277,6 +276,10 @@ public sealed class GrabService(
                 // grab can acquire it at the same time (Codex re-review of the pack plugin, finding 3).
                 claimed = await RefreshClaimsAsync(claimed, pack, addVersion, mode, cancellationToken).ConfigureAwait(false);
                 claimKeys = claimed.Select(item => ClaimKey(item.Episode.Id, ClaimsVersion(pack, addVersion, item.Held, mode))).ToArray();
+                // The key is read again in both of its stores right before it is written, under the gate every grab and
+                // re-import writes under (Codex re-review of P4.FU29).
+                if (await KeyedAsync(userId, request.IdempotencyKey, fingerprint, canAccess, cancellationToken).ConfigureAwait(false) is { } keyed)
+                    return (keyed, false);
                 database.GrabOperations.Add(operation);
                 foreach (var (claimedEpisode, held) in claimed)
                     database.GrabClaims.Add(new GrabClaim
@@ -291,11 +294,8 @@ public sealed class GrabService(
                 catch (DbUpdateException error) when (error.InnerException is SqliteException { SqliteErrorCode: 19 })
                 {
                     database.ChangeTracker.Clear();
-                    if (await FindByKeyAsync(userId, request.IdempotencyKey, cancellationToken).ConfigureAwait(false) is { } concurrent)
-                    {
-                        await AuthorizeReplayAsync(concurrent, canAccess, cancellationToken).ConfigureAwait(false);
-                        return (Replay(concurrent, fingerprint), false);
-                    }
+                    if (await KeyedAsync(userId, request.IdempotencyKey, fingerprint, canAccess, cancellationToken).ConfigureAwait(false) is { } concurrent)
+                        return (concurrent, false);
                     var owner = await database.GrabOperations.AsNoTracking()
                         .FirstOrDefaultAsync(value => value.ActiveTarget == operation.ActiveTarget, cancellationToken).ConfigureAwait(false);
                     if (owner is not null)
@@ -322,46 +322,80 @@ public sealed class GrabService(
     /// Imports a release again from the copy the client still seeds (user, 2026-10-28): a grab of a torrent that an earlier grab
     /// of the same title still owns in the client (its hash still held), whose import completed and none is open, starts a new
     /// import of that earlier grab instead of a second download, which the client would refuse as a duplicate anyway. The
-    /// earlier grab holds the title again while the import runs, so the picker follows it as its added row, and the finished
-    /// import's seed release is closed, so the queue shows the one new row and the new import's seed release takes over. A grab
-    /// already importing the copy is returned as it is. Null when the torrent is not such a copy (another title, a pack, a seed
-    /// release under way, nothing imported yet): the grab goes on as before.
+    /// earlier grab holds the title again while the import runs (and an episode's claim, so no pack takes it meanwhile), so the
+    /// picker follows it as its added row, and the finished import's seed release is closed, so the queue shows the one new row
+    /// and the new import's seed release takes over. A grab already importing the copy is returned as it is. The request's key
+    /// is saved with what it started, so a replay gets the same grab back. Null when the torrent is not such a copy (another
+    /// title, a pack, a seed release under way, nothing imported yet): the grab goes on as before.
     /// </summary>
-    private async Task<GrabOperation?> ReimportAsync(Entry entry, Episode? episode, Guid libraryId, Guid clientId, string infoHash,
-        CancellationToken cancellationToken)
+    /// <remarks>
+    /// Runs under the import tick gate, taken before the library lease as the monitor takes them (Codex review of P4.FU29,
+    /// finding 1): a seed release tick that read the old seed release finishes first, and everything is read again after it.
+    /// </remarks>
+    private async Task<GrabOperation?> ReimportAsync(Guid userId, GrabRequest request, string fingerprint, Entry entry, Episode? episode,
+        Guid libraryId, Guid clientId, string infoHash, Func<Entry, Episode?, bool> canAccess, CancellationToken cancellationToken)
     {
         var hashKey = HashKey(clientId, infoHash);
         var targetKey = TargetKey(entry.Id, episode?.Id);
+        var claimKey = episode is null ? null : ClaimKey(episode.Id, false);
         if (!await database.GrabOperations.AsNoTracking().AnyAsync(value => value.ActiveHash == hashKey, cancellationToken).ConfigureAwait(false))
             return null;
         GrabOperation owner;
         ImportOperation import;
+        await using (importGate is null ? null : await importGate.AcquireAsync(cancellationToken).ConfigureAwait(false))
         await using (await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false))
         {
             await AdmissionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                database.ChangeTracker.Clear();
+                // The same request again while the first was waiting for the gates.
+                if (await KeyedAsync(userId, request.IdempotencyKey, fingerprint, canAccess, cancellationToken).ConfigureAwait(false) is { } answered)
+                    return answered;
                 var found = await database.GrabOperations.SingleOrDefaultAsync(value => value.ActiveHash == hashKey, cancellationToken)
                     .ConfigureAwait(false);
                 if (found is null || found.State != GrabStates.Accepted || ReleaseScopes.IsPack(found.Scope) || found.EntryId != entry.Id ||
                     found.EpisodeId != episode?.Id)
                     return null;
                 owner = found;
+                var now = Now;
+                var key = new GrabRequestKey
+                {
+                    RequestedBy = userId, IdempotencyKey = request.IdempotencyKey, RequestFingerprint = fingerprint, GrabId = owner.Id,
+                    CreatedAt = now
+                };
                 var imports = await database.ImportOperations.Where(value => value.GrabId == owner.Id).ToListAsync(cancellationToken)
                     .ConfigureAwait(false);
-                if (imports.Any(value => ImportStates.Open.Contains(value.State))) return owner;
+                if (imports.Any(value => ImportStates.Open.Contains(value.State)))
+                {
+                    database.GrabRequestKeys.Add(key);
+                    await SaveAnswerAsync(cancellationToken).ConfigureAwait(false);
+                    return owner;
+                }
+
                 if (owner.ActiveTarget is not null || !imports.Any(value => value.State == ImportStates.Completed)) return null;
                 var seeds = await database.SeedReleaseOperations
                     .Where(value => value.GrabId == owner.Id && SeedReleaseStates.Open.Contains(value.State)).ToListAsync(cancellationToken)
                     .ConfigureAwait(false);
                 // A seeding copy being released may be gone from the client any moment: never imported from.
                 if (seeds.Any(value => value.State == SeedReleaseStates.Removing)) return null;
-                var now = Now;
                 import = await Import.ImportService.CreateForGrabAsync(database, owner, now, cancellationToken).ConfigureAwait(false)
                     ?? throw new GrabException(404, "target_not_found", "The title is not available.");
                 import.Intent = GrabIntents.Acquire;
                 owner.ActiveTarget = targetKey;
                 owner.UpdatedAt = now;
+                // The episode is claimed again under its acquire key, so a pack covering it is refused while it imports (Codex
+                // review of P4.FU29, finding 2); releasing the target clears the claim again (the GrabClaimRelease trigger).
+                if (episode is not null)
+                {
+                    var claim = await database.GrabClaims.SingleOrDefaultAsync(value => value.GrabId == owner.Id && value.EpisodeId == episode.Id,
+                        cancellationToken).ConfigureAwait(false);
+                    if (claim is null)
+                        database.GrabClaims.Add(claim = new GrabClaim { GrabId = owner.Id, EpisodeId = episode.Id, CreatedAt = now });
+                    claim.ActiveKey = claimKey;
+                    claim.Held = false;
+                }
+
                 foreach (var seed in seeds)
                 {
                     seed.State = SeedReleaseStates.Cancelled;
@@ -369,18 +403,9 @@ public sealed class GrabService(
                     seed.CompletedAt = seed.UpdatedAt = now;
                 }
 
-                try
-                {
-                    await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch (DbUpdateException error) when (error.InnerException is SqliteException { SqliteErrorCode: 19 })
-                {
-                    database.ChangeTracker.Clear();
-                    var holder = await database.GrabOperations.AsNoTracking()
-                        .FirstOrDefaultAsync(value => value.ActiveTarget == targetKey, cancellationToken)
-                        .ConfigureAwait(false);
-                    throw new GrabException(409, "grab_active", "Another grab for this title is still active.", holder?.Id);
-                }
+                // Saved with the import it starts (Codex review of P4.FU29, finding 3).
+                database.GrabRequestKeys.Add(key);
+                await SaveAnswerAsync(cancellationToken).ConfigureAwait(false);
             }
             finally
             {
@@ -391,6 +416,48 @@ public sealed class GrabService(
         logger.LogInformation("Grab {Operation} imports {Entry} again from its seeding copy (import {Import})", owner.Id, entry.Id, import.Id);
         importMonitor?.Wake();
         return owner;
+
+        async Task SaveAnswerAsync(CancellationToken token)
+        {
+            try
+            {
+                await database.SaveChangesAsync(token).ConfigureAwait(false);
+            }
+            catch (DbUpdateException error) when (error.InnerException is SqliteException { SqliteErrorCode: 19 })
+            {
+                database.ChangeTracker.Clear();
+                var holder = await database.GrabOperations.AsNoTracking()
+                    .FirstOrDefaultAsync(value => value.ActiveTarget == targetKey, token).ConfigureAwait(false);
+                var claimHolder = claimKey is null ? null : await database.GrabClaims.AsNoTracking()
+                    .FirstOrDefaultAsync(value => value.ActiveKey == claimKey, token).ConfigureAwait(false);
+                throw new GrabException(409, "grab_active", "Another grab for this title is still active.", holder?.Id ?? claimHolder?.GrabId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The grab a request with this key already got, from either store: a grab made with it, or one that answered it by importing
+    /// again (P4.FU29). A key used for another release is refused, and the grab answers only for a target the requester may
+    /// still read. Null when the key is new.
+    /// </summary>
+    private async Task<GrabOperation?> KeyedAsync(Guid userId, string key, string fingerprint, Func<Entry, Episode?, bool> canAccess,
+        CancellationToken cancellationToken)
+    {
+        if (await FindByKeyAsync(userId, key, cancellationToken).ConfigureAwait(false) is { } made)
+        {
+            await AuthorizeReplayAsync(made, canAccess, cancellationToken).ConfigureAwait(false);
+            return Replay(made, fingerprint);
+        }
+
+        var answered = await database.GrabRequestKeys.AsNoTracking()
+            .SingleOrDefaultAsync(value => value.RequestedBy == userId && value.IdempotencyKey == key, cancellationToken).ConfigureAwait(false);
+        if (answered is null) return null;
+        var grab = await database.GrabOperations.AsNoTracking().SingleAsync(value => value.Id == answered.GrabId, cancellationToken)
+            .ConfigureAwait(false);
+        await AuthorizeReplayAsync(grab, canAccess, cancellationToken).ConfigureAwait(false);
+        return answered.RequestFingerprint == fingerprint
+            ? grab
+            : throw new GrabException(409, "idempotency_conflict", "This idempotency key was used for a different release.", grab.Id);
     }
 
     /// <summary>

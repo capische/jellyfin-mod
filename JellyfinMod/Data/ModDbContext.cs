@@ -77,6 +77,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets the episodes each grab writes (season and series packs, 2026-10-08).</summary>
     public DbSet<GrabClaim> GrabClaims => Set<GrabClaim>();
 
+    /// <summary>Gets the grab requests answered with an earlier grab (P4.FU29).</summary>
+    public DbSet<GrabRequestKey> GrabRequestKeys => Set<GrabRequestKey>();
+
     /// <summary>Gets ordered client-to-local path mappings (P5.I2).</summary>
     public DbSet<DownloadClientPathMapping> DownloadClientPathMappings => Set<DownloadClientPathMapping>();
 
@@ -294,6 +297,12 @@ public class ModDbContext : DbContext
             e.HasOne<Episode>().WithMany().HasForeignKey(x => x.EpisodeId).OnDelete(DeleteBehavior.SetNull);
             // Releasing a grab's target clears its claims' keys (GrabClaimRelease trigger, migration SeasonPacks).
             e.ToTable(table => table.HasTrigger("GrabClaimRelease"));
+        });
+        b.Entity<GrabRequestKey>(e =>
+        {
+            // A key answers once per requester, like a grab's own (RequestedBy, IdempotencyKey).
+            e.HasIndex(x => new { x.RequestedBy, x.IdempotencyKey }).IsUnique();
+            e.HasOne<GrabOperation>().WithMany().HasForeignKey(x => x.GrabId).OnDelete(DeleteBehavior.Cascade);
         });
         b.Entity<GrabClaim>(e =>
         {

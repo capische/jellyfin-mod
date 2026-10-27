@@ -674,3 +674,31 @@ public sealed class GrabClaim
     /// <summary>Gets or sets when the claim was made.</summary>
     public DateTime CreatedAt { get; set; }
 }
+
+/// <summary>
+/// A grab request answered with an earlier grab instead of a new one: Add on a release that grab still seeds, imported again
+/// from the seeding copy (P4.FU29). Its requester, idempotency key and fingerprint are kept with the grab that answered, saved
+/// with the import they started, so a replay of the request gets the same grab back and starts nothing again.
+/// </summary>
+public sealed class GrabRequestKey
+{
+    /// <summary>Gets or sets the record identity.</summary>
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    /// <summary>Gets or sets the requesting user.</summary>
+    public Guid RequestedBy { get; set; }
+
+    /// <summary>Gets or sets the request's idempotency key; unique per requester, as a grab's own.</summary>
+    [MaxLength(128)]
+    public string IdempotencyKey { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the fingerprint of the search and release the key was used for.</summary>
+    [MaxLength(64)]
+    public string RequestFingerprint { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the grab that answered the request.</summary>
+    public Guid GrabId { get; set; }
+
+    /// <summary>Gets or sets when the request was answered.</summary>
+    public DateTime CreatedAt { get; set; }
+}
