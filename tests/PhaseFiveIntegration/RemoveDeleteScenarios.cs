@@ -20,6 +20,8 @@ internal static partial class Phase5
         {
             AddEntry(database, ids, "movieDel", "movie", 131, "Delete Movie", 2021, "tt0000131", null, world.Movies.Id);
             AddEntry(database, ids, "movieKeep", "movie", 132, "Keep Movie", 2021, "tt0000132", null, world.Movies.Id);
+            AddEntry(database, ids, "movieFail", "movie", 133, "Failed Movie", 2021, "tt0000133", null, world.Movies.Id);
+            AddEntry(database, ids, "movieGone", "movie", 134, "Gone Movie", 2021, "tt0000134", null, world.Movies.Id);
             await database.SaveChangesAsync();
         }
 
@@ -89,6 +91,74 @@ internal static partial class Phase5
                 "The history says the downloaded files were deleted: " + history.Summary);
         }
 
+        // ---------------- A failed row whose torrent is still in the client: its own hash is read although no open import
+        // tracks it, so its files are deleted (Codex review 2026-10-26, P2 6). The failure is written as FailAsync writes it.
+        var fixtureFail = Fixture("movieFail", "Failed.Movie.2021.1080p.WEB-DL-GRP", "0000133");
+        var (grabFail, hashFail) = await GrabAsync(admin, ids["movieFail"], null, fixtureFail);
+        transmission.Progress(hashFail, 0.4);
+        var waitingFail = await WaitAsync(async () =>
+        {
+            await tick();
+            var operation = await ImportFor(dbPath, grabFail);
+            return operation.State == ImportStates.Waiting && operation.Progress is > 0 and < 1 ? operation : null;
+        }, "Failed Movie is downloading");
+        var partialFail = DataPath(hashFail, fixtureFail);
+        Assert(File.Exists(partialFail), "The failed row's partial download is on disk: " + partialFail);
+        await using (var database = new ModDbContext(dbPath))
+            await database.ImportOperations.Where(value => value.Id == waitingFail.Id).ExecuteUpdateAsync(set => set
+                .SetProperty(value => value.State, ImportStates.Failed).SetProperty(value => value.Reason, ImportReasons.TargetMissing)
+                .SetProperty(value => value.OpenGrabKey, (string?)null).SetProperty(value => value.CompletedAt, DateTime.UtcNow));
+        var failDeletesBefore = transmission.RemoveDeletedData.Count;
+        var removedFail = await ReadAsync(await admin.SendAsync(Remove(waitingFail.Id, new { removeFromClient = true, deleteFiles = true })),
+            200, "Remove a failed row not yet imported and delete its files");
+        Assert(removedFail.GetProperty("state").GetString() == "cancelled" && !transmission.Torrents.ContainsKey(hashFail) && !File.Exists(partialFail) &&
+            transmission.RemoveDeletedData.Skip(failDeletesBefore).SequenceEqual([true]),
+            $"The client forgot the failed row's torrent and deleted its partial file: torrent {transmission.Torrents.ContainsKey(hashFail)}, " +
+            $"file {File.Exists(partialFail)}, delete-data [{string.Join(",", transmission.RemoveDeletedData.Skip(failDeletesBefore))}]");
+
+        // ---------------- An imported, seeding download whose torrent was removed outside the plugin: deleting is asked for, and
+        // the row goes with nothing deleted and nothing refused (Codex review 2026-10-26, P2 7).
+        var fixtureGone = Fixture("movieGone", "Gone.Movie.2021.1080p.WEB-DL-GRP", "0000134");
+        var (grabGone, hashGone) = await GrabAsync(admin, ids["movieGone"], null, fixtureGone);
+        transmission.Progress(hashGone, 1.0);
+        var completedGone = await CompleteAsync(dbPath, grabGone, tick);
+        var seedingGone = completedGone.SourceLocalPath!;
+        var libraryGone = completedGone.DestinationPath!;
+        var goneLinks = Links(libraryGone);
+        Assert(goneLinks == 2, $"The gone movie's import is a hardlink: {goneLinks}");
+        Assert(Row(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue")), completedGone.Id).GetProperty("state").GetString() == "seeding",
+            "The gone movie is seeding in the queue");
+        // As a seed release leaves it when its torrent-remove went through and then timed out: removing, the torrent gone.
+        Assert(transmission.Torrents.TryRemove(hashGone, out _), "The torrent is removed in the client");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedGone.Id);
+            seed.State = SeedReleaseStates.Removing;
+            seed.Reason = null;
+            seed.RemovingAt = DateTime.UtcNow;
+            await database.SaveChangesAsync();
+        }
+
+        await ExpectAsync(admin.SendAsync(Remove(completedGone.Id, new { removeFromClient = true, deleteFiles = false })), 409,
+            "seed_release_in_progress", "A removal that deletes nothing still waits for the seeding copy's release");
+        var goneRemovalsBefore = transmission.RemoveCalls;
+        var removedGone = await admin.SendAsync(Remove(completedGone.Id, new { removeFromClient = true, deleteFiles = true }));
+        var removedGoneBody = await removedGone.Content.ReadAsStringAsync();
+        Assert((int)removedGone.StatusCode == 200 && transmission.RemoveCalls == goneRemovalsBefore && File.Exists(seedingGone) &&
+            File.Exists(libraryGone) && Links(libraryGone) == goneLinks,
+            $"A torrent the client no longer has is not refused and nothing is deleted: {(int)removedGone.StatusCode} {removedGoneBody}, " +
+            $"remove calls {transmission.RemoveCalls - goneRemovalsBefore}, links {Links(libraryGone)}");
+        Assert(!Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue")).GetProperty("items").EnumerateArray()
+                .Any(row => row.GetProperty("id").AsGuid() == completedGone.Id),
+            "The gone movie's row left the queue");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var history = await database.History.AsNoTracking().SingleAsync(value => value.EntryId == ids["movieGone"] && value.EventType == "queue_removed");
+            Assert(history.Summary!.StartsWith("Removed from the queue; the download client no longer had the torrent, so nothing was deleted: ",
+                    StringComparison.Ordinal) && history.Data!.Contains("\"deleteFiles\":false", StringComparison.Ordinal),
+                "The history says nothing was deleted: " + history.Summary);
+        }
+
         // ---------------- An imported download: refused, with the library file, the seeding file and their link count unchanged.
         var fixtureKeep = Fixture("movieKeep", "Keep.Movie.2021.1080p.WEB-DL-GRP", "0000132");
         var (grabKeep, hashKeep) = await GrabAsync(admin, ids["movieKeep"], null, fixtureKeep);
@@ -101,6 +171,32 @@ internal static partial class Phase5
         var removalsBefore = transmission.RemoveCalls;
         await ExpectAsync(admin.SendAsync(Remove(completedKeep.Id, new { removeFromClient = true, deleteFiles = true })), 409, "delete_not_allowed",
             "An imported download's files are never deleted");
+
+        // The same while its seeding copy is being released and the client still has the torrent: delete_not_allowed, nothing
+        // changed; the release is then put back as it was.
+        string keepState;
+        string? keepReason;
+        DateTime? keepRemovingAt;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedKeep.Id);
+            (keepState, keepReason, keepRemovingAt) = (seed.State, seed.Reason, seed.RemovingAt);
+            seed.State = SeedReleaseStates.Removing;
+            seed.Reason = null;
+            seed.RemovingAt = DateTime.UtcNow;
+            await database.SaveChangesAsync();
+        }
+
+        await ExpectAsync(admin.SendAsync(Remove(completedKeep.Id, new { removeFromClient = true, deleteFiles = true })), 409, "delete_not_allowed",
+            "A download whose seeding copy is being released, its torrent still in the client, is never deleted");
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var seed = await database.SeedReleaseOperations.SingleAsync(value => value.ImportOperationId == completedKeep.Id);
+            Assert(seed.State == SeedReleaseStates.Removing, "The refused removal left the release as it was: " + seed.State);
+            (seed.State, seed.Reason, seed.RemovingAt) = (keepState, keepReason, keepRemovingAt);
+            await database.SaveChangesAsync();
+        }
+
         Assert(transmission.Torrents.ContainsKey(hashKeep) && transmission.RemoveCalls == removalsBefore && File.Exists(seedingKeep) &&
             File.Exists(libraryKeep) && Links(seedingKeep) == linksBefore && Links(libraryKeep) == linksBefore,
             $"The refused removal kept the torrent, the seeding file and the library file, still {Links(seedingKeep)} links");

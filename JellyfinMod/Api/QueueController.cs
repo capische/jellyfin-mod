@@ -299,17 +299,15 @@ public sealed class QueueController(
             : await database.SeedReleaseOperations.Where(value => value.ImportOperationId == id && SeedReleaseStates.Open.Contains(value.State))
                 .ToListAsync(cancellationToken);
         if (removed.Count == 0 && removedSeeds.Count == 0) return Refuse(409, "not_in_queue", "This import is no longer in the queue.");
-        if (removedSeeds.Any(value => value.State == SeedReleaseStates.Removing))
+        // A seeding copy being released waits for that release; a deleting removal asks the client first, so a release that
+        // removed the torrent and then timed out does not hold it up, and one whose torrent is still there is refused below as
+        // delete_not_allowed (Codex review of the P2 fixes, 2026-10-27).
+        if (!request.DeleteFiles && removedSeeds.Any(value => value.State == SeedReleaseStates.Removing))
             return Refuse(409, "seed_release_in_progress", "The seeding copy is being released; try again shortly.");
-        // Deleting the downloaded files (user, 2026-10-26) is the client's delete-with-data, so it needs the client removal, and
-        // only a download none of whose files reached the library: no import of this grab or of this torrent ever recorded a
-        // destination, linked or bound, and no seed release exists for either (for a pack, none of its episodes). Refused, never
-        // quietly downgraded to keeping the files.
+        // Deleting the downloaded files (user, 2026-10-26; Transmission's own delete-local-data, user, 2026-10-27) is the client's
+        // delete-with-data, so it needs the client removal.
         if (request.DeleteFiles && !request.RemoveFromClient)
             return Refuse(409, DeleteNotAllowed, "Deleting the downloaded files also removes the torrent from the client.");
-        if (request.DeleteFiles && (removedSeeds.Count > 0 || await AnyImportedAsync(operation, cancellationToken)))
-            return Refuse(409, DeleteNotAllowed,
-                "Part of this download is already in your library, so its files cannot be deleted; remove it without deleting them.");
 
         var removedFromClient = false;
         var deletedFiles = false;
@@ -319,14 +317,26 @@ public sealed class QueueController(
                 .SingleOrDefaultAsync(value => value.Id == operation.DownloadClientId, cancellationToken);
             if (client is null || drivers.Get(client.Kind) is not { } driver)
                 return Refuse(409, ImportReasons.ClientMissing, "The download client is no longer configured.");
-            var snapshot = await imports.SnapshotAsync(client.Id, TimeSpan.Zero, cancellationToken);
+            // The removed row's own torrent is always asked for: a failed row is not among the tracked hashes, and leaving it
+            // out would read as the client no longer having it (Codex review 2026-10-26, P2 6).
+            var snapshot = await imports.SnapshotAsync(client.Id, TimeSpan.Zero, cancellationToken, operation.InfoHash);
             if (!snapshot.Reachable)
                 return Refuse(503, ImportReasons.ClientUnreachable, "The download client cannot be reached; nothing was changed.");
+            // A torrent the client no longer has is not deleted, so the row goes with nothing refused (Codex review 2026-10-26,
+            // P2 7); every check below applies only to a torrent the client still holds.
             if (snapshot.Find(operation.InfoHash) is { } torrent)
             {
-                // Only a torrent this plugin added, and never one whose data lies in a library folder.
+                // Its files are deleted only while none of them reached the library: no import of this grab or of this torrent
+                // ever recorded a destination, linked or bound, and no seed release exists for either (for a pack, none of its
+                // episodes). Refused, never quietly downgraded to keeping the files.
+                if (request.DeleteFiles && (removedSeeds.Count > 0 || await AnyImportedAsync(operation, cancellationToken)))
+                    return Refuse(409, DeleteNotAllowed,
+                        "Part of this download is already in your library, so its files cannot be deleted; remove it without deleting them.");
+                // Only a torrent this plugin added, and never one whose data lies in a library folder. A removal that would
+                // delete files is refused as delete_not_allowed (review P3 9).
                 if (grab is null || !torrent.Labels.Contains(GrabService.OwnerLabel(grab.Id), StringComparer.Ordinal))
-                    return Refuse(409, SeedReleaseReasons.NotOwned, "JellyfinMod did not add this torrent; remove it in the client.");
+                    return Refuse(409, request.DeleteFiles ? DeleteNotAllowed : SeedReleaseReasons.NotOwned,
+                        "JellyfinMod did not add this torrent; remove it in the client.");
                 var mappings = await database.DownloadClientPathMappings.AsNoTracking()
                     .Where(mapping => mapping.DownloadClientId == client.Id).ToListAsync(cancellationToken);
                 // Every path the removal deletes, resolved through every symbolic link: an alias in the download folder that
@@ -334,7 +344,7 @@ public sealed class QueueController(
                 var dataPaths = ImportPaths.ResolveTorrentData(torrent, mappings, client, files);
                 var verified = dataPaths is null ? null : TorrentDataRemoval.Inspect(torrent, dataPaths, files);
                 if (dataPaths is null || verified is null || dataPaths.Any(InsideLibrary) || verified.Any(file => InsideLibrary(file.Path)))
-                    return Refuse(409, SeedReleaseReasons.SeedingInsideLibrary,
+                    return Refuse(409, request.DeleteFiles ? DeleteNotAllowed : SeedReleaseReasons.SeedingInsideLibrary,
                         "The torrent's data is not in a mapped download folder outside every library; remove it in the client.");
                 // A downloaded file with a second name somewhere (a hardlink the records do not know of) is never deleted.
                 if (request.DeleteFiles && verified.Any(file => !files.TryInspect(file.Path, out var current) || current.HardlinkCount > 1))
