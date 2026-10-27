@@ -226,6 +226,11 @@ public sealed class GrabService(
         // the current blocklist is read again with the resolved hash (whole-review chunk 2a, P2 5).
         if (await BlocklistedAsync(locator.InfoHash, candidate.IndexerId, candidate.SourceGuid, cancellationToken).ConfigureAwait(false))
             throw new GrabException(409, "release_blocklisted", "An administrator blocked this release; it is not grabbed again.");
+        // The torrent this plugin still seeds for this title, whose library file was deleted since, is imported again from the
+        // seeding copy instead of being downloaded twice (user, 2026-10-28).
+        if (!pack && !addVersion && !request.Automatic &&
+            await ReimportAsync(entry, episode, libraryId, client.Id, locator.InfoHash, cancellationToken).ConfigureAwait(false) is { } reimported)
+            return (reimported, false);
 
         var now = Now;
         var operation = new GrabOperation
@@ -311,6 +316,81 @@ public sealed class GrabService(
         vault.Put(operation.Id, locator);
         logger.LogInformation("Held grab {Operation} for {Entry} until {HoldUntil}", operation.Id, entry.Id, operation.HoldUntil);
         return (operation, true);
+    }
+
+    /// <summary>
+    /// Imports a release again from the copy the client still seeds (user, 2026-10-28): a grab of a torrent that an earlier grab
+    /// of the same title still owns in the client (its hash still held), whose import completed and none is open, starts a new
+    /// import of that earlier grab instead of a second download, which the client would refuse as a duplicate anyway. The
+    /// earlier grab holds the title again while the import runs, so the picker follows it as its added row, and the finished
+    /// import's seed release is closed, so the queue shows the one new row and the new import's seed release takes over. A grab
+    /// already importing the copy is returned as it is. Null when the torrent is not such a copy (another title, a pack, a seed
+    /// release under way, nothing imported yet): the grab goes on as before.
+    /// </summary>
+    private async Task<GrabOperation?> ReimportAsync(Entry entry, Episode? episode, Guid libraryId, Guid clientId, string infoHash,
+        CancellationToken cancellationToken)
+    {
+        var hashKey = HashKey(clientId, infoHash);
+        var targetKey = TargetKey(entry.Id, episode?.Id);
+        if (!await database.GrabOperations.AsNoTracking().AnyAsync(value => value.ActiveHash == hashKey, cancellationToken).ConfigureAwait(false))
+            return null;
+        GrabOperation owner;
+        ImportOperation import;
+        await using (await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false))
+        {
+            await AdmissionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var found = await database.GrabOperations.SingleOrDefaultAsync(value => value.ActiveHash == hashKey, cancellationToken)
+                    .ConfigureAwait(false);
+                if (found is null || found.State != GrabStates.Accepted || ReleaseScopes.IsPack(found.Scope) || found.EntryId != entry.Id ||
+                    found.EpisodeId != episode?.Id)
+                    return null;
+                owner = found;
+                var imports = await database.ImportOperations.Where(value => value.GrabId == owner.Id).ToListAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                if (imports.Any(value => ImportStates.Open.Contains(value.State))) return owner;
+                if (owner.ActiveTarget is not null || !imports.Any(value => value.State == ImportStates.Completed)) return null;
+                var seeds = await database.SeedReleaseOperations
+                    .Where(value => value.GrabId == owner.Id && SeedReleaseStates.Open.Contains(value.State)).ToListAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                // A seeding copy being released may be gone from the client any moment: never imported from.
+                if (seeds.Any(value => value.State == SeedReleaseStates.Removing)) return null;
+                var now = Now;
+                import = await Import.ImportService.CreateForGrabAsync(database, owner, now, cancellationToken).ConfigureAwait(false)
+                    ?? throw new GrabException(404, "target_not_found", "The title is not available.");
+                import.Intent = GrabIntents.Acquire;
+                owner.ActiveTarget = targetKey;
+                owner.UpdatedAt = now;
+                foreach (var seed in seeds)
+                {
+                    seed.State = SeedReleaseStates.Cancelled;
+                    seed.Reason = SeedReleaseReasons.Reimported;
+                    seed.CompletedAt = seed.UpdatedAt = now;
+                }
+
+                try
+                {
+                    await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (DbUpdateException error) when (error.InnerException is SqliteException { SqliteErrorCode: 19 })
+                {
+                    database.ChangeTracker.Clear();
+                    var holder = await database.GrabOperations.AsNoTracking()
+                        .FirstOrDefaultAsync(value => value.ActiveTarget == targetKey, cancellationToken)
+                        .ConfigureAwait(false);
+                    throw new GrabException(409, "grab_active", "Another grab for this title is still active.", holder?.Id);
+                }
+            }
+            finally
+            {
+                AdmissionGate.Release();
+            }
+        }
+
+        logger.LogInformation("Grab {Operation} imports {Entry} again from its seeding copy (import {Import})", owner.Id, entry.Id, import.Id);
+        importMonitor?.Wake();
+        return owner;
     }
 
     /// <summary>

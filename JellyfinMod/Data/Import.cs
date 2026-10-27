@@ -413,6 +413,11 @@ public static class SeedReleaseReasons
     /// <summary>Removed from the queue.</summary>
     public const string Cancelled = "cancelled";
 
+    /// <summary>
+    /// Closed because the same seeding copy is imported again (user, 2026-10-28): the new import's own seed release takes over.
+    /// </summary>
+    public const string Reimported = "reimported";
+
     /// <summary>Detached; its checked files wait for the administrator's manual cleanup.</summary>
     public const string CleanupPending = "cleanup_pending";
 
