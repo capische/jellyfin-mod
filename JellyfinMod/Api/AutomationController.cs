@@ -171,6 +171,7 @@ public sealed class AutomationController(
         settings.DecisionLogCap = request.DecisionLogCap;
         settings.EpisodeUpgradesEnabled = request.EpisodeUpgradesEnabled;
         settings.ReacquireReclaimed = request.ReacquireReclaimed;
+        if (request.FetchPhoneCopies is { } fetch) settings.FetchPhoneCopies = fetch;
         settings.AutomationRevision++;
         await database.SaveChangesAsync(cancellationToken);
         return ToDto(settings);
@@ -179,7 +180,7 @@ public sealed class AutomationController(
     private static AutomationSettingsDto ToDto(AcquisitionSettings settings) => new(settings.AutomationEnabled,
         settings.AutomationIntervalHours, settings.AutomationBatchSize, settings.NewEpisodeDelayMinutes, settings.DailyAutoGrabBudget,
         settings.MaxConcurrentImports, settings.FreeSpaceFloorPercent, settings.FreeSpaceFloorBytes, settings.DecisionLogCap,
-        settings.EpisodeUpgradesEnabled, settings.ReacquireReclaimed, settings.AutomationRevision);
+        settings.EpisodeUpgradesEnabled, settings.ReacquireReclaimed, settings.AutomationRevision, settings.FetchPhoneCopies);
 
     private static DateTime? Utc(DateTime? value) => value is { } date && date != DateTime.MaxValue
         ? DateTime.SpecifyKind(date, DateTimeKind.Utc) : null;

@@ -29,6 +29,8 @@ try
 {
     try
     {
+        // Phase 12 M36 on its own database and host first; Phase 6 then sets up its own world.
+        await PhoneCopiesScenario.RunAsync(folder, logs);
         await Phase6.RunAsync(folder, logs);
     }
     catch

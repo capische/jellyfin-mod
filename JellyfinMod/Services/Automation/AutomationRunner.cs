@@ -46,9 +46,12 @@ public sealed class AutomationRunAlreadyActiveException : InvalidOperationExcept
 
 /// <summary>One searchable target of a run.</summary>
 internal sealed record AutomationTarget(Guid TargetId, Entry Entry, Episode? Episode, AcquisitionQualityProfile Profile, bool Inherited,
-    UpgradeAssessment? Upgrade)
+    UpgradeAssessment? Upgrade, bool PhoneCopy = false, bool PhoneCopyRemoved = false)
 {
     public bool IsUpgrade => Upgrade is { Eligible: true };
+
+    /// <summary>Gets a value indicating whether the target holds a file and needs one: an upgrade or the missing phone copy.</summary>
+    public bool OnDisk => IsUpgrade || PhoneCopy;
 }
 
 /// <summary>
@@ -265,7 +268,7 @@ public sealed class AutomationRunner(
         if (!entry.Monitored) return false;
         if (target.Episode is not null && episode is not { Monitored: true }) return false;
         var state = episode?.State ?? entry.State;
-        return target.IsUpgrade ? state == FileState.OnDisk : state != FileState.OnDisk;
+        return target.OnDisk ? state == FileState.OnDisk : state != FileState.OnDisk;
     }
 
     /// <summary>Checks budgets, searches, picks and grabs for one target, recording exactly one decision.</summary>
@@ -297,6 +300,13 @@ public sealed class AutomationRunner(
                 cancellationToken).ConfigureAwait(false) ||
             await database.UpgradeOperations.AnyAsync(upgrade => upgrade.OpenTargetKey == targetKey, cancellationToken).ConfigureAwait(false))
             return Skip(run, target, row, AutomationReasons.ActiveGrabExists, null, retryIn: TimeSpan.FromHours(1));
+        // A copy for phones (Phase 12 M36): never one that was removed (Q6), and none once the title holds a file at 1080p or below.
+        if (target.PhoneCopyRemoved)
+            return Skip(run, target, row, AutomationReasons.PhoneCopyRemoved,
+                "A file at 1080p or below was removed from this title; it is not fetched again.", retryIn: MaxBackoff);
+        if (target.PhoneCopy &&
+            !await PhoneCopies.MissingAsync(database, target.Entry.Id, target.Episode?.Id, library, cancellationToken).ConfigureAwait(false))
+            return Skip(run, target, row, AutomationReasons.PhoneCopyHeld, null, retryIn: MaxBackoff);
         if (grabsToday >= Math.Max(0, settings.DailyAutoGrabBudget))
             return Skip(run, target, row, AutomationReasons.BudgetGrabs, "The daily automatic grab budget is used up.",
                 retryIn: now.Date.AddDays(1) - now, kind: AutomationDecisionKinds.BudgetExhausted);
@@ -334,18 +344,16 @@ public sealed class AutomationRunner(
         using (var scope = scopes.CreateScope())
         {
             var search = scope.ServiceProvider.GetRequiredService<ReleaseSearchService>();
-            var held = target.IsUpgrade
+            var held = target.OnDisk
                 ? (await VersionQuality.HeldAsync(database, target.Entry.Id, target.Episode?.Id, cancellationToken, library).ConfigureAwait(false))
                     .Select(version => version.Quality).OfType<string>().ToHashSet(StringComparer.Ordinal)
                 : new HashSet<string>(StringComparer.Ordinal);
             try
             {
                 snapshot = await search.SearchAsync(GrabService.AutomationUserId, ReleaseTargets.For(target.Entry, target.Episode),
-                    new EvaluationProfile(target.Profile.Id, target.Profile.Name, target.Profile.Revision,
-                        AcquisitionConfiguration.Qualities(target.Profile), target.Profile.MinimumBytesPerHour,
-                        target.Profile.MaximumBytesPerHour),
+                    EvaluationProfile.From(target.Profile, settings),
                     target.Inherited, settings.Revision, cancellationToken,
-                    new ReleaseSearchOptions(target.IsUpgrade ? GrabIntents.AddVersion : GrabIntents.Acquire, held)).ConfigureAwait(false);
+                    new ReleaseSearchOptions(target.OnDisk ? GrabIntents.AddVersion : GrabIntents.Acquire, held)).ConfigureAwait(false);
             }
             catch (Exception error) when (error is TorznabException or HttpRequestException or DbUpdateException)
             {
@@ -371,7 +379,9 @@ public sealed class AutomationRunner(
         var eligible = snapshot.Candidates.Where(candidate => candidate.Evaluation.Eligible &&
                 (candidate.Evaluation.Identity == "verified" ||
                  candidate.Evaluation.Identity == "title" && titleMatchIndexers.Contains(candidate.IndexerId)) &&
-                (!target.IsUpgrade || VersionQuality.ProfileIndex(qualities, candidate.Parsed.Quality) < heldIndex))
+                (!target.IsUpgrade || VersionQuality.ProfileIndex(qualities, candidate.Parsed.Quality) < heldIndex) &&
+                // The copy for phones is a file at 1080p or below, whatever the chosen profile allows.
+                (!target.PhoneCopy || PhoneCopies.Fits(candidate.Parsed.Resolution)))
             .ToArray();
         if (eligible.Length == 0)
         {
@@ -444,7 +454,11 @@ public sealed class AutomationRunner(
                 Id = id, EntryId = target.Entry.Id, EpisodeId = target.Episode?.Id, OpenTargetKey = GrabService.TargetKey(target.Entry.Id, target.Episode?.Id),
                 SupersededBindingId = target.Upgrade!.Superseded!.BindingId, SupersededPath = target.Upgrade.Superseded.MediaPath,
                 SupersededQuality = target.Upgrade.HeldBest,
-                NewQuality = best.Parsed.Quality, NewGrabId = grab.Id, Mode = target.Profile.UpgradeMode == "add" ? "add" : "replace",
+                NewQuality = best.Parsed.Quality, NewGrabId = grab.Id,
+                // While copies for phones are fetched, an upgrade from a file at 1080p or below to one above it adds, so the old
+                // file stays as the phone copy (Phase 12 M36).
+                Mode = target.Profile.UpgradeMode == "add" || settings.FetchPhoneCopies && PhoneCopies.Fits(target.Upgrade.Superseded.Resolution) &&
+                    !PhoneCopies.Fits(best.Parsed.Resolution) ? "add" : "replace",
                 State = UpgradeStates.Planned, CreatedAt = now, UpdatedAt = now
             });
             run.UpgradesPlanned++;
@@ -456,8 +470,8 @@ public sealed class AutomationRunner(
 
         run.Grabbed++;
         row.LastOutcome = AutomationReasons.Grabbed;
-        Record(run, target, AutomationDecisionKinds.Grabbed, AutomationReasons.Grabbed, best.RawTitle, grabId: grab.Id,
-            indexerId: best.IndexerId);
+        Record(run, target, AutomationDecisionKinds.Grabbed, AutomationReasons.Grabbed,
+            target.PhoneCopy ? "Copy for phones: " + best.RawTitle : best.RawTitle, grabId: grab.Id, indexerId: best.IndexerId);
         return AutomationReasons.Grabbed;
     }
 
@@ -481,16 +495,31 @@ public sealed class AutomationRunner(
         var episodes = await database.Episodes.AsNoTracking().Where(value => value.EntryId == entry.Id).ToListAsync(cancellationToken)
             .ConfigureAwait(false);
         var seasonEpisodes = episodes.Where(value => value.SeasonNumber == season).ToArray();
+        // A copy for phones (Phase 12 M36): a season whose every episode holds files and none at 1080p or below gets a pack added
+        // beside them; an episode without a file would be filled by the pack too, so such a season is searched episode by episode.
+        var phone = target.PhoneCopy;
+        var phoneWanted = new HashSet<Guid>();
+        if (phone)
+        {
+            if (seasonEpisodes.Any(value => value.State != FileState.OnDisk)) return null;
+            foreach (var value in seasonEpisodes.Where(value => value.Monitored))
+                if (await PhoneCopies.MissingAsync(database, entry.Id, value.Id, library, cancellationToken).ConfigureAwait(false) &&
+                    !await PhoneCopies.RemovedAsync(database, entry.Id, value.Id, cancellationToken).ConfigureAwait(false))
+                    phoneWanted.Add(value.Id);
+        }
+
         // An episode another grab already holds (its own or a pack's) is not missing for this purpose.
-        var keys = seasonEpisodes.Select(value => GrabService.TargetKey(entry.Id, value.Id)).ToArray();
+        var suffix = phone ? "+add" : string.Empty;
+        var keys = seasonEpisodes.Select(value => GrabService.TargetKey(entry.Id, value.Id) + suffix).ToArray();
         var taken = (await database.GrabOperations.AsNoTracking().Where(grab => grab.ActiveTarget != null && keys.Contains(grab.ActiveTarget))
                 .Select(grab => grab.ActiveTarget!).ToListAsync(cancellationToken).ConfigureAwait(false))
             .Concat(await database.GrabClaims.AsNoTracking().Where(claim => claim.ActiveKey != null && keys.Contains(claim.ActiveKey))
                 .Select(claim => claim.ActiveKey!).ToListAsync(cancellationToken).ConfigureAwait(false))
             .ToHashSet(StringComparer.Ordinal);
-        bool Wanted(Episode value) => value.Monitored && value.State != FileState.OnDisk &&
-            (value.State != FileState.Reclaimed || settings.ReacquireReclaimed) &&
-            !taken.Contains(GrabService.TargetKey(entry.Id, value.Id));
+        bool Wanted(Episode value) => (phone
+                ? phoneWanted.Contains(value.Id) && value.State == FileState.OnDisk
+                : value.Monitored && value.State != FileState.OnDisk && (value.State != FileState.Reclaimed || settings.ReacquireReclaimed)) &&
+            !taken.Contains(GrabService.TargetKey(entry.Id, value.Id) + suffix);
         if (season <= 0 || seasonEpisodes.Length == 0 ||
             seasonEpisodes.Any(value => value.AirDate is not { } aired || aired.AddMinutes(Math.Max(0, settings.NewEpisodeDelayMinutes)) > now) ||
             seasonEpisodes.Count(Wanted) < PackMinimumMissing)
@@ -507,9 +536,7 @@ public sealed class AutomationRunner(
             {
                 snapshot = await scope.ServiceProvider.GetRequiredService<ReleaseSearchService>().SearchAsync(GrabService.AutomationUserId,
                     ReleaseTargets.ForPack(entry, ReleaseScopes.Season, season, covered, episodes),
-                    new EvaluationProfile(target.Profile.Id, target.Profile.Name, target.Profile.Revision,
-                        AcquisitionConfiguration.Qualities(target.Profile), target.Profile.MinimumBytesPerHour,
-                        target.Profile.MaximumBytesPerHour),
+                    EvaluationProfile.From(target.Profile, settings),
                     target.Inherited, settings.Revision, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception error) when (error is TorznabException or HttpRequestException or DbUpdateException)
@@ -530,7 +557,8 @@ public sealed class AutomationRunner(
             (candidate.Evaluation.Identity == "verified" ||
              candidate.Evaluation.Identity == "title" && titleMatchIndexers.Contains(candidate.IndexerId)) &&
             (target.Profile.MinimumAutoScore is not { } score || candidate.Evaluation.Score >= score) &&
-            (target.Profile.MinimumSeeders is not { } seeders || (candidate.Seeders ?? 0) >= seeders));
+            (target.Profile.MinimumSeeders is not { } seeders || (candidate.Seeders ?? 0) >= seeders) &&
+            (!phone || PhoneCopies.Fits(candidate.Parsed.Resolution)));
         if (best is null)
         {
             // The episode's own search follows and records the step's one decision.
@@ -547,7 +575,8 @@ public sealed class AutomationRunner(
             {
                 var (operation, created) = await scope.ServiceProvider.GetRequiredService<GrabService>().CreateAsync(
                     GrabService.AutomationUserId,
-                    new GrabRequest(snapshot.SearchId, best.ReleaseId, $"auto-{run.Id:N}-pack-{entry.Id:N}-{season}", true, null, GrabModes.Fill),
+                    new GrabRequest(snapshot.SearchId, best.ReleaseId, $"auto-{run.Id:N}-pack-{entry.Id:N}-{season}{(phone ? "-phones" : "")}", true,
+                        null, phone ? GrabModes.Add : GrabModes.Fill),
                     (current, episode) => current.Monitored && (episode is null || Wanted(episode)), cancellationToken,
                     async token => await OpenImportsAsync(token).ConfigureAwait(false) + wantedCount > Math.Max(0, settings.MaxConcurrentImports)
                         ? "too_many_open_imports" : null).ConfigureAwait(false);
@@ -572,7 +601,8 @@ public sealed class AutomationRunner(
         row.NextSearchAt = now + FirstBackoff;
         run.Grabbed++;
         row.LastOutcome = AutomationReasons.Grabbed;
-        Record(run, target, AutomationDecisionKinds.Grabbed, AutomationReasons.Grabbed, $"Season {season} pack: {best.RawTitle}",
+        Record(run, target, AutomationDecisionKinds.Grabbed, AutomationReasons.Grabbed,
+            $"Season {season} pack{(phone ? " for phones" : "")}: {best.RawTitle}",
             grabId: grab.Id, indexerId: best.IndexerId);
         return AutomationReasons.Grabbed;
     }
@@ -623,6 +653,7 @@ public sealed class AutomationRunner(
         var profiles = await database.AcquisitionQualityProfiles.AsNoTracking().ToDictionaryAsync(profile => profile.Id, cancellationToken)
             .ConfigureAwait(false);
         var liveLibraries = LiveLibraries();
+        var phoneProfile = settings.PhoneProfileId is { } phoneId ? profiles.GetValueOrDefault(phoneId) : null;
         var entries = await database.Entries.AsNoTracking().Where(entry => entry.Monitored && entry.TargetLibraryId != null)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         var targets = new List<AutomationTarget>();
@@ -633,7 +664,8 @@ public sealed class AutomationRunner(
             var inherited = entry.QualityProfileId is null;
             if (entry.MediaType == "movie")
             {
-                var target = await TargetAsync(entry, null, entry.State, profile, inherited, settings, cancellationToken).ConfigureAwait(false);
+                var target = await TargetAsync(entry, null, entry.State, profile, inherited, settings, cancellationToken, phoneProfile)
+                    .ConfigureAwait(false);
                 if (target is not null) targets.Add(target);
                 continue;
             }
@@ -644,7 +676,8 @@ public sealed class AutomationRunner(
             foreach (var episode in episodes.Where(episode =>
                          episode.AirDate!.Value.AddMinutes(Math.Max(0, settings.NewEpisodeDelayMinutes)) <= now))
             {
-                var target = await TargetAsync(entry, episode, episode.State, profile, inherited, settings, cancellationToken).ConfigureAwait(false);
+                var target = await TargetAsync(entry, episode, episode.State, profile, inherited, settings, cancellationToken, phoneProfile)
+                    .ConfigureAwait(false);
                 if (target is not null) targets.Add(target);
             }
         }
@@ -653,14 +686,21 @@ public sealed class AutomationRunner(
     }
 
     private async Task<AutomationTarget?> TargetAsync(Entry entry, Episode? episode, FileState fileState, AcquisitionQualityProfile profile,
-        bool inherited, AcquisitionSettings settings, CancellationToken cancellationToken)
+        bool inherited, AcquisitionSettings settings, CancellationToken cancellationToken, AcquisitionQualityProfile? phoneProfile = null)
     {
         var targetId = episode?.Id ?? entry.Id;
         if (fileState == FileState.OnDisk)
         {
             var held = await VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken, library).ConfigureAwait(false);
             var assessment = UpgradeAssessment.For(profile, held, episode is not null, settings.EpisodeUpgradesEnabled);
-            return assessment.Eligible ? new AutomationTarget(targetId, entry, episode, profile, inherited, assessment) : null;
+            if (assessment.Eligible) return new AutomationTarget(targetId, entry, episode, profile, inherited, assessment);
+            // Also get a 1080p copy for phones (Phase 12 M36): a title whose files are all above 1080p is searched with the quality
+            // profile for phones and the release added beside them. A multi-episode file is never given a single-episode version.
+            if (!settings.FetchPhoneCopies || phoneProfile is null || held.Any(version => version.MultiEpisode) ||
+                !await PhoneCopies.MissingAsync(database, entry.Id, episode?.Id, library, cancellationToken).ConfigureAwait(false))
+                return null;
+            var removed = await PhoneCopies.RemovedAsync(database, entry.Id, episode?.Id, cancellationToken).ConfigureAwait(false);
+            return new AutomationTarget(targetId, entry, episode, phoneProfile, false, null, PhoneCopy: !removed, PhoneCopyRemoved: removed);
         }
 
         if (fileState == FileState.Reclaimed && !settings.ReacquireReclaimed) return null;

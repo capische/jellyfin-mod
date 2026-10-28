@@ -105,6 +105,12 @@ public static class AutomationReasons
     /// <summary>A release was grabbed.</summary>
     public const string Grabbed = "grabbed";
 
+    /// <summary>The title already holds a file at 1080p or below, so no copy for phones is fetched (Phase 12 M36).</summary>
+    public const string PhoneCopyHeld = "phone_copy_held";
+
+    /// <summary>A file at 1080p or below was removed from this title by retention or by Remove This Version; it is never fetched again (Q6).</summary>
+    public const string PhoneCopyRemoved = "phone_copy_removed";
+
     /// <summary>An upgrade was planned.</summary>
     public const string UpgradePlanned = "upgrade_planned";
 
