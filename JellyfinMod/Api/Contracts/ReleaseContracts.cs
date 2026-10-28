@@ -60,15 +60,17 @@ public sealed record ReleaseProfileDto(
 /// <param name="ActiveOperationId">The grab that holds the target, or null.</param>
 /// <param name="Modes">
 /// The grab modes this search's rows may offer (user, 2026-10-09): <c>fill</c> for a title or episode without a file,
-/// <c>add</c> for another version beside what is held, and <c>replace</c> only while episode upgrades are on. A web client
-/// that finds no list offers what it did before.
+/// <c>add</c> for another version beside what is held, and <c>replace</c> only while the "Upgrade episodes and allow Replace"
+/// switch is on. A web client that finds no list offers what it did before.
 /// </param>
+/// <param name="HeldFiles">For a movie's another version, how many files the movie holds: what Replace removes. Absent otherwise.</param>
 public sealed record GrabAvailabilityDto(
     [property: JsonPropertyName("available")] bool Available,
     [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Reason,
     [property: JsonPropertyName("holdSeconds")] int HoldSeconds,
     [property: JsonPropertyName("activeOperationId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? ActiveOperationId,
-    [property: JsonPropertyName("modes")] IReadOnlyList<string> Modes);
+    [property: JsonPropertyName("modes")] IReadOnlyList<string> Modes,
+    [property: JsonPropertyName("heldFiles")] int? HeldFiles = null);
 
 /// <summary>One per-indexer search outcome.</summary>
 public sealed record IndexerOutcomeDto(

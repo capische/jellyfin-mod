@@ -150,9 +150,9 @@ public sealed class GrabService(
             throw new GrabException(400, "invalid_mode", "The mode must be fill, add or replace.");
         var pack = ReleaseScopes.IsPack(target.Scope);
         if (!pack && request.Mode is { } asked && asked != (addVersion ? GrabModes.Add : GrabModes.Fill) &&
-            !(addVersion && asked == GrabModes.Replace && target.EpisodeId is not null))
+            !(addVersion && asked == GrabModes.Replace))
             throw new GrabException(400, "invalid_mode", addVersion
-                ? "Another version of an episode is added or replaces what is held; a movie's is added."
+                ? "Another version is added or replaces what is held."
                 : "This grab fills a title without a file.");
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == target.EntryId, cancellationToken)
             .ConfigureAwait(false);
@@ -165,7 +165,8 @@ public sealed class GrabService(
             throw new GrabException(404, "target_not_found", "The title is not available.");
 
         var state = await configuration.GetStateAsync(database, cancellationToken).ConfigureAwait(false);
-        // Adding another version by hand never needs episode upgrades; replacing what is held does (user, 2026-10-09).
+        // Adding another version by hand never needs the switch; replacing what is held does, for a movie too (user, 2026-10-09
+        // and 2026-10-28).
         if (request.Mode == GrabModes.Replace && !state.Settings.EpisodeUpgradesEnabled)
             throw new GrabException(409, ReplaceDisabled, ReplaceDisabledMessage);
         // A pack claims the episodes it will write: the missing ones to fill, every covered one to add or replace.
@@ -1020,23 +1021,26 @@ public sealed class GrabService(
         };
     }
 
-    /// <summary>The refusal of a replace grab while episode upgrades are off (user, 2026-10-09).</summary>
+    /// <summary>
+    /// The refusal of a replace grab while the "Upgrade episodes and allow Replace" switch (<c>episodeUpgradesEnabled</c>) is
+    /// off (user, 2026-10-09; a movie's Replace too, 2026-10-28). The code keeps its old name for older web clients.
+    /// </summary>
     public const string ReplaceDisabled = "episode_replace_disabled";
 
     private const string ReplaceDisabledMessage =
-        "Replacing an episode's file needs episode upgrades turned on in the plugin settings. Add keeps both files.";
+        "Replace needs \"Upgrade episodes and allow Replace\" turned on in the plugin settings. Add keeps both files.";
 
     /// <summary>
-    /// The grab modes a search's rows may offer (user, 2026-10-09): a pack fills, adds and, while episode upgrades are on,
-    /// replaces; another version of an episode is added and, while episode upgrades are on, replaces; another version of a movie
-    /// is only added; everything else fills. Adding by hand never needs episode upgrades.
+    /// The grab modes a search's rows may offer (user, 2026-10-09): a pack fills, adds and, while the switch is on, replaces;
+    /// another version of an episode or a movie (user, 2026-10-28) is added and, while the switch is on, replaces; everything
+    /// else fills. Adding by hand never needs the switch.
     /// </summary>
-    public static IReadOnlyList<string> ModesFor(bool pack, bool addVersion, bool episode, bool episodeUpgradesEnabled)
+    public static IReadOnlyList<string> ModesFor(bool pack, bool addVersion, bool episodeUpgradesEnabled)
     {
         if (pack)
             return episodeUpgradesEnabled ? [GrabModes.Fill, GrabModes.Add, GrabModes.Replace] : [GrabModes.Fill, GrabModes.Add];
         if (!addVersion) return [GrabModes.Fill];
-        return episode && episodeUpgradesEnabled ? [GrabModes.Add, GrabModes.Replace] : [GrabModes.Add];
+        return episodeUpgradesEnabled ? [GrabModes.Add, GrabModes.Replace] : [GrabModes.Add];
     }
 
     /// <summary>The system identity automatic grabs are made under; it is never a Jellyfin user.</summary>
