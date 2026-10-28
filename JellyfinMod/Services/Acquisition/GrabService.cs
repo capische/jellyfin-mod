@@ -688,8 +688,11 @@ public sealed class GrabService(
         // monitoring saves under: a title unmonitored while the client was asked is not sent (Codex delta review 2).
         // The switches and the client are read once more under the settings gate every settings change saves under: grabbing or
         // automation turned off, or the client changed, while the client was asked, stops the grab (final review, finding 3).
-        await using (await libraryLock.AcquireAsync(entry!.TargetLibraryId!.Value, cancellationToken).ConfigureAwait(false))
+        // The settings gate is taken before the library lease, in the one order every holder of both keeps: settings, then the
+        // retention execution gate, then the library locks (Codex re-review of the movie Replace: a switch-off waiting for a
+        // removal that waited for this library while this waited for the settings gate was a deadlock).
         await using (await JellyfinMod.Api.SettingsMutationGate.AcquireAsync(cancellationToken).ConfigureAwait(false))
+        await using (await libraryLock.AcquireAsync(entry!.TargetLibraryId!.Value, cancellationToken).ConfigureAwait(false))
         {
             var current = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entry.Id, cancellationToken)
                 .ConfigureAwait(false);
