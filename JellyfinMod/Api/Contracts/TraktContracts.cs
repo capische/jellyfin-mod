@@ -20,12 +20,42 @@ public sealed record TraktItemStatusDto(
 /// <param name="Since">For <c>reconnect</c>: when the plugin's sign-in expired, in UTC.</param>
 /// <param name="Collections">The plugin's "synchronize collections" switch for this user.</param>
 /// <param name="PostWatched">The plugin's "post watched history" switch for this user.</param>
+/// <param name="UserId">The Jellyfin user's id, for the Trakt plugin's own Deauthorize (Disconnect, D48).</param>
+/// <param name="TraktUsername">The Trakt username, read by the server (D49), or null.</param>
+/// <param name="AvatarUrl">The Trakt avatar's http(s) address, or null.</param>
 public sealed record TraktExportUserDto(
+    [property: JsonPropertyName("userId")] Guid UserId,
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("state")] string State,
     [property: JsonPropertyName("since")] DateTime? Since,
     [property: JsonPropertyName("collections")] bool Collections,
-    [property: JsonPropertyName("postWatched")] bool PostWatched);
+    [property: JsonPropertyName("postWatched")] bool PostWatched,
+    [property: JsonPropertyName("traktUsername")] string? TraktUsername,
+    [property: JsonPropertyName("avatarUrl")] string? AvatarUrl);
+
+/// <summary>One export run of Settings › Trakt's Activity (Phase 13, D50, D73), newest first.</summary>
+/// <param name="StartedAt">When it started, in UTC.</param>
+/// <param name="EndedAt">When it ended, in UTC.</param>
+/// <param name="Status">The host's result: Completed, Failed, Cancelled or Aborted.</param>
+/// <param name="Clean">Completed with no Trakt error logged while it ran.</param>
+/// <param name="Why"><c>watch</c>, <c>reconnect</c>, <c>daily</c>, <c>retry</c>, <c>sync_now</c>, <c>first</c>, or null when
+/// JellyfinMod did not start it.</param>
+/// <param name="EpisodesWatched">Episodes the plugin sent as watched (null when its log had no count lines for the run).</param>
+/// <param name="MoviesWatched">Movies it sent as watched.</param>
+/// <param name="EpisodesCollected">Episodes it added to the Trakt collection.</param>
+/// <param name="MoviesCollected">Movies it added to the Trakt collection.</param>
+/// <param name="Error">The Trakt error in a clause, or null.</param>
+public sealed record TraktExportActivityDto(
+    [property: JsonPropertyName("startedAt")] DateTime StartedAt,
+    [property: JsonPropertyName("endedAt")] DateTime EndedAt,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("clean")] bool Clean,
+    [property: JsonPropertyName("why")] string? Why,
+    [property: JsonPropertyName("episodesWatched")] int? EpisodesWatched,
+    [property: JsonPropertyName("moviesWatched")] int? MoviesWatched,
+    [property: JsonPropertyName("episodesCollected")] int? EpisodesCollected,
+    [property: JsonPropertyName("moviesCollected")] int? MoviesCollected,
+    [property: JsonPropertyName("error")] string? Error);
 
 /// <summary>The stock Trakt plugin's last export run, as the host recorded it (Phase 13).</summary>
 /// <param name="Status">The host's <c>TaskCompletionStatus</c>: Completed, Failed, Cancelled or Aborted.</param>
@@ -53,6 +83,8 @@ public sealed record TraktExportRunDto(
 /// <param name="Failures">Runs in a row that were not clean (this server start).</param>
 /// <param name="QuietMinutes">How long after an episode ends JellyfinMod waits before it starts the export.</param>
 /// <param name="Users">The Jellyfin users the plugin holds a Trakt sign-in for.</param>
+/// <param name="Activity">The last 20 runs, newest first (D50).</param>
+/// <param name="RunningWhy">While a run JellyfinMod started goes: why it started it (as <c>why</c> above), or null.</param>
 public sealed record TraktExportStatusDto(
     [property: JsonPropertyName("installed")] bool Installed,
     [property: JsonPropertyName("version")] string? Version,
@@ -65,7 +97,9 @@ public sealed record TraktExportStatusDto(
     [property: JsonPropertyName("nextAttemptAt")] DateTime? NextAttemptAt,
     [property: JsonPropertyName("failures")] int Failures,
     [property: JsonPropertyName("quietMinutes")] int QuietMinutes,
-    [property: JsonPropertyName("users")] IReadOnlyList<TraktExportUserDto> Users);
+    [property: JsonPropertyName("users")] IReadOnlyList<TraktExportUserDto> Users,
+    [property: JsonPropertyName("activity")] IReadOnlyList<TraktExportActivityDto> Activity,
+    [property: JsonPropertyName("runningWhy")] string? RunningWhy);
 
 /// <summary>The administrator's change to the export switch (Phase 13).</summary>
 /// <param name="AutoExport">Whether JellyfinMod runs the export by itself.</param>
