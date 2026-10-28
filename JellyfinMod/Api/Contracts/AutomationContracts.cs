@@ -99,7 +99,8 @@ public sealed record AutomationSettingsDto(
     [property: JsonPropertyName("decisionLogCap")] int DecisionLogCap,
     [property: JsonPropertyName("episodeUpgradesEnabled")] bool EpisodeUpgradesEnabled,
     [property: JsonPropertyName("reacquireReclaimed")] bool ReacquireReclaimed,
-    [property: JsonPropertyName("revision")] int Revision);
+    [property: JsonPropertyName("revision")] int Revision,
+    [property: JsonPropertyName("fetchPhoneCopies")] bool FetchPhoneCopies = false);
 
 /// <summary>Automation settings write contract; the request must echo the current revision.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -137,6 +138,13 @@ public sealed class AutomationSettingsRequest
 
     /// <summary>Gets or sets whether a reclaimed monitored title is acquired again.</summary>
     [JsonPropertyName("reacquireReclaimed")] public bool ReacquireReclaimed { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether automation fetches a missing 1080p copy for phones (Phase 12 M36). Left out, the stored value is
+    /// kept, so an older web's save never turns it off.
+    /// </summary>
+    [JsonPropertyName("fetchPhoneCopies")]
+    public bool? FetchPhoneCopies { get; set; }
 
     /// <summary>Gets or sets the revision being replaced.</summary>
     [JsonPropertyName("revision")] public int? Revision { get; set; }
@@ -187,6 +195,13 @@ public sealed record VersionDto(
     /// <summary>Gets the episodes a multi-episode file holds, such as <c>S01E01-E02</c>, or null (V1 decision 2).</summary>
     [JsonPropertyName("episodeRange"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public string? EpisodeRange { get; init; }
+
+    /// <summary>
+    /// Gets a value indicating whether this is the file phones play (Phase 12 M31): on a title with two or more files, the best
+    /// one at 1080p or below. Never set on a single file, and nothing names the best copy (the list is best first).
+    /// </summary>
+    [JsonPropertyName("phoneCopy")]
+    public bool PhoneCopy { get; init; }
 }
 
 /// <summary>A version's own retention state (P6.M7): seeding can hold one version while another is scheduled.</summary>

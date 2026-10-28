@@ -156,6 +156,9 @@ public class HealthController : ControllerBase
         "acquisition.grabHold",
         // Season and All Seasons searches, pack grabs that fill, add or replace, one queue row per pack (2026-10-08).
         "acquisition.packs",
+        // Phase 12: the quality profile for phones, Prefer, the TVs catalogue, versions[].phoneCopy and phoneCopyMissing, and the
+        // add-version search that starts on the profile for phones while the phone copy is missing.
+        "copies",
         "queue",
         "import",
         "seedRelease",

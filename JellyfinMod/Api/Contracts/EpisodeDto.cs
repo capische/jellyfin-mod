@@ -92,6 +92,10 @@ public sealed class EpisodeDto(Episode episode, RetentionSummaryDto? retention =
     [JsonPropertyName("versions")]
     public IReadOnlyList<VersionDto> Versions { get; init; } = [];
 
+    /// <summary>Gets whether the episode holds files and none at 1080p or below (Phase 12 M31).</summary>
+    [JsonPropertyName("phoneCopyMissing")]
+    public bool PhoneCopyMissing => JellyfinMod.Services.Automation.PhoneCopies.Missing(Versions);
+
     /// <summary>Gets the newest grab for this episode on entry detail responses (P4.A6); null when none.</summary>
     [JsonPropertyName("acquisition"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public AcquisitionSummaryDto? Acquisition { get; } = acquisition;

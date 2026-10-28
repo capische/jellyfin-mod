@@ -75,16 +75,19 @@ public sealed class ReleasesController(
                 .Select(version => version.Quality).OfType<string>().ToHashSet(StringComparer.Ordinal);
         }
 
-        var inherited = profileId is null && entry.QualityProfileId is null;
-        var chosenId = profileId ?? entry.QualityProfileId ?? state.Settings.DefaultQualityProfileId;
+        // Get Another Quality on a title whose files are all above 1080p starts on the quality profile for phones (Phase 12 M31).
+        var phoneId = profileId is null && intent == GrabIntents.AddVersion && state.Settings.PhoneProfileId is { } phones &&
+            await JellyfinMod.Services.Automation.PhoneCopies.MissingAsync(database, entry.Id, episode?.Id, library, cancellationToken)
+                ? phones : (Guid?)null;
+        var inherited = profileId is null && phoneId is null && entry.QualityProfileId is null;
+        var chosenId = profileId ?? phoneId ?? entry.QualityProfileId ?? state.Settings.DefaultQualityProfileId;
         if (chosenId is null) return Error(409, "no_quality_profile", "Choose a default quality profile in the plugin settings.");
         var profile = await database.AcquisitionQualityProfiles.AsNoTracking().SingleOrDefaultAsync(value => value.Id == chosenId, cancellationToken);
         if (profile is null) return Error(400, "invalid_quality_profile", "The quality profile does not exist.");
         if (await NoIndexerAsync(chosen, cancellationToken) is { } none) return none;
 
         var snapshot = await search.SearchAsync(user.Id, ReleaseTargets.For(entry, episode),
-            new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
-                profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
+            EvaluationProfile.From(profile, state.Settings),
             inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(intent, held, progressKey, chosen));
         return ReleaseSearchDto.From(snapshot, await AvailabilityAsync(snapshot, cancellationToken));
     }
@@ -117,8 +120,32 @@ public sealed class ReleasesController(
             ? await database.EntryBindings.AsNoTracking().CountAsync(binding => binding.EntryId == target.EntryId && binding.MediaPath != null,
                 cancellationToken)
             : null;
+        // The missing phone copy is only ever added: there is no file for phones to replace (Phase 12 M31, M34).
+        var forPhones = snapshot.Profile.Id == state.Settings.PhoneProfileId && (pack
+            ? await PhonePackAsync(target.EntryId, target.Covered.Select(episode => episode.Id).ToArray(), null, cancellationToken)
+            : addVersion && await JellyfinMod.Services.Automation.PhoneCopies.MissingAsync(database, target.EntryId, target.EpisodeId, library,
+                cancellationToken));
         return new GrabAvailabilityDto(reason is null, reason, (int)Math.Ceiling(hold.Hold.TotalSeconds), active?.Id,
-            GrabService.ModesFor(pack, addVersion, state.Settings.EpisodeUpgradesEnabled), heldFiles);
+            forPhones ? [GrabModes.Add] : GrabService.ModesFor(pack, addVersion, state.Settings.EpisodeUpgradesEnabled), heldFiles)
+        {
+            ForPhones = forPhones
+        };
+    }
+
+    /// <summary>Whether every covered episode holds a file and none of them one at 1080p or below (Phase 12 M31).</summary>
+    private async Task<bool> PhonePackAsync(Guid entryId, IReadOnlyList<Guid> covered, IReadOnlyList<Episode>? episodes,
+        CancellationToken cancellationToken)
+    {
+        if (covered.Count == 0) return false;
+        episodes ??= await database.Episodes.AsNoTracking().Where(value => value.EntryId == entryId).ToListAsync(cancellationToken);
+        foreach (var id in covered)
+        {
+            if (episodes.FirstOrDefault(value => value.Id == id) is not { State: FileState.OnDisk } ||
+                !await JellyfinMod.Services.Automation.PhoneCopies.MissingAsync(database, entryId, id, library, cancellationToken))
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -143,16 +170,19 @@ public sealed class ReleasesController(
         if (covered.Any(episode => !access.CanReadEpisode(user, episode))) return StatusCode(403);
 
         var state = await configuration.GetStateAsync(database, cancellationToken);
-        var inherited = profileId is null && entry.QualityProfileId is null;
-        var chosenId = profileId ?? entry.QualityProfileId ?? state.Settings.DefaultQualityProfileId;
+        // A pack over episodes that all hold files and none at 1080p or below starts on the quality profile for phones (Phase 12
+        // M31). An episode without a file keeps the default: the pack would fill it too, and its first copy is not a phone copy.
+        var phoneId = profileId is null && state.Settings.PhoneProfileId is { } phones &&
+            await PhonePackAsync(entry.Id, covered.Select(episode => episode.Id).ToArray(), episodes, cancellationToken) ? phones : (Guid?)null;
+        var inherited = profileId is null && phoneId is null && entry.QualityProfileId is null;
+        var chosenId = profileId ?? phoneId ?? entry.QualityProfileId ?? state.Settings.DefaultQualityProfileId;
         if (chosenId is null) return Error(409, "no_quality_profile", "Choose a default quality profile in the plugin settings.");
         var profile = await database.AcquisitionQualityProfiles.AsNoTracking().SingleOrDefaultAsync(value => value.Id == chosenId, cancellationToken);
         if (profile is null) return Error(400, "invalid_quality_profile", "The quality profile does not exist.");
         if (await NoIndexerAsync(indexerIds, cancellationToken) is { } none) return none;
 
         var snapshot = await search.SearchAsync(user.Id, ReleaseTargets.ForPack(entry, scope, seasonNumber, covered, episodes),
-            new EvaluationProfile(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile),
-                profile.MinimumBytesPerHour, profile.MaximumBytesPerHour),
+            EvaluationProfile.From(profile, state.Settings),
             inherited, state.Settings.Revision, cancellationToken, new ReleaseSearchOptions(ProgressKey: progressKey, IndexerIds: indexerIds));
         return ReleaseSearchDto.From(snapshot, await AvailabilityAsync(snapshot, cancellationToken));
     }

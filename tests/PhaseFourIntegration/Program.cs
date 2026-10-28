@@ -35,6 +35,8 @@ try
     await TrackerTitleScenarios.RunAsync(folder, logs);
     await SlowIndexerScenario.RunAsync(folder, logs);
     await SourcesScenario.RunAsync(folder, logs);
+    // Phase 12: the quality profile for phones, Prefer, the TVs catalogue and the add-version search for phones.
+    await CopiesScenario.RunAsync(folder, logs);
     await RunAsync(folder, far, foreign, logs, secrets);
     // No credential, API key or tracker passkey may appear in any log line the plugin wrote.
     foreach (var secret in secrets)

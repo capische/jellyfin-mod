@@ -70,7 +70,15 @@ public sealed record GrabAvailabilityDto(
     [property: JsonPropertyName("holdSeconds")] int HoldSeconds,
     [property: JsonPropertyName("activeOperationId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? ActiveOperationId,
     [property: JsonPropertyName("modes")] IReadOnlyList<string> Modes,
-    [property: JsonPropertyName("heldFiles")] int? HeldFiles = null);
+    [property: JsonPropertyName("heldFiles")] int? HeldFiles = null)
+{
+    /// <summary>
+    /// Gets a value indicating whether this search, on the quality profile for phones, adds the copy phones play to a title that
+    /// has none (Phase 12 M31): its rows offer Add only, and the picker says so.
+    /// </summary>
+    [JsonPropertyName("forPhones")]
+    public bool ForPhones { get; init; }
+}
 
 /// <summary>One per-indexer search outcome.</summary>
 public sealed record IndexerOutcomeDto(
