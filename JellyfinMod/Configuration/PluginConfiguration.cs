@@ -48,6 +48,19 @@ public class PluginConfiguration : BasePluginConfiguration
     /// </remarks>
     public string RatingsProviderBaseUrl { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Gets or sets a value indicating whether JellyfinMod runs the stock Trakt plugin's export by itself after episodes are
+    /// watched, after a reconnect and once a day (Phase 13). Off until an administrator turns it on (user decision Q3).
+    /// </summary>
+    public bool TraktAutoExport { get; set; }
+
+    /// <summary>
+    /// Gets or sets a test-only pace for the Trakt export in minutes: when above zero it replaces the 10-minute quiet period
+    /// and is the first retry wait (then doubling, at most 24 times it).
+    /// </summary>
+    /// <remarks>Not shown anywhere; set it in the XML of an isolated test instance only.</remarks>
+    public int TraktExportTestMinutes { get; set; }
+
     /// <summary>Gets or sets whose watched state starts the retention window.</summary>
     public WatchedUserMode RetentionWatchedUserMode { get; set; } = WatchedUserMode.AllUsers;
 
