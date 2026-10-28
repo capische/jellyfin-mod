@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using JellyfinMod.Data;
 using JellyfinMod.Services;
+using JellyfinMod.Services.Automation;
 
 namespace JellyfinMod.Api.Contracts;
 
@@ -162,6 +163,10 @@ public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto 
     /// <summary>Gets a movie's held versions for the version selector (P6.M8); empty for series and file-less titles.</summary>
     [JsonPropertyName("versions")]
     public IReadOnlyList<VersionDto> Versions { get; init; } = [];
+
+    /// <summary>Gets whether a movie holds files and none at 1080p or below, so phones have no copy of their own (Phase 12 M31).</summary>
+    [JsonPropertyName("phoneCopyMissing")]
+    public bool PhoneCopyMissing => PhoneCopies.Missing(Versions);
 
     /// <summary>Gets a movie's retention warning when its window is running (PHASE10 Q8, Q11); null otherwise.</summary>
     [JsonPropertyName("retentionWarning"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]

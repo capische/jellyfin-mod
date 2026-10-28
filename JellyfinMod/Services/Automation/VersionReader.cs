@@ -133,7 +133,7 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
             });
         }
 
-        return result;
+        return PhoneCopies.Mark(result);
     }
 
     private IEnumerable<NativeVersion> UntrackedVersions(IEnumerable<Guid> owners, IReadOnlySet<Guid> boundItems, IEnumerable<string?> boundPaths)
