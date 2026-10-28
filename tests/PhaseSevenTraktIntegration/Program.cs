@@ -165,10 +165,12 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         // Phase 13: the Trakt plugin's export task, never run.
         Worker(TraktPluginState.ExportTaskKey, () => exportState)
     };
-    var taskManager = Stub<ITaskManager>.Create((method, _) =>
+    EventHandler<TaskCompletionEventArgs>? taskCompleted = null;
+    var taskManager = Stub<ITaskManager>.Create((method, arguments) =>
     {
-        // Phase 13: a queued export runs, as the host's does, until the check ends it.
+        // Phase 13: a queued export runs, as the host's does, until the check ends it; its end is raised as the host does.
         if (method.Name == "QueueScheduledTask") exportState = TaskState.Running;
+        if (method.Name == "add_TaskCompleted") taskCompleted += (EventHandler<TaskCompletionEventArgs>)arguments![0]!;
         return method.Name == "get_ScheduledTasks" ? workers : null;
     });
     EventHandler<UserDataSaveEventArgs>? userDataSaved = null;
@@ -602,6 +604,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     await File.WriteAllLinesAsync(logFile, new[]
     {
         Line(refusedStart.AddSeconds(10), "ERR", "Trakt.ScheduledTasks.SyncLibraryTask", "Error updating episode play states"),
+        "System.Net.Http.HttpRequestException: Response status code does not indicate success: 500 (Internal Server Error).",
         Line(refusedEnd, "INF", "Emby.Server.Implementations.ScheduledTasks.TaskManager", "\"Export library to trakt.tv\" Completed after 0 minute(s) and 50 seconds")
     });
     Finish(TaskCompletionStatus.Completed, refusedStart, refusedEnd);
@@ -610,23 +613,65 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert(logReads > 0 && logReadsInRequest == 0, $"The status read never reads the host's log; the background check does ({logReads} read(s), {logReadsInRequest} in a request)");
     Assert(state.GetProperty("lastRunConfirmed").ValueKind == JsonValueKind.False && state.GetProperty("failures").GetInt32() == 1,
         "A Completed run with a Trakt error in the log while it ran is not clean, and counts one failure");
+    var refusedRun = state.GetProperty("activity")[0];
+    Assert(refusedRun.GetProperty("clean").GetBoolean() == false && refusedRun.GetProperty("error").GetString() == "Trakt answered 500 Internal Server Error" &&
+        !refusedRun.TryGetProperty("why", out _) && !refusedRun.TryGetProperty("episodesWatched", out _),
+        $"Activity lists that run: not clean, the Trakt error from its exception, no reason (not started by JellyfinMod), no counts ({refusedRun})");
     Assert(await SetAuto(true), "The administrator turns the automatic export on");
 
     var retries = Starts("the last run was not clean");
     Assert(await Started("the last run was not clean", retries), "Its retry wait over, the export starts again by itself");
     Assert((await ExportStatus()).GetProperty("running").GetBoolean(), "The retry is running");
-    // The retried run is clean: no Trakt error while it ran (a scrobble error from another source does not count).
-    var retryStart = DateTime.UtcNow.AddSeconds(-30);
-    var retryEnd = DateTime.UtcNow.AddSeconds(-20);
+    // The retried run is clean: no Trakt error while it ran (a scrobble error from another source does not count); the
+    // plugin's count lines say what it sent.
+    var retryStart = DateTime.UtcNow;
+    var retryEnd = retryStart.AddSeconds(1);
     await File.AppendAllLinesAsync(logFile, new[]
     {
-        Line(retryStart.AddSeconds(2), "ERR", "Trakt.ServerMediator", "Exception occurred while sending a playback status update to trakt.tv"),
+        Line(retryStart.AddMilliseconds(200), "ERR", "Trakt.ServerMediator", "Exception occurred while sending a playback status update to trakt.tv"),
+        Line(retryStart.AddMilliseconds(300), "INF", "Trakt.ScheduledTasks.SyncLibraryTask", "Episodes to set \"watched\": 2"),
+        Line(retryStart.AddMilliseconds(400), "INF", "Trakt.ScheduledTasks.SyncLibraryTask", "Episodes to \"add to\" collection 2"),
         Line(retryEnd, "INF", "Emby.Server.Implementations.ScheduledTasks.TaskManager", "\"Export library to trakt.tv\" Completed after 0 minute(s) and 10 seconds")
     });
     Finish(TaskCompletionStatus.Completed, retryStart, retryEnd);
     state = await Judged();
     Assert(state.GetProperty("lastRunConfirmed").ValueKind == JsonValueKind.True && state.GetProperty("failures").GetInt32() == 0 &&
         !(state.TryGetProperty("nextAttemptAt", out var next) && next.ValueKind != JsonValueKind.Null), "The retried run is clean: no failure and no retry");
+    var retriedRun = state.GetProperty("activity")[0];
+    Assert(retriedRun.GetProperty("why").GetString() == "retry" && retriedRun.GetProperty("clean").GetBoolean() &&
+        retriedRun.GetProperty("episodesWatched").GetInt32() == 2 && retriedRun.GetProperty("episodesCollected").GetInt32() == 2 &&
+        retriedRun.GetProperty("moviesWatched").GetInt32() == 0 && state.GetProperty("activity").GetArrayLength() == 2,
+        $"Activity lists the retry first: why retry, clean, the plugin's counts (2 watched, 2 collected) ({retriedRun})");
+    var activityFile = Path.Combine(folder, "jellyfinmod", "trakt-activity.json");
+    Assert(File.Exists(activityFile) && JsonDocument.Parse(await File.ReadAllTextAsync(activityFile)).RootElement.GetArrayLength() == 2,
+        "The activity is kept in the plugin's data folder");
+
+    // Two runs that end between two checks (two Sync Nows a few seconds apart) are both listed, each with its reason.
+    var exportWorker = workers.Single(worker => worker.ScheduledTask?.Key == TraktPluginState.ExportTaskKey);
+    void Ended(DateTime started, DateTime ended)
+    {
+        Finish(TaskCompletionStatus.Completed, started, ended);
+        taskCompleted!(null, new TaskCompletionEventArgs(exportWorker, exportLast!));
+    }
+
+    using (var syncNow = await admin.PostAsync("JellyfinMod/Trakt/Export", null)) Assert(syncNow.StatusCode == HttpStatusCode.Accepted, "Sync Now is accepted");
+    var firstStart = DateTime.UtcNow;
+    Ended(firstStart, firstStart.AddMilliseconds(300));
+    await Task.Delay(1000);
+    using (var syncNow = await admin.PostAsync("JellyfinMod/Trakt/Export", null)) Assert(syncNow.StatusCode == HttpStatusCode.Accepted, "Sync Now is accepted again");
+    var secondStart = DateTime.UtcNow;
+    Ended(secondStart, secondStart.AddMilliseconds(300));
+    JsonElement close = default;
+    for (var waited = 0; waited < 400; waited++)
+    {
+        close = (await ExportStatus()).GetProperty("activity");
+        if (close.GetArrayLength() >= 4) break;
+        await Task.Delay(100);
+    }
+
+    Assert(close.GetArrayLength() >= 4 && close[0].GetProperty("why").GetString() == "sync_now" && close[1].GetProperty("why").GetString() == "sync_now" &&
+        close[0].GetProperty("startedAt").GetDateTime() > close[1].GetProperty("startedAt").GetDateTime(),
+        $"Two runs between two checks are both listed, newest first, each as Sync Now ({close.GetArrayLength()} runs)");
     var anyStart = logs.Lines.Count(line => line.Contains("starts the Trakt plugin's export (", StringComparison.Ordinal));
     await Task.Delay(TimeSpan.FromSeconds(35));
     Assert(logs.Lines.Count(line => line.Contains("starts the Trakt plugin's export (", StringComparison.Ordinal)) == anyStart,
@@ -663,6 +708,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(5), new PluginConfiguration(), Configure);
     admin = host.Client(world.Admin, true);
     Assert(Status((await Get(admin, season1.Id)).Body, true, true), "Observations survive a restart");
+    var afterRestart = JsonDocument.Parse(await admin.GetStringAsync("JellyfinMod/Trakt/Export")).RootElement.GetProperty("activity");
+    Assert(afterRestart.GetArrayLength() >= 2 && afterRestart.EnumerateArray().Any(run => run.TryGetProperty("why", out var why) && why.ValueKind == JsonValueKind.String && why.GetString() == "retry"),
+        $"The Trakt activity survives a restart of the host ({afterRestart.GetArrayLength()} runs)");
     await host.DisposeAsync();
 
     Assert(!logs.Lines.Any(line => line.Contains("TraktObservationListener", StringComparison.Ordinal) &&
