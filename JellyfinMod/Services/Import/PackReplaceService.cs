@@ -31,7 +31,10 @@ public sealed class PackReplaceService(
     private static readonly HashSet<string> Passing = new(StringComparer.Ordinal)
     {
         RetentionExecutionReasons.SuccessorUnavailable, RetentionExecutionReasons.OperationOpen,
-        RetentionPreviewReasons.ActiveSession, RetentionPreviewReasons.ActiveSessionUnknown
+        RetentionPreviewReasons.ActiveSession, RetentionPreviewReasons.ActiveSessionUnknown,
+        // A copy Jellyfin lists that is not bound yet, as a version being imported is for a moment: waited out, never removed
+        // around (a + on a seeding release while a Replace waits, user 2026-10-28).
+        RetentionPreviewReasons.VersionsUntracked, RetentionPreviewReasons.EpisodeVersionsUntracked
     };
 
     private DateTime Now => time.GetUtcNow().UtcDateTime;
@@ -111,9 +114,17 @@ public sealed class PackReplaceService(
                 .Select(binding => new { binding.Id, binding.MediaPath }).ToListAsync(cancellationToken).ConfigureAwait(false);
             foreach (var target in targets.OrderBy(target => target.Path, StringComparer.Ordinal))
             {
-                var other = current.FirstOrDefault(binding => binding.MediaPath == target.Path);
-                if (other is null) continue;
                 var name = Path.GetFileName(target.Path);
+                // Only the very binding that was chosen: a file bound again at that path since (the same release imported again
+                // from its seeding copy, the same inode and content) is another version and stays (Codex review of the movie
+                // Replace, P1 2). The executor loads the binding by this id under its locks.
+                var other = current.FirstOrDefault(binding => binding.Id == target.BindingId && binding.MediaPath == target.Path);
+                if (other is null)
+                {
+                    if (current.Any(binding => binding.MediaPath == target.Path)) refused.Add(name + " (" + RetentionExecutionReasons.BindingChanged + ")");
+                    continue;
+                }
+
                 RetentionExecutionResult result;
                 using (var scope = scopes.CreateScope())
                     result = await scope.ServiceProvider.GetRequiredService<RetentionExecutor>()
@@ -174,6 +185,10 @@ public sealed class PackReplaceService(
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         return JsonSerializer.Serialize(targets);
     }
+
+    /// <summary>A grab's fixed targets without the new file: its own binding and anything at its path is never removed.</summary>
+    public static string Without(string targetsJson, Guid newBindingId, string? destination) => JsonSerializer.Serialize(
+        ReadTargets(targetsJson).Where(target => target.BindingId != newBindingId && target.Path != destination).ToList());
 
     private sealed class BoundFile
     {

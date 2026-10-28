@@ -23,7 +23,8 @@ public sealed class RetentionExecutor(
     ILogger<RetentionExecutor> logger,
     RetentionLiveCheck liveCheck,
     ILibraryMonitor? libraryMonitor = null,
-    LibraryNotifications? notifications = null)
+    LibraryNotifications? notifications = null,
+    MediaBrowser.Controller.Library.IMediaSourceManager? mediaSources = null)
 {
     /// <summary>Revalidates and reclaims one binding selected by the shared retention preview.</summary>
     public async Task<RetentionExecutionResult> ReclaimAsync(Guid bindingId, CancellationToken cancellationToken)
@@ -301,11 +302,16 @@ public sealed class RetentionExecutor(
         var (reason, observed) = await CheckRemovableAsync(target, cancellationToken).ConfigureAwait(false);
         if (reason is not null) return RetentionExecutionResult.NotStarted(bindingId, reason);
         if (!await ImportedFilePresentAsync(successorImportId, entryId, episodeId, cancellationToken).ConfigureAwait(false) ||
-            await SuccessorIsTargetAsync(successorImportId, bindingId, observed, cancellationToken).ConfigureAwait(false))
+            await SuccessorIsTargetAsync(successorImportId, bindingId, observed, cancellationToken).ConfigureAwait(false) ||
+            !await SuccessorPlayableAsync(successorImportId, cancellationToken).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.SuccessorUnavailable);
         if (await Import.RetainedDownloads.ProtectionAsync(database, files, observed.CanonicalPath, cancellationToken)
                 .ConfigureAwait(false) is not null)
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.RetainedDownload);
+        // Replace needs its switch at the removal too: turned off while a replacement waits, nothing more is removed (Codex review
+        // of the movie Replace, P1 3).
+        if (!(await Acquisition.AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken).ConfigureAwait(false)).EpisodeUpgradesEnabled)
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.ReplaceDisabled);
         // Keep on the title or the episode, read last: Keep is set under these same locks, so a Keep that returned before
         // this point is seen here and nothing it protects is unlinked (Codex re-review of the pack plugin, finding 1).
         if (await database.Entries.AsNoTracking().AnyAsync(entry => entry.Id == entryId && entry.RetentionPolicy == RetentionPolicy.Never,
@@ -342,6 +348,27 @@ public sealed class RetentionExecutor(
         await SaveAfterUnlinkAsync([operation]).ConfigureAwait(false);
         await TryRemoveNativeAsync(operation).ConfigureAwait(false);
         return await CompleteUnderLeaseAsync([operation], bindingId, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether the successor plays (Codex review of the movie Replace, P1 4): its own item is refreshed, no placeholder, and its
+    /// probe found a video stream. The import's readiness lets a file without one through after a grace or a timeout; a
+    /// replacement does not, so a broken new file never costs the good ones. Unknown is not playable.
+    /// </summary>
+    private async Task<bool> SuccessorPlayableAsync(Guid successorImportId, CancellationToken cancellationToken)
+    {
+        var itemId = await database.ImportOperations.AsNoTracking().Where(value => value.Id == successorImportId)
+            .Select(value => value.NativeItemId).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (itemId is not { } id || mediaSources is null) return false;
+        try
+        {
+            return library.GetItemById(id) is Video { IsPlaceHolder: false } item && item.DateLastRefreshed != DateTime.MinValue &&
+                mediaSources.GetMediaStreams(id).Any(stream => stream.Type == MediaBrowser.Model.Entities.MediaStreamType.Video);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            return false;
+        }
     }
 
     /// <summary>Whether the successor is the very file to be removed: its binding, or the same path.</summary>
@@ -1298,6 +1325,12 @@ public sealed record RetentionExecutionResult(
 
 internal static class RetentionExecutionReasons
 {
+    /// <summary>Replace was turned off while the replacement waited; nothing more is removed.</summary>
+    public const string ReplaceDisabled = "replace_disabled";
+
+    /// <summary>The file at a replacement's target path is bound again since the replacement was decided: another version.</summary>
+    public const string BindingChanged = "binding_changed";
+
     /// <summary>The library path is a download JellyfinMod keeps on disk, or another name for one.</summary>
     public const string RetainedDownload = "retained_download";
 

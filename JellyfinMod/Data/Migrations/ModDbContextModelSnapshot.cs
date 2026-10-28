@@ -1068,6 +1068,9 @@ namespace JellyfinMod.Data.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("ReplaceTargets")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("RequestFingerprint")
                         .IsRequired()
                         .HasMaxLength(64)

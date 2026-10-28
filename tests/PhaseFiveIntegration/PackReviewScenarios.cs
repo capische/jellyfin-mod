@@ -287,6 +287,19 @@ internal static class PackReviewScenarios
         transmission.Progress(replPack.InfoHash, 1.0);
         await SettleAsync(replId, 7, "Every import of the replace pack is final");
         for (var index = 0; index < 2; index++) await tick();
+        // Codex review of the movie Replace, P1 4: a new file Jellyfin has not shown to play (no video stream from its probe) never
+        // replaces anything, however long the import waited; the old files stay until the new one plays.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var e1Unprobed = await database.ImportOperations.AsNoTracking().SingleAsync(value => value.GrabId == replId &&
+                value.EpisodeId == ids["repls1e1"]);
+            Assert(e1Unprobed.ReplaceState == ReplaceStates.Pending && e1Unprobed.ReplaceDetail!.Contains("successor_unavailable", StringComparison.Ordinal) &&
+                File.Exists(Old(1)), $"S01E01's old file stays while the new one has no video stream: {e1Unprobed.ReplaceState} {e1Unprobed.ReplaceDetail}");
+        }
+
+        foreach (var child in await ChildrenAsync(replId))
+            if (child.DestinationPath is { } probed) world.Native.Probe(probed);
+        for (var index = 0; index < 2; index++) await tick();
         var replChildren = (await ChildrenAsync(replId)).ToDictionary(child => child.EpisodeId!.Value);
         ImportOperation Child(int number) => replChildren[ids[$"repls1e{number}"]];
         await using (var database = new ModDbContext(dbPath))

@@ -1095,23 +1095,33 @@ public sealed class ImportService(
         }
 
         // A replace grab removes the episode's or the movie's other files once this one is bound, through the version removal
-        // and its guards. The files it may remove are the ones the episode or movie holds now, fixed here under the library lock:
-        // a version added later, while the replacement waits, is never one of them (Codex re-review of the pack plugin, finding
-        // 2). A movie's Replace (user, 2026-10-28) is imported as an added version either way, so the switch is read again here:
-        // turned off since the grab, nothing is removed and both stay. An episode's replace import is refused at planning instead.
+        // and its guards. A movie's or an episode's Replace removes the files it held when the grab was admitted (user,
+        // 2026-10-28; Codex review of the movie Replace, P1 1); a pack's, the files each episode holds now, fixed here under the
+        // library lock (Codex re-review of the pack plugin, finding 2). Either way a version added later is never one of them.
+        // The switch is read again here for every scope: turned off since the grab, nothing is removed and both stay (P1 3).
         if (grab?.Mode == GrabModes.Replace && operation.Intent == GrabIntents.AddVersion && operation.EntryId is { } replacedEntry)
         {
-            if (operation.EpisodeId is null &&
-                !(await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken).ConfigureAwait(false)).EpisodeUpgradesEnabled)
+            if (!(await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken).ConfigureAwait(false)).EpisodeUpgradesEnabled)
             {
                 operation.ReplaceState = ReplaceStates.Refused;
                 operation.ReplaceDetail = "Replace was turned off before the new file arrived; it was added beside the files you have.";
             }
-            else
+            else if (pack)
             {
                 operation.ReplaceState = ReplaceStates.Pending;
                 operation.ReplaceTargets = await PackReplaceService.SnapshotTargetsAsync(database, replacedEntry, operation.EpisodeId,
                     bindingId, operation.DestinationPath, cancellationToken).ConfigureAwait(false);
+            }
+            else if (grab.ReplaceTargets is null)
+            {
+                // A Replace grabbed before its files were recorded at the grab: nothing is known to be safe to remove.
+                operation.ReplaceState = ReplaceStates.Refused;
+                operation.ReplaceDetail = "This Replace was grabbed before its files were recorded; it was added beside the files you have.";
+            }
+            else
+            {
+                operation.ReplaceState = ReplaceStates.Pending;
+                operation.ReplaceTargets = PackReplaceService.Without(grab.ReplaceTargets, bindingId, operation.DestinationPath);
             }
         }
 
