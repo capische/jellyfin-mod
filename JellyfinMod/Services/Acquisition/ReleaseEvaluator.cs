@@ -30,14 +30,26 @@ public sealed record ReleaseTarget(
     public IReadOnlyList<int> CoveredSeasons() => Covered.Select(episode => episode.SeasonNumber).Distinct().Order().ToArray();
 }
 
-/// <summary>A profile as evaluated: ordered qualities and optional size-per-hour limits.</summary>
+/// <summary>
+/// A profile as evaluated: ordered qualities, optional size-per-hour limits, and the Prefer field with what the ticked TVs
+/// play (Phase 12 M30; null TVs when none is ticked).
+/// </summary>
 public sealed record EvaluationProfile(
     Guid Id,
     string Name,
     int Revision,
     IReadOnlyList<string> Qualities,
     long? MinimumBytesPerHour,
-    long? MaximumBytesPerHour);
+    long? MaximumBytesPerHour,
+    string? Prefer = null,
+    TvCapabilities? Tvs = null)
+{
+    /// <summary>The evaluated form of a stored profile under the current settings (its Prefer and the ticked TVs).</summary>
+    public static EvaluationProfile From(JellyfinMod.Data.AcquisitionQualityProfile profile, JellyfinMod.Data.AcquisitionSettings settings) =>
+        new(profile.Id, profile.Name, profile.Revision, AcquisitionConfiguration.Qualities(profile), profile.MinimumBytesPerHour,
+            profile.MaximumBytesPerHour, profile.Prefer, profile.Prefer == JellyfinMod.Data.ProfilePreferences.Tvs
+                ? TvCatalog.Capabilities(settings.TvModels) : null);
+}
 
 /// <summary>How a feed row was found, which decides whether its identity is verified.</summary>
 public enum SearchIdentity
@@ -90,13 +102,15 @@ public sealed record ReleaseFacts(
 /// </summary>
 /// <remarks>
 /// Scoring version <see cref="Version"/>: quality rank is <c>(count - index) * 100</c> for the profile's ordered
-/// list; proper or repack adds 15; freeleech adds 10; known seeders add up to 20 on a logarithmic scale. Ties are
-/// broken by seeders (unknown last), then indexer priority, then newer publication, then release id.
+/// list; proper or repack adds 15; freeleech adds 10; known seeders add up to 20 on a logarithmic scale; a profile's Prefer adds
+/// up to 20 for the picture and 20 for the sound (Phase 12, <see cref="ReleasePreference"/>), so everything but the quality
+/// stays under one quality step. Ties are broken by seeders (unknown last), then indexer priority, then newer publication,
+/// then release id.
 /// </remarks>
 public static class ReleaseEvaluator
 {
     /// <summary>The scoring rules version recorded on every grab.</summary>
-    public const string Version = "p4.a4.v1";
+    public const string Version = "p12.m30.v1";
 
     /// <summary>
     /// The identity of an episodic text match that carries no year: grabbable by hand, never by automation, because nothing
@@ -153,6 +167,9 @@ public static class ReleaseEvaluator
         if (facts.Freeleech == true) contributions.Add(new("freeleech", 10));
         if (facts.Seeders is { } seeders and > 0)
             contributions.Add(new("seeders", Math.Min(20, (int)Math.Floor(Math.Log2(seeders + 1) * 4))));
+        var (picture, sound) = ReleasePreference.Points(profile.Prefer, profile.Tvs, parsed);
+        if (picture > 0) contributions.Add(new("prefer_picture", picture));
+        if (sound > 0) contributions.Add(new("prefer_sound", sound));
         return new ReleaseEvaluation(rejections.Count == 0, contributions.Sum(item => item.Points), contributions,
             rejections, identity);
     }

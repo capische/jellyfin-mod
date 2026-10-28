@@ -232,6 +232,10 @@ namespace JellyfinMod.Data.Migrations
                         .HasMaxLength(128)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("Prefer")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("QualitiesJson")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -300,6 +304,9 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<bool>("EpisodeUpgradesEnabled")
                         .HasColumnType("INTEGER");
 
+                    b.Property<bool>("FetchPhoneCopies")
+                        .HasColumnType("INTEGER");
+
                     b.Property<long>("FreeSpaceFloorBytes")
                         .HasColumnType("INTEGER");
 
@@ -320,6 +327,9 @@ namespace JellyfinMod.Data.Migrations
 
                     b.Property<int>("NewEpisodeDelayMinutes")
                         .HasColumnType("INTEGER");
+
+                    b.Property<Guid?>("PhoneProfileId")
+                        .HasColumnType("TEXT");
 
                     b.Property<bool>("QueueVisibleToUsers")
                         .HasColumnType("INTEGER");
@@ -377,6 +387,14 @@ namespace JellyfinMod.Data.Migrations
                     b.Property<string>("TmdbReadAccessTokenRef")
                         .HasMaxLength(64)
                         .HasColumnType("TEXT");
+
+                    b.Property<string>("TvModels")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("TvModelsRevision")
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("VideoExtensions")
                         .IsRequired()

@@ -307,12 +307,12 @@ public sealed partial class AcquisitionSettingsController(
     public async Task<ActionResult<IReadOnlyList<QualityProfileDto>>> QualityProfiles(CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
-        var defaultId = (await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken)).DefaultQualityProfileId;
+        var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
         var profiles = await database.AcquisitionQualityProfiles.AsNoTracking().ToListAsync(cancellationToken);
         // Best first (user, 2026-10-19): the one order every list of profiles shows, so no list sorts on its own. By the
         // resolution of the profile's best quality (4K, 2K, 1080p, 720p, SD), then by name.
         return profiles.OrderByDescending(profile => QualityCatalog.BestResolution(AcquisitionConfiguration.Qualities(profile)))
-            .ThenBy(profile => profile.Name, StringComparer.Ordinal).Select(profile => ToDto(profile, defaultId)).ToArray();
+            .ThenBy(profile => profile.Name, StringComparer.Ordinal).Select(profile => ToDto(profile, settings.DefaultQualityProfileId, settings.PhoneProfileId)).ToArray();
     }
 
     /// <summary>Lists the shipped quality profile presets and whether each is already a profile (P4.FU9).</summary>
@@ -383,7 +383,8 @@ public sealed partial class AcquisitionSettingsController(
         Apply(profile, request);
         profile.Revision++;
         if (await SaveAsync(cancellationToken) is { } conflict) return conflict;
-        return ToDto(profile, (await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken)).DefaultQualityProfileId);
+        var current = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
+        return ToDto(profile, current.DefaultQualityProfileId, current.PhoneProfileId);
     }
 
     /// <summary>Deletes a profile that is neither the default nor assigned to an entry.</summary>
@@ -393,14 +394,53 @@ public sealed partial class AcquisitionSettingsController(
         if (!readiness.IsReady) return StatusCode(503);
         var profile = await database.AcquisitionQualityProfiles.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (profile is null) return NotFound();
-        if ((await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken)).DefaultQualityProfileId == id)
+        var current = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
+        if (current.DefaultQualityProfileId == id)
             return Conflict(ProblemBody("profile_is_default", "Choose another default profile first."));
+        if (current.PhoneProfileId == id)
+            return Conflict(ProblemBody("profile_is_phone_profile", "Choose another quality profile for phones first."));
         if (await database.Entries.AnyAsync(entry => entry.QualityProfileId == id, cancellationToken))
             return Conflict(ProblemBody("profile_assigned", "Titles still use this profile; reassign them first."));
         database.AcquisitionQualityProfiles.Remove(profile);
         await database.SaveChangesAsync(cancellationToken);
         cache.Invalidate();
         return NoContent();
+    }
+
+    /// <summary>The TVs catalogue and the ticked models (Phase 12 M30).</summary>
+    [HttpGet("TvModels")]
+    public async Task<ActionResult<TvModelsDto>> TvModels(CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        return ToDto(await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken));
+    }
+
+    /// <summary>
+    /// Ticks the TVs the household watches on (Phase 12 M30): a profile set to Best on My TVs then prefers what every ticked
+    /// TV plays. Cached searches are dropped, because their order may change.
+    /// </summary>
+    [HttpPatch("TvModels")]
+    public async Task<ActionResult<TvModelsDto>> PatchTvModels(TvModelsRequest request, CancellationToken cancellationToken)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
+        var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
+        if (request.Revision != settings.TvModelsRevision) return RevisionConflict();
+        if (request.Selected.Any(id => !TvCatalog.IsKnown(id)))
+            return Invalid("invalid_tv_model", "One of the TVs is not in the catalogue.");
+        settings.TvModels = string.Join(',', TvCatalog.Ticked(string.Join(',', request.Selected)));
+        settings.TvModelsRevision++;
+        await database.SaveChangesAsync(cancellationToken);
+        cache.Invalidate();
+        return ToDto(settings);
+    }
+
+    private static TvModelsDto ToDto(AcquisitionSettings settings)
+    {
+        var ticked = TvCatalog.Ticked(settings.TvModels);
+        return new TvModelsDto(TvCatalog.All.Select(model => new TvModelDto(model.Id, model.Name, model.Year, model.WebOs, model.DolbyVision,
+            model.Hdr10Plus, model.Hlg, model.DdPlusAtmos, model.Dts, model.TrueHd, ticked.Contains(model.Id))).ToArray(), ticked,
+            settings.TvModelsRevision);
     }
 
     /// <summary>Gets enablement, defaults and readiness.</summary>
@@ -431,6 +471,9 @@ public sealed partial class AcquisitionSettingsController(
         if (request.DefaultQualityProfileId is { } profileId &&
             !await database.AcquisitionQualityProfiles.AnyAsync(value => value.Id == profileId, cancellationToken))
             return Invalid("invalid_quality_profile");
+        if (request.PhoneProfileIdSet && request.PhoneProfileId is { } phoneId &&
+            !await database.AcquisitionQualityProfiles.AnyAsync(value => value.Id == phoneId, cancellationToken))
+            return Invalid("invalid_phone_profile");
         if (request.DefaultQualityProfileId != settings.DefaultQualityProfileId)
         {
             // Titles that inherit the default now search with another profile: their backoff starts afresh, as for a
@@ -447,6 +490,7 @@ public sealed partial class AcquisitionSettingsController(
 
         settings.DownloadClientId = request.DownloadClientId;
         settings.DefaultQualityProfileId = request.DefaultQualityProfileId;
+        if (request.PhoneProfileIdSet) settings.PhoneProfileId = request.PhoneProfileId;
         settings.Enabled = false;
         await database.SaveChangesAsync(cancellationToken);
         if (request.Enabled)
@@ -484,7 +528,8 @@ public sealed partial class AcquisitionSettingsController(
             AcquisitionConfiguration.NormalizeEndpoint(client.BaseUrl) == AcquisitionConfiguration.NormalizeEndpoint(seedUrl);
         return new AcquisitionSettingsDto(state.Settings.Enabled, state.Settings.DownloadClientId, state.Settings.DefaultQualityProfileId,
             state.Settings.Revision, state.Ready, state.Blockers, (int)Math.Ceiling(hold.Hold.TotalSeconds), seedMatches,
-            QualityCatalog.All.Select(quality => new QualityDefinitionDto(quality.Id, quality.Source, quality.Resolution)).ToArray());
+            QualityCatalog.All.Select(quality => new QualityDefinitionDto(quality.Id, quality.Source, quality.Resolution)).ToArray(),
+            state.Settings.PhoneProfileId);
     }
 
     private async Task<string?> ApplySecretAsync(string? current, SecretChangeRequest change, CancellationToken cancellationToken) =>
@@ -555,6 +600,7 @@ public sealed partial class AcquisitionSettingsController(
         if (request.Cutoff is { } cutoff && !request.Qualities.Contains(cutoff, StringComparer.Ordinal)) return "invalid_cutoff";
         if (request.UpgradeAllowed && request.Cutoff is null) return "invalid_cutoff";
         if (request.UpgradeMode is not ("replace" or "add")) return "invalid_upgrade_mode";
+        if (!ProfilePreferences.IsKnown(request.Prefer)) return "invalid_prefer";
         return null;
     }
 
@@ -562,6 +608,7 @@ public sealed partial class AcquisitionSettingsController(
     {
         "invalid_cutoff" => "The cutoff must be one of the profile's allowed qualities, and upgrades need a cutoff.",
         "invalid_upgrade_mode" => "The upgrade mode must be replace or add.",
+        "invalid_prefer" => "Prefer must be tvs, everywhere or null.",
         _ => null
     };
 
@@ -614,6 +661,7 @@ public sealed partial class AcquisitionSettingsController(
         profile.UpgradeMode = request.UpgradeMode;
         profile.MinimumAutoScore = request.MinimumAutoScore;
         profile.MinimumSeeders = request.MinimumSeeders;
+        if (request.PreferSet) profile.Prefer = request.Prefer;
     }
 
     private static IndexerSettingsDto ToDto(AcquisitionIndexer indexer)
@@ -676,14 +724,14 @@ public sealed partial class AcquisitionSettingsController(
         }
     }
 
-    private static QualityProfileDto ToDto(AcquisitionQualityProfile profile, Guid? defaultId) => new(profile.Id, profile.Name,
+    private static QualityProfileDto ToDto(AcquisitionQualityProfile profile, Guid? defaultId, Guid? phoneId = null) => new(profile.Id, profile.Name,
         AcquisitionConfiguration.Qualities(profile), profile.MinimumBytesPerHour, profile.MaximumBytesPerHour, profile.Revision,
         profile.Id == defaultId, profile.Cutoff, profile.UpgradeAllowed, profile.UpgradeMode, profile.MinimumAutoScore, profile.MinimumSeeders,
-        QualityPresets.PresetIdOf(profile.Id));
+        QualityPresets.PresetIdOf(profile.Id), profile.Prefer, profile.Id == phoneId);
 
     private static QualityPresetDto ToDto(QualityPreset preset, bool added) => new(preset.Id, preset.Name, preset.Description, preset.Default,
         preset.Qualities, preset.MinimumBytesPerHour, preset.MaximumBytesPerHour, preset.Cutoff, preset.UpgradeAllowed, preset.UpgradeMode,
-        preset.MinimumSeeders, added);
+        preset.MinimumSeeders, added, preset.Prefer, preset.Phones);
 
     private BadRequestObjectResult Invalid(string code, string? message = null) =>
         BadRequest(new ProblemDetails { Status = 400, Type = code, Title = message ?? "The configuration is not valid." });
