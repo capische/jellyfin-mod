@@ -132,6 +132,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         {
             "GetItemById" when arguments is [Guid id, User user] => items.GetValueOrDefault(id) is { } item && Visible(user, item) ? item : null,
             "GetItemById" when arguments is [Guid id] => Lookup(id),
+            "GetItemList" => new List<BaseItem>(),
             _ => null
         };
     });
@@ -145,10 +146,14 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     });
     // The host's scheduled tasks: the Trakt plugin's import task, running or idle, beside another task.
     var traktTaskState = TaskState.Running;
+    // Phase 13: the export task's state and last result, as the host's worker reports them; the checks set them.
+    var exportState = TaskState.Idle;
+    TaskResult? exportLast = null;
     IScheduledTaskWorker Worker(string key, Func<TaskState> state) => Stub<IScheduledTaskWorker>.Create((method, _) => method.Name switch
     {
         "get_ScheduledTask" => Stub<IScheduledTask>.Create((inner, _) => inner.Name == "get_Key" ? key : null),
         "get_State" => state(),
+        "get_LastExecutionResult" when key == TraktPluginState.ExportTaskKey => exportLast,
         _ => null
     });
     // First, a task whose State getter throws, as Jellyfin's can when that task finishes between its two reads of its
@@ -156,9 +161,16 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     var workers = new[]
     {
         Worker("Finishing", () => throw new NullReferenceException("a finishing task's cancellation source")),
-        Worker("RefreshLibrary", () => TaskState.Running), Worker(TraktPluginState.SyncTaskKey, () => traktTaskState)
+        Worker("RefreshLibrary", () => TaskState.Running), Worker(TraktPluginState.SyncTaskKey, () => traktTaskState),
+        // Phase 13: the Trakt plugin's export task, never run.
+        Worker(TraktPluginState.ExportTaskKey, () => exportState)
     };
-    var taskManager = Stub<ITaskManager>.Create((method, _) => method.Name == "get_ScheduledTasks" ? workers : null);
+    var taskManager = Stub<ITaskManager>.Create((method, _) =>
+    {
+        // Phase 13: a queued export runs, as the host's does, until the check ends it.
+        if (method.Name == "QueueScheduledTask") exportState = TaskState.Running;
+        return method.Name == "get_ScheduledTasks" ? workers : null;
+    });
     EventHandler<UserDataSaveEventArgs>? userDataSaved = null;
     var userData = Stub<IUserDataManager>.Create((method, arguments) =>
     {
@@ -178,6 +190,17 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
             UserData = new UserItemData { Key = item.Id.ToString("N"), Played = played, PlaybackPositionTicks = position, PlayCount = playCount }
         });
 
+    // Phase 13: who reads the host's log folder. A read made while the export's status request runs has that controller
+    // on its stack (its status read is synchronous); the background check reads it from its own loop.
+    var logReads = 0;
+    var logReadsInRequest = 0;
+    string LogFolderRead()
+    {
+        Interlocked.Increment(ref logReads);
+        if (Environment.StackTrace.Contains("TraktExportController", StringComparison.Ordinal)) Interlocked.Increment(ref logReadsInRequest);
+        return Path.Combine(folder, "log");
+    }
+
     void Configure(IServiceCollection services)
     {
         services.AddSingleton(library);
@@ -186,11 +209,26 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         services.AddSingleton(taskManager);
         services.AddSingleton(userManager);
         services.AddSingleton<TraktPluginState>();
+        // Phase 13: the export's state, refusals and triggers (its loop looks every 15 s at the test pace).
+        services.AddSingleton(Stub<MediaBrowser.Common.Configuration.IApplicationPaths>.Create((method, _) =>
+            method.Name == "get_LogDirectoryPath" ? LogFolderRead() : null));
+        services.AddSingleton<TraktExportService>();
+        services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<TraktExportService>());
         // Deleted users are looked for every 300 ms here instead of every five minutes.
         services.AddSingleton<IHostedService>(provider =>
             ActivatorUtilities.CreateInstance<TraktObservationListener>(provider, (TimeSpan?)TimeSpan.FromMilliseconds(300)));
     }
 
+    // Phase 13: the plugin itself, for the export's switch and its test pace (one minute; the loop looks every 15 s). Its
+    // XML is held here: nothing is written to disk.
+    var pluginPaths = Stub<MediaBrowser.Common.Configuration.IApplicationPaths>.Create((method, _) => method.Name switch
+    {
+        "get_DataPath" or "get_PluginsPath" or "get_PluginConfigurationsPath" => folder,
+        _ => null
+    });
+    var savedConfiguration = new PluginConfiguration { TraktExportTestMinutes = 1 };
+    _ = new Plugin(pluginPaths, Stub<MediaBrowser.Model.Serialization.IXmlSerializer>.Create((method, _) =>
+        method.Name == "DeserializeFromFile" ? savedConfiguration : null));
     var time = new ShiftedTimeProvider();
     var host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(5), new PluginConfiguration(), Configure);
     var anonymous = host.Client(null, false);
@@ -467,6 +505,151 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     installed.Clear();
     Assert(Status((await Get(admin, series.Id)).Body, false, false), "With the plugin uninstalled the series answers installed:false");
 
+    // ---- Phase 13: the export reads the Trakt plugin's per-user links only when every field it relies on has the
+    // expected type, refuses when no account is linked, and never returns a token.
+    async Task<(HttpStatusCode Status, string Text)> Export(HttpClient client)
+    {
+        using var response = await client.GetAsync("JellyfinMod/Trakt/Export");
+        return (response.StatusCode, await response.Content.ReadAsStringAsync());
+    }
+
+    static string? Refusal(string text) => JsonDocument.Parse(text).RootElement.TryGetProperty("refusal", out var value) &&
+        value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+    LocalPlugin TraktWith(object users)
+    {
+        var plugin = TraktPlugin(PluginStatus.Active, "33.0.0.0");
+        var configuration = new FakeTraktConfiguration { TraktUsers = users };
+        plugin.Instance = Stub<IFakeTraktPlugin>.Create((method, _) => method.Name == "get_Configuration" ? configuration : null);
+        return plugin;
+    }
+
+    installed.Add(TraktWith(new[] { new FakeTraktUser { LinkedMbUserId = world.Admin.Id, AccessToken = "p13-access-value", RefreshToken = "p13-refresh-value" } }));
+    var exported = await Export(admin);
+    Assert(exported.Status == HttpStatusCode.OK && Refusal(exported.Text) is null &&
+        JsonDocument.Parse(exported.Text).RootElement.GetProperty("users")[0].GetProperty("state").GetString() == "linked",
+        "Trakt 33 with a linked account: the export is allowed and the account reads linked");
+    Assert(!exported.Text.Contains("p13-access-value", StringComparison.Ordinal) && !exported.Text.Contains("p13-refresh-value", StringComparison.Ordinal),
+        "The export state never carries a token value");
+    Assert((await Export(viewer)).Status == HttpStatusCode.Forbidden && (await Export(anonymous)).Status == HttpStatusCode.Unauthorized,
+        "The export state is for administrators only: 403 for an ordinary user, 401 anonymous");
+
+    installed.Clear();
+    installed.Add(TraktWith(new[] { new FakeTraktUser { LinkedMbUserId = world.Admin.Id, AccessToken = "a", RefreshToken = "r", PostUnwatchedHistory = true } }));
+    Assert(Refusal((await Export(admin)).Text) == "unwatched_history", "Post unwatched history on: the export is refused");
+
+    installed.Clear();
+    installed.Add(TraktWith(new[] { new FakeTraktUserStringSwitch { LinkedMbUserId = world.Admin.Id, AccessToken = "a", RefreshToken = "r", PostUnwatchedHistory = "false" } }));
+    Assert(Refusal((await Export(admin)).Text) == "unknown", "A post-unwatched-history switch of another type reads unknown and the export is refused");
+
+    installed.Clear();
+    installed.Add(TraktWith(new[] { new FakeTraktUserNoSwitch { LinkedMbUserId = world.Admin.Id, AccessToken = "a", RefreshToken = "r" } }));
+    Assert(Refusal((await Export(admin)).Text) == "unknown", "A missing post-unwatched-history switch reads unknown and the export is refused");
+
+    installed.Clear();
+    installed.Add(TraktWith(new[] { new FakeTraktUser { LinkedMbUserId = world.Admin.Id, AccessToken = "", RefreshToken = "r" } }));
+    exported = await Export(admin);
+    Assert(Refusal(exported.Text) == "no_users" &&
+        JsonDocument.Parse(exported.Text).RootElement.GetProperty("users")[0].GetProperty("state").GetString() == "reconnect",
+        "Every account needing a reconnect: none is linked, so the export is refused, and the account reads reconnect");
+    installed.Clear();
+
+    // ---- Phase 13: what starts the export. The checks stand in for the host: a queued export runs until the check ends
+    // it with a result, and the host's file log is written here in the host's format.
+    var logFolder = Path.Combine(folder, "log");
+    Directory.CreateDirectory(logFolder);
+    var logFile = Path.Combine(logFolder, $"log_{DateTime.Now:yyyyMMdd}.log");
+    static string Line(DateTimeOffset at, string level, string source, string message) =>
+        $"[{at.ToLocalTime():yyyy-MM-dd HH:mm:ss.fff zzz}] [{level}] [1] {source}: {message}";
+    async Task<JsonElement> ExportStatus() => JsonDocument.Parse(await admin.GetStringAsync("JellyfinMod/Trakt/Export")).RootElement;
+    async Task<bool> SetAuto(bool on)
+    {
+        using var put = await admin.PutAsync("JellyfinMod/Trakt/Export/Settings",
+            new StringContent($"{{\"autoExport\":{(on ? "true" : "false")}}}", System.Text.Encoding.UTF8, "application/json"));
+        return put.IsSuccessStatusCode && JsonDocument.Parse(await put.Content.ReadAsStringAsync()).RootElement.GetProperty("autoExport").GetBoolean() == on;
+    }
+    int Starts(string why) => logs.Lines.Count(line => line.Contains($"starts the Trakt plugin's export ({why})", StringComparison.Ordinal));
+    // The background check judges a run (every 15 s here); a status read only answers what it found.
+    async Task<JsonElement> Judged()
+    {
+        var state = await ExportStatus();
+        for (var waited = 0; waited < 400 && !(state.TryGetProperty("lastRunConfirmed", out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False); waited++)
+        {
+            await Task.Delay(100);
+            state = await ExportStatus();
+        }
+
+        return state;
+    }
+
+    async Task<bool> Started(string why, int before, int seconds = 40)
+    {
+        for (var waited = 0; waited < seconds * 10 && Starts(why) == before; waited++) await Task.Delay(100);
+        return Starts(why) > before;
+    }
+
+    // The host ends the run: idle again, with its result.
+    void Finish(TaskCompletionStatus status, DateTime started, DateTime ended)
+    {
+        exportLast = new TaskResult { Status = status, StartTimeUtc = started, EndTimeUtc = ended, Key = TraktPluginState.ExportTaskKey, Name = "Export library to trakt.tv" };
+        exportState = TaskState.Idle;
+    }
+
+    var linkedAdmin = new FakeTraktUser { LinkedMbUserId = world.Admin.Id, AccessToken = "a", RefreshToken = "r" };
+    installed.Add(TraktWith(new[] { linkedAdmin }));
+    // A run two minutes ago in which Trakt refused the history write: the plugin logged it and the host says Completed.
+    var refusedStart = DateTime.UtcNow.AddMinutes(-3);
+    var refusedEnd = DateTime.UtcNow.AddMinutes(-2);
+    await File.WriteAllLinesAsync(logFile, new[]
+    {
+        Line(refusedStart.AddSeconds(10), "ERR", "Trakt.ScheduledTasks.SyncLibraryTask", "Error updating episode play states"),
+        Line(refusedEnd, "INF", "Emby.Server.Implementations.ScheduledTasks.TaskManager", "\"Export library to trakt.tv\" Completed after 0 minute(s) and 50 seconds")
+    });
+    Finish(TaskCompletionStatus.Completed, refusedStart, refusedEnd);
+    for (var read = 0; read < 5; read++) await ExportStatus();
+    var state = await Judged();
+    Assert(logReads > 0 && logReadsInRequest == 0, $"The status read never reads the host's log; the background check does ({logReads} read(s), {logReadsInRequest} in a request)");
+    Assert(state.GetProperty("lastRunConfirmed").ValueKind == JsonValueKind.False && state.GetProperty("failures").GetInt32() == 1,
+        "A Completed run with a Trakt error in the log while it ran is not clean, and counts one failure");
+    Assert(await SetAuto(true), "The administrator turns the automatic export on");
+
+    var retries = Starts("the last run was not clean");
+    Assert(await Started("the last run was not clean", retries), "Its retry wait over, the export starts again by itself");
+    Assert((await ExportStatus()).GetProperty("running").GetBoolean(), "The retry is running");
+    // The retried run is clean: no Trakt error while it ran (a scrobble error from another source does not count).
+    var retryStart = DateTime.UtcNow.AddSeconds(-30);
+    var retryEnd = DateTime.UtcNow.AddSeconds(-20);
+    await File.AppendAllLinesAsync(logFile, new[]
+    {
+        Line(retryStart.AddSeconds(2), "ERR", "Trakt.ServerMediator", "Exception occurred while sending a playback status update to trakt.tv"),
+        Line(retryEnd, "INF", "Emby.Server.Implementations.ScheduledTasks.TaskManager", "\"Export library to trakt.tv\" Completed after 0 minute(s) and 10 seconds")
+    });
+    Finish(TaskCompletionStatus.Completed, retryStart, retryEnd);
+    state = await Judged();
+    Assert(state.GetProperty("lastRunConfirmed").ValueKind == JsonValueKind.True && state.GetProperty("failures").GetInt32() == 0 &&
+        !(state.TryGetProperty("nextAttemptAt", out var next) && next.ValueKind != JsonValueKind.Null), "The retried run is clean: no failure and no retry");
+    var anyStart = logs.Lines.Count(line => line.Contains("starts the Trakt plugin's export (", StringComparison.Ordinal));
+    await Task.Delay(TimeSpan.FromSeconds(35));
+    Assert(logs.Lines.Count(line => line.Contains("starts the Trakt plugin's export (", StringComparison.Ordinal)) == anyStart,
+        "After a clean run, with no new play, no reconnect and less than a day since, nothing starts");
+
+    // Reconnect: the account's sign-in could not be renewed, then it is linked again; the export starts by itself.
+    linkedAdmin.AccessToken = "";
+    await Task.Delay(TimeSpan.FromSeconds(20));
+    Assert(Refusal(JsonSerializer.Serialize(await ExportStatus())) == "no_users", "While the only account needs reconnecting the export is refused");
+    var relinks = Starts("a Trakt account was linked again");
+    linkedAdmin.AccessToken = "a";
+    Assert(await Started("a Trakt account was linked again", relinks), "Linked again: the export starts by itself");
+    Finish(TaskCompletionStatus.Completed, DateTime.UtcNow.AddSeconds(-20), DateTime.UtcNow.AddSeconds(-10));
+
+    // The daily safety net: the last clean run ended more than a day ago, with nothing else due.
+    var dailies = Starts("the daily safety-net export");
+    Finish(TaskCompletionStatus.Completed, DateTime.UtcNow.AddHours(-25).AddMinutes(-1), DateTime.UtcNow.AddHours(-25));
+    Assert(await Started("the daily safety-net export", dailies), "A day after the last run, the daily safety-net export starts");
+    Finish(TaskCompletionStatus.Completed, DateTime.UtcNow.AddSeconds(-20), DateTime.UtcNow.AddSeconds(-10));
+    Assert(await SetAuto(false), "The automatic export is turned off again");
+
+    installed.Clear();
+
     // ---- A stop writes what is already queued: a burst raised right before the host stops is all there after it.
     installed.Add(TraktPlugin(PluginStatus.Active));
     var late = Enumerable.Range(0, 200).Select(n => new Movie { Id = Guid.NewGuid(), Name = $"JellyfinMod Late {n}" }).ToArray();
@@ -495,3 +678,48 @@ static void Assert(bool condition, string message)
     if (!condition) throw new Exception("FAIL: " + message);
     Console.WriteLine("ok - " + message);
 }
+
+/// <summary>The Trakt plugin as the host's plugin list holds it: a plugin with a configuration (Phase 13 checks).</summary>
+public interface IFakeTraktPlugin : IPlugin, IHasPluginConfiguration;
+
+/// <summary>The Trakt plugin's configuration shape (v31–v33): a <c>TraktUsers</c> array.</summary>
+public sealed class FakeTraktConfiguration : BasePluginConfiguration
+{
+    public object TraktUsers { get; set; } = Array.Empty<object>();
+}
+
+/// <summary>One linked user with the v33 field types.</summary>
+public sealed class FakeTraktUser
+{
+    public Guid LinkedMbUserId { get; set; }
+    public string? AccessToken { get; set; }
+    public string? RefreshToken { get; set; }
+    public DateTime AccessTokenExpiration { get; set; } = DateTime.UtcNow.AddDays(30);
+    public bool PostWatchedHistory { get; set; } = true;
+    public bool PostUnwatchedHistory { get; set; }
+    public bool SynchronizeCollections { get; set; } = true;
+}
+
+/// <summary>A changed shape: the destructive switch as a string.</summary>
+public sealed class FakeTraktUserStringSwitch
+{
+    public Guid LinkedMbUserId { get; set; }
+    public string? AccessToken { get; set; }
+    public string? RefreshToken { get; set; }
+    public DateTime AccessTokenExpiration { get; set; } = DateTime.UtcNow.AddDays(30);
+    public bool PostWatchedHistory { get; set; } = true;
+    public string PostUnwatchedHistory { get; set; } = "false";
+    public bool SynchronizeCollections { get; set; } = true;
+}
+
+/// <summary>A changed shape: the destructive switch is missing.</summary>
+public sealed class FakeTraktUserNoSwitch
+{
+    public Guid LinkedMbUserId { get; set; }
+    public string? AccessToken { get; set; }
+    public string? RefreshToken { get; set; }
+    public DateTime AccessTokenExpiration { get; set; } = DateTime.UtcNow.AddDays(30);
+    public bool PostWatchedHistory { get; set; } = true;
+    public bool SynchronizeCollections { get; set; } = true;
+}
+
