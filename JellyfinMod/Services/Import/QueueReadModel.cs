@@ -103,7 +103,7 @@ public static class QueueReadModel
     /// file progress from the client snapshot.
     /// </summary>
     public static QueuePackDto Pack(GrabOperation grab, IReadOnlyList<Episode> claimed, IReadOnlyList<ImportOperation> children,
-        ClientSnapshot? snapshot)
+        ClientSnapshot? snapshot, IReadOnlySet<Guid>? held = null)
     {
         var torrent = snapshot is { Reachable: true } && grab.InfoHash is { } hash ? snapshot.Find(hash) : null;
         var parsed = System.Text.Json.JsonSerializer.Deserialize<ParsedRelease>(grab.ParsedJson);
@@ -121,7 +121,7 @@ public static class QueueReadModel
                 : torrent is null ? null : FileProgress(torrent, import.SourceClientPath);
             var file = torrent is null || import is null ? -1 : ImportPaths.FileIndex(torrent, import.SourceClientPath);
             return new QueuePackEpisodeDto(episode.Id, episode.SeasonNumber, episode.EpisodeNumber, import?.Id, import?.State, import?.Reason,
-                progress, file >= 0 ? torrent!.Files[file].Length : null);
+                progress, file >= 0 ? torrent!.Files[file].Length : null, held?.Contains(episode.Id) == true);
         }).ToArray());
     }
 
@@ -132,7 +132,7 @@ public static class QueueReadModel
     /// client accepts it, the import row (created in the same commit) takes its place.
     /// </summary>
     public static QueueRowDto Held(GrabOperation grab, Entry? entry, Episode? episode, IReadOnlyList<Episode> claimed,
-        AcquisitionDownloadClient? client, bool administrator) => new QueueRowDto(grab.Id, grab.Id,
+        AcquisitionDownloadClient? client, bool administrator, IReadOnlySet<Guid>? held = null) => new QueueRowDto(grab.Id, grab.Id,
             entry is null ? null : new QueueEntryDto(entry.Id, entry.MediaType, entry.Title, entry.Year, entry.PosterPath,
                 entry.JellyfinItemId, entry.TargetLibraryId),
             episode is null ? null : new QueueEpisodeDto(episode.Id, episode.SeasonNumber, episode.EpisodeNumber, episode.Title),
@@ -141,10 +141,22 @@ public static class QueueReadModel
             administrator && client is not null ? new QueueClientDto(client.Id, client.Name, client.OpenUrl) : null, null,
             administrator && grab.InfoHash is { } hash ? new QueueAdminDetailDto(null, null, null, null, null, null, null, hash) : null)
     {
-        Pack = ReleaseScopes.IsPack(grab.Scope) ? Pack(grab, claimed, [], null) : null,
+        Pack = ReleaseScopes.IsPack(grab.Scope) ? Pack(grab, claimed, [], null, held) : null,
         Parsed = Parsed(grab),
-        IndexerName = grab.IndexerName
+        IndexerName = grab.IndexerName,
+        Mode = grab.Mode,
+        Replaces = Replaces(grab)
     };
+
+    /// <summary>
+    /// What a movie's or an episode's Replace removes, from the grab's fixed targets (the upgrade status, 2026-10-28): each file's
+    /// binding and the resolution its name gives. Null for any other grab and for a pack, whose targets are fixed per episode later.
+    /// </summary>
+    public static IReadOnlyList<QueueReplaceTargetDto>? Replaces(GrabOperation grab) =>
+        grab.Mode != GrabModes.Replace || ReleaseScopes.IsPack(grab.Scope) ? null
+            : PackReplaceService.ReadTargets(grab.ReplaceTargets)
+                .Select(target => new QueueReplaceTargetDto(target.BindingId, Automation.VersionQuality.Parse(target.Path).Resolution))
+                .ToArray();
 
     /// <summary>The grab's release name as parsed when it was grabbed (P1.FU20); null for a grab that kept none.</summary>
     public static ParsedRelease? Parsed(GrabOperation grab)
