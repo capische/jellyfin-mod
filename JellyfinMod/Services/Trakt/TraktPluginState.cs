@@ -31,7 +31,8 @@ public sealed record TraktLink(Guid UserId, bool Linked, bool ReconnectNeeded, D
 
 /// <summary>
 /// Reads the host's own plugin list and scheduled tasks for the stock Trakt plugin, and (Phase 13, user decision Q2) the
-/// plugin's per-user link state read-only. JellyfinMod never reads a token's value and never calls Trakt itself.
+/// plugin's per-user link state read-only. JellyfinMod never calls Trakt for the plugin; it reads a token's value for one
+/// call only, the linked account's profile (decision D49, <see cref="ReadProfileAccess"/>), on the server.
 /// </summary>
 public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks, ILogger<TraktPluginState> logger)
 {
@@ -182,6 +183,42 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
         catch (Exception error) when (error is InvalidOperationException or ArgumentException or NullReferenceException or TargetException or TargetInvocationException or MethodAccessException)
         {
             logger.LogDebug(error, "JellyfinMod could not read the Trakt plugin's links; they are reported unknown");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// What one read-only call to Trakt for a user's profile needs (Phase 13, decision D49): the plugin's public client id
+    /// (its <c>TraktUris.ClientId</c> constant, an application identifier it sends with every request) and the access token
+    /// the plugin holds for <paramref name="userId"/>. Server-side only: neither value is logged, returned or stored.
+    /// Null when the plugin, its constant or a token is not there.
+    /// </summary>
+    internal (string ClientId, string AccessToken)? ReadProfileAccess(Guid userId)
+    {
+        try
+        {
+            var plugin = plugins.Plugins.ToArray()
+                .Where(candidate => candidate.Id == PluginId && candidate.Manifest.Status == PluginStatus.Active)
+                .OrderByDescending(candidate => candidate.Version).FirstOrDefault();
+            if (plugin?.Instance is not IHasPluginConfiguration configured) return null;
+            var clientId = plugin.Instance.GetType().Assembly.GetTypes()
+                .FirstOrDefault(type => type.Name == "TraktUris")?
+                .GetField("ClientId", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) as string;
+            if (string.IsNullOrWhiteSpace(clientId)) return null;
+            var configuration = configured.Configuration;
+            if (configuration?.GetType().GetProperty("TraktUsers", BindingFlags.Public | BindingFlags.Instance)?.GetValue(configuration)
+                is not IEnumerable traktUsers) return null;
+            foreach (var user in traktUsers)
+            {
+                if (user is null || !TryRead(user, "LinkedMbUserId", out Guid id) || id != userId) continue;
+                return TryRead(user, "AccessToken", out string? access) && !string.IsNullOrWhiteSpace(access) ? (clientId, access!) : null;
+            }
+
+            return null;
+        }
+        catch (Exception error) when (error is InvalidOperationException or ArgumentException or NullReferenceException or TargetException or TargetInvocationException or MethodAccessException or ReflectionTypeLoadException or FieldAccessException)
+        {
+            logger.LogDebug("JellyfinMod could not read what the Trakt profile read needs: {Error}", error.GetType().Name);
             return null;
         }
     }

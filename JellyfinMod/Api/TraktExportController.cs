@@ -69,8 +69,16 @@ public sealed class TraktExportController(TraktExportService export) : Controlle
             status.NextAttemptAt,
             status.Failures,
             testMinutes > 0 ? testMinutes : 10,
-            status.Users.Select(pair => new TraktExportUserDto(pair.Name, pair.Link.ReconnectNeeded ? "reconnect" : "linked",
-                pair.Link.ReconnectNeeded ? pair.Link.TokenExpiresAt : null, pair.Link.SynchronizeCollections, pair.Link.PostWatchedHistory)).ToList());
+            status.Users.Select(pair =>
+            {
+                var profile = status.Profiles.GetValueOrDefault(pair.Link.UserId);
+                return new TraktExportUserDto(pair.Link.UserId, pair.Name, pair.Link.ReconnectNeeded ? "reconnect" : "linked",
+                    pair.Link.ReconnectNeeded ? pair.Link.TokenExpiresAt : null, pair.Link.SynchronizeCollections, pair.Link.PostWatchedHistory,
+                    profile?.Username, profile?.AvatarUrl);
+            }).ToList(),
+            status.Activity.Select(run => new TraktExportActivityDto(Utc(run.StartedAt), Utc(run.EndedAt), run.Status, run.Clean, run.Why,
+                run.EpisodesWatched, run.MoviesWatched, run.EpisodesCollected, run.MoviesCollected, run.Error)).ToList(),
+            status.RunningWhy);
     }
 
     private static DateTime Utc(DateTime value) => value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc);
