@@ -525,12 +525,15 @@ public sealed class GrabService(
             .ToArray();
         var episodes = await database.Episodes.AsNoTracking().Where(value => value.EntryId == entry.Id && ids.Contains(value.Id))
             .OrderBy(value => value.SeasonNumber).ThenBy(value => value.EpisodeNumber).ToListAsync(cancellationToken).ConfigureAwait(false);
-        // Automation fills only what it wants (monitored, without a file); never adds or replaces.
+        // Automation fills only what it wants (monitored, without a file), or adds a copy for phones beside episodes that hold
+        // files (Phase 12 M36, "Also get a 1080p copy for phones"); it never replaces.
         if (automatic)
         {
-            if (requested is not (null or GrabModes.Fill))
-                throw new GrabException(400, "invalid_mode", "Automation only fills episodes without a file.");
-            episodes = episodes.Where(value => value.State != FileState.OnDisk && canAccess(entry, value)).ToList();
+            if (requested is not (null or GrabModes.Fill or GrabModes.Add))
+                throw new GrabException(400, "invalid_mode", "Automation only fills episodes without a file or adds a copy for phones.");
+            var adds = requested == GrabModes.Add;
+            episodes = episodes.Where(value => (adds ? value.State == FileState.OnDisk : value.State != FileState.OnDisk) && canAccess(entry, value))
+                .ToList();
         }
         else if (episodes.Any(value => !canAccess(entry, value)))
         {
