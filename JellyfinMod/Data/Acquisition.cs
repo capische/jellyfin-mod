@@ -632,6 +632,13 @@ public sealed class GrabOperation
     /// </summary>
     [MaxLength(16)]
     public string Mode { get; set; } = GrabModes.Fill;
+
+    /// <summary>
+    /// Gets or sets the files a movie's or an episode's <c>replace</c> grab may remove, as JSON: every file it held when the grab
+    /// (or the import again from its seeding copy) was admitted, read under the library lease (user, 2026-10-28). A file added
+    /// later is never one. Null for every other grab, and for a pack, whose files are fixed as each episode's import completes.
+    /// </summary>
+    public string? ReplaceTargets { get; set; }
 }
 
 /// <summary>How a grab writes the episodes it covers (season and series packs, 2026-10-08).</summary>

@@ -278,6 +278,12 @@ public sealed class GrabService(
                 // grab can acquire it at the same time (Codex re-review of the pack plugin, finding 3).
                 claimed = await RefreshClaimsAsync(claimed, pack, addVersion, mode, cancellationToken).ConfigureAwait(false);
                 claimKeys = claimed.Select(item => ClaimKey(item.Episode.Id, ClaimsVersion(pack, addVersion, item.Held, mode))).ToArray();
+                // A movie's or an episode's Replace removes what it holds now, at the grab, not what it holds when the file arrives
+                // (Codex review of the movie Replace, P1 1); fixed under the library lease the version writers take.
+                operation.ReplaceTargets = !pack && mode == GrabModes.Replace
+                    ? await Import.PackReplaceService.SnapshotTargetsAsync(database, entry.Id, episode?.Id, Guid.Empty, null, cancellationToken)
+                        .ConfigureAwait(false)
+                    : null;
                 // The key is read again in both of its stores right before it is written, under the gate every grab and
                 // re-import writes under (Codex re-review of P4.FU29).
                 if (await KeyedAsync(userId, request.IdempotencyKey, fingerprint, canAccess, cancellationToken).ConfigureAwait(false) is { } keyed)
@@ -395,6 +401,11 @@ public sealed class GrabService(
                 import.Intent = addVersion ? GrabIntents.AddVersion : GrabIntents.Acquire;
                 // The import reads its grab's mode: Replace takes the files held when it completes, as a downloaded one does.
                 owner.Mode = versionMode ?? GrabModes.Fill;
+                // A Replace from the seeding copy removes what the title holds now, as a new Replace grab does (P1 1).
+                owner.ReplaceTargets = versionMode == GrabModes.Replace
+                    ? await Import.PackReplaceService.SnapshotTargetsAsync(database, entry.Id, episode?.Id, Guid.Empty, null, cancellationToken)
+                        .ConfigureAwait(false)
+                    : null;
                 owner.ActiveTarget = targetKey;
                 owner.UpdatedAt = now;
                 // The episode is claimed again under its acquire key, so a pack covering it is refused while it imports (Codex

@@ -326,6 +326,61 @@ internal static class UpgradesOffScenarios
         var rewrittenRow = Versions(1).SingleOrDefault(version => version.GetProperty("label").GetString() == "1080p WEB-DL");
         Assert(rewrittenRow.ValueKind == JsonValueKind.Object && rewrittenRow.GetProperty("resolution").ValueKind == JsonValueKind.Null,
             "A file rewritten in place at the version's path is no longer read as the import's 1080p: " + rewrittenRow);
+
+        // Codex review of the movie Replace, P1 3: an episode's Replace that passed its planning while the switch was on, and is
+        // waiting for Jellyfin to pick its file up when the switch is turned off, removes nothing once it completes.
+        await SetEpisodeUpgradesAsync(admin, true);
+        const string lateRelease = "Alias.Show.S01E04.2160p.WEB-DL-GRP";
+        var lateFixture = TorrentFixture.Single(lateRelease + ".mkv", Size);
+        torznab.Torrents["aliasLate"] = lateFixture.Bytes;
+        transmission.Register(lateFixture);
+        lock (torznab.MovieItems)
+            torznab.TvItems.Add(new(lateRelease, "guid-aliasLate", torznab.Download("aliasLate"), Size, 25, new() { ["tvdbid"] = "380" }));
+        var lateSearch = await ReadAsync(await admin.GetAsync(
+            $"/JellyfinMod/Releases?entryId={ids["alias"]}&episodeId={ids["aliass1e4"]}&intent=addVersion"), 200, "Get Another Quality for S01E04");
+        var lateGrab = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+        {
+            searchId = lateSearch.GetProperty("searchId").AsGuid(),
+            releaseId = lateSearch.GetProperty("candidates").EnumerateArray().Single(item => item.GetProperty("rawTitle").GetString() == lateRelease)
+                .GetProperty("releaseId").GetString(),
+            idempotencyKey = "p5-alias-late-" + Guid.NewGuid().ToString("N"), mode = "replace", acceptRejected = true
+        }), 202, "Replace S01E04's files while the switch is on");
+        var lateGrabId = lateGrab.GetProperty("id").AsGuid();
+        await WaitAsync(async () => Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Grabs/{lateGrabId}")).GetProperty("state").GetString() ==
+            "accepted" ? true : null, "The S01E04 Replace is accepted");
+        world.Native.AutoScan = false;
+        ImportOperation? late = null;
+        try
+        {
+            transmission.Progress(lateFixture.InfoHash, 1.0);
+            await WaitAsync(async () =>
+            {
+                await tick();
+                await using var database = new ModDbContext(dbPath);
+                late = await database.ImportOperations.AsNoTracking().SingleOrDefaultAsync(value => value.GrabId == lateGrabId);
+                return late is { State: ImportStates.Scanning } ? true : null;
+            }, "The S01E04 Replace passed its planning and waits for Jellyfin", 60);
+            await SetEpisodeUpgradesAsync(admin, false);
+            world.Native.Scan(late!.DestinationPath!);
+        }
+        finally
+        {
+            world.Native.AutoScan = true;
+        }
+
+        await WaitAsync(async () =>
+        {
+            await tick();
+            await using var database = new ModDbContext(dbPath);
+            late = await database.ImportOperations.AsNoTracking().SingleAsync(value => value.GrabId == lateGrabId);
+            return late.State == ImportStates.Completed ? true : null;
+        }, "The S01E04 Replace import completes", 60);
+        for (var index = 0; index < 2; index++) await tick();
+        await using (var database = new ModDbContext(dbPath))
+            Assert(late!.ReplaceState == ReplaceStates.Refused && late.ReplaceDetail!.Contains("turned off", StringComparison.Ordinal) &&
+                File.Exists(heldE4) && File.Exists(e4.DestinationPath!) &&
+                await database.EpisodeBindings.CountAsync(binding => binding.EpisodeId == ids["aliass1e4"]) == 3,
+                $"An episode's Replace whose switch went off before it completed removes nothing: {late.ReplaceState} {late.ReplaceDetail}");
     }
 
     private static async Task SetEpisodeUpgradesAsync(HttpClient admin, bool on)

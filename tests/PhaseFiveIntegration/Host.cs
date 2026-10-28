@@ -160,6 +160,15 @@ internal sealed partial class NativeWorld
     /// <summary>The media streams Jellyfin's probe recorded for an item; an item without any reads as unprobed.</summary>
     public ConcurrentDictionary<Guid, MediaStream[]> Streams { get; } = new();
 
+    /// <summary>Records a video stream for the item at the path, as Jellyfin's probe of a playable file does; false when none is there.</summary>
+    public bool Probe(string path)
+    {
+        var item = _items.Values.FirstOrDefault(value => value is Video && value.Path == path);
+        if (item is null) return false;
+        Streams[item.Id] = [new MediaStream { Type = MediaStreamType.Video, Index = 0, Codec = "h264" }];
+        return true;
+    }
+
     private IMediaSourceManager? _mediaSources;
 
     public IMediaSourceManager MediaSources => _mediaSources ??= Stub<IMediaSourceManager>.Create((method, arguments) =>
