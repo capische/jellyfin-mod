@@ -112,8 +112,13 @@ public sealed class ReleasesController(
             : !state.Ready ? state.Blockers[0]
             : active is not null ? "grab_active"
             : null;
+        // A movie's Replace removes every file the movie holds, so its confirmation names how many (user, 2026-10-28).
+        int? heldFiles = addVersion && !pack && target.EpisodeId is null
+            ? await database.EntryBindings.AsNoTracking().CountAsync(binding => binding.EntryId == target.EntryId && binding.MediaPath != null,
+                cancellationToken)
+            : null;
         return new GrabAvailabilityDto(reason is null, reason, (int)Math.Ceiling(hold.Hold.TotalSeconds), active?.Id,
-            GrabService.ModesFor(pack, addVersion, pack || target.EpisodeId is not null, state.Settings.EpisodeUpgradesEnabled));
+            GrabService.ModesFor(pack, addVersion, state.Settings.EpisodeUpgradesEnabled), heldFiles);
     }
 
     /// <summary>

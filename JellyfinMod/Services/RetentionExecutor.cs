@@ -257,7 +257,8 @@ public sealed class RetentionExecutor(
 
     /// <summary>
     /// Replaces one version of an episode with the file a pack's <c>replace</c> grab imported for that same episode (season and
-    /// series packs; Codex review of the pack plugin, findings 1 and 2). It is the administrator's explicit Replace, confirmed in
+    /// series packs; Codex review of the pack plugin, findings 1 and 2), or one version of a movie with the file its
+    /// <c>replace</c> grab imported for that same movie (user, 2026-10-28). It is the administrator's explicit Replace, confirmed in
     /// the picker, so, as with Remove this version, neither retention being off nor its schedule stops it. Everything that
     /// protects this one file still does: a per-file Keep, the file playing, a multi-part file, unwritable media, changed
     /// storage or contents, a file another binding shares, a library path that is a download JellyfinMod keeps on disk, and a
@@ -275,19 +276,22 @@ public sealed class RetentionExecutor(
     {
         await using var executionLease = await executionGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
         var target = await LoadVersionAsync(entryId, bindingId, cancellationToken).ConfigureAwait(false);
-        if (target?.EpisodeId is null) return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
+        if (target is null) return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
         if (await database.RetentionOperations.AsNoTracking().AnyAsync(operation => operation.BindingId == bindingId &&
                 (operation.State == RetentionOperationStates.Prepared || operation.State == RetentionOperationStates.Unlinked),
                 cancellationToken).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.OperationOpen);
+        // The movie or episode the old file belongs to; the successor must be the import of that same one.
+        var targetEpisodeId = target.EpisodeId;
         var successorPath = await database.ImportOperations.AsNoTracking().Where(value => value.Id == successorImportId)
             .Select(value => value.DestinationPath).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         // Both files' libraries are locked: the successor is read under the same locks as the file it replaces.
         var libraries = LibrariesContaining(target.Path).Concat(LibrariesContaining(successorPath)).Append(target.LibraryId).ToHashSet();
         await using var libraryLease = await AcquireLibrariesAsync(libraries, cancellationToken).ConfigureAwait(false);
         target = await LoadVersionAsync(entryId, bindingId, cancellationToken).ConfigureAwait(false);
-        if (target?.EpisodeId is not { } episodeId)
+        if (target is null || target.EpisodeId != targetEpisodeId)
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
+        var episodeId = target.EpisodeId;
         // Only a file the replacement chose when it was decided, and only while it is still that file.
         if (!string.Equals(target.Path, expectedPath, StringComparison.Ordinal) || string.IsNullOrEmpty(expectedFingerprint) ||
             !string.Equals(target.Fingerprint, expectedFingerprint, StringComparison.Ordinal))
@@ -306,7 +310,7 @@ public sealed class RetentionExecutor(
         // this point is seen here and nothing it protects is unlinked (Codex re-review of the pack plugin, finding 1).
         if (await database.Entries.AsNoTracking().AnyAsync(entry => entry.Id == entryId && entry.RetentionPolicy == RetentionPolicy.Never,
                 cancellationToken).ConfigureAwait(false) ||
-            await database.Episodes.AsNoTracking().AnyAsync(episode => episode.Id == episodeId &&
+            episodeId is not null && await database.Episodes.AsNoTracking().AnyAsync(episode => episode.Id == episodeId &&
                 episode.RetentionPolicy == RetentionPolicy.Never, cancellationToken).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionLiveReasons.Kept);
         var policy = await database.RetentionPolicySnapshots.AsNoTracking()
@@ -853,7 +857,8 @@ public sealed class RetentionExecutor(
                 EventType = replaced ? "upgrade_replaced" : packReplaced ? "version_replaced" : versionRemoved ? "version_removed" : "reclaimed",
                 BindingId = operation.BindingId == Guid.Empty ? null : operation.BindingId,
                 Summary = packReplaced
-                    ? $"Replaced the version {Path.GetFileName(operation.MediaPath)} with the file from the pack"
+                    ? $"Replaced the version {Path.GetFileName(operation.MediaPath)} with the " +
+                        (operation.EpisodeId.HasValue ? "file from the pack" : "new file")
                     : versionRemoved
                     ? $"Removed the version {Path.GetFileName(operation.MediaPath)}; the folder and its other files stay" +
                         (lastRemoved ? ". It was the last copy, so this is no longer monitored" : string.Empty)

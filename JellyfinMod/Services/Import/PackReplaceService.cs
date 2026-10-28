@@ -7,8 +7,8 @@ using Microsoft.Extensions.Logging;
 namespace JellyfinMod.Services.Import;
 
 /// <summary>
-/// Finishes <c>replace</c> grabs (season and series packs, 2026-10-08): once the pack's file for an episode is imported, the
-/// episode's other files are removed one by one through <see cref="RetentionExecutor.ReplaceVersionAsync"/>, which removes a
+/// Finishes <c>replace</c> grabs (season and series packs, 2026-10-08; an episode's and a movie's another version, 2026-10-09
+/// and 2026-10-28): once the new file for an episode or a movie is imported, its other files are removed one by one through <see cref="RetentionExecutor.ReplaceVersionAsync"/>, which removes a
 /// file only while the new one is, under its locks and right before the unlink, still bound to that episode, still the file
 /// the import linked and the file Jellyfin plays, and only when nothing protects the old file (a per-file Keep, playback,
 /// sharing, a download kept on disk, or a binding by episode number only). Keep on the title or the episode keeps every file.
@@ -67,21 +67,29 @@ public sealed class PackReplaceService(
         database.ChangeTracker.Clear();
         var import = await database.ImportOperations.SingleAsync(value => value.Id == importId, cancellationToken).ConfigureAwait(false);
         if (import.ReplaceState != ReplaceStates.Pending) return true;
-        if (import.State != ImportStates.Completed || import.EntryId is not { } entryId || import.EpisodeId is not { } episodeId ||
-            import.BindingId is not { } newBinding)
+        if (import.State != ImportStates.Completed || import.EntryId is not { } entryId || import.BindingId is not { } newBinding)
             return await EndAsync(import, ReplaceStates.Refused, "The new file is no longer tracked; nothing was removed.", cancellationToken)
                 .ConfigureAwait(false);
+        var episodeId = import.EpisodeId;
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken)
             .ConfigureAwait(false);
-        var episode = await database.Episodes.AsNoTracking().SingleOrDefaultAsync(value => value.Id == episodeId, cancellationToken)
-            .ConfigureAwait(false);
-        if (entry is null || episode is null)
-            return await EndAsync(import, ReplaceStates.Refused, "The episode was removed from the catalog; nothing was removed.",
+        var episode = episodeId is { } id
+            ? await database.Episodes.AsNoTracking().SingleOrDefaultAsync(value => value.Id == id, cancellationToken).ConfigureAwait(false)
+            : null;
+        if (entry is null || episodeId.HasValue && episode is null)
+            return await EndAsync(import, ReplaceStates.Refused, episodeId.HasValue
+                    ? "The episode was removed from the catalog; nothing was removed."
+                    : "The movie was removed from the catalog; nothing was removed.",
                 cancellationToken).ConfigureAwait(false);
-        var label = $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00}";
-        // Keep protects the whole title or episode: a kept episode only gains files, as an upgrade of it does.
-        if (entry.RetentionPolicy == RetentionPolicy.Never || episode.RetentionPolicy == RetentionPolicy.Never)
-            return await EndAsync(import, ReplaceStates.Refused, $"{label}: Keep protects this episode; its other files were kept.",
+        // An episode's lines start with its number, as History reads them; a movie's need none.
+        string Line(string text) => episode is null
+            ? char.ToUpperInvariant(text[0]) + text[1..]
+            : $"S{episode.SeasonNumber:00}E{episode.EpisodeNumber:00}: {text}";
+        // Keep protects the whole title or episode: a kept title or episode only gains files, as an upgrade of it does.
+        if (entry.RetentionPolicy == RetentionPolicy.Never || episode?.RetentionPolicy == RetentionPolicy.Never)
+            return await EndAsync(import, ReplaceStates.Refused, episode is null
+                    ? Line("Keep protects this movie; its other files were kept.")
+                    : Line("Keep protects this episode; its other files were kept."),
                 cancellationToken).ConfigureAwait(false);
 
         var waiting = new List<string>();
@@ -94,13 +102,12 @@ public sealed class PackReplaceService(
         var refused = new List<string>();
         if (waiting.Count == 0)
         {
-            // Only the files the episode held when the import completed (finding 2 of the re-review), each while it is still
-            // bound to the episode at the same path; the new file's own binding, and anything at its path, is never one.
+            // Only the files the episode or movie held when the import completed (finding 2 of the re-review), each while it is
+            // still bound to it at the same path; the new file's own binding, and anything at its path, is never one.
             var targets = ReadTargets(import.ReplaceTargets);
             var paths = targets.Select(target => target.Path).ToArray();
-            var current = await database.EpisodeBindings.AsNoTracking()
-                .Where(binding => binding.EpisodeId == episodeId && binding.Id != newBinding && binding.MediaPath != import.DestinationPath &&
-                    binding.MediaPath != null && paths.Contains(binding.MediaPath))
+            var current = await BindingsOf(database, entryId, episodeId)
+                .Where(binding => binding.Id != newBinding && binding.MediaPath != import.DestinationPath && paths.Contains(binding.MediaPath))
                 .Select(binding => new { binding.Id, binding.MediaPath }).ToListAsync(cancellationToken).ConfigureAwait(false);
             foreach (var target in targets.OrderBy(target => target.Path, StringComparer.Ordinal))
             {
@@ -126,7 +133,7 @@ public sealed class PackReplaceService(
         {
             if (Now - (import.CompletedAt ?? import.UpdatedAt) < WaitLimit)
             {
-                var detail = ImportService.Bound($"{label}: waiting to replace: {string.Join(", ", waiting)}" +
+                var detail = ImportService.Bound(Line($"waiting to replace: {string.Join(", ", waiting)}") +
                     (removed.Count > 0 ? "; removed " + string.Join(", ", removed) : string.Empty) + ".");
                 if (import.ReplaceDetail != detail)
                 {
@@ -143,31 +150,46 @@ public sealed class PackReplaceService(
 
         if (refused.Count > 0)
             return await EndAsync(import, ReplaceStates.Refused,
-                $"{label}: kept {string.Join(", ", refused)} beside the new file" +
+                Line($"kept {string.Join(", ", refused)} beside the new file") +
                 (removed.Count > 0 ? "; removed " + string.Join(", ", removed) : string.Empty) + ".", cancellationToken).ConfigureAwait(false);
         return await EndAsync(import, ReplaceStates.Done, removed.Count == 0
-            ? $"{label}: no other file was left to replace."
-            : $"{label}: replaced {string.Join(", ", removed)}.", cancellationToken).ConfigureAwait(false);
+            ? Line("no other file was left to replace.")
+            : Line($"replaced {string.Join(", ", removed)}."), cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>One file a replacement may remove: its binding when the replacement was decided, its path and content.</summary>
     public sealed record ReplaceTarget(Guid BindingId, string Path, string? Fingerprint);
 
     /// <summary>
-    /// The episode's other files when a replace import completes, as <see cref="ImportOperation.ReplaceTargets"/>: every file
-    /// bound to the episode but the new one. Read by the caller under the library lock, in the import's completing transaction.
+    /// The episode's or the movie's other files when a replace import completes, as <see cref="ImportOperation.ReplaceTargets"/>:
+    /// every file bound to it but the new one. Read by the caller under the library lock, in the import's completing transaction.
     /// </summary>
-    public static async Task<string> SnapshotTargetsAsync(ModDbContext database, Guid episodeId, Guid newBindingId, string? destination,
-        CancellationToken cancellationToken)
+    public static async Task<string> SnapshotTargetsAsync(ModDbContext database, Guid entryId, Guid? episodeId, Guid newBindingId,
+        string? destination, CancellationToken cancellationToken)
     {
-        var targets = await database.EpisodeBindings.AsNoTracking()
-            .Where(binding => binding.EpisodeId == episodeId && binding.Id != newBindingId && binding.MediaPath != null &&
-                binding.MediaPath != destination)
+        var targets = await BindingsOf(database, entryId, episodeId)
+            .Where(binding => binding.Id != newBindingId && binding.MediaPath != destination)
             .OrderBy(binding => binding.MediaPath)
             .Select(binding => new ReplaceTarget(binding.Id, binding.MediaPath!, binding.FileFingerprint))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         return JsonSerializer.Serialize(targets);
     }
+
+    private sealed class BoundFile
+    {
+        public Guid Id { get; init; }
+
+        public string? MediaPath { get; init; }
+
+        public string? FileFingerprint { get; init; }
+    }
+
+    /// <summary>The files bound to the episode, or to the movie when there is no episode.</summary>
+    private static IQueryable<BoundFile> BindingsOf(ModDbContext database, Guid entryId, Guid? episodeId) => episodeId is { } episode
+        ? database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == episode && binding.MediaPath != null)
+            .Select(binding => new BoundFile { Id = binding.Id, MediaPath = binding.MediaPath, FileFingerprint = binding.FileFingerprint })
+        : database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entryId && binding.MediaPath != null)
+            .Select(binding => new BoundFile { Id = binding.Id, MediaPath = binding.MediaPath, FileFingerprint = binding.FileFingerprint });
 
     private static List<ReplaceTarget> ReadTargets(string? json)
     {
