@@ -23,6 +23,7 @@ public sealed class AutomationController(
     AutomationStatusService status,
     AutomationRunGate runGate,
     ITaskManager taskManager,
+    RetentionExecutionGate executionGate,
     MediaBrowser.Controller.Library.ILibraryManager? library = null) : ControllerBase
 {
     /// <summary>Gets whether automation runs, why it is paused, its budgets and the last run.</summary>
@@ -146,6 +147,11 @@ public sealed class AutomationController(
         if (!readiness.IsReady) return StatusCode(503);
         // Revision check and save under one gate (whole-review chunk 3a P2 3, 3b P2 3).
         await using var settingsMutation = await SettingsMutationGate.AcquireAsync(cancellationToken);
+        // Turning Replace off waits for a removal under way and holds every new one back until it is saved: a replacement reads
+        // the switch under this gate right before its unlink (Codex re-review of the movie Replace, P1 2). Lock order: the
+        // settings gate, then the retention execution gate, then (in the executor) the library locks; nothing takes them the
+        // other way round.
+        await using var executionLease = request.EpisodeUpgradesEnabled ? null : await executionGate.AcquireAsync(cancellationToken);
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
         if (request.Revision != settings.AutomationRevision)
             return Conflict(new ProblemDetails

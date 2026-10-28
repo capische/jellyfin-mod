@@ -73,6 +73,20 @@ public sealed class PackReplaceService(
         if (import.State != ImportStates.Completed || import.EntryId is not { } entryId || import.BindingId is not { } newBinding)
             return await EndAsync(import, ReplaceStates.Refused, "The new file is no longer tracked; nothing was removed.", cancellationToken)
                 .ConfigureAwait(false);
+        // Turned off while it waited, a replacement ends for good, whatever it waits for: turning the switch on again never revives
+        // it (Codex re-review of the movie Replace, P2 3). The removal reads the switch again under its gate.
+        if (!(await Acquisition.AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken).ConfigureAwait(false)).EpisodeUpgradesEnabled)
+            return await EndAsync(import, ReplaceStates.Refused, "Replace was turned off while it waited; nothing more was removed.",
+                cancellationToken).ConfigureAwait(false);
+        // A movie's or an episode's replacement decided before its files were fixed at the grab (an older build) took them when its
+        // import completed, perhaps with a version added later: it removes nothing more (Codex re-review, P1 1). A pack's targets are
+        // fixed as its imports complete, as accepted.
+        var grab = await database.GrabOperations.AsNoTracking().Where(value => value.Id == import.GrabId)
+            .Select(value => new { value.Scope, value.ReplaceTargets }).SingleOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (grab is null || !Acquisition.ReleaseScopes.IsPack(grab.Scope) && grab.ReplaceTargets is null)
+            return await EndAsync(import, ReplaceStates.Refused,
+                "This Replace was decided before its files were recorded at the grab; nothing more was removed.", cancellationToken)
+                .ConfigureAwait(false);
         var episodeId = import.EpisodeId;
         var entry = await database.Entries.AsNoTracking().SingleOrDefaultAsync(value => value.Id == entryId, cancellationToken)
             .ConfigureAwait(false);

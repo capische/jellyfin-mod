@@ -1425,6 +1425,8 @@ internal static class Phase6
         release(torznab, "swapBd1080", "Swap.Movie.2020.1080p.BluRay-GRP", "0900489", null);
         release(torznab, "swapBd2160", "Swap.Movie.2020.2160p.BluRay-GRP", "0900489", null);
         release(torznab, "swapBd720", "Swap.Movie.2020.720p.BluRay-GRP", "0900489", null);
+        release(torznab, "swapWeb720", "Swap.Movie.2020.720p.WEB-DL-GRP", "0900489", null);
+        release(torznab, "swapRip1080", "Swap.Movie.2020.1080p.WEBRip-GRP", "0900489", null);
         async Task<JsonElement> SwapSearchAsync() => Json.Parse(await admin.GetStringAsync(
             $"/JellyfinMod/Releases?entryId={ids["mrepl"]}&intent=addVersion&profileId={any.GetProperty("id").AsGuid()}"));
         string[] SwapModes(JsonElement search) =>
@@ -1632,24 +1634,92 @@ internal static class Phase6
             $"The replacement removed the 480p it chose and kept the 1080p WEB-DL added again since (P1 2): {bindingChanged.ReplaceState} " +
             $"{bindingChanged.ReplaceDetail} [{string.Join(", ", afterReuse)}] {reuseDebug}");
 
-        // The switch turned off while a replacement waits stops it at the removal (Codex review of the movie Replace, P1 3): the
-        // 1080p WEB-DL goes, the playing 2160p waits, the switch goes off, playback stops, and the 2160p stays.
+        // A replacement an older build decided (its targets taken when its import completed, none fixed at the grab) removes
+        // nothing more once this build runs (Codex re-review of the movie Replace, P1 1): the 1080p WEB-DL goes, the playing
+        // 2160p WEB-DL waits, the grab's list is cleared as an older build left it, playback stops, and the 2160p WEB-DL stays.
         var swapUhdWeb = SwapPath("2160p WEB-DL");
         world.Native.Playing[ItemAt(swapUhdWeb)] = true;
-        var offWhileWaiting = await ReadAsync(await SwapGrabAsync(await SwapSearchAsync(), "Swap.Movie.2020.2160p.BluRay-GRP", "replace"), 202,
+        var legacyGrab = await ReadAsync(await SwapGrabAsync(await SwapSearchAsync(), "Swap.Movie.2020.2160p.BluRay-GRP", "replace"), 202,
             "Replace with the 2160p BluRay while the 2160p WEB-DL plays");
-        var offWhileWaitingImport = await SwapImportAsync(offWhileWaiting, "swapBd2160");
-        Assert(world.Native.Probe(offWhileWaitingImport.DestinationPath!), "The 2160p BluRay plays");
+        var legacyImport = await SwapImportAsync(legacyGrab, "swapBd2160");
+        Assert(world.Native.Probe(legacyImport.DestinationPath!), "The 2160p BluRay plays");
+        await ReplacementWaitsAsync(legacyImport.Id, "active_session", "The replacement waits while the 2160p WEB-DL plays");
+        await using (var database = new ModDbContext(dbPath))
+            await database.GrabOperations.Where(value => value.Id == legacyGrab.GetProperty("id").AsGuid())
+                .ExecuteUpdateAsync(setters => setters.SetProperty(value => value.ReplaceTargets, (string?)null));
+        world.Native.Playing.TryRemove(ItemAt(swapUhdWeb), out _);
+        var legacyDone = await ReplacementEndsAsync(legacyImport.Id, "The older build's replacement ends");
+        var afterLegacy = await SwapFilesAsync();
+        Assert(legacyDone.ReplaceState == ReplaceStates.Refused && legacyDone.ReplaceDetail!.Contains("before its files were recorded", StringComparison.Ordinal) &&
+            File.Exists(swapUhdWeb) &&
+            afterLegacy.SequenceEqual(["Swap Movie (2020) [tmdbid-489] - 2160p BluRay.mkv", "Swap Movie (2020) [tmdbid-489] - 2160p WEB-DL.mkv"]),
+            $"A replacement without the grab's list removes nothing more: {legacyDone.ReplaceState} {legacyDone.ReplaceDetail} [{string.Join(", ", afterLegacy)}]");
+
+        // The switch turned off while a replacement waits ends it for good (Codex re-review, P2 3): the 2160p BluRay goes, the
+        // playing 2160p WEB-DL waits, the switch goes off, then on again, playback stops, and the 2160p WEB-DL stays.
+        world.Native.Playing[ItemAt(swapUhdWeb)] = true;
+        var offWhileWaiting = await ReadAsync(await SwapGrabAsync(await SwapSearchAsync(), "Swap.Movie.2020.720p.WEB-DL-GRP", "replace"), 202,
+            "Replace with the 720p WEB-DL while the 2160p WEB-DL plays");
+        var offWhileWaitingImport = await SwapImportAsync(offWhileWaiting, "swapWeb720");
+        Assert(world.Native.Probe(offWhileWaitingImport.DestinationPath!), "The 720p WEB-DL plays");
         await ReplacementWaitsAsync(offWhileWaitingImport.Id, "active_session", "The replacement waits while the 2160p WEB-DL plays");
         Assert((await SetAutomationSwitchAsync("episodeUpgradesEnabled", false)).IsSuccessStatusCode, "The switch is turned off while it waits");
+        for (var index = 0; index < 3; index++) await Tick();
+        Assert((await SetAutomationSwitchAsync("episodeUpgradesEnabled", true)).IsSuccessStatusCode, "The switch is turned on again");
         world.Native.Playing.TryRemove(ItemAt(swapUhdWeb), out _);
-        var stoppedBySwitch = await ReplacementEndsAsync(offWhileWaitingImport.Id, "The waiting replacement ends after the switch went off");
+        for (var index = 0; index < 3; index++) await Tick();
+        ImportOperation stoppedBySwitch;
+        await using (var database = new ModDbContext(dbPath))
+            stoppedBySwitch = await database.ImportOperations.AsNoTracking().SingleAsync(value => value.Id == offWhileWaitingImport.Id);
         var afterOff = await SwapFilesAsync();
-        Assert(stoppedBySwitch.ReplaceState == ReplaceStates.Refused && stoppedBySwitch.ReplaceDetail!.Contains("replace_disabled", StringComparison.Ordinal) &&
+        Assert(stoppedBySwitch.ReplaceState == ReplaceStates.Refused && stoppedBySwitch.ReplaceDetail!.Contains("turned off while it waited", StringComparison.Ordinal) &&
             File.Exists(swapUhdWeb) &&
-            afterOff.SequenceEqual(["Swap Movie (2020) [tmdbid-489] - 2160p BluRay.mkv", "Swap Movie (2020) [tmdbid-489] - 2160p WEB-DL.mkv"]),
-            $"With the switch off the waiting replacement removes nothing more: {stoppedBySwitch.ReplaceState} {stoppedBySwitch.ReplaceDetail} " +
+            afterOff.SequenceEqual(["Swap Movie (2020) [tmdbid-489] - 2160p WEB-DL.mkv", "Swap Movie (2020) [tmdbid-489] - 720p WEB-DL.mkv"]),
+            $"A replacement the switch stopped stays stopped when it is turned on again: {stoppedBySwitch.ReplaceState} {stoppedBySwitch.ReplaceDetail} " +
             $"[{string.Join(", ", afterOff)}]");
+
+        // Turning Replace off while a removal is under way (Codex re-review, P1 2): the request waits until that removal is done,
+        // so no removal that read the switch on can unlink after it returns; the next file the replacement waits for is not removed.
+        var swapSdWeb = SwapPath("720p WEB-DL");
+        world.Native.Playing[ItemAt(swapSdWeb)] = true;
+        var raceGrab = await ReadAsync(await SwapGrabAsync(await SwapSearchAsync(), "Swap.Movie.2020.1080p.WEBRip-GRP", "replace"), 202,
+            "Replace with the 1080p WEBRip while the 720p WEB-DL plays");
+        var raceImport = await SwapImportAsync(raceGrab, "swapRip1080");
+        await ReplacementWaitsAsync(raceImport.Id, "successor_unavailable", "The replacement waits for the 1080p WEBRip to play");
+        Task<HttpResponseMessage>? switchOff = null;
+        var returnedDuringRemoval = (bool?)null;
+        world.Native.SessionsRead = () =>
+        {
+            if (!Environment.StackTrace.Contains(nameof(RetentionExecutor.ReplaceVersionAsync), StringComparison.Ordinal)) return;
+            world.Native.SessionsRead = null;
+            switchOff = Task.Run(() => SetAutomationSwitchAsync("episodeUpgradesEnabled", false));
+            Thread.Sleep(1500);
+            returnedDuringRemoval = switchOff.IsCompleted;
+        };
+        try
+        {
+            Assert(world.Native.Probe(raceImport.DestinationPath!), "The 1080p WEBRip plays");
+            await WaitAsync(async () =>
+            {
+                await Tick();
+                return switchOff is not null ? true : (bool?)null;
+            }, "A removal of the replacement reads the sessions");
+        }
+        finally
+        {
+            world.Native.SessionsRead = null;
+        }
+
+        Assert((await switchOff!).IsSuccessStatusCode && returnedDuringRemoval == false,
+            $"Turning Replace off waited for the removal under way (returned during it: {returnedDuringRemoval})");
+        var raceDone = await ReplacementEndsAsync(raceImport.Id, "The raced replacement ends");
+        world.Native.Playing.TryRemove(ItemAt(swapSdWeb), out _);
+        for (var index = 0; index < 2; index++) await Tick();
+        var afterRace = await SwapFilesAsync();
+        Assert(raceDone.ReplaceState == ReplaceStates.Refused && !File.Exists(swapUhdWeb) && File.Exists(swapSdWeb) &&
+            afterRace.SequenceEqual(["Swap Movie (2020) [tmdbid-489] - 1080p WEBRip.mkv", "Swap Movie (2020) [tmdbid-489] - 720p WEB-DL.mkv"]),
+            $"The removal under way finished before the switch went off, and nothing was removed after it: {raceDone.ReplaceState} " +
+            $"{raceDone.ReplaceDetail} [{string.Join(", ", afterRace)}]");
 
         // Keep on the title keeps every file: a Replace while the movie is kept only adds the new one.
         Assert((await SetAutomationSwitchAsync("episodeUpgradesEnabled", true)).IsSuccessStatusCode, "The Replace switch is on again");
