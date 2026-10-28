@@ -44,6 +44,9 @@ public sealed class BrowseRequest
     /// <summary>Gets or sets the alphabetical starting letter, or # for titles before A.</summary>
     [MaxLength(8), JsonPropertyName("alphabet")]
     public string? Alphabet { get; set; }
+    /// <summary>Gets or sets the one rating source a card may show; rows carry <c>rating</c> only when it is set (P9.R5, R7).</summary>
+    [MaxLength(32), JsonPropertyName("ratingSource")]
+    public string? RatingSource { get; set; }
 }
 
 /// <summary>Catalog-aware equivalents of the Movies and TV filter groups.</summary>
@@ -81,7 +84,12 @@ public sealed record BrowseRow(
     [property: JsonPropertyName("kind")] string Kind,
     [property: JsonPropertyName("nativeItem")] BaseItemDto? NativeItem,
     [property: JsonPropertyName("entry")] EntryDto? Entry,
-    [property: JsonPropertyName("retention")] RetentionSummaryDto? Retention);
+    [property: JsonPropertyName("retention")] RetentionSummaryDto? Retention)
+{
+    /// <summary>Gets the requested source's value for this title, only when the request named a source and a value exists.</summary>
+    [JsonPropertyName("rating"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public RatingDto? Rating { get; init; }
+}
 
 /// <summary>One correctly paginated combined result with its exact filtered total.</summary>
 public sealed record BrowseResult(

@@ -38,6 +38,16 @@ public class PluginConfiguration : BasePluginConfiguration
     /// <remarks>Not shown in the Dashboard; set it in the XML of an isolated test instance only.</remarks>
     public int RetentionTestWindowMinutes { get; set; }
 
+    /// <summary>
+    /// Gets or sets the address ratings are fetched from instead of MDBList's own (P9, plan decision 6).
+    /// </summary>
+    /// <remarks>
+    /// Not shown on any page; set it in the XML of an isolated test instance only, to point at a boundary server. Empty
+    /// means <c>https://api.mdblist.com</c>. Only an absolute http(s) address without credentials, query or fragment is
+    /// honoured, and the ratings settings report <c>providerOverride</c> while it is set.
+    /// </remarks>
+    public string RatingsProviderBaseUrl { get; set; } = string.Empty;
+
     /// <summary>Gets or sets whose watched state starts the retention window.</summary>
     public WatchedUserMode RetentionWatchedUserMode { get; set; } = WatchedUserMode.AllUsers;
 
