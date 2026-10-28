@@ -220,7 +220,8 @@ public sealed class PackReplaceService(
         : database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == entryId && binding.MediaPath != null)
             .Select(binding => new BoundFile { Id = binding.Id, MediaPath = binding.MediaPath, FileFingerprint = binding.FileFingerprint });
 
-    private static List<ReplaceTarget> ReadTargets(string? json)
+    /// <summary>The targets recorded as JSON; none for an empty or unreadable value.</summary>
+    public static List<ReplaceTarget> ReadTargets(string? json)
     {
         if (string.IsNullOrEmpty(json)) return [];
         try

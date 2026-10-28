@@ -98,7 +98,7 @@ public sealed class QueueController(
         var packChildren = packs.Count == 0 ? [] : await database.ImportOperations.AsNoTracking()
             .Where(operation => packs.Keys.Contains(operation.GrabId)).ToListAsync(cancellationToken);
         var packClaims = packs.Count == 0 ? [] : await database.GrabClaims.AsNoTracking().Where(claim => packs.Keys.Contains(claim.GrabId))
-            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (claim, value) => new { claim.GrabId, Episode = value })
+            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (claim, value) => new { claim.GrabId, claim.Held, Episode = value })
             .ToListAsync(cancellationToken);
         var packsShown = new HashSet<Guid>();
         foreach (var operation in operations)
@@ -128,9 +128,11 @@ public sealed class QueueController(
                 if (states is { Length: > 0 } && !states.Contains(packRow.State, StringComparer.Ordinal)) continue;
                 rows.Add(packRow with
                 {
-                    Pack = QueueReadModel.Pack(pack, claimed, packChildren, clientSnapshots.GetValueOrDefault(representative.DownloadClientId)),
+                    Pack = QueueReadModel.Pack(pack, claimed, packChildren, clientSnapshots.GetValueOrDefault(representative.DownloadClientId),
+                        packClaims.Where(claim => claim.GrabId == pack.Id && claim.Held).Select(claim => claim.Episode.Id).ToHashSet()),
                     Parsed = QueueReadModel.Parsed(pack),
-                    IndexerName = pack.IndexerName
+                    IndexerName = pack.IndexerName,
+                    Mode = pack.Mode
                 });
                 continue;
             }
@@ -142,7 +144,10 @@ public sealed class QueueController(
                 seed is not null && LibraryLinkPresent(seed));
             if (states is { Length: > 0 } && !states.Contains(row.State, StringComparer.Ordinal)) continue;
             var grab = grabs.GetValueOrDefault(operation.GrabId);
-            rows.Add(grab is null ? row : row with { Parsed = QueueReadModel.Parsed(grab), IndexerName = grab.IndexerName });
+            rows.Add(grab is null ? row : row with
+            {
+                Parsed = QueueReadModel.Parsed(grab), IndexerName = grab.IndexerName, Mode = grab.Mode, Replaces = QueueReadModel.Replaces(grab)
+            });
         }
 
         held = held.Where(grab => !grabs.ContainsKey(grab.Id)).ToList();
@@ -534,7 +539,7 @@ public sealed class QueueController(
             .ToDictionaryAsync(entry => entry.Id, cancellationToken);
         var heldIds = held.Select(grab => grab.Id).ToArray();
         var claims = await database.GrabClaims.AsNoTracking().Where(claim => heldIds.Contains(claim.GrabId))
-            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (claim, value) => new { claim.GrabId, Episode = value })
+            .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (claim, value) => new { claim.GrabId, claim.Held, Episode = value })
             .ToListAsync(cancellationToken);
         var rows = new List<QueueRowDto>();
         foreach (var grab in held)
@@ -544,7 +549,8 @@ public sealed class QueueController(
                 .OrderBy(value => value.SeasonNumber).ThenBy(value => value.EpisodeNumber).ToArray();
             var episode = grab.EpisodeId is { } episodeId ? claimed.FirstOrDefault(value => value.Id == episodeId) : null;
             if (!CanSee(user, administrator, entry, episode) || claimed.Any(value => !CanSee(user, administrator, entry, value))) continue;
-            rows.Add(QueueReadModel.Held(grab, entry, episode, claimed, clients.GetValueOrDefault(grab.DownloadClientId), administrator));
+            rows.Add(QueueReadModel.Held(grab, entry, episode, claimed, clients.GetValueOrDefault(grab.DownloadClientId), administrator,
+                claims.Where(claim => claim.GrabId == grab.Id && claim.Held).Select(claim => claim.Episode.Id).ToHashSet()));
         }
 
         return rows;

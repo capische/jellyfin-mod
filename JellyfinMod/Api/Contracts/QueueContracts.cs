@@ -95,7 +95,27 @@ public sealed record QueueRowDto(
     /// <summary>Gets the name of the indexer the release was grabbed from (P1.FU20); null when the grab is gone.</summary>
     [JsonPropertyName("indexerName"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public string? IndexerName { get; init; }
+
+    /// <summary>
+    /// Gets the grab's mode (<c>GrabModes</c>): <c>fill</c> for a first download, <c>add</c> for another version beside
+    /// what the title holds, <c>replace</c> for one that then replaces it (the upgrade status, 2026-10-28). Null when the grab is gone.
+    /// </summary>
+    [JsonPropertyName("mode"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public string? Mode { get; init; }
+
+    /// <summary>
+    /// Gets the files a movie's or an episode's Replace removes once the new file is in the library (the grab's fixed
+    /// <c>ReplaceTargets</c>), each with the resolution its file name gives, so a page can say "replaces 1080p". Null for every
+    /// other row; empty for a Replace decided before its files were recorded.
+    /// </summary>
+    [JsonPropertyName("replaces"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public IReadOnlyList<QueueReplaceTargetDto>? Replaces { get; init; }
 }
+
+/// <summary>One file a Replace removes: its binding and the resolution read from its file name, null when the name gives none.</summary>
+public sealed record QueueReplaceTargetDto(
+    [property: JsonPropertyName("bindingId")] Guid BindingId,
+    [property: JsonPropertyName("label"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Label);
 
 /// <summary>A pack's queue row detail: "Season 2 pack · 8 episodes", "Complete pack · S01–S05".</summary>
 public sealed record QueuePackDto(
@@ -108,7 +128,8 @@ public sealed record QueuePackDto(
 /// One claimed episode of a pack and where its import stands. <c>progress</c> is the episode's own file, 0–1 (next-up
 /// priority, P5.FU3): read from the client while it downloads, 1 once its import left waiting, null when unknown.
 /// <c>sizeBytes</c> is that file's length while the client lists it, null otherwise (P4.FU5: the web estimates the episode's
-/// time left from it and the pack's rate).
+/// time left from it and the pack's rate). <c>held</c>: the episode held a file when the pack claimed it, so an <c>add</c> or
+/// <c>replace</c> pack brings it a new version rather than its first file (the upgrade status, 2026-10-28).
 /// </summary>
 public sealed record QueuePackEpisodeDto(
     [property: JsonPropertyName("episodeId")] Guid EpisodeId,
@@ -118,7 +139,8 @@ public sealed record QueuePackEpisodeDto(
     [property: JsonPropertyName("importState"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? ImportState,
     [property: JsonPropertyName("reason"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Reason,
     [property: JsonPropertyName("progress"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] double? Progress = null,
-    [property: JsonPropertyName("sizeBytes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? SizeBytes = null);
+    [property: JsonPropertyName("sizeBytes"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? SizeBytes = null,
+    [property: JsonPropertyName("held")] bool Held = false);
 
 /// <summary>Whether the download client answered the latest read.</summary>
 public sealed record QueueClientStatusDto(
