@@ -98,6 +98,9 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         // The Trakt indicator (P7.Q16): the host's plugin list, and a listener of its own for Trakt's history imports.
         services.AddSingleton<TraktPluginState>();
         services.AddSingleton<IHostedService, TraktObservationListener>();
+        // Missed watches to Trakt (Phase 13): JellyfinMod decides when the Trakt plugin's own export runs.
+        services.AddSingleton<TraktExportService>();
+        services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<TraktExportService>());
         // Placeholders for missing episodes (P1.FU24): the writer, the item stamp, and the filter that keeps stock apps from
         // offering or playing them. The filter shapes every stock controller's answers; MVC is configured after this runs.
         services.AddTransient<PlaceholderService>();

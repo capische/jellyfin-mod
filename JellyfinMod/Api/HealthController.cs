@@ -176,6 +176,8 @@ public class HealthController : ControllerBase
         "setup",
         "acquisition.prowlarr",
         "trakt.history",
+        // Missed watches to Trakt: GET/POST /JellyfinMod/Trakt/Export and PUT …/Export/Settings, administrators (Phase 13).
+        "trakt.export",
         // Missing aired episodes as Jellyfin placeholder items, per TV library, with a dry run (P1.FU24).
         "placeholders",
         // Phase 9: ratings on detail pages and Ratings/Items (ratings), the card source on Browse (ratings.cards), and the

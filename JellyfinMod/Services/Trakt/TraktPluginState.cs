@@ -1,3 +1,5 @@
+using System.Collections;
+using System.Reflection;
 using MediaBrowser.Common.Plugins;
 using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Tasks;
@@ -11,8 +13,25 @@ namespace JellyfinMod.Services.Trakt;
 public sealed record TraktPluginInfo(bool Installed, string? Version);
 
 /// <summary>
-/// Reads the host's own plugin list and scheduled tasks for the stock Trakt plugin. JellyfinMod never reads that
-/// plugin's configuration or credentials and never calls Trakt; it only asks the host what is installed and running.
+/// One Jellyfin user's link to Trakt as the stock Trakt plugin holds it in memory (P13.T1). Read-only, and never a secret:
+/// only <em>whether</em> the plugin holds a token, never its value (user decision, Phase 13 Q2).
+/// </summary>
+/// <param name="UserId">The Jellyfin user.</param>
+/// <param name="Linked">True while the plugin holds an access token for the user, so it scrobbles and exports for them.</param>
+/// <param name="ReconnectNeeded">
+/// True when the plugin has a refresh token but no access token: a token refresh failed and the plugin skips the user
+/// until it is authorized again (<c>TraktApi.SetRequestHeaders</c> blanks the token before refreshing, v33).
+/// </param>
+/// <param name="TokenExpiresAt">When the plugin's access token expires (or expired), in UTC, or null.</param>
+/// <param name="PostWatchedHistory">The plugin's "post watched history" switch: its export sends watched episodes.</param>
+/// <param name="PostUnwatchedHistory">The plugin's "post unwatched history" switch: its export removes Trakt plays.</param>
+/// <param name="SynchronizeCollections">The plugin's "synchronize collections" switch: its export updates the collection.</param>
+public sealed record TraktLink(Guid UserId, bool Linked, bool ReconnectNeeded, DateTime? TokenExpiresAt,
+    bool PostWatchedHistory, bool PostUnwatchedHistory, bool SynchronizeCollections);
+
+/// <summary>
+/// Reads the host's own plugin list and scheduled tasks for the stock Trakt plugin, and (Phase 13, user decision Q2) the
+/// plugin's per-user link state read-only. JellyfinMod never reads a token's value and never calls Trakt itself.
 /// </summary>
 public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks, ILogger<TraktPluginState> logger)
 {
@@ -27,6 +46,18 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
     /// trakt.tv" — the only thing that writes Trakt's history into Jellyfin.
     /// </summary>
     public const string SyncTaskKey = "TraktSyncFromTraktTask";
+
+    /// <summary>
+    /// The <c>Key</c> of the Trakt plugin's <c>SyncLibraryTask</c>, "Export library to trakt.tv": for every linked user it
+    /// sends each episode played in Jellyfin that has no play on Trakt, with Jellyfin's <c>LastPlayedDate</c> (P13).
+    /// </summary>
+    public const string ExportTaskKey = "TraktSyncLibraryTask";
+
+    /// <summary>
+    /// The oldest Trakt plugin whose export JellyfinMod runs (Phase 13 Q6): 33 carries the pagination and export-matching
+    /// fixes that keep the export from posting plays Trakt already has. It needs Jellyfin 12.1 or later.
+    /// </summary>
+    public static readonly Version MinimumExportVersion = new(33, 0, 0, 0);
 
     /// <summary>
     /// Describes the plugin as the host reports it now. Only an <see cref="PluginStatus.Active"/> copy counts: a copy
@@ -71,6 +102,87 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
         {
             logger.LogDebug(error, "JellyfinMod could not read the host's scheduled tasks; the import is not attributed to Trakt");
             return false;
+        }
+    }
+
+    /// <summary>Reads a public property only when it exists with exactly the type <typeparamref name="T"/>.</summary>
+    private static bool TryRead<T>(object source, string name, out T value)
+    {
+        value = default!;
+        var property = source.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+        if (property is null || property.PropertyType != typeof(T) || property.GetIndexParameters().Length > 0) return false;
+        var read = property.GetValue(source);
+        if (read is null)
+        {
+            // Only a string may be null (a token never set); a value type cannot be.
+            return typeof(T) == typeof(string);
+        }
+
+        if (read is not T typed) return false;
+        value = typed;
+        return true;
+    }
+
+    /// <summary>The host's worker for the Trakt plugin's export task, or null when the plugin or its task is absent.</summary>
+    public IScheduledTaskWorker? FindExportTask()
+    {
+        try
+        {
+            return tasks.ScheduledTasks.ToArray()
+                .FirstOrDefault(worker => string.Equals(worker.ScheduledTask?.Key, ExportTaskKey, StringComparison.Ordinal));
+        }
+        catch (Exception error) when (error is InvalidOperationException or ArgumentException or NullReferenceException or ObjectDisposedException)
+        {
+            logger.LogDebug(error, "JellyfinMod could not read the host's scheduled tasks; the Trakt export is reported absent");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The per-user links the active Trakt plugin holds in memory, or null when the plugin is absent or its settings do not
+    /// have the shape of v31–v33 (then JellyfinMod reports "unknown" and starts nothing). Read through reflection on the
+    /// plugin's own configuration object; nothing is written and no token value leaves this method.
+    /// </summary>
+    public IReadOnlyList<TraktLink>? ReadLinks()
+    {
+        try
+        {
+            var plugin = plugins.Plugins.ToArray()
+                .Where(candidate => candidate.Id == PluginId && candidate.Manifest.Status == PluginStatus.Active)
+                .OrderByDescending(candidate => candidate.Version).FirstOrDefault();
+            if (plugin?.Instance is not IHasPluginConfiguration configured) return null;
+            var configuration = configured.Configuration;
+            if (configuration?.GetType().GetProperty("TraktUsers", BindingFlags.Public | BindingFlags.Instance)?.GetValue(configuration)
+                is not IEnumerable users) return null;
+            var links = new List<TraktLink>();
+            foreach (var user in users)
+            {
+                if (user is null) continue;
+                // Every field this relies on must be there with the type of v31–v33, or nothing is read (Codex review
+                // P2-3): a missing or retyped "post unwatched history" must never read as off.
+                if (!TryRead(user, "LinkedMbUserId", out Guid id) || !TryRead(user, "AccessToken", out string? access) ||
+                    !TryRead(user, "RefreshToken", out string? refresh) || !TryRead(user, "AccessTokenExpiration", out DateTime expires) ||
+                    !TryRead(user, "PostWatchedHistory", out bool postWatched) || !TryRead(user, "PostUnwatchedHistory", out bool postUnwatched) ||
+                    !TryRead(user, "SynchronizeCollections", out bool collections))
+                {
+                    return null;
+                }
+
+                if (id == Guid.Empty) continue;
+                var hasAccess = !string.IsNullOrWhiteSpace(access);
+                var hasRefresh = !string.IsNullOrWhiteSpace(refresh);
+                if (!hasAccess && !hasRefresh) continue; // added on the plugin's page but never authorized
+                DateTime? expiresAt = expires == DateTime.MinValue ? null
+                    : expires.Kind == DateTimeKind.Utc ? expires : DateTime.SpecifyKind(expires, DateTimeKind.Local).ToUniversalTime();
+                links.Add(new TraktLink(id, hasAccess, !hasAccess, expiresAt, postWatched, postUnwatched, collections));
+            }
+
+            return links;
+        }
+        catch (Exception error) when (error is InvalidOperationException or ArgumentException or NullReferenceException or TargetException or TargetInvocationException or MethodAccessException)
+        {
+            logger.LogDebug(error, "JellyfinMod could not read the Trakt plugin's links; they are reported unknown");
+            return null;
         }
     }
 }
