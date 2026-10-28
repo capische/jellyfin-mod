@@ -2113,6 +2113,100 @@ internal static class Phase6
                 "Only the qualifying season is searched as a pack");
         }
 
+        // ---- Codex re-review of the movie Replace: a grab's dispatch, a version removal and turning Replace off at the same time
+        // all finish. Each lock is taken in one order (settings gate, retention execution gate, library locks); with the dispatch
+        // taking the library first, the three waited on one another for ever. The movies library is held while they line up:
+        // the dispatch first (it reaches the lock section once the client is asked), then the removal (of a version kept by
+        // itself, so nothing is removed), then the switch-off; then the library is let go.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            AddMovie(database, ids, world.Movies.Id, "lockorder", 490, "Lock Order Movie", 2020, "tt0900490", monitored: false);
+            await database.SaveChangesAsync();
+        }
+
+        Assert((await SetAutomationSwitchAsync("episodeUpgradesEnabled", true)).IsSuccessStatusCode, "Replace is on before the race");
+        Guid keptVersion;
+        await using (var database = new ModDbContext(dbPath))
+            keptVersion = await database.EntryBindings.AsNoTracking().Where(value => value.EntryId == ids["mrepl"]).Select(value => value.Id).FirstAsync();
+        await ReadAsync(await admin.PostAsync($"/JellyfinMod/Entries/{ids["mrepl"]}/Versions/{keptVersion}/Keep", null), 200,
+            "Keep one of the movie's files by itself");
+        var lockGrab = Guid.NewGuid();
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var template = await database.GrabOperations.AsNoTracking().FirstAsync(value => value.EntryId == ids["seedy"]);
+            var lockClient = await database.AcquisitionDownloadClients.AsNoTracking().SingleAsync(value => value.Id == template.DownloadClientId);
+            database.GrabOperations.Add(new GrabOperation
+            {
+                Id = lockGrab, RequestedBy = world.Admin.Id, IdempotencyKey = "lock-order", RequestFingerprint = "lock-order",
+                EntryId = ids["lockorder"], ActiveTarget = JellyfinMod.Services.Acquisition.GrabService.TargetKey(ids["lockorder"], null),
+                SearchId = template.SearchId, ReleaseId = "lock-order", IndexerId = template.IndexerId, IndexerName = template.IndexerName,
+                SourceGuid = "lock-order", RawTitle = "Lock.Order.Movie.2020.1080p.WEB-DL-GRP", ProfileId = template.ProfileId,
+                DownloadClientId = template.DownloadClientId, DownloadClientRevision = lockClient.Revision, InfoHash = fixtures["unwatch"].InfoHash,
+                Label = template.Label, DownloadDirectory = template.DownloadDirectory, State = GrabStates.Pending,
+                CreatedAt = time.GetUtcNow().UtcDateTime, UpdatedAt = time.GetUtcNow().UtcDateTime, HoldUntil = time.GetUtcNow().UtcDateTime
+            });
+            await database.SaveChangesAsync();
+        }
+
+        host.Service<JellyfinMod.Services.Acquisition.GrabPayloadVault>().Put(lockGrab,
+            new JellyfinMod.Services.Acquisition.TorrentLocator(fixtures["unwatch"].InfoHash, fixtures["unwatch"].Bytes, null, null, null));
+        var clientAsked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        transmission.AfterGet = async asked =>
+        {
+            if (asked is not { Count: 1 } || !asked.Contains(fixtures["unwatch"].InfoHash)) return;
+            transmission.AfterGet = null;
+            // Grabbing goes off while the client is asked, so the dispatch fails under its locks and sends nothing.
+            await using var database = new ModDbContext(dbPath);
+            await database.AcquisitionSettings.ExecuteUpdateAsync(setters => setters.SetProperty(value => value.Enabled, false));
+            clientAsked.TrySetResult();
+        };
+        Task dispatch, removal, lockSwitchOff;
+        var heldLibrary = await host.Service<ReconciliationLibraryLock>().AcquireAsync(world.Movies.Id, default);
+        try
+        {
+            dispatch = Task.Run(async () =>
+            {
+                using var scope = host.Service<IServiceScopeFactory>().CreateScope();
+                await scope.ServiceProvider.GetRequiredService<JellyfinMod.Services.Acquisition.GrabService>().DispatchAsync(lockGrab, default);
+            });
+            await clientAsked.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.Delay(500);
+            removal = Task.Run(async () =>
+            {
+                using var scope = host.Service<IServiceScopeFactory>().CreateScope();
+                await scope.ServiceProvider.GetRequiredService<RetentionExecutor>().RemoveVersionAsync(ids["mrepl"], keptVersion, default);
+            });
+            await Task.Delay(500);
+            lockSwitchOff = Task.Run(async () => (await SetAutomationSwitchAsync("episodeUpgradesEnabled", false)).EnsureSuccessStatusCode());
+            await Task.Delay(500);
+        }
+        finally
+        {
+            transmission.AfterGet = null;
+            await heldLibrary.DisposeAsync();
+        }
+
+        var all = Task.WhenAll(dispatch, removal, lockSwitchOff);
+        var finished = await Task.WhenAny(all, Task.Delay(TimeSpan.FromSeconds(20))) == all;
+        await using (var database = new ModDbContext(dbPath))
+            await database.AcquisitionSettings.ExecuteUpdateAsync(setters => setters.SetProperty(value => value.Enabled, true));
+        Assert(finished, $"The dispatch, the removal and the switch-off all finish (dispatch {dispatch.Status}, removal {removal.Status}, " +
+            $"switch-off {lockSwitchOff.Status})");
+        await all;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            var lockGrabRow = await database.GrabOperations.AsNoTracking().SingleAsync(value => value.Id == lockGrab);
+            Assert(lockGrabRow is { State: GrabStates.Failed, FailureCode: "acquisition_disabled" } &&
+                !transmission.Torrents.ContainsKey(fixtures["unwatch"].InfoHash) &&
+                await database.EntryBindings.AnyAsync(value => value.Id == keptVersion) &&
+                !(await database.AcquisitionSettings.AsNoTracking().SingleAsync()).EpisodeUpgradesEnabled,
+                $"The dispatch reached its locks and sent nothing, the kept file stayed, and Replace is off: {lockGrabRow.State} {lockGrabRow.FailureCode}");
+        }
+
+        await ReadAsync(await admin.DeleteAsync($"/JellyfinMod/Entries/{ids["mrepl"]}/Versions/{keptVersion}/Keep"), 200, "The file's Keep is lifted");
+        Assert((await SetAutomationSwitchAsync("episodeUpgradesEnabled", switchesBefore["episodeUpgradesEnabled"]!.GetValue<bool>())).IsSuccessStatusCode,
+            "The Replace switch is put back after the race");
+
         // ---- Settings survive a restart; the whole run wrote no media_missing.
         await host.DisposeAsync();
         host = await PluginHost.StartAsync(world, dbPath, time, logs, configuration, taskManager);
