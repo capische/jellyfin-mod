@@ -1522,6 +1522,64 @@ internal static class Phase6
                 string.Join("; ", removals.Select(value => $"{value.Provenance} {value.State} {value.Reason}")));
         }
 
+        // A release Replace removed from the library still seeds (user, 2026-10-28: "when replace download is done - it can be
+        // reused"): + on it in Get Another Quality imports it again from the seeding copy as another version, with no new
+        // download; the same release again from that search is refused as already in the library; and Replace on another
+        // seeding release imports it the same way and removes what the movie holds.
+        async Task<ImportOperation> ReimportedAsync(Guid grabId, Guid previousImport, string what) => await WaitAsync(async () =>
+        {
+            await Tick();
+            await using var database = new ModDbContext(dbPath);
+            var latest = await database.ImportOperations.AsNoTracking().Where(value => value.GrabId == grabId)
+                .OrderByDescending(value => value.CreatedAt).FirstAsync();
+            Assert(latest.State is not (ImportStates.Blocked or ImportStates.Failed), $"{what} stopped: {latest.State} {latest.Reason} {latest.Error}");
+            return latest.Id != previousImport && latest.State == ImportStates.Completed ? latest : null;
+        }, what);
+        Guid swapAddImport, lateOffImportId;
+        await using (var database = new ModDbContext(dbPath))
+        {
+            swapAddImport = (await database.ImportOperations.AsNoTracking().Where(value => value.GrabId == swapAdd.GetProperty("id").AsGuid())
+                .SingleAsync()).Id;
+            lateOffImportId = lateOffImport.Id;
+            Assert(await database.GrabOperations.AsNoTracking().CountAsync(value => value.EntryId == ids["mrepl"] && value.ActiveHash != null) >= 2 &&
+                transmission.Torrents.ContainsKey(fixtures["swap1080"].InfoHash) && transmission.Torrents.ContainsKey(fixtures["swap2160"].InfoHash),
+                "The replaced releases still seed and their grabs still own them");
+        }
+
+        var reuseSearch = await SwapSearchAsync();
+        var addsBefore = transmission.AddCalls;
+        var reused = await ReadAsync(await SwapGrabAsync(reuseSearch, "Swap.Movie.2020.1080p.WEB-DL-GRP", "add"), 200,
+            "+ on the replaced 1080p WEB-DL answers with its earlier grab");
+        Assert(reused.GetProperty("id").AsGuid() == swapAdd.GetProperty("id").AsGuid(), "The earlier grab answers: " + reused.GetRawText());
+        var reusedImport = await ReimportedAsync(swapAdd.GetProperty("id").AsGuid(), swapAddImport, "The replaced 1080p WEB-DL is imported again");
+        var reusedFiles = await SwapFilesAsync();
+        Assert(transmission.AddCalls == addsBefore && reusedImport.Intent == "addVersion" && reusedImport.ReplaceState is null &&
+            reusedFiles.Length == 2 && reusedFiles.Contains("Swap Movie (2020) [tmdbid-489] - 1080p BluRay.mkv"),
+            $"The seeding copy came back as another version beside the held file, with nothing sent to the client: adds " +
+            $"{transmission.AddCalls - addsBefore}, {reusedImport.Intent} {reusedImport.ReplaceState} [{string.Join(", ", reusedFiles)}]");
+        var already = await SwapGrabAsync(reuseSearch, "Swap.Movie.2020.1080p.WEB-DL-GRP", "add");
+        var alreadyBody = await already.Content.ReadAsStringAsync();
+        Assert((int)already.StatusCode == 409 && alreadyBody.Contains("\"duplicate_hash\"", StringComparison.Ordinal) &&
+            alreadyBody.Contains("This release is already in your library.", StringComparison.Ordinal) && transmission.AddCalls == addsBefore,
+            "The same seeding release again, its file now in the library, is refused plainly: " + alreadyBody);
+
+        var replaceReuse = await ReadAsync(await SwapGrabAsync(await SwapSearchAsync(), "Swap.Movie.2020.2160p.WEB-DL-GRP", "replace"), 200,
+            "Replace on the replaced 2160p WEB-DL answers with its earlier grab");
+        Assert(replaceReuse.GetProperty("id").AsGuid() == lateOff.GetProperty("id").AsGuid(), "The earlier grab answers: " + replaceReuse.GetRawText());
+        var replaceReuseImport = await ReimportedAsync(lateOff.GetProperty("id").AsGuid(), lateOffImportId, "The replaced 2160p is imported again");
+        var replaceReuseDone = await WaitAsync(async () =>
+        {
+            await Tick();
+            await using var database = new ModDbContext(dbPath);
+            var import = await database.ImportOperations.AsNoTracking().SingleAsync(value => value.Id == replaceReuseImport.Id);
+            return import.ReplaceState is ReplaceStates.Done or ReplaceStates.Refused ? import : null;
+        }, "The re-imported Replace ends");
+        var replaceReuseFiles = await SwapFilesAsync();
+        Assert(transmission.AddCalls == addsBefore && replaceReuseDone.ReplaceState == ReplaceStates.Done &&
+            replaceReuseFiles.SequenceEqual(["Swap Movie (2020) [tmdbid-489] - 2160p WEB-DL.mkv"]),
+            $"Replace from the seeding copy removed both held files and kept the re-imported one, with nothing sent to the client: " +
+            $"{replaceReuseDone.ReplaceState} {replaceReuseDone.ReplaceDetail} [{string.Join(", ", replaceReuseFiles)}]");
+
         // Keep on the title keeps every file: a Replace while the movie is kept only adds the new one.
         await ReadAsync(await admin.PostAsync($"/JellyfinMod/Entries/{ids["mrepl"]}/Keep", null), 200, "Keep the movie");
         var keptSwap = await ReadAsync(await SwapGrabAsync(await SwapSearchAsync(), "Swap.Movie.2020.2160p.BluRay-GRP", "replace"), 202,

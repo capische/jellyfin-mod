@@ -226,10 +226,11 @@ public sealed class GrabService(
         if (await BlocklistedAsync(locator.InfoHash, candidate.IndexerId, candidate.SourceGuid, cancellationToken).ConfigureAwait(false))
             throw new GrabException(409, "release_blocklisted", "An administrator blocked this release; it is not grabbed again.");
         // The torrent this plugin still seeds for this title, whose library file was deleted since, is imported again from the
-        // seeding copy instead of being downloaded twice (user, 2026-10-28).
-        if (!pack && !addVersion && !request.Automatic &&
-            await ReimportAsync(userId, request, fingerprint, entry, episode, libraryId, client.Id, locator.InfoHash, canAccess, cancellationToken)
-                .ConfigureAwait(false) is { } reimported)
+        // seeding copy instead of being downloaded twice (user, 2026-10-28), as another version too: Add keeps the files held and
+        // Replace removes them once it is bound, as a downloaded one would (user, 2026-10-28).
+        if (!pack && !request.Automatic &&
+            await ReimportAsync(userId, request, fingerprint, entry, episode, libraryId, client.Id, locator.InfoHash, canAccess,
+                addVersion ? mode : null, cancellationToken).ConfigureAwait(false) is { } reimported)
             return (reimported, false);
 
         var now = Now;
@@ -327,18 +328,22 @@ public sealed class GrabService(
     /// picker follows it as its added row, and the finished import's seed release is closed, so the queue shows the one new row
     /// and the new import's seed release takes over. A grab already importing the copy is returned as it is. The request's key
     /// is saved with what it started, so a replay gets the same grab back. Null when the torrent is not such a copy (another
-    /// title, a pack, a seed release under way, nothing imported yet): the grab goes on as before.
+    /// title, a pack, a seed release under way, nothing imported yet): the grab goes on as before. With <paramref name="versionMode"/>
+    /// (Get Another Quality: add or replace) the copy is imported as another version in that mode; a copy whose file is still
+    /// bound in the library is refused as already there.
     /// </summary>
     /// <remarks>
     /// Runs under the import tick gate, taken before the library lease as the monitor takes them (Codex review of P4.FU29,
     /// finding 1): a seed release tick that read the old seed release finishes first, and everything is read again after it.
     /// </remarks>
     private async Task<GrabOperation?> ReimportAsync(Guid userId, GrabRequest request, string fingerprint, Entry entry, Episode? episode,
-        Guid libraryId, Guid clientId, string infoHash, Func<Entry, Episode?, bool> canAccess, CancellationToken cancellationToken)
+        Guid libraryId, Guid clientId, string infoHash, Func<Entry, Episode?, bool> canAccess, string? versionMode,
+        CancellationToken cancellationToken)
     {
+        var addVersion = versionMode is not null;
         var hashKey = HashKey(clientId, infoHash);
-        var targetKey = TargetKey(entry.Id, episode?.Id);
-        var claimKey = episode is null ? null : ClaimKey(episode.Id, false);
+        var targetKey = TargetKey(entry.Id, episode?.Id) + (addVersion ? "+add" : string.Empty);
+        var claimKey = episode is null ? null : ClaimKey(episode.Id, addVersion);
         if (!await database.GrabOperations.AsNoTracking().AnyAsync(value => value.ActiveHash == hashKey, cancellationToken).ConfigureAwait(false))
             return null;
         GrabOperation owner;
@@ -375,6 +380,11 @@ public sealed class GrabService(
                 }
 
                 if (owner.ActiveTarget is not null || !imports.Any(value => value.State == ImportStates.Completed)) return null;
+                // The copy's own file still in the library: there is nothing to import again.
+                var bound = imports.Where(value => value.BindingId.HasValue).Select(value => value.BindingId!.Value).ToList();
+                if (await database.EntryBindings.AnyAsync(value => bound.Contains(value.Id), cancellationToken).ConfigureAwait(false) ||
+                    await database.EpisodeBindings.AnyAsync(value => bound.Contains(value.Id), cancellationToken).ConfigureAwait(false))
+                    throw new GrabException(409, "duplicate_hash", "This release is already in your library.", owner.Id);
                 var seeds = await database.SeedReleaseOperations
                     .Where(value => value.GrabId == owner.Id && SeedReleaseStates.Open.Contains(value.State)).ToListAsync(cancellationToken)
                     .ConfigureAwait(false);
@@ -382,7 +392,9 @@ public sealed class GrabService(
                 if (seeds.Any(value => value.State == SeedReleaseStates.Removing)) return null;
                 import = await Import.ImportService.CreateForGrabAsync(database, owner, now, cancellationToken).ConfigureAwait(false)
                     ?? throw new GrabException(404, "target_not_found", "The title is not available.");
-                import.Intent = GrabIntents.Acquire;
+                import.Intent = addVersion ? GrabIntents.AddVersion : GrabIntents.Acquire;
+                // The import reads its grab's mode: Replace takes the files held when it completes, as a downloaded one does.
+                owner.Mode = versionMode ?? GrabModes.Fill;
                 owner.ActiveTarget = targetKey;
                 owner.UpdatedAt = now;
                 // The episode is claimed again under its acquire key, so a pack covering it is refused while it imports (Codex
@@ -394,7 +406,7 @@ public sealed class GrabService(
                     if (claim is null)
                         database.GrabClaims.Add(claim = new GrabClaim { GrabId = owner.Id, EpisodeId = episode.Id, CreatedAt = now });
                     claim.ActiveKey = claimKey;
-                    claim.Held = false;
+                    claim.Held = addVersion;
                 }
 
                 foreach (var seed in seeds)
