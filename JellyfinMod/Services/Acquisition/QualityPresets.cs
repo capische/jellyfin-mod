@@ -17,7 +17,9 @@ public sealed record QualityPreset(
     [property: JsonPropertyName("cutoff")] string? Cutoff,
     [property: JsonPropertyName("upgradeAllowed")] bool UpgradeAllowed,
     [property: JsonPropertyName("upgradeMode")] string UpgradeMode,
-    [property: JsonPropertyName("minimumSeeders")] int? MinimumSeeders = null);
+    [property: JsonPropertyName("minimumSeeders")] int? MinimumSeeders = null,
+    [property: JsonPropertyName("prefer")] string? Prefer = null,
+    [property: JsonPropertyName("phones")] bool Phones = false);
 
 /// <summary>What adding the presets did: the profiles created and the presets left out, with why.</summary>
 public sealed record QualityPresetsAdded(
@@ -44,6 +46,9 @@ public static class QualityPresets
     /// <summary>Gets the preset a fresh install uses as its default profile.</summary>
     public static QualityPreset Default => All.Single(preset => preset.Default);
 
+    /// <summary>Gets the preset a fresh install uses as its quality profile for phones (Phase 12: the 1080p preset).</summary>
+    public static QualityPreset Phones => All.Single(preset => preset.Phones);
+
     /// <summary>
     /// On a fresh install, one that has no quality profile and has never saved its acquisition settings, creates every preset
     /// and makes the default one the default profile. Anything else is left exactly as it is. Returns whether it seeded.
@@ -57,6 +62,7 @@ public static class QualityPresets
         settings ??= database.AcquisitionSettings.Add(new AcquisitionSettings()).Entity;
         foreach (var preset in All) database.AcquisitionQualityProfiles.Add(ToProfile(preset));
         settings.DefaultQualityProfileId = Default.Id;
+        settings.PhoneProfileId = Phones.Id;
         settings.Revision++;
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return true;
@@ -95,6 +101,13 @@ public static class QualityPresets
             defaultSet = Default.Id;
         }
 
+        // With no quality profile for phones chosen, the 1080p preset becomes it, as the 4K one becomes the default.
+        if (settings.PhoneProfileId is null && (ids.Contains(Phones.Id) || added.Any(preset => preset.Id == Phones.Id)))
+        {
+            settings.PhoneProfileId = Phones.Id;
+            settings.Revision++;
+        }
+
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return new QualityPresetsAdded(added, skipped, defaultSet);
     }
@@ -109,7 +122,8 @@ public static class QualityPresets
         Cutoff = preset.Cutoff,
         UpgradeAllowed = preset.UpgradeAllowed,
         UpgradeMode = preset.UpgradeMode,
-        MinimumSeeders = preset.MinimumSeeders
+        MinimumSeeders = preset.MinimumSeeders,
+        Prefer = preset.Prefer
     };
 
     /// <summary>Returns the preset a profile was created from, by id, or null.</summary>
@@ -129,11 +143,11 @@ public static class QualityPresets
                 preset.Qualities.Any(quality => !QualityCatalog.IsKnown(quality)) ||
                 preset.Cutoff is { } cutoff && !preset.Qualities.Contains(cutoff, StringComparer.Ordinal) ||
                 preset.UpgradeAllowed && preset.Cutoff is null || preset.UpgradeMode is not ("replace" or "add") ||
-                preset.MinimumBytesPerHour > preset.MaximumBytesPerHour)
+                preset.MinimumBytesPerHour > preset.MaximumBytesPerHour || !ProfilePreferences.IsKnown(preset.Prefer))
                 throw new InvalidOperationException($"The quality preset {preset.Name} is not valid.");
         }
 
-        if (presets.Count(preset => preset.Default) != 1 || presets.Select(preset => preset.Id).Distinct().Count() != presets.Count ||
+        if (presets.Count(preset => preset.Default) != 1 || presets.Count(preset => preset.Phones) != 1 || presets.Select(preset => preset.Id).Distinct().Count() != presets.Count ||
             presets.Select(preset => preset.Name).Distinct(StringComparer.Ordinal).Count() != presets.Count)
             throw new InvalidOperationException("The quality presets need one default and unique ids and names.");
         return presets;

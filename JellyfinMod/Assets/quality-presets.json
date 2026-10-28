@@ -1,11 +1,12 @@
 {
-  "comment": "Quality profile presets shipped with the plugin (P4.FU9, user 2026-10-15; the approved Quality Profiles redesign). Each is created as an ordinary profile whose id is the preset id, so adding presets again never duplicates one. Qualities are best first: by resolution, then by source (remux, Blu-ray, WEB-DL, WEBRip, HDTV, DVD), falling back down to the preset's lowest resolution. maximumBytesPerHour is the preset's file size for its best resolution as the redesign draws it (Small: 4K 8, 2K 4, 1080p 2, 720p 1, SD 0.5 GB per hour; Balanced: 20, 10, 6, 3, 1.5; Large: no limit; 2K and 1080p are Balanced, 720p and SD Small, 4K and Any Quality Large, so the 4K preset has no size limit: user, 2026-10-19) (decimal GB per runtime hour); no preset sets a minimum, so a smaller lower-resolution copy is never refused when it falls back. Upgrades are off; the cutoff is the first quality, so turning upgrades on needs nothing else.",
+  "comment": "Quality profile presets shipped with the plugin (P4.FU9, user 2026-10-15; the approved Quality Profiles redesign). Each is created as an ordinary profile whose id is the preset id, so adding presets again never duplicates one. Qualities are best first: by resolution, then by source (remux, Blu-ray, WEB-DL, WEBRip, HDTV, DVD), falling back down to the preset's lowest resolution. maximumBytesPerHour is the preset's file size for its best resolution as the redesign draws it (Small: 4K 8, 2K 4, 1080p 2, 720p 1, SD 0.5 GB per hour; Balanced: 20, 10, 6, 3, 1.5; Large: no limit; 2K and 1080p are Balanced, 720p and SD Small, 4K and Any Quality Large, so the 4K preset has no size limit: user, 2026-10-19) (decimal GB per runtime hour); no preset sets a minimum, so a smaller lower-resolution copy is never refused when it falls back. Upgrades are off; the cutoff is the first quality, so turning upgrades on needs nothing else. Phase 12 (user, 2026-10-29): the 4K preset prefers Best on My TVs, and the 1080p preset prefers Plays Everywhere and is the quality profile for phones (phones: true) on a fresh install; there is no Mobile preset.",
   "presets": [
     {
       "id": "8fc450fa-ec3d-4d42-962e-a7835ed239e7",
       "name": "4K",
       "description": "Best picture, big files. Falls back to lower quality if 4K is not available.",
       "default": true,
+      "prefer": "tvs",
       "qualities": [
         "remux-2160p",
         "bluray-2160p",
@@ -61,8 +62,10 @@
     {
       "id": "49375e78-8599-44fa-9d7e-59e12a8b87da",
       "name": "1080p",
-      "description": "Full HD, the sensible middle. Falls back to 720p.",
+      "description": "Full HD, the sensible middle. Plays on phones too. Falls back to 720p.",
       "default": false,
+      "phones": true,
+      "prefer": "everywhere",
       "qualities": [
         "remux-1080p",
         "bluray-1080p",

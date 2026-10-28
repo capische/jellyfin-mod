@@ -279,6 +279,26 @@ public sealed class AcquisitionQualityProfile
 
     /// <summary>Gets or sets the minimum seeders an automatic grab needs.</summary>
     public int? MinimumSeeders { get; set; }
+
+    /// <summary>
+    /// Gets or sets how releases of the same quality are ordered (Phase 12 M30): <c>tvs</c> (Best on My TVs), <c>everywhere</c>
+    /// (Plays Everywhere), or null for No Preference, today's order and the value of every profile stored before Phase 12.
+    /// </summary>
+    [MaxLength(16)]
+    public string? Prefer { get; set; }
+}
+
+/// <summary>The values of a quality profile's Prefer field (Phase 12 M30); null is No Preference.</summary>
+public static class ProfilePreferences
+{
+    /// <summary>Best on My TVs: the picture and sound every ticked TV plays best.</summary>
+    public const string Tvs = "tvs";
+
+    /// <summary>Plays Everywhere: what phones and browsers play without the server converting it.</summary>
+    public const string Everywhere = "everywhere";
+
+    /// <summary>Whether a value is one of the stored preferences.</summary>
+    public static bool IsKnown(string? value) => value is null or Tvs or Everywhere;
 }
 
 /// <summary>Singleton acquisition enablement and defaults (P4.A2).</summary>
@@ -424,6 +444,26 @@ public sealed class AcquisitionSettings
 
     /// <summary>Gets or sets the automation settings revision.</summary>
     public int AutomationRevision { get; set; } = 1;
+
+    /// <summary>
+    /// Gets or sets the quality profile for phones (Phase 12 M30): Get Another Quality starts with it on a title that holds no
+    /// file at 1080p or below, and automation fetches a missing phone copy with it. Validated in code, not by a foreign key, so
+    /// the migration adds a column instead of rebuilding the settings table; deleting the profile is refused while it is chosen.
+    /// </summary>
+    public Guid? PhoneProfileId { get; set; }
+
+    /// <summary>Gets or sets the ticked TV models of the TVs catalogue, comma-separated ids (Phase 12 M30); empty for none.</summary>
+    [MaxLength(512)]
+    public string TvModels { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the TVs settings revision.</summary>
+    public int TvModelsRevision { get; set; } = 1;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether automation fetches a missing 1080p copy for phones (Phase 12 M36, "Also get a
+    /// 1080p copy for phones"). Off by default (Q1/Q5, user 2026-10-28).
+    /// </summary>
+    public bool FetchPhoneCopies { get; set; }
 }
 
 /// <summary>Where seed protection reads Transmission state from (P7.S7).</summary>

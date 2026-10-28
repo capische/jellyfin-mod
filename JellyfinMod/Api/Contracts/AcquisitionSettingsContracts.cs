@@ -209,7 +209,9 @@ public sealed record QualityProfileDto(
     [property: JsonPropertyName("upgradeMode")] string UpgradeMode = "replace",
     [property: JsonPropertyName("minimumAutoScore"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumAutoScore = null,
     [property: JsonPropertyName("minimumSeeders"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumSeeders = null,
-    [property: JsonPropertyName("presetId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? PresetId = null);
+    [property: JsonPropertyName("presetId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? PresetId = null,
+    [property: JsonPropertyName("prefer"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Prefer = null,
+    [property: JsonPropertyName("isPhoneProfile")] bool IsPhoneProfile = false);
 
 /// <summary>Quality profile write contract. PATCH must echo the current revision.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -251,6 +253,28 @@ public sealed class QualityProfileRequest
     [Range(0, 100000), JsonPropertyName("minimumSeeders")]
     public int? MinimumSeeders { get; set; }
 
+    /// <summary>
+    /// Gets or sets the Prefer field (Phase 12 M30): <c>tvs</c>, <c>everywhere</c> or null for No Preference. A request that
+    /// leaves it out keeps the stored value, so an editor that does not know the field (the Dashboard page, an older web)
+    /// never clears it.
+    /// </summary>
+    [JsonPropertyName("prefer")]
+    public string? Prefer
+    {
+        get => prefer;
+        set
+        {
+            prefer = value;
+            PreferSet = true;
+        }
+    }
+
+    /// <summary>Gets a value indicating whether the request carried <see cref="Prefer"/>.</summary>
+    [JsonIgnore]
+    public bool PreferSet { get; private set; }
+
+    private string? prefer;
+
     /// <summary>Gets or sets the revision being replaced; required by PATCH.</summary>
     [JsonPropertyName("revision")]
     public int? Revision { get; set; }
@@ -269,7 +293,9 @@ public sealed record QualityPresetDto(
     [property: JsonPropertyName("upgradeAllowed")] bool UpgradeAllowed,
     [property: JsonPropertyName("upgradeMode")] string UpgradeMode,
     [property: JsonPropertyName("minimumSeeders"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? MinimumSeeders,
-    [property: JsonPropertyName("added")] bool Added);
+    [property: JsonPropertyName("added")] bool Added,
+    [property: JsonPropertyName("prefer"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Prefer = null,
+    [property: JsonPropertyName("isPhonesPreset")] bool IsPhonesPreset = false);
 
 /// <summary>One preset that Add Preset Profiles left out, with why: <c>already_added</c> or <c>name_in_use</c>.</summary>
 public sealed record QualityPresetSkippedDto(
@@ -300,7 +326,8 @@ public sealed record AcquisitionSettingsDto(
     [property: JsonPropertyName("blockers")] IReadOnlyList<string> Blockers,
     [property: JsonPropertyName("holdSeconds")] int HoldSeconds,
     [property: JsonPropertyName("seedProtectionMatchesClient")] bool SeedProtectionMatchesClient,
-    [property: JsonPropertyName("qualities")] IReadOnlyList<QualityDefinitionDto> Qualities);
+    [property: JsonPropertyName("qualities")] IReadOnlyList<QualityDefinitionDto> Qualities,
+    [property: JsonPropertyName("phoneProfileId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? PhoneProfileId = null);
 
 /// <summary>Acquisition defaults write contract.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -317,6 +344,27 @@ public sealed class AcquisitionSettingsRequest
     /// <summary>Gets or sets the default quality profile.</summary>
     [JsonPropertyName("defaultQualityProfileId")]
     public Guid? DefaultQualityProfileId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the quality profile for phones (Phase 12 M30). A request that leaves it out keeps the stored choice, so an
+    /// older web's Grabbing save never clears it.
+    /// </summary>
+    [JsonPropertyName("phoneProfileId")]
+    public Guid? PhoneProfileId
+    {
+        get => phoneProfileId;
+        set
+        {
+            phoneProfileId = value;
+            PhoneProfileIdSet = true;
+        }
+    }
+
+    /// <summary>Gets a value indicating whether the request carried <see cref="PhoneProfileId"/>.</summary>
+    [JsonIgnore]
+    public bool PhoneProfileIdSet { get; private set; }
+
+    private Guid? phoneProfileId;
 
     /// <summary>Gets or sets the revision being replaced.</summary>
     [JsonPropertyName("revision")]
@@ -394,6 +442,39 @@ public sealed class ProwlarrSourceRequest
     public int SyncIntervalMinutes { get; set; } = 360;
 
     /// <summary>Gets or sets the revision the change was made against.</summary>
+    [JsonPropertyName("revision")]
+    public int? Revision { get; set; }
+}
+
+/// <summary>One model of the TVs catalogue and whether it is ticked (Phase 12 M30).</summary>
+public sealed record TvModelDto(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("year")] int Year,
+    [property: JsonPropertyName("webOS")] string WebOs,
+    [property: JsonPropertyName("dolbyVision")] bool DolbyVision,
+    [property: JsonPropertyName("hdr10Plus")] bool Hdr10Plus,
+    [property: JsonPropertyName("hlg")] bool Hlg,
+    [property: JsonPropertyName("ddPlusAtmos")] bool DdPlusAtmos,
+    [property: JsonPropertyName("dts")] bool Dts,
+    [property: JsonPropertyName("trueHd")] bool TrueHd,
+    [property: JsonPropertyName("selected")] bool Selected);
+
+/// <summary>The TVs catalogue with the ticked models (Phase 12 M30).</summary>
+public sealed record TvModelsDto(
+    [property: JsonPropertyName("models")] IReadOnlyList<TvModelDto> Models,
+    [property: JsonPropertyName("selected")] IReadOnlyList<string> Selected,
+    [property: JsonPropertyName("revision")] int Revision);
+
+/// <summary>The TVs write contract: the ticked model ids and the revision being replaced.</summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed class TvModelsRequest
+{
+    /// <summary>Gets or sets the ticked model ids.</summary>
+    [JsonPropertyName("selected")]
+    public string[] Selected { get; set; } = [];
+
+    /// <summary>Gets or sets the revision being replaced.</summary>
     [JsonPropertyName("revision")]
     public int? Revision { get; set; }
 }

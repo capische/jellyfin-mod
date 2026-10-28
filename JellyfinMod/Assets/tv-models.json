@@ -1,0 +1,29 @@
+{
+  "comment": "The TVs catalogue (Phase 12 M30, user 2026-10-28: \"it should be a DB of TVs and I have two C1 and G2\"). One row per TV model; an administrator ticks the models they watch on (setting tvModels), and a profile set to Best on My TVs prefers releases that every ticked model plays. A capability counts only when every ticked model has it. HDR10+ off means the set plays the HDR10 layer; trueHd off because the household has no eARC receiver (Q7). Phase 8's device catalogue grows from this file.",
+  "models": [
+    {
+      "id": "lg-c1",
+      "name": "LG C1",
+      "year": 2021,
+      "webOS": "6",
+      "dolbyVision": true,
+      "hdr10Plus": false,
+      "hlg": true,
+      "ddPlusAtmos": true,
+      "dts": false,
+      "trueHd": false
+    },
+    {
+      "id": "lg-g2",
+      "name": "LG G2",
+      "year": 2022,
+      "webOS": "22",
+      "dolbyVision": true,
+      "hdr10Plus": false,
+      "hlg": true,
+      "ddPlusAtmos": true,
+      "dts": false,
+      "trueHd": false
+    }
+  ]
+}
