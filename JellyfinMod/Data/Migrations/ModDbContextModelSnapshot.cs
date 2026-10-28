@@ -1499,6 +1499,130 @@ namespace JellyfinMod.Data.Migrations
                     b.ToTable("ProwlarrSources");
                 });
 
+            modelBuilder.Entity("JellyfinMod.Data.RatingsFetch", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("AttemptedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Error")
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("Manual")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("MediaType")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Outcome")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("TmdbId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AttemptedAt");
+
+                    b.HasIndex("MediaType", "TmdbId")
+                        .IsUnique();
+
+                    b.ToTable("RatingsFetches");
+                });
+
+            modelBuilder.Entity("JellyfinMod.Data.RatingsProviderState", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Blocker")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BreakerReason")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("BreakerUntil")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("BudgetDay")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("BudgetUsed")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("ConsecutiveFailures")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("LastRunFailed")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("LastRunFetched")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("LastRunFinishedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("LastRunStartedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LastRunStopReason")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("RatingsProviderStates");
+                });
+
+            modelBuilder.Entity("JellyfinMod.Data.RatingsSettings", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ApiKeyRef")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("DailyBudget")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("DefaultSources")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("RefreshDays")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("Revision")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("VerifiedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("VerifiedRevision")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("RatingsSettings");
+                });
+
             modelBuilder.Entity("JellyfinMod.Data.ReconciliationRun", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1997,6 +2121,47 @@ namespace JellyfinMod.Data.Migrations
                     b.ToTable("SeedReleaseOperations");
                 });
 
+            modelBuilder.Entity("JellyfinMod.Data.TitleRating", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT");
+
+                    b.Property<Guid>("EntryId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("FetchedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Provider")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Scale")
+                        .IsRequired()
+                        .HasMaxLength(8)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Source")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<double>("Value")
+                        .HasColumnType("REAL");
+
+                    b.Property<int?>("Votes")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("EntryId", "Source", "Provider")
+                        .IsUnique();
+
+                    b.ToTable("TitleRatings");
+                });
+
             modelBuilder.Entity("JellyfinMod.Data.TraktObservation", b =>
                 {
                     b.Property<Guid>("Id")
@@ -2334,6 +2499,15 @@ namespace JellyfinMod.Data.Migrations
                         .WithMany()
                         .HasForeignKey("ImportOperationId")
                         .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("JellyfinMod.Data.TitleRating", b =>
+                {
+                    b.HasOne("JellyfinMod.Data.Entry", null)
+                        .WithMany()
+                        .HasForeignKey("EntryId")
+                        .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });
 

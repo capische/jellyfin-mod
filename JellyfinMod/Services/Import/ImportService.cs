@@ -59,7 +59,8 @@ public sealed class ImportService(
     ILogger<ImportService> logger,
     IMediaDiscovery? discovery = null,
     MediaBrowser.Controller.Library.IMediaSourceManager? mediaSources = null,
-    LibraryNotifications? notifications = null)
+    LibraryNotifications? notifications = null,
+    Ratings.RatingsAutoFetch? ratingsFetch = null)
 {
     private DateTime Now => time.GetUtcNow().UtcDateTime;
 
@@ -1169,6 +1170,9 @@ public sealed class ImportService(
         await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
         logger.LogInformation("Import {Operation} completed: bound as native item {Item}", operation.Id, nativeItemId);
         TellClients(operation, nativeItemId);
+        // The imported title's ratings are fetched within seconds when they are due (user decision 8); this only wakes the
+        // background fetcher, after the import's own transaction has committed.
+        if (operation.EntryId is { } imported) ratingsFetch?.Arrived(imported);
     }
 
     private sealed record DestinationPlan(string? Path, string? Root, string? Label, IReadOnlyList<string> MissingDirectories,

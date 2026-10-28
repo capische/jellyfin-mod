@@ -31,13 +31,19 @@ public sealed class EntriesController(
     MediaBrowser.Controller.Library.ILibraryManager? library = null,
     MediaBrowser.Controller.Library.IUserDataManager? userData = null,
     JellyfinMod.Services.Placeholders.PlaceholderSyncQueue? placeholderQueue = null,
-    JellyfinMod.Services.Placeholders.PlaceholderService? placeholderService = null) : ControllerBase
+    JellyfinMod.Services.Placeholders.PlaceholderService? placeholderService = null,
+    JellyfinMod.Services.Ratings.RatingsStore? ratings = null,
+    JellyfinMod.Services.Ratings.RatingsAutoFetch? ratingsFetch = null) : ControllerBase
 {
     /// <summary>
     /// The catalog entries a placeholder movie of the plugin's stands for (P1.FU26): a placeholder is never bound, so a lookup
-    /// by its id finds the movie entry of its TMDB id in its library.
+    /// by its id finds the movie entry of its TMDB id in its library. A placeholder's ratings find their entry the same way (P9.R5).
     /// </summary>
-    private async Task<Guid[]> PlaceholderMovieEntriesAsync(Guid itemId, CancellationToken cancellationToken)
+    private Task<Guid[]> PlaceholderMovieEntriesAsync(Guid itemId, CancellationToken cancellationToken) =>
+        PlaceholderMovieEntriesAsync(library, database, itemId, cancellationToken);
+
+    internal static async Task<Guid[]> PlaceholderMovieEntriesAsync(MediaBrowser.Controller.Library.ILibraryManager? library,
+        ModDbContext database, Guid itemId, CancellationToken cancellationToken)
     {
         try
         {
@@ -203,6 +209,8 @@ public sealed class EntriesController(
 
             // A title added with no file becomes a Jellyfin placeholder item within seconds (P1.FU26).
             placeholderQueue?.Enqueue(entry.TargetLibraryId, entry.Id);
+            // Its ratings are fetched within seconds in the background, not at 04:00 (user decision 8).
+            ratingsFetch?.Arrived(entry.Id);
             return new CreateEntryResult(new EntryDto(entry), true);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
@@ -1250,7 +1258,10 @@ public sealed class EntriesController(
             Upgrade = isAdmin && entry.MediaType == "movie" ? await versions.UpgradeAsync(entry, cancellationToken) : null,
             RetentionWarning = entry.MediaType == "movie" ? warnings.GetValueOrDefault(entry.Id) : null,
             EpisodeListLoaded = entry.MediaType != "series" || episodes.Any(episode => !episode.IsPositionIdentity) ||
-                history.Any(record => record.EventType == SeriesMetadataRefresher.EpisodeListEvent)
+                history.Any(record => record.EventType == SeriesMetadataRefresher.EpisodeListEvent),
+            // Display only (user decision 7): read from SQLite and the host's item, never fetched here (P9.R5).
+            Ratings = ratings is null ? [] : await ratings.ForEntryAsync(entry, await ratings.ReadSettingsAsync(cancellationToken).ConfigureAwait(false),
+                cancellationToken).ConfigureAwait(false)
         };
     }
 }

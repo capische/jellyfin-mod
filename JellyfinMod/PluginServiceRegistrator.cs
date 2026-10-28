@@ -5,6 +5,7 @@ using JellyfinMod.Services.Acquisition;
 using JellyfinMod.Services.Automation;
 using JellyfinMod.Services.Import;
 using JellyfinMod.Services.Placeholders;
+using JellyfinMod.Services.Ratings;
 using JellyfinMod.Services.Trakt;
 using JellyfinMod.Services.Web;
 using MediaBrowser.Common.Net;
@@ -68,6 +69,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         AcquisitionServices.Add(services, () => Plugin.Instance!.DataPath);
         ImportServices.Add(services);
         AutomationServices.Add(services);
+        RatingsServices.Add(services, () => Plugin.Instance!.Configuration);
         services.AddSingleton(provider => new WebBundleStore(
             Plugin.Instance!.DataPath,
             Path.GetDirectoryName(typeof(Plugin).Assembly.Location) ?? Plugin.Instance!.DataPath,
@@ -116,5 +118,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<PlaceholderSyncQueue>());
         services.AddSingleton<PlaceholderFilter>();
         services.Configure<MvcOptions>(options => options.Filters.AddService<PlaceholderFilter>());
+        // Ratings (Phase 9): manual refreshes run in the background, through the daily task's gate and budget.
+        RatingsServices.AddHostedServices(services);
     }
 }

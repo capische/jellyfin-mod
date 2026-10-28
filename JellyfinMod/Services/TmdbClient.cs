@@ -338,7 +338,9 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             certifications.Distinct().ToArray(), Array(item, "seasons").Select(s => new TmdbSeason(Number(s, "season_number") ?? 0,
                 Text(s, "name") ?? string.Empty, Number(s, "episode_count") ?? 0, Text(s, "air_date"), Text(s, "poster_path"),
                 Text(s, "overview"))).ToArray(),
-            Text(item, mediaType == "movie" ? "original_title" : "original_name"), Cast: cast);
+            Text(item, mediaType == "movie" ? "original_title" : "original_name"), Cast: cast,
+            // The vote count beside the score, from the same response (P9.R4).
+            VoteCount: Number(item, "vote_count") is { } votes && votes > 0 ? votes : null);
     }
 
     private static TmdbCastCredit CastCredit(JsonElement person) => new(Number(person, "id") ?? 0, Text(person, "name") ?? string.Empty,
@@ -373,7 +375,8 @@ public sealed record TmdbMetadata(
     [property: JsonPropertyName("seasons")] TmdbSeason[] Seasons,
     [property: JsonPropertyName("originalTitle")] string? OriginalTitle = null,
     [property: JsonPropertyName("episodeRatings")] IReadOnlyDictionary<int, double>? EpisodeRatings = null,
-    [property: JsonPropertyName("cast")] IReadOnlyList<TmdbCastCredit>? Cast = null)
+    [property: JsonPropertyName("cast")] IReadOnlyList<TmdbCastCredit>? Cast = null,
+    [property: JsonPropertyName("voteCount")] int? VoteCount = null)
 {
     /// <summary>
     /// The series with TMDB's rating of each listed episode, by TMDB episode id (P1.FU14): an episode Jellyfin has no item
