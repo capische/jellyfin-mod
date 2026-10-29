@@ -149,11 +149,14 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     // Phase 13: the export task's state and last result, as the host's worker reports them; the checks set them.
     var exportState = TaskState.Idle;
     TaskResult? exportLast = null;
+    // Phase 13, both ways: the Trakt plugin's import task (the one above), its last result.
+    TaskResult? importLast = null;
     IScheduledTaskWorker Worker(string key, Func<TaskState> state) => Stub<IScheduledTaskWorker>.Create((method, _) => method.Name switch
     {
         "get_ScheduledTask" => Stub<IScheduledTask>.Create((inner, _) => inner.Name == "get_Key" ? key : null),
         "get_State" => state(),
         "get_LastExecutionResult" when key == TraktPluginState.ExportTaskKey => exportLast,
+        "get_LastExecutionResult" when key == TraktPluginState.SyncTaskKey => importLast,
         _ => null
     });
     // First, a task whose State getter throws, as Jellyfin's can when that task finishes between its two reads of its
@@ -169,7 +172,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     var taskManager = Stub<ITaskManager>.Create((method, arguments) =>
     {
         // Phase 13: a queued export runs, as the host's does, until the check ends it; its end is raised as the host does.
-        if (method.Name == "QueueScheduledTask") exportState = TaskState.Running;
+        if (method.Name == "QueueScheduledTask" && (arguments![0] as IScheduledTask)?.Key == TraktPluginState.SyncTaskKey) traktTaskState = TaskState.Running;
+        else if (method.Name == "QueueScheduledTask") exportState = TaskState.Running;
         if (method.Name == "add_TaskCompleted") taskCompleted += (EventHandler<TaskCompletionEventArgs>)arguments![0]!;
         return method.Name == "get_ScheduledTasks" ? workers : null;
     });
@@ -569,7 +573,19 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
             new StringContent($"{{\"autoExport\":{(on ? "true" : "false")}}}", System.Text.Encoding.UTF8, "application/json"));
         return put.IsSuccessStatusCode && JsonDocument.Parse(await put.Content.ReadAsStringAsync()).RootElement.GetProperty("autoExport").GetBoolean() == on;
     }
+    async Task<bool> SetImport(bool on)
+    {
+        using var put = await admin.PutAsync("JellyfinMod/Trakt/Export/Settings",
+            new StringContent($"{{\"import\":{(on ? "true" : "false")}}}", System.Text.Encoding.UTF8, "application/json"));
+        return put.IsSuccessStatusCode && JsonDocument.Parse(await put.Content.ReadAsStringAsync()).RootElement.GetProperty("importEnabled").GetBoolean() == on;
+    }
     int Starts(string why) => logs.Lines.Count(line => line.Contains($"starts the Trakt plugin's export ({why})", StringComparison.Ordinal));
+    int Imports(string why) => logs.Lines.Count(line => line.Contains($"starts the Trakt plugin's import ({why})", StringComparison.Ordinal));
+    async Task<bool> ImportStarted(string why, int before, int seconds = 40)
+    {
+        for (var waited = 0; waited < seconds * 10 && Imports(why) == before; waited++) await Task.Delay(100);
+        return Imports(why) > before;
+    }
     // The background check judges a run (every 15 s here); a status read only answers what it found.
     async Task<JsonElement> Judged()
     {
@@ -598,6 +614,10 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
 
     var linkedAdmin = new FakeTraktUser { LinkedMbUserId = world.Admin.Id, AccessToken = "a", RefreshToken = "r" };
     installed.Add(TraktWith(new[] { linkedAdmin }));
+    traktTaskState = TaskState.Idle; // the Trakt plugin's import, left running by the history checks above
+    Assert((await ExportStatus()).GetProperty("importEnabled").GetBoolean(), "The import from Trakt is on by default");
+    // The export's checks first, with the import off (its own checks follow).
+    Assert(await SetImport(false), "The administrator turns the import from Trakt off");
     // A run two minutes ago in which Trakt refused the history write: the plugin logged it and the host says Completed.
     var refusedStart = DateTime.UtcNow.AddMinutes(-3);
     var refusedEnd = DateTime.UtcNow.AddMinutes(-2);
@@ -691,7 +711,90 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Finish(TaskCompletionStatus.Completed, DateTime.UtcNow.AddHours(-25).AddMinutes(-1), DateTime.UtcNow.AddHours(-25));
     Assert(await Started("the daily safety-net export", dailies), "A day after the last run, the daily safety-net export starts");
     Finish(TaskCompletionStatus.Completed, DateTime.UtcNow.AddSeconds(-20), DateTime.UtcNow.AddSeconds(-10));
+
+    // ---- Phase 13, both ways: the Trakt plugin's import runs too, never writing Trakt data itself.
+    var importWorker = workers.Single(worker => worker.ScheduledTask?.Key == TraktPluginState.SyncTaskKey);
+    void FinishImport(DateTime started, DateTime ended)
+    {
+        importLast = new TaskResult { Status = TaskCompletionStatus.Completed, StartTimeUtc = started, EndTimeUtc = ended, Key = TraktPluginState.SyncTaskKey,
+            Name = "Import watched states and playback progress from trakt.tv" };
+        traktTaskState = TaskState.Idle;
+        taskCompleted!(null, new TaskCompletionEventArgs(importWorker, importLast));
+    }
+
+    JsonElement ImportRun(JsonElement status) => status.GetProperty("activity").EnumerateArray().FirstOrDefault(run => run.TryGetProperty("kind", out var kind) && kind.GetString() == "import");
+    async Task<JsonElement> ImportListed(DateTime started)
+    {
+        for (var waited = 0; waited < 400; waited++)
+        {
+            var run = ImportRun(await ExportStatus());
+            if (run.ValueKind == JsonValueKind.Object && run.GetProperty("startedAt").GetDateTime().ToUniversalTime() >= started.AddSeconds(-1)) return run;
+            await Task.Delay(100);
+        }
+
+        return default;
+    }
+
+    var firstImports = Imports("the import has not run yet");
+    Assert(await SetImport(true), "The administrator turns the import from Trakt on again");
+    Assert(await ImportStarted("the import has not run yet", firstImports), "With the automatic export on and no import yet, the import starts by itself");
+    Assert((await ExportStatus()).GetProperty("importRunning").GetBoolean(), "The import is running");
+    var importStart = DateTime.UtcNow;
+    // What the plugin's import saves while it runs: one episode Trakt has a play of, one playback position.
+    Raise(world.Admin, episode1, UserDataSaveReason.Import, played: true, playCount: 1);
+    Raise(world.Admin, episode2, UserDataSaveReason.Import, played: false, position: 6_000_000_000);
+    FinishImport(importStart, DateTime.UtcNow.AddMilliseconds(300));
+    var firstImport = await ImportListed(importStart);
+    Assert(firstImport.ValueKind == JsonValueKind.Object && firstImport.GetProperty("why").GetString() == "first" && firstImport.GetProperty("clean").GetBoolean() &&
+        firstImport.GetProperty("episodesWatched").GetInt32() == 1 && firstImport.GetProperty("progressUpdated").GetInt32() == 1,
+        $"Activity lists the import: first, clean, 1 episode marked watched in Jellyfin, 1 playback position ({firstImport})");
+
+    // Sync Now: the import first, then the export.
+    var syncImports = Imports("requested by an administrator");
+    var afterImport = Starts("after the import from Trakt");
+    using (var syncNow = await admin.PostAsync("JellyfinMod/Trakt/Export", null)) Assert(syncNow.StatusCode == HttpStatusCode.Accepted, "Sync Now is accepted with the import on");
+    Assert(await ImportStarted("requested by an administrator", syncImports, 5) && Starts("after the import from Trakt") == afterImport,
+        "Sync Now starts the import first, and not the export yet");
+    var syncImportStart = DateTime.UtcNow;
+    FinishImport(syncImportStart, DateTime.UtcNow.AddMilliseconds(200));
+    Assert(await Started("after the import from Trakt", afterImport, 10), "When the import ends, the export starts");
+    var syncExportStart = DateTime.UtcNow;
+    Finish(TaskCompletionStatus.Completed, syncExportStart, syncExportStart.AddMilliseconds(300));
+    taskCompleted!(null, new TaskCompletionEventArgs(workers.Single(worker => worker.ScheduledTask?.Key == TraktPluginState.ExportTaskKey), exportLast!));
+    var syncImport = await ImportListed(syncImportStart);
+    JsonElement syncActivity = default;
+    for (var waited = 0; waited < 400; waited++)
+    {
+        syncActivity = (await ExportStatus()).GetProperty("activity");
+        if (syncActivity.EnumerateArray().Any(run => !run.TryGetProperty("kind", out _) && run.GetProperty("startedAt").GetDateTime().ToUniversalTime() >= syncExportStart.AddSeconds(-1))) break;
+        await Task.Delay(100);
+    }
+
+    Assert(syncImport.ValueKind == JsonValueKind.Object && syncImport.GetProperty("why").GetString() == "sync_now" && syncImport.GetProperty("episodesWatched").GetInt32() == 0 &&
+        !syncActivity[0].TryGetProperty("kind", out _) && syncActivity[0].GetProperty("why").GetString() == "sync_now",
+        $"Activity lists both, newest first: the export (Sync Now) above the import (Sync Now, nothing imported) ({syncImport.ValueKind}: {(syncImport.ValueKind == JsonValueKind.Object ? syncImport.ToString() : "")} | {syncActivity[0]})");
+
+    // Once a day by itself.
+    var dailyImports = Imports("the daily import");
+    FinishImport(DateTime.UtcNow.AddHours(-25).AddMinutes(-1), DateTime.UtcNow.AddHours(-25));
+    Assert(await ImportStarted("the daily import", dailyImports), "A day after the last import, the daily import starts");
+    FinishImport(DateTime.UtcNow, DateTime.UtcNow.AddMilliseconds(100));
+
+    // A linked user whose Trakt plugin would import unwatched states (marking unwatched here what Trakt has no play of):
+    // the import is refused, and Sync Now runs the export alone.
+    linkedAdmin.SkipUnwatchedImportFromTrakt = false;
+    var refusedImport = await ExportStatus();
+    Assert(refusedImport.GetProperty("importRefusal").GetString() == "unwatched_import" && Refusal(JsonSerializer.Serialize(refusedImport)) is null,
+        "Unwatched import on in the Trakt plugin: the import is refused, the export is not");
+    var directExports = Starts("requested by an administrator");
+    var noImports = Imports("requested by an administrator");
+    using (var syncNow = await admin.PostAsync("JellyfinMod/Trakt/Export", null)) Assert(syncNow.StatusCode == HttpStatusCode.Accepted, "Sync Now is accepted with the import refused");
+    Assert(Starts("requested by an administrator") == directExports + 1 && Imports("requested by an administrator") == noImports,
+        "With the import refused, Sync Now starts the export alone");
+    Finish(TaskCompletionStatus.Completed, DateTime.UtcNow.AddSeconds(-20), DateTime.UtcNow.AddSeconds(-10));
+    linkedAdmin.SkipUnwatchedImportFromTrakt = true;
     Assert(await SetAuto(false), "The automatic export is turned off again");
+    traktTaskState = TaskState.Running; // as the history checks below expect
 
     installed.Clear();
 
@@ -746,6 +849,7 @@ public sealed class FakeTraktUser
     public bool PostWatchedHistory { get; set; } = true;
     public bool PostUnwatchedHistory { get; set; }
     public bool SynchronizeCollections { get; set; } = true;
+    public bool SkipUnwatchedImportFromTrakt { get; set; } = true;
 }
 
 /// <summary>A changed shape: the destructive switch as a string.</summary>
@@ -758,6 +862,7 @@ public sealed class FakeTraktUserStringSwitch
     public bool PostWatchedHistory { get; set; } = true;
     public string PostUnwatchedHistory { get; set; } = "false";
     public bool SynchronizeCollections { get; set; } = true;
+    public bool SkipUnwatchedImportFromTrakt { get; set; } = true;
 }
 
 /// <summary>A changed shape: the destructive switch is missing.</summary>
@@ -769,5 +874,6 @@ public sealed class FakeTraktUserNoSwitch
     public DateTime AccessTokenExpiration { get; set; } = DateTime.UtcNow.AddDays(30);
     public bool PostWatchedHistory { get; set; } = true;
     public bool SynchronizeCollections { get; set; } = true;
+    public bool SkipUnwatchedImportFromTrakt { get; set; } = true;
 }
 
