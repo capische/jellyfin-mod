@@ -7,6 +7,7 @@ using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -30,6 +31,12 @@ public static class TraktExportRefusal
 
     /// <summary>A linked user has "post unwatched history" on, so the export would remove Trakt plays.</summary>
     public const string UnwatchedHistory = "unwatched_history";
+
+    /// <summary>
+    /// For the import only: a linked user has the Trakt plugin's "skip unwatched import" off, so the import would mark
+    /// unwatched here everything Trakt has no play for.
+    /// </summary>
+    public const string UnwatchedImport = "unwatched_import";
 }
 
 /// <summary>What the Settings section and the Home notice show (Phase 13, P13.T3).</summary>
@@ -46,7 +53,10 @@ public sealed record TraktExportStatus(
     IReadOnlyList<(TraktLink Link, string Name)> Users,
     IReadOnlyDictionary<Guid, TraktProfile> Profiles,
     IReadOnlyList<TraktExportRun> Activity,
-    string? RunningWhy);
+    string? RunningWhy,
+    bool ImportEnabled,
+    string? ImportRefusal,
+    bool ImportRunning);
 
 /// <summary>Why JellyfinMod started an export run (Phase 13, D73); null for a run started elsewhere (the Dashboard).</summary>
 public static class TraktExportWhy
@@ -84,8 +94,12 @@ public static class TraktExportWhy
 /// <param name="EpisodesCollected">Episodes the plugin added to the Trakt collection.</param>
 /// <param name="MoviesCollected">Movies the plugin added to the Trakt collection.</param>
 /// <param name="Error">The Trakt error in a clause ("Trakt answered 503 Service Unavailable"), or null.</param>
+/// <param name="Kind"><c>import</c> for a run of the plugin's import (the watched counts are then what it marked watched in
+/// Jellyfin), null for an export.</param>
+/// <param name="ProgressUpdated">For an import: playback positions it set in Jellyfin.</param>
 public sealed record TraktExportRun(DateTime StartedAt, DateTime EndedAt, string Status, bool Clean, string? Why,
-    int? EpisodesWatched, int? MoviesWatched, int? EpisodesCollected, int? MoviesCollected, string? Error);
+    int? EpisodesWatched, int? MoviesWatched, int? EpisodesCollected, int? MoviesCollected, string? Error,
+    string? Kind = null, int? ProgressUpdated = null);
 
 /// <summary>A linked user's Trakt username and avatar (Phase 13, D49), read by the server; never a token.</summary>
 /// <param name="Username">The Trakt username, or null.</param>
@@ -141,6 +155,12 @@ public sealed class TraktExportService(
     // Every run's result as the host reports its end, so two runs close together are both listed; the background check
     // judges them in order. The host's last result covers a restart.
     private readonly System.Collections.Concurrent.ConcurrentQueue<TaskResult> _finished = new();
+    private readonly System.Collections.Concurrent.ConcurrentQueue<TaskResult> _finishedImports = new();
+    // The import (Phase 13, bidirectional): the starts asked for, the export that follows it, and what it saved in Jellyfin
+    // (the plugin logs its changes at debug level only, so they are counted from the host's own save events).
+    private readonly List<(string Why, DateTime At)> _importAsked = [];
+    private string? _exportAfterImport;
+    private readonly List<(DateTime At, bool Episode, bool Played, bool Progress)> _imported = [];
     private static readonly int[] RetrySteps = [1, 2, 4, 8, 16, 24];
     private static readonly TimeSpan Daily = TimeSpan.FromDays(1);
     // The plugin's log lines reach the file through an asynchronous sink: a run is judged once this has passed after its end.
@@ -164,10 +184,14 @@ public sealed class TraktExportService(
     /// <summary>Gets a value indicating whether the administrator turned the automatic export on.</summary>
     public static bool AutoExport => Plugin.Instance?.Configuration.TraktAutoExport == true;
 
+    /// <summary>Gets a value indicating whether JellyfinMod also runs the Trakt plugin's import (on by default).</summary>
+    public static bool ImportEnabled => Plugin.Instance?.Configuration.TraktImport != false;
+
     /// <inheritdoc />
     public Task StartAsync(CancellationToken cancellationToken)
     {
         taskManager.TaskCompleted += OnTaskCompleted;
+        userData.UserDataSaved += OnUserDataSaved;
         _stopping = new CancellationTokenSource();
         var token = _stopping.Token;
         _loop = Task.Run(async () =>
@@ -197,6 +221,7 @@ public sealed class TraktExportService(
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         taskManager.TaskCompleted -= OnTaskCompleted;
+        userData.UserDataSaved -= OnUserDataSaved;
         if (_stopping is null) return;
         await _stopping.CancelAsync().ConfigureAwait(false);
         if (_loop is not null) await Task.WhenAny(_loop, Task.Delay(Timeout.Infinite, cancellationToken)).ConfigureAwait(false);
@@ -207,9 +232,47 @@ public sealed class TraktExportService(
 
     private void OnTaskCompleted(object? sender, TaskCompletionEventArgs args)
     {
-        if (string.Equals(args.Task?.ScheduledTask?.Key, TraktPluginState.ExportTaskKey, StringComparison.Ordinal) && args.Result is { } result)
+        var key = args.Task?.ScheduledTask?.Key;
+        if (args.Result is not { } result) return;
+        if (string.Equals(key, TraktPluginState.ExportTaskKey, StringComparison.Ordinal)) _finished.Enqueue(result);
+        if (!string.Equals(key, TraktPluginState.SyncTaskKey, StringComparison.Ordinal)) return;
+        _finishedImports.Enqueue(result);
+        string? then;
+        lock (_gate)
         {
-            _finished.Enqueue(result);
+            then = _exportAfterImport;
+            _exportAfterImport = null;
+        }
+
+        // Import first, then the export (Sync Now, a reconnect): the export also sends what the import did not change.
+        if (then is not null) _ = Task.Run(() => StartExportAfterImport(then));
+    }
+
+    private void StartExportAfterImport(string code)
+    {
+        try
+        {
+            var info = trakt.Describe();
+            var worker = info.Installed ? trakt.FindExportTask() : null;
+            if (RefusalFor(info, worker, info.Installed ? trakt.ReadLinks() : null) is null) Start(worker!, "after the import from Trakt", code);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogWarning("JellyfinMod could not start the Trakt export after the import: {Error}", error.Message);
+        }
+    }
+
+    /// <summary>What the Trakt plugin's import saves in Jellyfin (it saves with the reason Import), counted for Activity.</summary>
+    private void OnUserDataSaved(object? sender, UserDataSaveEventArgs args)
+    {
+        if (args.SaveReason != UserDataSaveReason.Import || args.Item is not (MediaBrowser.Controller.Entities.TV.Episode or MediaBrowser.Controller.Entities.Movies.Movie)) return;
+        var played = args.UserData?.Played == true;
+        var progress = !played && args.UserData?.PlaybackPositionTicks > 0;
+        lock (_gate)
+        {
+            var now = DateTime.UtcNow;
+            _imported.RemoveAll(save => now - save.At > TimeSpan.FromHours(2));
+            if (_imported.Count < 10000) _imported.Add((now, args.Item is MediaBrowser.Controller.Entities.TV.Episode, played, progress));
         }
     }
 
@@ -226,6 +289,9 @@ public sealed class TraktExportService(
             .OrderBy(pair => pair.Item2, StringComparer.OrdinalIgnoreCase)
             .ToList();
         var last = worker?.LastExecutionResult;
+        var importer = info.Installed ? trakt.FindImportTask() : null;
+        var importRefusal = ImportRefusalFor(info, importer, links);
+        var importRunning = importer?.State is TaskState.Running or TaskState.Cancelling;
         lock (_gate)
         {
             // Only the background check judges a run (it reads the log); a status read answers what it found, or null.
@@ -234,7 +300,8 @@ public sealed class TraktExportService(
             return new TraktExportStatus(info.Installed, info.Version, AutoExport, running,
                 RefusalFor(info, worker, links), last, clean, AutoExport ? _nextAttemptAt : null, _failures, named,
                 _profiles.ToDictionary(pair => pair.Key, pair => pair.Value.Profile), [.. Activity()],
-                running && _pending.Count > 0 ? _pending[^1].Why : null);
+                running && _pending.Count > 0 ? _pending[^1].Why : importRunning && _importAsked.Count > 0 ? _importAsked[^1].Why : null,
+                ImportEnabled, importRefusal, importRunning);
         }
     }
 
@@ -243,10 +310,49 @@ public sealed class TraktExportService(
     {
         var info = trakt.Describe();
         var worker = info.Installed ? trakt.FindExportTask() : null;
-        var refusal = RefusalFor(info, worker, info.Installed ? trakt.ReadLinks() : null);
+        var links = info.Installed ? trakt.ReadLinks() : null;
+        var refusal = RefusalFor(info, worker, links);
         if (refusal is not null) return refusal;
+        var importer = trakt.FindImportTask();
+        if (ImportEnabled && ImportRefusalFor(info, importer, links) is null && worker!.State == TaskState.Idle)
+        {
+            // Import first, then the export; a run of the import already going is joined.
+            lock (_gate)
+            {
+                _exportAfterImport = TraktExportWhy.SyncNow;
+            }
+
+            if (importer!.State == TaskState.Idle) StartImport(importer, "requested by an administrator", TraktExportWhy.SyncNow);
+            return null;
+        }
+
         Start(worker!, "requested by an administrator", TraktExportWhy.SyncNow);
         return null;
+    }
+
+    /// <summary>Why JellyfinMod will not run the Trakt plugin's import, or null (the export's refusals but the unwatched-history one, and its own).</summary>
+    private static string? ImportRefusalFor(TraktPluginInfo info, IScheduledTaskWorker? importer, IReadOnlyList<TraktLink>? links)
+    {
+        if (!info.Installed) return TraktExportRefusal.NotInstalled;
+        if (!Version.TryParse(info.Version, out var version) || version < TraktPluginState.MinimumExportVersion) return TraktExportRefusal.OldPlugin;
+        if (importer is null || links is null) return TraktExportRefusal.Unknown;
+        if (!links.Any(link => link.Linked)) return TraktExportRefusal.NoUsers;
+        if (links.Any(link => link.Linked && link.ImportsUnwatched)) return TraktExportRefusal.UnwatchedImport;
+        return null;
+    }
+
+    private void StartImport(IScheduledTaskWorker importer, string why, string code)
+    {
+        if (importer.State != TaskState.Idle) return;
+        lock (_gate)
+        {
+            _relinked = false;
+            _importAsked.Add((code, DateTime.UtcNow));
+            if (_importAsked.Count > 8) _importAsked.RemoveAt(0);
+        }
+
+        logger.LogInformation("JellyfinMod starts the Trakt plugin's import ({Why})", why);
+        taskManager.QueueScheduledTask(importer.ScheduledTask, new TaskOptions());
     }
 
     private static string? RefusalFor(TraktPluginInfo info, IScheduledTaskWorker? worker, IReadOnlyList<TraktLink>? links)
@@ -285,16 +391,44 @@ public sealed class TraktExportService(
         if (links is not null) NoteReconnects(links);
         // Runs that ended since the last check, oldest first, once their log has arrived; then the host's last result.
         while (_finished.TryPeek(out var done) && DateTime.UtcNow >= Utc(done.EndTimeUtc) + LogSettle && _finished.TryDequeue(out done)) Judge(done);
+        while (_finishedImports.TryPeek(out var done) && DateTime.UtcNow >= Utc(done.EndTimeUtc) + LogSettle && _finishedImports.TryDequeue(out done)) JudgeImport(done);
+        var importer = trakt.FindImportTask();
+        JudgeImport(importer?.LastExecutionResult);
         var last = worker?.LastExecutionResult;
         var clean = Judge(last);
         if (!AutoExport || RefusalFor(info, worker, links) is not null || worker!.State != TaskState.Idle) return;
+        // One of the plugin's two tasks at a time.
+        if (importer is not null && importer.State != TaskState.Idle) return;
 
         var now = DateTime.UtcNow;
         bool relinked;
         lock (_gate)
         {
-            if (_nextAttemptAt is { } next && now < next) return;
             relinked = _relinked;
+        }
+
+        // The import (both ways): after a reconnect, before the export; once a day by itself.
+        var importAllowed = ImportEnabled && ImportRefusalFor(info, importer, links) is null;
+        if (importAllowed && relinked)
+        {
+            lock (_gate)
+            {
+                _exportAfterImport = TraktExportWhy.Reconnect;
+            }
+
+            StartImport(importer!, "a Trakt account was linked again", TraktExportWhy.Reconnect);
+            return;
+        }
+
+        if (importAllowed && importer!.LastExecutionResult is var lastImport && (lastImport is null || now - Utc(lastImport.EndTimeUtc) >= Daily))
+        {
+            StartImport(importer, lastImport is null ? "the import has not run yet" : "the daily import", lastImport is null ? TraktExportWhy.First : TraktExportWhy.Daily);
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_nextAttemptAt is { } next && now < next) return;
         }
 
         var latest = LatestEpisodePlay(links!.Where(link => link.Linked));
@@ -324,7 +458,7 @@ public sealed class TraktExportService(
         {
             if (_judgedStart == start) return _judgedClean;
             // A run already listed, older than the one judged last (its end was queued, then it was the host's last result).
-            if (_judgedStart is not null && start < _judgedStart && Activity().FirstOrDefault(known => known.StartedAt == start) is { } listed) return listed.Clean;
+            if (_judgedStart is not null && start < _judgedStart && Activity().FirstOrDefault(known => known.StartedAt == start && known.Kind is null) is { } listed) return listed.Clean;
         }
 
         if (DateTime.UtcNow < end + LogSettle) return null;
@@ -371,6 +505,42 @@ public sealed class TraktExportService(
         }
     }
 
+    /// <summary>
+    /// Lists a finished run of the Trakt plugin's import in Activity, once: its result, the Trakt error in a clause, and what
+    /// it saved in Jellyfin while it ran. It does not pace anything: a failed import waits for the next Sync Now, reconnect
+    /// or daily import.
+    /// </summary>
+    private void JudgeImport(TaskResult? run)
+    {
+        if (run is null) return;
+        var start = Utc(run.StartTimeUtc);
+        var end = Utc(run.EndTimeUtc);
+        if (DateTime.UtcNow < end + LogSettle) return;
+        lock (_gate)
+        {
+            if (Activity().Any(known => known.Kind == "import" && known.StartedAt == start)) return;
+        }
+
+        var scan = ScanRunLog(start, end, end + LogSettle, import: true);
+        lock (_gate)
+        {
+            if (Activity().Any(known => known.Kind == "import" && known.StartedAt == start)) return;
+            string? why = null;
+            var asked = _importAsked.FindLastIndex(pending => pending.At <= start.AddMilliseconds(200));
+            if (asked >= 0)
+            {
+                if (start - _importAsked[asked].At < TimeSpan.FromMinutes(30)) why = _importAsked[asked].Why;
+                _importAsked.RemoveRange(0, asked + 1);
+            }
+
+            var saves = _imported.Where(save => save.At >= start.AddSeconds(-1) && save.At <= end.AddSeconds(1)).ToList();
+            var clean = run.Status == TaskCompletionStatus.Completed && !scan.Error;
+            Record(new TraktExportRun(start, end, run.Status.ToString(), clean, why,
+                saves.Count(save => save.Episode && save.Played), saves.Count(save => !save.Episode && save.Played), null, null,
+                scan.Error ? scan.Clause ?? "the Trakt plugin logged an error" : null, "import", saves.Count(save => save.Progress)));
+        }
+    }
+
     private sealed record RunScan(bool Error, string? Clause, int? EpisodesWatched, int? MoviesWatched, int? EpisodesCollected, int? MoviesCollected);
 
     /// <summary>
@@ -379,8 +549,9 @@ public sealed class TraktExportService(
     /// counts of what it sent (up to a second after the run's <paramref name="end"/>). Reads the log files written since the run started; when none can be read the host's status
     /// alone decides and no counts are known.
     /// </summary>
-    private RunScan ScanRunLog(DateTime from, DateTime end, DateTime to)
+    private RunScan ScanRunLog(DateTime from, DateTime end, DateTime to, bool import = false)
     {
+        var task = import ? "Trakt.ScheduledTasks.SyncFromTraktTask" : "Trakt.ScheduledTasks.SyncLibraryTask";
         // The count lines are the run's own, logged before its end; a run seconds later must not add its counts here.
         var countsTo = end.AddSeconds(1);
         var error = false;
@@ -408,7 +579,7 @@ public sealed class TraktExportService(
                     if (!DateTimeOffset.TryParseExact(match.Groups["at"].Value, "yyyy-MM-dd HH:mm:ss.fff zzz", CultureInfo.InvariantCulture,
                         DateTimeStyles.None, out var at) || at.UtcDateTime < from.AddSeconds(-1) || at.UtcDateTime > to) continue;
                     var source = match.Groups["source"].Value;
-                    if (source != "Trakt.ScheduledTasks.SyncLibraryTask" && source != "Trakt.Api.TraktApi") continue;
+                    if (source != task && source != "Trakt.Api.TraktApi") continue;
                     var message = match.Groups["message"].Value;
                     if (match.Groups["level"].Value is "ERR" or "FTL")
                     {
@@ -417,7 +588,7 @@ public sealed class TraktExportService(
                         continue;
                     }
 
-                    if (at.UtcDateTime > countsTo) continue;
+                    if (import || at.UtcDateTime > countsTo) continue;
                     if (Count(EpisodesWatchedLine, message) is { } e) { episodes = (episodes ?? 0) + e; counted = true; }
                     else if (Count(MoviesWatchedLine, message) is { } m) { movies = (movies ?? 0) + m; counted = true; }
                     else if (Count(EpisodesCollectedLine, message) is { } ec) { episodesCollected = (episodesCollected ?? 0) + ec; counted = true; }
@@ -474,8 +645,10 @@ public sealed class TraktExportService(
     {
         var activity = Activity();
         // A restart judges the last run again; it is listed once.
-        if (activity.Any(known => known.StartedAt == run.StartedAt)) return;
-        activity.Insert(0, run);
+        if (activity.Any(known => known.StartedAt == run.StartedAt && known.Kind == run.Kind)) return;
+        // Newest first by start: an import and the export after it may be judged in either order.
+        var at = activity.FindIndex(known => known.StartedAt < run.StartedAt);
+        activity.Insert(at < 0 ? activity.Count : at, run);
         if (activity.Count > ActivityLength) activity.RemoveRange(ActivityLength, activity.Count - ActivityLength);
         if (ActivityFile is not { } file) return;
         try

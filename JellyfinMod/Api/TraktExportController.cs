@@ -35,7 +35,7 @@ public sealed class TraktExportController(TraktExportService export) : Controlle
         return Accepted(Describe());
     }
 
-    /// <summary>Turns the automatic export on or off.</summary>
+    /// <summary>Turns the automatic export, or the import from Trakt, on or off.</summary>
     /// <param name="request">The wanted state.</param>
     /// <response code="200">The resulting state.</response>
     [HttpPut("Settings")]
@@ -43,11 +43,20 @@ public sealed class TraktExportController(TraktExportService export) : Controlle
     public ActionResult<TraktExportStatusDto> PutSettings([FromBody] TraktExportSettingsRequest request)
     {
         var configuration = Plugin.Instance!.Configuration;
-        if (configuration.TraktAutoExport != request.AutoExport)
+        var changed = false;
+        if (request.AutoExport is { } autoExport && configuration.TraktAutoExport != autoExport)
         {
-            configuration.TraktAutoExport = request.AutoExport;
-            Plugin.Instance.UpdateConfiguration(configuration);
+            configuration.TraktAutoExport = autoExport;
+            changed = true;
         }
+
+        if (request.Import is { } import && configuration.TraktImport != import)
+        {
+            configuration.TraktImport = import;
+            changed = true;
+        }
+
+        if (changed) Plugin.Instance.UpdateConfiguration(configuration);
 
         return Describe();
     }
@@ -77,8 +86,8 @@ public sealed class TraktExportController(TraktExportService export) : Controlle
                     profile?.Username, profile?.AvatarUrl);
             }).ToList(),
             status.Activity.Select(run => new TraktExportActivityDto(Utc(run.StartedAt), Utc(run.EndedAt), run.Status, run.Clean, run.Why,
-                run.EpisodesWatched, run.MoviesWatched, run.EpisodesCollected, run.MoviesCollected, run.Error)).ToList(),
-            status.RunningWhy);
+                run.EpisodesWatched, run.MoviesWatched, run.EpisodesCollected, run.MoviesCollected, run.Error, run.Kind, run.ProgressUpdated)).ToList(),
+            status.RunningWhy, status.ImportEnabled, status.ImportRefusal, status.ImportRunning);
     }
 
     private static DateTime Utc(DateTime value) => value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc);

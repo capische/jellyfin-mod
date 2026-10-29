@@ -26,8 +26,12 @@ public sealed record TraktPluginInfo(bool Installed, string? Version);
 /// <param name="PostWatchedHistory">The plugin's "post watched history" switch: its export sends watched episodes.</param>
 /// <param name="PostUnwatchedHistory">The plugin's "post unwatched history" switch: its export removes Trakt plays.</param>
 /// <param name="SynchronizeCollections">The plugin's "synchronize collections" switch: its export updates the collection.</param>
+/// <param name="ImportsUnwatched">
+/// The plugin's "skip unwatched import from trakt.tv" switch is off: its import would mark unwatched here every episode and
+/// movie Trakt has no play for.
+/// </param>
 public sealed record TraktLink(Guid UserId, bool Linked, bool ReconnectNeeded, DateTime? TokenExpiresAt,
-    bool PostWatchedHistory, bool PostUnwatchedHistory, bool SynchronizeCollections);
+    bool PostWatchedHistory, bool PostUnwatchedHistory, bool SynchronizeCollections, bool ImportsUnwatched = false);
 
 /// <summary>
 /// Reads the host's own plugin list and scheduled tasks for the stock Trakt plugin, and (Phase 13, user decision Q2) the
@@ -44,7 +48,9 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
 
     /// <summary>
     /// The <c>Key</c> of the Trakt plugin's <c>SyncFromTraktTask</c>, "Import watched states and playback progress from
-    /// trakt.tv" — the only thing that writes Trakt's history into Jellyfin.
+    /// trakt.tv" — the only thing that writes Trakt's history into Jellyfin. No default trigger at v33; JellyfinMod runs it
+    /// (Phase 13, both ways). It saves with <c>UserDataSaveReason.Import</c>, which the plugin's own ServerMediator ignores
+    /// (it acts on TogglePlayed only), so nothing it imports is sent back to Trakt.
     /// </summary>
     public const string SyncTaskKey = "TraktSyncFromTraktTask";
 
@@ -53,6 +59,7 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
     /// sends each episode played in Jellyfin that has no play on Trakt, with Jellyfin's <c>LastPlayedDate</c> (P13).
     /// </summary>
     public const string ExportTaskKey = "TraktSyncLibraryTask";
+
 
     /// <summary>
     /// The oldest Trakt plugin whose export JellyfinMod runs (Phase 13 Q6): 33 carries the pagination and export-matching
@@ -125,12 +132,17 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
     }
 
     /// <summary>The host's worker for the Trakt plugin's export task, or null when the plugin or its task is absent.</summary>
-    public IScheduledTaskWorker? FindExportTask()
+    public IScheduledTaskWorker? FindExportTask() => FindTask(ExportTaskKey);
+
+    /// <summary>The host's worker for the Trakt plugin's import task, or null when the plugin or its task is absent.</summary>
+    public IScheduledTaskWorker? FindImportTask() => FindTask(SyncTaskKey);
+
+    private IScheduledTaskWorker? FindTask(string key)
     {
         try
         {
             return tasks.ScheduledTasks.ToArray()
-                .FirstOrDefault(worker => string.Equals(worker.ScheduledTask?.Key, ExportTaskKey, StringComparison.Ordinal));
+                .FirstOrDefault(worker => string.Equals(worker.ScheduledTask?.Key, key, StringComparison.Ordinal));
         }
         catch (Exception error) when (error is InvalidOperationException or ArgumentException or NullReferenceException or ObjectDisposedException)
         {
@@ -164,7 +176,7 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
                 if (!TryRead(user, "LinkedMbUserId", out Guid id) || !TryRead(user, "AccessToken", out string? access) ||
                     !TryRead(user, "RefreshToken", out string? refresh) || !TryRead(user, "AccessTokenExpiration", out DateTime expires) ||
                     !TryRead(user, "PostWatchedHistory", out bool postWatched) || !TryRead(user, "PostUnwatchedHistory", out bool postUnwatched) ||
-                    !TryRead(user, "SynchronizeCollections", out bool collections))
+                    !TryRead(user, "SynchronizeCollections", out bool collections) || !TryRead(user, "SkipUnwatchedImportFromTrakt", out bool skipUnwatched))
                 {
                     return null;
                 }
@@ -175,7 +187,7 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
                 if (!hasAccess && !hasRefresh) continue; // added on the plugin's page but never authorized
                 DateTime? expiresAt = expires == DateTime.MinValue ? null
                     : expires.Kind == DateTimeKind.Utc ? expires : DateTime.SpecifyKind(expires, DateTimeKind.Local).ToUniversalTime();
-                links.Add(new TraktLink(id, hasAccess, !hasAccess, expiresAt, postWatched, postUnwatched, collections));
+                links.Add(new TraktLink(id, hasAccess, !hasAccess, expiresAt, postWatched, postUnwatched, collections, !skipUnwatched));
             }
 
             return links;

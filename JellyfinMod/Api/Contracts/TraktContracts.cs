@@ -45,6 +45,9 @@ public sealed record TraktExportUserDto(
 /// <param name="EpisodesCollected">Episodes it added to the Trakt collection.</param>
 /// <param name="MoviesCollected">Movies it added to the Trakt collection.</param>
 /// <param name="Error">The Trakt error in a clause, or null.</param>
+/// <param name="Kind"><c>import</c> for a run of the Trakt plugin's import (the watched counts are what it marked watched in
+/// Jellyfin), left out for an export.</param>
+/// <param name="ProgressUpdated">For an import: playback positions it set in Jellyfin.</param>
 public sealed record TraktExportActivityDto(
     [property: JsonPropertyName("startedAt")] DateTime StartedAt,
     [property: JsonPropertyName("endedAt")] DateTime EndedAt,
@@ -55,7 +58,9 @@ public sealed record TraktExportActivityDto(
     [property: JsonPropertyName("moviesWatched")] int? MoviesWatched,
     [property: JsonPropertyName("episodesCollected")] int? EpisodesCollected,
     [property: JsonPropertyName("moviesCollected")] int? MoviesCollected,
-    [property: JsonPropertyName("error")] string? Error);
+    [property: JsonPropertyName("error")] string? Error,
+    [property: JsonPropertyName("kind")] string? Kind,
+    [property: JsonPropertyName("progressUpdated")] int? ProgressUpdated);
 
 /// <summary>The stock Trakt plugin's last export run, as the host recorded it (Phase 13).</summary>
 /// <param name="Status">The host's <c>TaskCompletionStatus</c>: Completed, Failed, Cancelled or Aborted.</param>
@@ -85,6 +90,10 @@ public sealed record TraktExportRunDto(
 /// <param name="Users">The Jellyfin users the plugin holds a Trakt sign-in for.</param>
 /// <param name="Activity">The last 20 runs, newest first (D50).</param>
 /// <param name="RunningWhy">While a run JellyfinMod started goes: why it started it (as <c>why</c> above), or null.</param>
+/// <param name="ImportEnabled">The "also import watches from Trakt" switch (on by default).</param>
+/// <param name="ImportRefusal">Why JellyfinMod will not run the Trakt plugin's import, or null; <c>unwatched_import</c> when
+/// a linked user's "skip unwatched import" is off in the Trakt plugin.</param>
+/// <param name="ImportRunning">True while the Trakt plugin's import runs.</param>
 public sealed record TraktExportStatusDto(
     [property: JsonPropertyName("installed")] bool Installed,
     [property: JsonPropertyName("version")] string? Version,
@@ -99,8 +108,14 @@ public sealed record TraktExportStatusDto(
     [property: JsonPropertyName("quietMinutes")] int QuietMinutes,
     [property: JsonPropertyName("users")] IReadOnlyList<TraktExportUserDto> Users,
     [property: JsonPropertyName("activity")] IReadOnlyList<TraktExportActivityDto> Activity,
-    [property: JsonPropertyName("runningWhy")] string? RunningWhy);
+    [property: JsonPropertyName("runningWhy")] string? RunningWhy,
+    [property: JsonPropertyName("importEnabled")] bool ImportEnabled,
+    [property: JsonPropertyName("importRefusal")] string? ImportRefusal,
+    [property: JsonPropertyName("importRunning")] bool ImportRunning);
 
-/// <summary>The administrator's change to the export switch (Phase 13).</summary>
+/// <summary>The administrator's change to the export switches (Phase 13); a switch left out keeps its value.</summary>
 /// <param name="AutoExport">Whether JellyfinMod runs the export by itself.</param>
-public sealed record TraktExportSettingsRequest([property: JsonPropertyName("autoExport")] bool AutoExport);
+/// <param name="Import">Whether JellyfinMod also runs the Trakt plugin's import.</param>
+public sealed record TraktExportSettingsRequest(
+    [property: JsonPropertyName("autoExport")] bool? AutoExport,
+    [property: JsonPropertyName("import")] bool? Import = null);
