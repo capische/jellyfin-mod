@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net.Http.Json;
+using System.Text.Json;
 using JellyfinMod.Data;
 using JellyfinMod.Services;
 using Microsoft.EntityFrameworkCore;
@@ -22,6 +23,7 @@ internal static partial class Phase5
             AddEntry(database, ids, "movieKeep", "movie", 132, "Keep Movie", 2021, "tt0000132", null, world.Movies.Id);
             AddEntry(database, ids, "movieFail", "movie", 133, "Failed Movie", 2021, "tt0000133", null, world.Movies.Id);
             AddEntry(database, ids, "movieGone", "movie", 134, "Gone Movie", 2021, "tt0000134", null, world.Movies.Id);
+            AddEntry(database, ids, "movieBlk", "movie", 139, "Blocked Movie", 2021, "tt0000139", null, world.Movies.Id);
             await database.SaveChangesAsync();
         }
 
@@ -55,6 +57,8 @@ internal static partial class Phase5
         }, "Delete Movie is downloading");
         var partial = DataPath(hashDel, fixtureDel);
         var libraryBefore = LibraryFiles(world);
+        Assert(CanDelete(Row(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue")), waitingDel.Id)) == true,
+            "A download not yet imported may have its files deleted (canDeleteFiles)");
         Assert(File.Exists(partial) && new FileInfo(partial).Length > 0, "The partial download is on disk: " + partial);
 
         await ExpectAsync(admin.SendAsync(Remove(waitingDel.Id, new { removeFromClient = false, deleteFiles = true })), 409, "delete_not_allowed",
@@ -115,6 +119,75 @@ internal static partial class Phase5
             transmission.RemoveDeletedData.Skip(failDeletesBefore).SequenceEqual([true]),
             $"The client forgot the failed row's torrent and deleted its partial file: torrent {transmission.Torrents.ContainsKey(hashFail)}, " +
             $"file {File.Exists(partialFail)}, delete-data [{string.Join(",", transmission.RemoveDeletedData.Skip(failDeletesBefore))}]");
+
+        // ---------------- A link that failed (queue Remove dialog, user 2026-10-29): the import records its destination before it
+        // makes the hardlink and keeps it when the link fails, as BlockAsync leaves a cross-filesystem link. Nothing at that path
+        // is not in a library, so its files may be deleted; the download's own hardlink there, or any other file there, still
+        // counts as imported and refuses the delete with nothing changed.
+        var fixtureBlk = Fixture("movieBlk", "Blocked.Movie.2021.1080p.WEB-DL-GRP", "0000139");
+        var (grabBlk, hashBlk) = await GrabAsync(admin, ids["movieBlk"], null, fixtureBlk);
+        transmission.Progress(hashBlk, 0.4);
+        var waitingBlk = await WaitAsync(async () =>
+        {
+            await tick();
+            var operation = await ImportFor(dbPath, grabBlk);
+            return operation.State == ImportStates.Waiting && operation.Progress is > 0 and < 1 ? operation : null;
+        }, "Blocked Movie is downloading");
+        var partialBlk = DataPath(hashBlk, fixtureBlk);
+        Assert(inspector.TryInspect(partialBlk, out var sourceBlk), "The blocked movie's download is on disk: " + partialBlk);
+        var plannedFolder = Path.Combine(world.Movies.Location, "Blocked Movie (2021) [tmdbid-139]");
+        var planned = Path.Combine(plannedFolder, "Blocked Movie (2021) [tmdbid-139].mkv");
+        await using (var database = new ModDbContext(dbPath))
+            await database.ImportOperations.Where(value => value.Id == waitingBlk.Id).ExecuteUpdateAsync(set => set
+                .SetProperty(value => value.State, ImportStates.Blocked).SetProperty(value => value.Reason, ImportReasons.CrossFilesystem)
+                .SetProperty(value => value.SourceLocalPath, sourceBlk.CanonicalPath)
+                .SetProperty(value => value.SourcePhysicalIdentity, sourceBlk.PhysicalIdentity)
+                .SetProperty(value => value.DestinationPath, planned));
+        var blockedRow = Row(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue")), waitingBlk.Id);
+        Assert(blockedRow.GetProperty("state").GetString() == "blocked", "The failed link is a blocked row: " + blockedRow);
+
+        async Task RefusedAsImportedAsync(string message)
+        {
+            Assert(CanDelete(Row(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue")), waitingBlk.Id)) == false,
+                message + ": canDeleteFiles is false");
+            using var refused = await admin.SendAsync(Remove(waitingBlk.Id, new { removeFromClient = true, deleteFiles = true }));
+            var body = await refused.Content.ReadAsStringAsync();
+            Assert((int)refused.StatusCode == 409 && body.Contains("\"delete_not_allowed\"", StringComparison.Ordinal) &&
+                body.Contains("already in your library", StringComparison.Ordinal), $"{message}: refused as imported, {(int)refused.StatusCode} {body}");
+            Assert(transmission.Torrents.ContainsKey(hashBlk) && File.Exists(partialBlk) && File.Exists(planned) &&
+                (await ImportFor(dbPath, grabBlk)).State == ImportStates.Blocked, message + ": the refused removal changed nothing");
+        }
+
+        // The download's own hardlink at the recorded destination, as a link made before a crash could leave it.
+        Directory.CreateDirectory(plannedFolder);
+        using (var link = Process.Start("ln", [partialBlk, planned])!)
+        {
+            await link.WaitForExitAsync();
+            Assert(link.ExitCode == 0 && Links(planned) == 2, "The download is hardlinked at its recorded destination");
+        }
+
+        await RefusedAsImportedAsync("The download's own file at its recorded destination");
+        Assert(Links(partialBlk) == 2, "The refused removal kept both names of the download");
+        File.Delete(planned);
+
+        // A different file at the recorded destination.
+        await File.WriteAllBytesAsync(planned, new byte[4096]);
+        await RefusedAsImportedAsync("A different file at the recorded destination");
+        Assert(new FileInfo(planned).Length == 4096, "The different file is untouched");
+        File.Delete(planned);
+        Directory.Delete(plannedFolder);
+
+        // Nothing at the recorded destination: the delete goes through and only the download goes.
+        Assert(CanDelete(Row(Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue")), waitingBlk.Id)) == true,
+            "A link that failed leaves the files deletable (canDeleteFiles)");
+        var blkLibraryBefore = LibraryFiles(world);
+        var blkDeletesBefore = transmission.RemoveDeletedData.Count;
+        var removedBlk = await ReadAsync(await admin.SendAsync(Remove(waitingBlk.Id, new { removeFromClient = true, deleteFiles = true })),
+            200, "Remove a blocked row whose link failed and delete its files");
+        Assert(removedBlk.GetProperty("state").GetString() == "cancelled" && !transmission.Torrents.ContainsKey(hashBlk) && !File.Exists(partialBlk) &&
+            transmission.RemoveDeletedData.Skip(blkDeletesBefore).SequenceEqual([true]) && LibraryFiles(world).SequenceEqual(blkLibraryBefore),
+            $"The client forgot the blocked row's torrent and deleted its file, and the library is as it was: torrent {transmission.Torrents.ContainsKey(hashBlk)}, " +
+            $"file {File.Exists(partialBlk)}, delete-data [{string.Join(",", transmission.RemoveDeletedData.Skip(blkDeletesBefore))}]");
 
         // ---------------- An imported, seeding download whose torrent was removed outside the plugin: deleting is asked for, and
         // the row goes with nothing deleted and nothing refused (Codex review 2026-10-26, P2 7).
@@ -202,6 +275,7 @@ internal static partial class Phase5
             $"The refused removal kept the torrent, the seeding file and the library file, still {Links(seedingKeep)} links");
         var queue = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue"));
         Assert(Row(queue, completedKeep.Id).GetProperty("state").GetString() == "seeding", "The seeding row stays in the queue");
+        Assert(CanDelete(Row(queue, completedKeep.Id)) == false, "A seeding row's files may not be deleted (canDeleteFiles)");
 
         // The same removal without deleting: the client forgets the torrent and both files stay.
         await ReadAsync(await admin.SendAsync(Remove(completedKeep.Id, new { removeFromClient = true, deleteFiles = false })), 200,
@@ -209,4 +283,8 @@ internal static partial class Phase5
         Assert(!transmission.Torrents.ContainsKey(hashKeep) && transmission.RemoveDeletedData.Last() == false && File.Exists(seedingKeep) &&
             File.Exists(libraryKeep) && Links(libraryKeep) == linksBefore, "Without deleteFiles nothing is deleted");
     }
+
+    /// <summary>A queue row's <c>canDeleteFiles</c>; null when the row has none.</summary>
+    internal static bool? CanDelete(JsonElement row) =>
+        row.TryGetProperty("canDeleteFiles", out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False ? value.GetBoolean() : null;
 }
