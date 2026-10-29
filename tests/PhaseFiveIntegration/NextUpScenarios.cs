@@ -319,6 +319,9 @@ internal static class NextUpScenarios
         var viewerE2 = (await ChildrenAsync(viewerId))[ids["nxviewe2"]];
         // Its files cannot be deleted from any of its rows while one episode is in the library (user, 2026-10-26).
         var viewerE4 = (await ChildrenAsync(viewerId))[ids["nxviewe4"]];
+        var viewerRow = Json.Parse(await admin.GetStringAsync("/JellyfinMod/Queue")).GetProperty("items").EnumerateArray()
+            .Single(item => item.GetProperty("grabId").AsGuid() == viewerId);
+        Assert(Phase5.CanDelete(viewerRow) == false, "A pack with an imported episode offers no delete (canDeleteFiles): " + viewerRow);
         using (var refused = await admin.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"/JellyfinMod/Queue/{viewerE4.Id}")
                { Content = JsonContent.Create(new { removeFromClient = true, deleteFiles = true }) }))
         {

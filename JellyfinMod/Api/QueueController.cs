@@ -150,6 +150,9 @@ public sealed class QueueController(
             });
         }
 
+        // Whether Remove may delete what the download fetched, by the removal's own test (queue Remove dialog, 2026-10-29).
+        if (administrator) rows = await WithDeleteFlagsAsync(rows, operations, cancellationToken);
+
         held = held.Where(grab => !grabs.ContainsKey(grab.Id)).ToList();
         if (held.Count > 0 && (states is not { Length: > 0 } || states.Contains("queued", StringComparer.Ordinal)))
             rows.AddRange(await HeldRowsAsync(held, user, administrator, clients, cancellationToken));
@@ -332,8 +335,8 @@ public sealed class QueueController(
             if (snapshot.Find(operation.InfoHash) is { } torrent)
             {
                 // Its files are deleted only while none of them reached the library: no import of this grab or of this torrent
-                // ever recorded a destination, linked or bound, and no seed release exists for either (for a pack, none of its
-                // episodes). Refused, never quietly downgraded to keeping the files.
+                // linked, bound or has a file at its recorded destination, and no seed release exists for either (for a pack, none
+                // of its episodes; AnyImportedAsync). Refused, never quietly downgraded to keeping the files.
                 if (request.DeleteFiles && (removedSeeds.Count > 0 || await AnyImportedAsync(operation, cancellationToken)))
                     return Refuse(409, DeleteNotAllowed,
                         "Part of this download is already in your library, so its files cannot be deleted; remove it without deleting them.");
@@ -573,18 +576,53 @@ public sealed class QueueController(
     /// <summary>Why a removal that would delete the downloaded files was refused, with nothing changed.</summary>
     private const string DeleteNotAllowed = "delete_not_allowed";
 
+    private static readonly string[] LinkedStates = [ImportStates.Linking, ImportStates.Linked, ImportStates.Scanning, ImportStates.Completed];
+
     /// <summary>
-    /// Whether any file of this download may be in a library: an import of its grab or of its torrent that recorded a
-    /// destination (recorded before the link is made), linked, bound or reached a linking state, or a seed release of either.
+    /// Whether any file of this download may be in a library, the one test both the removal's delete and the queue's
+    /// <c>canDeleteFiles</c> use: an import of its grab or of its torrent that linked, bound or reached a linking state, or
+    /// whose recorded destination is there (the destination is recorded before the link is made, so a link that failed leaves
+    /// it with nothing at that path; any file there, the download's or not, or a path that cannot be read, counts; user,
+    /// 2026-10-29), or a seed release of either.
     /// </summary>
     private async Task<bool> AnyImportedAsync(ImportOperation operation, CancellationToken cancellationToken)
     {
-        string[] linkedStates = [ImportStates.Linking, ImportStates.Linked, ImportStates.Scanning, ImportStates.Completed];
-        return await database.ImportOperations.AnyAsync(value => (value.GrabId == operation.GrabId || value.InfoHash == operation.InfoHash) &&
-                (value.DestinationPath != null || value.LinkedAt != null || value.BindingId != null || linkedStates.Contains(value.State)),
-                cancellationToken) ||
+        var related = await database.ImportOperations.AsNoTracking()
+            .Where(value => value.GrabId == operation.GrabId || value.InfoHash == operation.InfoHash).ToListAsync(cancellationToken);
+        return Imported(related, files) ||
             await database.SeedReleaseOperations.AnyAsync(value => value.GrabId == operation.GrabId || value.InfoHash == operation.InfoHash,
                 cancellationToken);
+    }
+
+    /// <summary>The imports' half of <see cref="AnyImportedAsync"/>, for a removal and for a queue read alike.</summary>
+    private static bool Imported(IEnumerable<ImportOperation> related, UnixFileInspector files) =>
+        related.Any(value => value.LinkedAt != null || value.BindingId != null || LinkedStates.Contains(value.State) ||
+            value.DestinationPath is { } destination && files.Probe(destination) != PathPresence.Absent);
+
+    /// <summary>
+    /// Sets each administrator row's <c>canDeleteFiles</c> by <see cref="AnyImportedAsync"/>'s test, read for all rows at once:
+    /// a held grab (no import yet) keeps null.
+    /// </summary>
+    private async Task<List<QueueRowDto>> WithDeleteFlagsAsync(List<QueueRowDto> rows, IReadOnlyCollection<ImportOperation> operations,
+        CancellationToken cancellationToken)
+    {
+        var byId = operations.ToDictionary(operation => operation.Id);
+        var shown = rows.Where(row => byId.ContainsKey(row.Id)).Select(row => byId[row.Id]).ToList();
+        if (shown.Count == 0) return rows;
+        var grabIds = shown.Select(operation => operation.GrabId).Distinct().ToArray();
+        var hashes = shown.Select(operation => operation.InfoHash).Distinct().ToArray();
+        var related = await database.ImportOperations.AsNoTracking()
+            .Where(value => grabIds.Contains(value.GrabId) || hashes.Contains(value.InfoHash)).ToListAsync(cancellationToken);
+        var seeded = await database.SeedReleaseOperations.AsNoTracking()
+            .Where(value => grabIds.Contains(value.GrabId) || hashes.Contains(value.InfoHash))
+            .Select(value => new { value.GrabId, value.InfoHash }).ToListAsync(cancellationToken);
+        return rows.Select(row =>
+        {
+            if (!byId.TryGetValue(row.Id, out var operation)) return row;
+            var imported = seeded.Any(value => value.GrabId == operation.GrabId || value.InfoHash == operation.InfoHash) ||
+                Imported(related.Where(value => value.GrabId == operation.GrabId || value.InfoHash == operation.InfoHash), files);
+            return row with { CanDeleteFiles = !imported };
+        }).ToList();
     }
 
     private ObjectResult Refuse(int status, string code, string title) =>

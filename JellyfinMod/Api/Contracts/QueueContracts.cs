@@ -110,6 +110,15 @@ public sealed record QueueRowDto(
     /// </summary>
     [JsonPropertyName("replaces"), JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     public IReadOnlyList<QueueReplaceTargetDto>? Replaces { get; init; }
+
+    /// <summary>
+    /// Gets whether removing this row may also delete what its torrent downloaded (administrators only; null otherwise and for
+    /// a held grab): false once any file of it may be in a library, by the removal's own test, so a page offers the delete
+    /// only where the removal accepts it (queue Remove dialog, 2026-10-29). The removal still refuses a file linked elsewhere,
+    /// data outside the mapped folder and a torrent JellyfinMod did not add.
+    /// </summary>
+    [JsonPropertyName("canDeleteFiles"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? CanDeleteFiles { get; init; }
 }
 
 /// <summary>One file a Replace removes: its binding and the resolution read from its file name, null when the name gives none.</summary>
