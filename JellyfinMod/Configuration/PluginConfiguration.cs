@@ -55,6 +55,13 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool TraktAutoExport { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether JellyfinMod also runs the stock Trakt plugin's import ("Import watched states
+    /// and playback progress from trakt.tv") so the sync goes both ways (Phase 13, user 2026-10-29): before the export on
+    /// Sync Now and after a reconnect, and once a day while the automatic export is on. On by default.
+    /// </summary>
+    public bool TraktImport { get; set; } = true;
+
+    /// <summary>
     /// Gets or sets a test-only pace for the Trakt export in minutes: when above zero it replaces the 10-minute quiet period
     /// and is the first retry wait (then doubling, at most 24 times it).
     /// </summary>
