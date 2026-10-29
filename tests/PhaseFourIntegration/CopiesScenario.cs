@@ -251,6 +251,25 @@ internal static class CopiesScenario
             Assert(acquire.GetProperty("profile").GetProperty("id").AsGuid() == FourK && !acquire.GetProperty("grab").GetProperty("forPhones").GetBoolean(),
                 "A search that is not for another quality keeps the default profile");
 
+            // A 2K beside the 4K is no phone copy either (D114): phones play a file at 1080p or below, so the search still opens on
+            // the profile for phones.
+            await using (var database = new ModDbContext(dbPath))
+            {
+                var item = Guid.NewGuid();
+                database.EntryBindings.Add(new EntryBinding
+                {
+                    EntryId = movieId, JellyfinItemId = item, VersionGroupId = item, TargetLibraryId = world.Movies.Id,
+                    MediaPath = Path.Combine(Path.GetDirectoryName(uhdPath)!, "Copy Movie (2025) - 1440p WEB-DL.mkv")
+                });
+                await database.SaveChangesAsync();
+            }
+
+            var twoK = await ReadAsync(await admin.GetAsync($"/JellyfinMod/Releases?entryId={movieId}&intent=addVersion"), 200,
+                "Get Another Quality on a movie with a 4K and a 2K");
+            Assert(twoK.GetProperty("profile").GetProperty("id").AsGuid() == FullHd && twoK.GetProperty("grab").GetProperty("forPhones").GetBoolean(),
+                "A 4K and a 2K still lack the phone copy: Get Another Quality opens on the profile for phones: " +
+                twoK.GetProperty("profile").GetRawText() + twoK.GetProperty("grab").GetRawText());
+
             // Once the movie also holds a 1080p file, the phone copy is no longer missing.
             await using (var database = new ModDbContext(dbPath))
             {

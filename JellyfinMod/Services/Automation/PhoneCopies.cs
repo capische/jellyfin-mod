@@ -8,18 +8,19 @@ namespace JellyfinMod.Services.Automation;
 /// <summary>
 /// Which held file is the phone copy (Phase 12 M31). Nothing stores copies: they follow from the files a title holds, by the
 /// rule the detail page already uses to pick a copy per device (V1 decision 4). The best copy, the one TVs and computers play,
-/// is the highest resolution; the phone copy is the best file at 1080p or below (the 1080p tier, 1440p included, as
-/// <see cref="VersionQuality.RankOf"/> ranks it), standard dynamic range first. A single file is both and nothing is marked;
-/// the phone copy is missing when every held file is above 1080p. A file whose resolution cannot be read is never taken for
+/// is the highest resolution; the phone copy is the best file at 1080p or below, standard dynamic range first. A 1440p is above
+/// it (D114, 2026-10-29: with many files a phone must not start the 2K the mark does not name), though retention ranks 1440p
+/// with 1080p (P4.FU9). A single file is both and nothing is marked; the phone copy is missing when every held file is above
+/// 1080p. A file whose resolution cannot be read is never taken for
 /// either, so an unknown file never makes the phone copy "missing".
 /// </summary>
 public static class PhoneCopies
 {
-    /// <summary>The highest resolution tier a phone copy may have (1080p, <see cref="VersionQuality.RankOf"/>).</summary>
-    public const int PhoneTier = 3;
+    /// <summary>Whether a resolution (<c>1080p</c>) is one a phone copy may have: 1080p or below, never 1440p.</summary>
+    public static bool Fits(string? resolution) => resolution is "1080p" or "720p" or "576p" or "480p";
 
-    /// <summary>Whether a resolution (<c>1080p</c>) is one a phone copy may have.</summary>
-    public static bool Fits(string? resolution) => VersionQuality.RankOf(resolution) is > 0 and <= PhoneTier;
+    /// <summary>Whether a known resolution is above what a phone copy may have (2160p, 1440p).</summary>
+    private static bool Above(string? resolution) => VersionQuality.RankOf(resolution) > 0 && !Fits(resolution);
 
     /// <summary>
     /// Marks the phone copy among a title's versions, as listed (the plugin's default first): only with two or more files, the
@@ -39,7 +40,7 @@ public static class PhoneCopies
 
     /// <summary>Whether a title's listed versions lack a phone copy: at least one file and every file above 1080p.</summary>
     public static bool Missing(IReadOnlyList<VersionDto> versions) =>
-        versions.Count > 0 && versions.All(version => VersionQuality.RankOf(version.Resolution) > PhoneTier);
+        versions.Count > 0 && versions.All(version => Above(version.Resolution));
 
     /// <summary>
     /// Whether a movie or an episode holds files and none of them at 1080p or below, from the files it holds (bound, and not yet
@@ -49,7 +50,7 @@ public static class PhoneCopies
         CancellationToken cancellationToken)
     {
         var held = await VersionQuality.HeldAsync(database, entryId, episodeId, cancellationToken, library).ConfigureAwait(false);
-        return held.Count > 0 && held.All(version => Rank(version, library) > PhoneTier);
+        return held.Count > 0 && held.All(version => Above(ResolutionOf(version, library)));
     }
 
     /// <summary>
@@ -66,19 +67,18 @@ public static class PhoneCopies
         return paths.Any(path => Fits(VersionQuality.Parse(path).Resolution));
     }
 
-    private static int Rank(HeldVersion version, ILibraryManager? library)
+    private static string? ResolutionOf(HeldVersion version, ILibraryManager? library)
     {
-        var rank = VersionQuality.RankOf(version.Resolution);
-        if (rank > 0 || library is null) return rank;
+        if (VersionQuality.RankOf(version.Resolution) > 0 || library is null) return version.Resolution;
         try
         {
             return library.GetItemById(version.JellyfinItemId) is MediaBrowser.Controller.Entities.Video video
-                ? VersionQuality.NativeRank(video.Width, video.Height)
-                : 0;
+                ? VersionQuality.NativeResolution(video.Width, video.Height)
+                : null;
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
-            return 0;
+            return null;
         }
     }
 
