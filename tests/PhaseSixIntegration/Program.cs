@@ -693,10 +693,12 @@ internal static class Phase6
         var uhd = addSearch.GetProperty("candidates").EnumerateArray().Single(item => item.GetProperty("rawTitle").GetString() == "Up.Movie.2020.2160p.WEB-DL-GRP");
         Assert(addSearch.GetProperty("intent").GetString() == "addVersion" && held.GetProperty("heldQuality").GetBoolean() &&
             !uhd.GetProperty("heldQuality").GetBoolean(), "The picker marks the held quality");
+        // Only Replace compares with what is held; Add takes a held quality too (user, 2026-10-29; covered below on Many Movie).
         await ExpectAsync(admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
         {
-            searchId = addSearch.GetProperty("searchId").AsGuid(), releaseId = held.GetProperty("releaseId").GetString(), idempotencyKey = "p6-held-1080"
-        }), 409, "held_quality", "A second copy of a held quality is refused");
+            searchId = addSearch.GetProperty("searchId").AsGuid(), releaseId = held.GetProperty("releaseId").GetString(), mode = "replace",
+            idempotencyKey = "p6-held-1080"
+        }), 409, "held_quality", "Replacing the files held with a held quality is refused");
         var addGrab = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
         {
             searchId = addSearch.GetProperty("searchId").AsGuid(), releaseId = uhd.GetProperty("releaseId").GetString(), idempotencyKey = "p6-add-2160"
@@ -771,6 +773,73 @@ internal static class Phase6
             $"(whole-review c2bf5): {rootImport.State}/{rootImport.Reason} {rootImport.DestinationPath}");
         await ReadAsync(await admin.SendAsync(new HttpRequestMessage(HttpMethod.Delete, $"/JellyfinMod/Queue/{rootImport.Id}")
             { Content = JsonContent.Create(new { removeFromClient = true, blocklist = false }) }), 200, "The refused import leaves the queue");
+
+        // Many files (user, 2026-10-29: "if I want to download 3 different profiles or the same quality profile but different
+        // files - i should be able to do so. Mobile is only tiny feature attached to ability to have many video files"). A movie
+        // that holds a 2160p gains a 1080p, a 1440p and a 720p, each with its own profile, then a second 2160p from another
+        // release: Add takes every one, each lands beside the others, and the phone mark stays on one file.
+        await using (var database = new ModDbContext(dbPath))
+        {
+            AddMovie(database, ids, world.Movies.Id, "many", 1399, "Many Movie", 2020, "tt0901399", monitored: false);
+            await database.SaveChangesAsync();
+        }
+
+        var manyFolder = Path.Combine(world.Movies.Location, "Many Movie (2020)");
+        Directory.CreateDirectory(manyFolder);
+        var manyFirst = Path.Combine(manyFolder, "Many Movie (2020) - 2160p WEB-DL.mkv");
+        await File.WriteAllBytesAsync(manyFirst, new byte[4096]);
+        world.Native.AddMovie(world.Movies, manyFirst, 1399);
+        await WaitAsync(async () =>
+        {
+            await using var database = new ModDbContext(dbPath);
+            return await database.EntryBindings.AnyAsync(value => value.EntryId == ids["many"]) &&
+                (await database.Entries.SingleAsync(value => value.Id == ids["many"])).State == FileState.OnDisk ? true : (bool?)null;
+        }, "Many Movie's 2160p is bound");
+        async Task<JsonElement> ProfileOf(string name, string quality) => await ReadAsync(await admin.PostAsJsonAsync(
+            "/JellyfinMod/Settings/QualityProfiles", new { name, qualities = new[] { quality } }), 201, "Profile " + name);
+        var manyAdds = new[]
+        {
+            ("many1080", "Many.Movie.2020.1080p.WEB-DL-GRP", await ProfileOf("Only 1080p", "webdl-1080p"), " - 1080p WEB-DL.mkv"),
+            ("many1440", "Many.Movie.2020.1440p.WEB-DL-GRP", await ProfileOf("Only 2K", "webdl-1440p"), " - 1440p WEB-DL.mkv"),
+            ("many720", "Many.Movie.2020.720p.WEB-DL-GRP", await ProfileOf("Only 720p", "webdl-720p"), " - 720p WEB-DL.mkv"),
+            ("many2160b", "Many.Movie.2020.2160p.WEB-DL-OTHER", any, " - 2160p WEB-DL v2.mkv")
+        };
+        foreach (var (key, title, profile, _) in manyAdds) release(torznab, key, title, "0901399", null);
+        foreach (var (key, title, profile, ending) in manyAdds)
+        {
+            var search = Json.Parse(await admin.GetStringAsync(
+                $"/JellyfinMod/Releases?entryId={ids["many"]}&intent=addVersion&profileId={profile.GetProperty("id").AsGuid()}"));
+            var row = search.GetProperty("candidates").EnumerateArray().Single(item => item.GetProperty("rawTitle").GetString() == title);
+            Assert(row.GetProperty("eligible").GetBoolean() && row.GetProperty("heldQuality").GetBoolean() == (key == "many2160b"),
+                $"{title} is eligible on {profile.GetProperty("name").GetString()}, marked held only when its quality is: {row.GetRawText()}");
+            var grab = await ReadAsync(await admin.PostAsJsonAsync("/JellyfinMod/Releases/Grab", new
+            {
+                searchId = search.GetProperty("searchId").AsGuid(), releaseId = row.GetProperty("releaseId").GetString(), mode = "add",
+                idempotencyKey = "p12-" + key
+            }), 202, $"Add takes {title}");
+            await WaitForTorrentAsync(transmission, fixtures[key].InfoHash);
+            transmission.Progress(fixtures[key].InfoHash, 1.0);
+            var imported = await WaitAsync(async () =>
+            {
+                await Tick();
+                await using var database = new ModDbContext(dbPath);
+                return await database.ImportOperations.AsNoTracking().SingleOrDefaultAsync(value => value.GrabId == grab.GetProperty("id").AsGuid() &&
+                    value.State == ImportStates.Completed);
+            }, $"{title} is imported");
+            Assert(imported.Intent == "addVersion" && imported.DestinationPath!.EndsWith("Many Movie (2020)" + ending, StringComparison.Ordinal) &&
+                Path.GetDirectoryName(imported.DestinationPath) == manyFolder,
+                $"{title} lands beside the others as {Path.GetFileName(imported.DestinationPath)}");
+        }
+
+        var manyVersions = Json.Parse(await admin.GetStringAsync($"/JellyfinMod/Entries/{ids["many"]}")).GetProperty("versions").EnumerateArray().ToArray();
+        string ManyRows() => string.Join("; ", manyVersions.Select(item => $"{item.GetProperty("resolution").GetString()} {item.GetProperty("label").GetString()} phone={item.GetProperty("phoneCopy").GetBoolean()}"));
+        Assert(manyVersions.Length == 5 && manyVersions.Select(item => item.GetProperty("resolution").GetString()).Order()
+                .SequenceEqual(["1080p", "1440p", "2160p", "2160p", "720p"]) &&
+            manyVersions.Select(item => item.GetProperty("mediaSourceId").GetString()).Distinct().Count() == 5,
+            "The movie lists five files, two of them 2160p: " + ManyRows());
+        Assert(manyVersions.Count(item => item.GetProperty("phoneCopy").GetBoolean()) == 1 &&
+            manyVersions.Single(item => item.GetProperty("phoneCopy").GetBoolean()).GetProperty("resolution").GetString() == "1080p",
+            "One file carries the phone mark, the 1080p, never the 2K above it (D114): " + ManyRows());
 
         // V1 review P2-12: the 2160p is a further version of the readable 1080p main item. With its own tag blocked for a user,
         // Jellyfin's rule hides that version from them: the entry's rows leave it out for the ordinary user and the

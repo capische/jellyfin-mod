@@ -141,8 +141,10 @@ public sealed class GrabService(
                 string.Join(", ", candidate.Evaluation.Rejections.Select(rejection => rejection.Code)));
         }
         var addVersion = snapshot.Intent == GrabIntents.AddVersion;
-        // Another quality must be another quality: a held one is refused (P6.M6).
-        if (addVersion && candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality))
+        // Add takes any release the person picks, a quality already held included: another profile's file or another file of
+        // the same quality (user, 2026-10-29: "if I want to download 3 different profiles or the same quality profile but
+        // different files - i should be able to do so"). Only Replace compares with what is held (P6.M6).
+        if (addVersion && request.Mode == GrabModes.Replace && candidate.Parsed.Quality is { } quality && snapshot.HeldQualities.Contains(quality))
             throw new GrabException(409, "held_quality", "This quality is already in the library.");
 
         var target = snapshot.Target;
