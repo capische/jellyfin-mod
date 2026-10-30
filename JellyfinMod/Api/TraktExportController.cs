@@ -14,13 +14,13 @@ namespace JellyfinMod.Api;
 [ApiController]
 [Authorize(Policy = Policies.RequiresElevation)]
 [Route("JellyfinMod/Trakt/Export")]
-public sealed class TraktExportController(TraktExportService export) : ControllerBase
+public sealed class TraktExportController(TraktExportService export, MediaBrowser.Controller.Library.IUserManager users) : ControllerBase
 {
     /// <summary>Reports the export's state.</summary>
     /// <response code="200">The state.</response>
     [HttpGet]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public ActionResult<TraktExportStatusDto> Get() => Describe();
+    public async Task<ActionResult<TraktExportStatusDto>> Get() => await DescribeAsync().ConfigureAwait(false);
 
     /// <summary>Starts the plugin's export now, or joins the run already going.</summary>
     /// <response code="202">Started, or already running.</response>
@@ -28,11 +28,11 @@ public sealed class TraktExportController(TraktExportService export) : Controlle
     [HttpPost]
     [ProducesResponseType(StatusCodes.Status202Accepted)]
     [ProducesResponseType(StatusCodes.Status409Conflict)]
-    public ActionResult<TraktExportStatusDto> Run()
+    public async Task<ActionResult<TraktExportStatusDto>> Run()
     {
         var refusal = export.RunNow();
         if (refusal is not null) return Conflict(new { error = refusal });
-        return Accepted(Describe());
+        return Accepted(await DescribeAsync().ConfigureAwait(false));
     }
 
     /// <summary>Turns the automatic export, or the import from Trakt, on or off.</summary>
@@ -40,7 +40,7 @@ public sealed class TraktExportController(TraktExportService export) : Controlle
     /// <response code="200">The resulting state.</response>
     [HttpPut("Settings")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public ActionResult<TraktExportStatusDto> PutSettings([FromBody] TraktExportSettingsRequest request)
+    public async Task<ActionResult<TraktExportStatusDto>> PutSettings([FromBody] TraktExportSettingsRequest request)
     {
         var configuration = Plugin.Instance!.Configuration;
         var changed = false;
@@ -58,12 +58,15 @@ public sealed class TraktExportController(TraktExportService export) : Controlle
 
         if (changed) Plugin.Instance.UpdateConfiguration(configuration);
 
-        return Describe();
+        return await DescribeAsync().ConfigureAwait(false);
     }
 
-    private TraktExportStatusDto Describe()
+    private async Task<TraktExportStatusDto> DescribeAsync()
     {
         var status = export.Describe();
+        var log = await export.ReadActivityAsync().ConfigureAwait(false);
+        string? NameOf(Guid id) => users.GetUserById(id)?.Username;
+        var viewer = Guid.TryParse(User.FindFirst("Jellyfin-UserId")?.Value, out var viewerId) ? NameOf(viewerId) : null;
         var testMinutes = Plugin.Instance?.Configuration.TraktExportTestMinutes ?? 0;
         var last = status.LastRun;
         return new TraktExportStatusDto(
@@ -85,9 +88,9 @@ public sealed class TraktExportController(TraktExportService export) : Controlle
                     pair.Link.ReconnectNeeded ? pair.Link.TokenExpiresAt : null, pair.Link.SynchronizeCollections, pair.Link.PostWatchedHistory,
                     profile?.Username, profile?.AvatarUrl);
             }).ToList(),
-            status.Activity.Select(run => new TraktExportActivityDto(Utc(run.StartedAt), Utc(run.EndedAt), run.Status, run.Clean, run.Why,
-                run.EpisodesWatched, run.MoviesWatched, run.EpisodesCollected, run.MoviesCollected, run.Error, run.Kind, run.ProgressUpdated)).ToList(),
-            status.RunningWhy, status.ImportEnabled, status.ImportRefusal, status.ImportRunning);
+            log.Select(row => new TraktActivityDto(Utc(row.At), NameOf(row.UserId) ?? string.Empty, row.Title, row.Code, row.Kind, row.Direction,
+                row.State, row.Detail)).ToList(),
+            status.ImportEnabled, status.ImportRefusal, status.ImportRunning, status.NextExportAt, status.LastError, viewer);
     }
 
     private static DateTime Utc(DateTime value) => value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc);
