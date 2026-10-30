@@ -94,7 +94,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     TvEpisode MakeEpisode(Season season, int number) => new()
     {
         Id = Guid.NewGuid(), Name = $"Episode {number}", Path = Path.Combine(media, "tv", $"e{season.IndexNumber}{number}.mkv"),
-        IndexNumber = number, ParentIndexNumber = season.IndexNumber, SeriesId = series.Id, SeasonId = season.Id
+        IndexNumber = number, ParentIndexNumber = season.IndexNumber, SeriesId = series.Id, SeasonId = season.Id, SeriesName = series.Name
     };
     var episode1 = MakeEpisode(season1, 1);
     var episode2 = MakeEpisode(season1, 2);
@@ -207,6 +207,16 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         return Path.Combine(folder, "log");
     }
 
+    // Phase 13: the host's playback events, raised by the checks as the host raises them (Activity's live rows).
+    EventHandler<PlaybackProgressEventArgs>? playbackStart = null;
+    EventHandler<PlaybackStopEventArgs>? playbackStopped = null;
+    var sessionManager = Stub<MediaBrowser.Controller.Session.ISessionManager>.Create((method, arguments) =>
+    {
+        if (method.Name == "add_PlaybackStart") playbackStart += (EventHandler<PlaybackProgressEventArgs>)arguments![0]!;
+        if (method.Name == "add_PlaybackStopped") playbackStopped += (EventHandler<PlaybackStopEventArgs>)arguments![0]!;
+        return null;
+    });
+
     void Configure(IServiceCollection services)
     {
         services.AddSingleton(library);
@@ -218,6 +228,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         // Phase 13: the export's state, refusals and triggers (its loop looks every 15 s at the test pace).
         services.AddSingleton(Stub<MediaBrowser.Common.Configuration.IApplicationPaths>.Create((method, _) =>
             method.Name == "get_LogDirectoryPath" ? LogFolderRead() : null));
+        services.AddSingleton(sessionManager);
+        services.AddSingleton<TraktActivityLog>();
         services.AddSingleton<TraktExportService>();
         services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<TraktExportService>());
         // Deleted users are looked for every 300 ms here instead of every five minutes.
@@ -618,11 +630,38 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert((await ExportStatus()).GetProperty("importEnabled").GetBoolean(), "The import from Trakt is on by default");
     // The export's checks first, with the import off (its own checks follow).
     Assert(await SetImport(false), "The administrator turns the import from Trakt off");
+
+    // Activity (D125-D127, D134, D135): one row per title and direction, from the host's own events and the judged runs.
+    async Task<JsonElement> RowWhere(Func<JsonElement, bool> match, int seconds = 40)
+    {
+        for (var waited = 0; waited < seconds * 10; waited++)
+        {
+            var found = (await ExportStatus()).GetProperty("activity").EnumerateArray().FirstOrDefault(match);
+            if (found.ValueKind == JsonValueKind.Object) return found;
+            await Task.Delay(100);
+        }
+
+        return default;
+    }
+
+    // The server leaves null fields out (a count row has no code).
+    static bool Is(JsonElement row, string code, string direction, string state) => row.TryGetProperty("code", out var value) &&
+        value.GetString() == code && row.GetProperty("direction").GetString() == direction && row.GetProperty("state").GetString() == state;
+    static bool Count(JsonElement row, string direction, string state, int detail) => row.GetProperty("direction").GetString() == direction &&
+        row.GetProperty("state").GetString() == state && row.TryGetProperty("detail", out var value) && value.GetInt32() == detail;
+
+    // A watch here by the linked account (a play to its end): waiting for the export.
+    playbackStopped!(null, new PlaybackStopEventArgs { Users = [world.Admin], Item = episode1, PlaybackPositionTicks = episode1.RunTimeTicks, PlayedToCompletion = true });
+    var watched = await RowWhere(row => Is(row, "S01E01", "to", "waiting"));
+    Assert(watched.ValueKind == JsonValueKind.Object && watched.GetProperty("title").GetString() == series.Name && watched.GetProperty("user").GetString() == world.Admin.Username,
+        $"A watch here by the linked account is listed: the series, S01E01, waiting for the export ({watched})");
+
     // A run two minutes ago in which Trakt refused the history write: the plugin logged it and the host says Completed.
     var refusedStart = DateTime.UtcNow.AddMinutes(-3);
     var refusedEnd = DateTime.UtcNow.AddMinutes(-2);
     await File.WriteAllLinesAsync(logFile, new[]
     {
+        Line(refusedStart.AddSeconds(5), "INF", "Trakt.ScheduledTasks.SyncLibraryTask", "Episodes to \"add to\" collection 3"),
         Line(refusedStart.AddSeconds(10), "ERR", "Trakt.ScheduledTasks.SyncLibraryTask", "Error updating episode play states"),
         "System.Net.Http.HttpRequestException: Response status code does not indicate success: 500 (Internal Server Error).",
         Line(refusedEnd, "INF", "Emby.Server.Implementations.ScheduledTasks.TaskManager", "\"Export library to trakt.tv\" Completed after 0 minute(s) and 50 seconds")
@@ -631,19 +670,19 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     for (var read = 0; read < 5; read++) await ExportStatus();
     var state = await Judged();
     Assert(logReads > 0 && logReadsInRequest == 0, $"The status read never reads the host's log; the background check does ({logReads} read(s), {logReadsInRequest} in a request)");
-    Assert(state.GetProperty("lastRunConfirmed").ValueKind == JsonValueKind.False && state.GetProperty("failures").GetInt32() == 1,
-        "A Completed run with a Trakt error in the log while it ran is not clean, and counts one failure");
-    var refusedRun = state.GetProperty("activity")[0];
-    Assert(refusedRun.GetProperty("clean").GetBoolean() == false && refusedRun.GetProperty("error").GetString() == "Trakt answered 500 Internal Server Error" &&
-        !refusedRun.TryGetProperty("why", out _) && !refusedRun.TryGetProperty("episodesWatched", out _),
-        $"Activity lists that run: not clean, the Trakt error from its exception, no reason (not started by JellyfinMod), no counts ({refusedRun})");
+    Assert(state.GetProperty("lastRunConfirmed").ValueKind == JsonValueKind.False && state.GetProperty("failures").GetInt32() == 1 &&
+        state.GetProperty("lastError").GetString() == "Trakt answered 500 Internal Server Error",
+        "A Completed run with a Trakt error in the log while it ran is not clean, counts one failure and says the error");
+    Assert((await RowWhere(row => Is(row, "S01E01", "to", "waiting"))).ValueKind == JsonValueKind.Object &&
+        (await RowWhere(row => Count(row, "to", "collection", 3), 1)).ValueKind != JsonValueKind.Object,
+        "After a run that is not clean the watch still waits, and the collection adds it only meant to send are not listed");
     Assert(await SetAuto(true), "The administrator turns the automatic export on");
 
     var retries = Starts("the last run was not clean");
     Assert(await Started("the last run was not clean", retries), "Its retry wait over, the export starts again by itself");
     Assert((await ExportStatus()).GetProperty("running").GetBoolean(), "The retry is running");
     // The retried run is clean: no Trakt error while it ran (a scrobble error from another source does not count); the
-    // plugin's count lines say what it sent.
+    // plugin's count lines say what it added to the collection.
     var retryStart = DateTime.UtcNow;
     var retryEnd = retryStart.AddSeconds(1);
     await File.AppendAllLinesAsync(logFile, new[]
@@ -657,16 +696,14 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     state = await Judged();
     Assert(state.GetProperty("lastRunConfirmed").ValueKind == JsonValueKind.True && state.GetProperty("failures").GetInt32() == 0 &&
         !(state.TryGetProperty("nextAttemptAt", out var next) && next.ValueKind != JsonValueKind.Null), "The retried run is clean: no failure and no retry");
-    var retriedRun = state.GetProperty("activity")[0];
-    Assert(retriedRun.GetProperty("why").GetString() == "retry" && retriedRun.GetProperty("clean").GetBoolean() &&
-        retriedRun.GetProperty("episodesWatched").GetInt32() == 2 && retriedRun.GetProperty("episodesCollected").GetInt32() == 2 &&
-        retriedRun.GetProperty("moviesWatched").GetInt32() == 0 && state.GetProperty("activity").GetArrayLength() == 2,
-        $"Activity lists the retry first: why retry, clean, the plugin's counts (2 watched, 2 collected) ({retriedRun})");
-    var activityFile = Path.Combine(folder, "jellyfinmod", "trakt-activity.json");
-    Assert(File.Exists(activityFile) && JsonDocument.Parse(await File.ReadAllTextAsync(activityFile)).RootElement.GetArrayLength() == 2,
-        "The activity is kept in the plugin's data folder");
+    Assert((await RowWhere(row => Is(row, "S01E01", "to", "sent"))).ValueKind == JsonValueKind.Object,
+        "The watch reads marked watched on Trakt once a clean export that started after it has run");
+    Assert((await RowWhere(row => Count(row, "to", "collection", 2))).ValueKind == JsonValueKind.Object, "Its collection adds are one count row: 2");
 
-    // Two runs that end between two checks (two Sync Nows a few seconds apart) are both listed, each with its reason.
+    // A title the export logs as not found on Trakt reads failed; a burst of more than 50 sent at once is one count row.
+    episode2.SetProviderId(MetadataProvider.Tvdb, "990202");
+    Raise(world.Admin, episode2, UserDataSaveReason.TogglePlayed, played: true, playCount: 1);
+    Assert((await RowWhere(row => Is(row, "S01E02", "to", "waiting"))).ValueKind == JsonValueKind.Object, "A watch marked here by hand is listed, waiting");
     var exportWorker = workers.Single(worker => worker.ScheduledTask?.Key == TraktPluginState.ExportTaskKey);
     void Ended(DateTime started, DateTime ended)
     {
@@ -675,27 +712,40 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     }
 
     using (var syncNow = await admin.PostAsync("JellyfinMod/Trakt/Export", null)) Assert(syncNow.StatusCode == HttpStatusCode.Accepted, "Sync Now is accepted");
-    var firstStart = DateTime.UtcNow;
-    Ended(firstStart, firstStart.AddMilliseconds(300));
+    var lostStart = DateTime.UtcNow;
+    await File.AppendAllLinesAsync(logFile, new[]
+    {
+        Line(lostStart.AddMilliseconds(100), "ERR", "Trakt.ScheduledTasks.SyncLibraryTask", "Episode not found on trakt.tv: TraktEpisode { Ids: TraktEpisodeId { Tvdb: \"990202\" } }")
+    });
+    Ended(lostStart, lostStart.AddMilliseconds(300));
+    Assert((await RowWhere(row => Is(row, "S01E02", "to", "failed"))).ValueKind == JsonValueKind.Object,
+        "The title the export logged as not found on Trakt reads failed");
+    state = await Judged();
+    Assert(state.GetProperty("lastRunConfirmed").ValueKind == JsonValueKind.True && state.GetProperty("failures").GetInt32() == 0,
+        "A title Trakt does not know does not hold back the run: it counts as delivered, with no retry");
     await Task.Delay(1000);
     using (var syncNow = await admin.PostAsync("JellyfinMod/Trakt/Export", null)) Assert(syncNow.StatusCode == HttpStatusCode.Accepted, "Sync Now is accepted again");
-    var secondStart = DateTime.UtcNow;
-    Ended(secondStart, secondStart.AddMilliseconds(300));
-    JsonElement close = default;
-    for (var waited = 0; waited < 400; waited++)
-    {
-        close = (await ExportStatus()).GetProperty("activity");
-        if (close.GetArrayLength() >= 4) break;
-        await Task.Delay(100);
-    }
+    var burstStart = DateTime.UtcNow;
+    await File.AppendAllLinesAsync(logFile, new[] { Line(burstStart.AddMilliseconds(100), "INF", "Trakt.ScheduledTasks.SyncLibraryTask", "Episodes to set \"watched\": 60") });
+    Ended(burstStart, burstStart.AddMilliseconds(300));
+    Assert((await RowWhere(row => Count(row, "to", "summary", 60))).ValueKind == JsonValueKind.Object, "60 episodes sent at once are one count row");
+    Assert((await RowWhere(row => Is(row, "S01E02", "to", "failed"), 2)).ValueKind == JsonValueKind.Object, "A later clean run leaves the failed title failed");
 
-    Assert(close.GetArrayLength() >= 4 && close[0].GetProperty("why").GetString() == "sync_now" && close[1].GetProperty("why").GetString() == "sync_now" &&
-        close[0].GetProperty("startedAt").GetDateTime() > close[1].GetProperty("startedAt").GetDateTime(),
-        $"Two runs between two checks are both listed, newest first, each as Sync Now ({close.GetArrayLength()} runs)");
+    // Live: a linked account with the Trakt plugin's Scrobble on plays a title; it stops before the end.
+    episode3.RunTimeTicks = 10_000_000_000;
+    playbackStart!(null, new PlaybackProgressEventArgs { Users = [world.Admin], Item = episode3 });
+    Assert((await RowWhere(row => Is(row, "S02E01", "to", "playing"))).ValueKind == JsonValueKind.Object, "A play by the linked account reads watching now");
+    // The host saves the stop as PlaybackFinished first; a rewatch keeps Played, which is not a new watch.
+    Raise(world.Admin, episode3, UserDataSaveReason.PlaybackFinished, played: true, playCount: 1);
+    playbackStopped!(null, new PlaybackStopEventArgs { Users = [world.Admin], Item = episode3, PlaybackPositionTicks = 3_000_000_000, PlayedToCompletion = false });
+    var stopped = await RowWhere(row => Is(row, "S02E01", "to", "stopped"));
+    Assert(stopped.ValueKind == JsonValueKind.Object && stopped.GetProperty("detail").GetInt32() == 30, $"Stopped before its end it reads where it stopped: 30 % ({stopped})");
+
     var anyStart = logs.Lines.Count(line => line.Contains("starts the Trakt plugin's export (", StringComparison.Ordinal));
     await Task.Delay(TimeSpan.FromSeconds(35));
     Assert(logs.Lines.Count(line => line.Contains("starts the Trakt plugin's export (", StringComparison.Ordinal)) == anyStart,
-        "After a clean run, with no new play, no reconnect and less than a day since, nothing starts");
+        "After clean runs, with no new watch and no reconnect, no export starts (a play that stopped early is not a watch)");
+    Finish(TaskCompletionStatus.Completed, DateTime.UtcNow.AddSeconds(-20), DateTime.UtcNow.AddSeconds(-10));
 
     // Reconnect: the account's sign-in could not be renewed, then it is linked again; the export starts by itself.
     linkedAdmin.AccessToken = "";
@@ -722,57 +772,32 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         taskCompleted!(null, new TaskCompletionEventArgs(importWorker, importLast));
     }
 
-    JsonElement ImportRun(JsonElement status) => status.GetProperty("activity").EnumerateArray().FirstOrDefault(run => run.TryGetProperty("kind", out var kind) && kind.GetString() == "import");
-    async Task<JsonElement> ImportListed(DateTime started)
-    {
-        for (var waited = 0; waited < 400; waited++)
-        {
-            var run = ImportRun(await ExportStatus());
-            if (run.ValueKind == JsonValueKind.Object && run.GetProperty("startedAt").GetDateTime().ToUniversalTime() >= started.AddSeconds(-1)) return run;
-            await Task.Delay(100);
-        }
-
-        return default;
-    }
-
     var firstImports = Imports("the import has not run yet");
     Assert(await SetImport(true), "The administrator turns the import from Trakt on again");
     Assert(await ImportStarted("the import has not run yet", firstImports), "With the automatic export on and no import yet, the import starts by itself");
     Assert((await ExportStatus()).GetProperty("importRunning").GetBoolean(), "The import is running");
     var importStart = DateTime.UtcNow;
-    // What the plugin's import saves while it runs: one episode Trakt has a play of, one playback position.
+    // What the plugin's import saves while it runs: one episode Trakt has a play of, one playback position (10 minutes).
     Raise(world.Admin, episode1, UserDataSaveReason.Import, played: true, playCount: 1);
     Raise(world.Admin, episode2, UserDataSaveReason.Import, played: false, position: 6_000_000_000);
     FinishImport(importStart, DateTime.UtcNow.AddMilliseconds(300));
-    var firstImport = await ImportListed(importStart);
-    Assert(firstImport.ValueKind == JsonValueKind.Object && firstImport.GetProperty("why").GetString() == "first" && firstImport.GetProperty("clean").GetBoolean() &&
-        firstImport.GetProperty("episodesWatched").GetInt32() == 1 && firstImport.GetProperty("progressUpdated").GetInt32() == 1,
-        $"Activity lists the import: first, clean, 1 episode marked watched in Jellyfin, 1 playback position ({firstImport})");
+    Assert((await RowWhere(row => Is(row, "S01E01", "from", "imported"))).ValueKind == JsonValueKind.Object, "The import's watch is listed: marked watched in Jellyfin (from Trakt)");
+    var position = await RowWhere(row => Is(row, "S01E02", "from", "position"));
+    Assert(position.ValueKind == JsonValueKind.Object && position.GetProperty("detail").GetInt32() == 10, $"The import's playback position is listed: 10 min ({position})");
+    Assert((await RowWhere(row => Is(row, "S01E01", "to", "sent"), 2)).ValueKind == JsonValueKind.Object, "The title's row to Trakt stays as it was (one row per direction)");
 
-    // Sync Now: the import first, then the export.
+    // Sync Now: the import first, then the export; an import of more than 50 titles at once is one count row.
     var syncImports = Imports("requested by an administrator");
     var afterImport = Starts("after the import from Trakt");
     using (var syncNow = await admin.PostAsync("JellyfinMod/Trakt/Export", null)) Assert(syncNow.StatusCode == HttpStatusCode.Accepted, "Sync Now is accepted with the import on");
     Assert(await ImportStarted("requested by an administrator", syncImports, 5) && Starts("after the import from Trakt") == afterImport,
         "Sync Now starts the import first, and not the export yet");
     var syncImportStart = DateTime.UtcNow;
+    foreach (var item in burst.Take(51)) Raise(world.Admin, item, UserDataSaveReason.Import, played: true, playCount: 1);
     FinishImport(syncImportStart, DateTime.UtcNow.AddMilliseconds(200));
     Assert(await Started("after the import from Trakt", afterImport, 10), "When the import ends, the export starts");
-    var syncExportStart = DateTime.UtcNow;
-    Finish(TaskCompletionStatus.Completed, syncExportStart, syncExportStart.AddMilliseconds(300));
-    taskCompleted!(null, new TaskCompletionEventArgs(workers.Single(worker => worker.ScheduledTask?.Key == TraktPluginState.ExportTaskKey), exportLast!));
-    var syncImport = await ImportListed(syncImportStart);
-    JsonElement syncActivity = default;
-    for (var waited = 0; waited < 400; waited++)
-    {
-        syncActivity = (await ExportStatus()).GetProperty("activity");
-        if (syncActivity.EnumerateArray().Any(run => !run.TryGetProperty("kind", out _) && run.GetProperty("startedAt").GetDateTime().ToUniversalTime() >= syncExportStart.AddSeconds(-1))) break;
-        await Task.Delay(100);
-    }
-
-    Assert(syncImport.ValueKind == JsonValueKind.Object && syncImport.GetProperty("why").GetString() == "sync_now" && syncImport.GetProperty("episodesWatched").GetInt32() == 0 &&
-        !syncActivity[0].TryGetProperty("kind", out _) && syncActivity[0].GetProperty("why").GetString() == "sync_now",
-        $"Activity lists both, newest first: the export (Sync Now) above the import (Sync Now, nothing imported) ({syncImport.ValueKind}: {(syncImport.ValueKind == JsonValueKind.Object ? syncImport.ToString() : "")} | {syncActivity[0]})");
+    Finish(TaskCompletionStatus.Completed, DateTime.UtcNow, DateTime.UtcNow.AddMilliseconds(300));
+    Assert((await RowWhere(row => Count(row, "from", "summary", 51))).ValueKind == JsonValueKind.Object, "51 titles imported at once are one count row");
 
     // Once a day by itself.
     var dailyImports = Imports("the daily import");
@@ -793,6 +818,21 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         "With the import refused, Sync Now starts the export alone");
     Finish(TaskCompletionStatus.Completed, DateTime.UtcNow.AddSeconds(-20), DateTime.UtcNow.AddSeconds(-10));
     linkedAdmin.SkipUnwatchedImportFromTrakt = true;
+
+    // Kept 30 days: an older row goes at the next write.
+    await using (var database = new ModDbContext(dbPath))
+    {
+        database.TraktActivity.Add(new TraktActivityEntry { UserId = world.Admin.Id, Title = "JellyfinMod Old", State = "sent", At = DateTime.UtcNow.AddDays(-31) });
+        await database.SaveChangesAsync();
+    }
+
+    playbackStopped!(null, new PlaybackStopEventArgs { Users = [world.Admin], Item = episode3, PlaybackPositionTicks = episode3.RunTimeTicks, PlayedToCompletion = true });
+    await RowWhere(row => Is(row, "S02E01", "to", "waiting"));
+    await using (var database = new ModDbContext(dbPath))
+    {
+        Assert(!await database.TraktActivity.AnyAsync(row => row.Title == "JellyfinMod Old"), "A row older than 30 days is removed at the next write");
+    }
+
     Assert(await SetAuto(false), "The automatic export is turned off again");
     traktTaskState = TaskState.Running; // as the history checks below expect
 
@@ -812,8 +852,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     admin = host.Client(world.Admin, true);
     Assert(Status((await Get(admin, season1.Id)).Body, true, true), "Observations survive a restart");
     var afterRestart = JsonDocument.Parse(await admin.GetStringAsync("JellyfinMod/Trakt/Export")).RootElement.GetProperty("activity");
-    Assert(afterRestart.GetArrayLength() >= 2 && afterRestart.EnumerateArray().Any(run => run.TryGetProperty("why", out var why) && why.ValueKind == JsonValueKind.String && why.GetString() == "retry"),
-        $"The Trakt activity survives a restart of the host ({afterRestart.GetArrayLength()} runs)");
+    Assert(afterRestart.EnumerateArray().Any(row => row.TryGetProperty("code", out var code) && code.GetString() == "S01E01" &&
+            row.GetProperty("direction").GetString() == "to" && row.GetProperty("state").GetString() == "sent"),
+        $"The Trakt activity is in the plugin's database and survives a restart of the host ({afterRestart.GetArrayLength()} rows)");
     await host.DisposeAsync();
 
     Assert(!logs.Lines.Any(line => line.Contains("TraktObservationListener", StringComparison.Ordinal) &&
@@ -850,6 +891,7 @@ public sealed class FakeTraktUser
     public bool PostUnwatchedHistory { get; set; }
     public bool SynchronizeCollections { get; set; } = true;
     public bool SkipUnwatchedImportFromTrakt { get; set; } = true;
+    public bool Scrobble { get; set; } = true;
 }
 
 /// <summary>A changed shape: the destructive switch as a string.</summary>
@@ -863,6 +905,7 @@ public sealed class FakeTraktUserStringSwitch
     public string PostUnwatchedHistory { get; set; } = "false";
     public bool SynchronizeCollections { get; set; } = true;
     public bool SkipUnwatchedImportFromTrakt { get; set; } = true;
+    public bool Scrobble { get; set; } = true;
 }
 
 /// <summary>A changed shape: the destructive switch is missing.</summary>
@@ -875,5 +918,6 @@ public sealed class FakeTraktUserNoSwitch
     public bool PostWatchedHistory { get; set; } = true;
     public bool SynchronizeCollections { get; set; } = true;
     public bool SkipUnwatchedImportFromTrakt { get; set; } = true;
+    public bool Scrobble { get; set; } = true;
 }
 
