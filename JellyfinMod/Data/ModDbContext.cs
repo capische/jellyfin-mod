@@ -116,6 +116,9 @@ public class ModDbContext : DbContext
     /// <summary>Gets the latest ratings fetch attempt per entry (P9.R3).</summary>
     public DbSet<RatingsFetch> RatingsFetches => Set<RatingsFetch>();
 
+    /// <summary>Gets Settings › Trakt's per-title activity, the last 30 days (Phase 13, D127).</summary>
+    public DbSet<TraktActivityEntry> TraktActivity => Set<TraktActivityEntry>();
+
     /// <summary>
     /// Saves, and saves again after a pause when SQLite reported the database busy (another writer held the write lock past
     /// the busy timeout). A failed save wrote nothing and leaves every tracked change in place, so the retry is the same
@@ -401,6 +404,17 @@ public class ModDbContext : DbContext
             // One attempt per title identity, outliving any one entry (review 2026-10-07 round 2, P2 5).
             e.HasIndex(x => new { x.MediaType, x.TmdbId }).IsUnique();
             e.HasIndex(x => x.AttemptedAt);
+        });
+        b.Entity<TraktActivityEntry>(e =>
+        {
+            e.ToTable("TraktActivity");
+            e.Property(x => x.Direction).HasMaxLength(8);
+            e.Property(x => x.Title).HasMaxLength(300);
+            e.Property(x => x.Code).HasMaxLength(16);
+            e.Property(x => x.State).HasMaxLength(16);
+            e.Property(x => x.Kind).HasMaxLength(8);
+            e.HasIndex(x => new { x.UserId, x.ItemId, x.Direction });
+            e.HasIndex(x => x.At);
         });
     }
 }

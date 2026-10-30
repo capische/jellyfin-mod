@@ -30,8 +30,9 @@ public sealed record TraktPluginInfo(bool Installed, string? Version);
 /// The plugin's "skip unwatched import from trakt.tv" switch is off: its import would mark unwatched here every episode and
 /// movie Trakt has no play for.
 /// </param>
+/// <param name="Scrobble">The plugin's "scrobble" switch: it reports plays to Trakt live (Activity's "watching now").</param>
 public sealed record TraktLink(Guid UserId, bool Linked, bool ReconnectNeeded, DateTime? TokenExpiresAt,
-    bool PostWatchedHistory, bool PostUnwatchedHistory, bool SynchronizeCollections, bool ImportsUnwatched = false);
+    bool PostWatchedHistory, bool PostUnwatchedHistory, bool SynchronizeCollections, bool ImportsUnwatched = false, bool Scrobble = false);
 
 /// <summary>
 /// Reads the host's own plugin list and scheduled tasks for the stock Trakt plugin, and (Phase 13, user decision Q2) the
@@ -187,7 +188,9 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
                 if (!hasAccess && !hasRefresh) continue; // added on the plugin's page but never authorized
                 DateTime? expiresAt = expires == DateTime.MinValue ? null
                     : expires.Kind == DateTimeKind.Utc ? expires : DateTime.SpecifyKind(expires, DateTimeKind.Local).ToUniversalTime();
-                links.Add(new TraktLink(id, hasAccess, !hasAccess, expiresAt, postWatched, postUnwatched, collections, !skipUnwatched));
+                // Scrobble only feeds Activity's live rows, so a plugin without it reads off rather than unknown.
+                var scrobble = TryRead(user, "Scrobble", out bool live) && live;
+                links.Add(new TraktLink(id, hasAccess, !hasAccess, expiresAt, postWatched, postUnwatched, collections, !skipUnwatched, scrobble));
             }
 
             return links;
