@@ -1204,7 +1204,9 @@ public sealed class ImportService(
                 .SingleOrDefaultAsync(value => value.Id == operation.GrabId, cancellationToken).ConfigureAwait(false);
             // Another version added by hand never needs episode upgrades; an automatic one and a replacement still do, as when
             // they were grabbed (user, 2026-10-09).
-            var manualAdd = episodeGrab is { Automatic: false } && episodeGrab.Mode != GrabModes.Replace;
+            // Automation's copy for phones replaces nothing either, so it never needs the switch (Codex review of Phase 12, P1).
+            var manualAdd = episodeGrab is { Automatic: false } && episodeGrab.Mode != GrabModes.Replace ||
+                episodeGrab is not null && GrabService.IsPhoneCopyAdd(episodeGrab);
             var addEpisodeVersion = operation.Intent == GrabIntents.AddVersion && (settings.EpisodeUpgradesEnabled || manualAdd);
             if (await database.EpisodeBindings.AsNoTracking().AnyAsync(binding => binding.EpisodeId == episode.Id, cancellationToken)
                     .ConfigureAwait(false) && !addEpisodeVersion)

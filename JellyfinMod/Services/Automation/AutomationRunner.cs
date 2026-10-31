@@ -693,14 +693,16 @@ public sealed class AutomationRunner(
         {
             var held = await VersionQuality.HeldAsync(database, entry.Id, episode?.Id, cancellationToken, library).ConfigureAwait(false);
             var assessment = UpgradeAssessment.For(profile, held, episode is not null, settings.EpisodeUpgradesEnabled);
-            if (assessment.Eligible) return new AutomationTarget(targetId, entry, episode, profile, inherited, assessment);
             // Also get a 1080p copy for phones (Phase 12 M36): a title whose files are all above 1080p is searched with the quality
             // profile for phones and the release added beside them. A multi-episode file is never given a single-episode version.
-            if (!settings.FetchPhoneCopies || phoneProfile is null || held.Any(version => version.MultiEpisode) ||
-                !await PhoneCopies.MissingAsync(database, entry.Id, episode?.Id, library, cancellationToken).ConfigureAwait(false))
-                return null;
-            var removed = await PhoneCopies.RemovedAsync(database, entry.Id, episode?.Id, cancellationToken).ConfigureAwait(false);
-            return new AutomationTarget(targetId, entry, episode, phoneProfile, false, null, PhoneCopy: !removed, PhoneCopyRemoved: removed);
+            // The missing copy comes before an upgrade, so an upgrade whose release never appears cannot keep it from being
+            // searched (Codex review of Phase 12, P2); once the copy is held, the upgrade is the target again.
+            var phoneMissing = settings.FetchPhoneCopies && phoneProfile is not null && !held.Any(version => version.MultiEpisode) &&
+                await PhoneCopies.MissingAsync(database, entry.Id, episode?.Id, library, cancellationToken).ConfigureAwait(false);
+            var removed = phoneMissing && await PhoneCopies.RemovedAsync(database, entry.Id, episode?.Id, cancellationToken).ConfigureAwait(false);
+            if (phoneMissing && !removed) return new AutomationTarget(targetId, entry, episode, phoneProfile!, false, null, PhoneCopy: true);
+            if (assessment.Eligible) return new AutomationTarget(targetId, entry, episode, profile, inherited, assessment);
+            return phoneMissing ? new AutomationTarget(targetId, entry, episode, phoneProfile!, false, null, PhoneCopyRemoved: true) : null;
         }
 
         if (fileState == FileState.Reclaimed && !settings.ReacquireReclaimed) return null;

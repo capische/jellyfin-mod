@@ -304,6 +304,7 @@ public sealed record GrabOperationDto(
             "automation_disabled" => "Automatic grabbing was turned off during the hold; nothing was sent.",
             "episode_upgrades_disabled" => "Episode upgrades were turned off during the hold; nothing was sent.",
             "reacquire_disabled" => "Reacquiring reclaimed titles was turned off during the hold; nothing was sent.",
+            "phone_copies_disabled" => "Fetching copies for phones was turned off during the hold; nothing was sent.",
             "no_longer_wanted" => "The title was no longer wanted when the hold ended; nothing was sent.",
             _ => "The grab failed."
         }

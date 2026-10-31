@@ -104,7 +104,8 @@ public sealed class GrabService(
     TimeProvider time,
     ILogger<GrabService> logger,
     Import.ImportMonitor? importMonitor = null,
-    Import.ImportTickGate? importGate = null)
+    Import.ImportTickGate? importGate = null,
+    MediaBrowser.Controller.Library.ILibraryManager? library = null)
 {
     /// <summary>How long after submission an absent torrent still counts as possibly in flight.</summary>
     public static readonly TimeSpan AbsentGrace = TimeSpan.FromMinutes(2);
@@ -569,16 +570,45 @@ public sealed class GrabService(
     }
 
     /// <summary>
+    /// Whether an operation is automation's copy for phones (Phase 12 M36): an automatic Add that no upgrade made. Automation
+    /// adds a version only for that, or for an upgrade in add mode, which carries its upgrade operation.
+    /// </summary>
+    public static bool IsPhoneCopyAdd(GrabOperation operation) =>
+        operation.Automatic && operation.Mode == GrabModes.Add && operation.UpgradeOperationId is null;
+
+    /// <summary>
     /// Why automation would no longer make this automatic grab, or null while it still would: automation on, the target
     /// monitored and still without a file (or still holding the one an upgrade replaces), and the switch for its kind of grab
     /// still on: episode upgrades for an episode upgrade or extra version, reacquisition for a reclaimed title (final review 2,
-    /// finding 1).
+    /// finding 1). A copy for phones is still wanted while its switch is on and the title (each claimed episode, for a pack)
+    /// holds files and still none at 1080p or below (Codex review of Phase 12, P1); it never needs the episode upgrades switch,
+    /// since it replaces nothing.
     /// </summary>
     private async Task<string?> AutomaticBlockAsync(GrabOperation operation, Entry entry, AcquisitionSettings settings,
         CancellationToken cancellationToken)
     {
         if (!settings.AutomationEnabled) return "automation_disabled";
         if (!entry.Monitored) return "no_longer_wanted";
+        if (IsPhoneCopyAdd(operation))
+        {
+            if (!settings.FetchPhoneCopies) return "phone_copies_disabled";
+            var targets = ReleaseScopes.IsPack(operation.Scope)
+                ? await database.GrabClaims.AsNoTracking().Where(claim => claim.GrabId == operation.Id)
+                    .Join(database.Episodes.AsNoTracking(), claim => claim.EpisodeId, value => value.Id, (claim, value) => value)
+                    .ToListAsync(cancellationToken).ConfigureAwait(false)
+                : operation.EpisodeId is { } phoneEpisodeId
+                    ? await database.Episodes.AsNoTracking().Where(value => value.Id == phoneEpisodeId).ToListAsync(cancellationToken).ConfigureAwait(false)
+                    : null;
+            if (targets is null)
+                return entry.State == FileState.OnDisk &&
+                    await JellyfinMod.Services.Automation.PhoneCopies.MissingAsync(database, entry.Id, null, library, cancellationToken).ConfigureAwait(false)
+                    ? null : "no_longer_wanted";
+            foreach (var target in targets.Where(value => value.Monitored && value.State == FileState.OnDisk))
+                if (await JellyfinMod.Services.Automation.PhoneCopies.MissingAsync(database, entry.Id, target.Id, library, cancellationToken)
+                        .ConfigureAwait(false))
+                    return null;
+            return "no_longer_wanted";
+        }
         if (ReleaseScopes.IsPack(operation.Scope))
         {
             // A pack is still wanted while one of the episodes it claimed is monitored and still without a file.

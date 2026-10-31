@@ -218,5 +218,7 @@ public sealed class VersionReader(ModDbContext database, IMediaSourceManager? me
         return separator < 0 ? null : name[(separator + 3)..];
     }
 
-    private static string? ResolutionOf(MediaStream? video) => VersionQuality.NativeResolution(video?.Width, video?.Height);
+    // A file whose name says nothing reads its size: a 2K picture is 1440p here, not 1080p, so it is never taken for the phone
+    // copy (Codex review of Phase 12, P2).
+    private static string? ResolutionOf(MediaStream? video) => VersionQuality.FineNativeResolution(video?.Width, video?.Height);
 }
