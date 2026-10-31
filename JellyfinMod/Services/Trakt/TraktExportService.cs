@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Jellyfin.Data.Enums;
+using Jellyfin.Data.Events;
 using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Entities;
@@ -120,7 +121,10 @@ public sealed class TraktExportService(
     // The import (Phase 13, bidirectional): whether the export follows it, and what it saved in Jellyfin (the plugin logs
     // its changes at debug level only, so they are taken from the host's own save events).
     private bool _exportAfterImport;
-    private readonly List<(Guid UserId, Guid ItemId, bool Played, long PositionTicks, DateTime At)> _imported = [];
+    private readonly List<(Guid UserId, Guid ItemId, bool Played, long PositionTicks, bool WasPlayed, long WasPositionTicks, DateTime At)> _imported = [];
+    // Each linked account's watched state and resume point of its titles as the import starts (Codex re-review of the
+    // additions, P3 1): a save is read against them, as the plugin's own saves say only what a title is now.
+    private Dictionary<(Guid UserId, Guid ItemId), (bool Played, long PositionTicks)> _beforeImport = [];
     private static readonly int[] RetrySteps = [1, 2, 4, 8, 16, 24];
     private static readonly TimeSpan Daily = TimeSpan.FromDays(1);
     // The plugin's log lines reach the file through an asynchronous sink: a run is judged once this has passed after its end.
@@ -151,6 +155,7 @@ public sealed class TraktExportService(
     public Task StartAsync(CancellationToken cancellationToken)
     {
         taskManager.TaskCompleted += OnTaskCompleted;
+        taskManager.TaskExecuting += OnTaskExecuting;
         userData.UserDataSaved += OnUserDataSaved;
         sessions.PlaybackStart += OnPlaybackStart;
         sessions.PlaybackStopped += OnPlaybackStopped;
@@ -183,6 +188,7 @@ public sealed class TraktExportService(
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         taskManager.TaskCompleted -= OnTaskCompleted;
+        taskManager.TaskExecuting -= OnTaskExecuting;
         userData.UserDataSaved -= OnUserDataSaved;
         sessions.PlaybackStart -= OnPlaybackStart;
         sessions.PlaybackStopped -= OnPlaybackStopped;
@@ -210,6 +216,38 @@ public sealed class TraktExportService(
 
         // Import first, then the export (Sync Now, a reconnect): the export also sends what the import did not change.
         if (then) _ = Task.Run(StartExportAfterImport);
+    }
+
+    /// <summary>
+    /// The import is about to run: the host raises this before the task starts, so what it reads here is the state before
+    /// any of the import's saves. Only the titles a linked account has watched or paused here are kept.
+    /// </summary>
+    private void OnTaskExecuting(object? sender, GenericEventArgs<IScheduledTaskWorker> args)
+    {
+        if (!string.Equals(args.Argument?.ScheduledTask?.Key, TraktPluginState.SyncTaskKey, StringComparison.Ordinal)) return;
+        try
+        {
+            var before = new Dictionary<(Guid UserId, Guid ItemId), (bool Played, long PositionTicks)>();
+            foreach (var link in trakt.ReadLinks() ?? [])
+            {
+                if (users.GetUserById(link.UserId) is not { } user) continue;
+                foreach (var query in new[] { new InternalItemsQuery(user) { IsPlayed = true }, new InternalItemsQuery(user) { IsResumable = true } })
+                {
+                    query.IncludeItemTypes = [BaseItemKind.Movie, BaseItemKind.Episode];
+                    query.Recursive = true;
+                    foreach (var item in library.GetItemList(query))
+                    {
+                        if (userData.GetUserData(user, item) is { } data) before[(user.Id, item.Id)] = (data.Played, data.PlaybackPositionTicks);
+                    }
+                }
+            }
+
+            lock (_gate) _beforeImport = before;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogWarning("JellyfinMod could not read the watched states before the Trakt import: {Error}", error.Message);
+        }
     }
 
     private void StartExportAfterImport()
@@ -240,7 +278,8 @@ public sealed class TraktExportService(
             lock (_gate)
             {
                 _imported.RemoveAll(save => now - save.At > TimeSpan.FromHours(2));
-                if (_imported.Count < 10000) _imported.Add((args.UserId, args.Item.Id, data.Played, data.PlaybackPositionTicks, now));
+                var was = _beforeImport.GetValueOrDefault((args.UserId, args.Item.Id));
+                if (_imported.Count < 10000) _imported.Add((args.UserId, args.Item.Id, data.Played, data.PlaybackPositionTicks, was.Played, was.PositionTicks, now));
             }
 
             return;
@@ -531,7 +570,7 @@ public sealed class TraktExportService(
         var start = Utc(run.StartTimeUtc);
         var end = Utc(run.EndTimeUtc);
         if (DateTime.UtcNow < end + LogSettle) return;
-        List<(Guid UserId, Guid ItemId, bool Played, long PositionTicks, DateTime At)> saves;
+        List<(Guid UserId, Guid ItemId, bool Played, long PositionTicks, bool WasPlayed, long WasPositionTicks, DateTime At)> saves;
         lock (_gate)
         {
             if (!_judgedImports.Add(start)) return;
@@ -555,7 +594,9 @@ public sealed class TraktExportService(
     private RunScan ScanRunLog(DateTime from, DateTime end, DateTime to, bool import = false)
     {
         var task = import ? "Trakt.ScheduledTasks.SyncFromTraktTask" : "Trakt.ScheduledTasks.SyncLibraryTask";
-        // The count lines are the run's own, logged before its end; a run seconds later must not add its counts here.
+        // The count lines are the run's own, logged after its start and before its end: a run seconds later must not add its
+        // counts here, nor one that ended less than a second before it started (Codex re-review of the additions, P3 2).
+        var countsFrom = from.AddMilliseconds(-1);
         var countsTo = end.AddSeconds(1);
         var error = false;
         string? clause = null;
@@ -600,7 +641,7 @@ public sealed class TraktExportService(
                         continue;
                     }
 
-                    if (import || at.UtcDateTime > countsTo) continue;
+                    if (import || at.UtcDateTime < countsFrom || at.UtcDateTime > countsTo) continue;
                     if (Count(EpisodesWatchedLine, message) is { } e) { episodes = (episodes ?? 0) + e; counted = true; }
                     else if (Count(MoviesWatchedLine, message) is { } m) { movies = (movies ?? 0) + m; counted = true; }
                     else if (Count(EpisodesCollectedLine, message) is { } ec) { episodesCollected = (episodesCollected ?? 0) + ec; counted = true; }
