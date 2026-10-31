@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
+using Jellyfin.Data.Enums;
+using Jellyfin.Data.Events;
 using Jellyfin.Database.Implementations.Entities;
 using JellyfinMod;
 using JellyfinMod.Data;
@@ -127,6 +129,8 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     bool Visible(User user, BaseItem item) => !hidden.Contains((user.Id, item.Id)) &&
         !(user.Id == world.RestrictedAdmin.Id && item is Movie);
     EventHandler<ItemChangeEventArgs>? itemRemoved = null;
+    // Phase 13: what a user has watched or paused here before the Trakt import runs (its watched and resumable queries).
+    var localData = new Dictionary<(Guid UserId, Guid ItemId), (bool Played, long PositionTicks)>();
     var library = Stub<ILibraryManager>.Create((method, arguments) =>
     {
         if (method.Name == "add_ItemRemoved") itemRemoved += (EventHandler<ItemChangeEventArgs>)arguments![0]!;
@@ -135,6 +139,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         {
             "GetItemById" when arguments is [Guid id, User user] => items.GetValueOrDefault(id) is { } item && Visible(user, item) ? item : null,
             "GetItemById" when arguments is [Guid id] => Lookup(id),
+            "GetItemList" when arguments?[0] is InternalItemsQuery { User: { } owner } query && (query.IsPlayed == true || query.IsResumable == true) =>
+                localData.Where(entry => entry.Key.UserId == owner.Id && (query.IsPlayed == true ? entry.Value.Played : entry.Value.PositionTicks > 0))
+                    .Select(entry => Lookup(entry.Key.ItemId)).OfType<BaseItem>().ToList(),
             "GetItemList" => new List<BaseItem>(),
             _ => null
         };
@@ -172,8 +179,10 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         Worker(TraktPluginState.ExportTaskKey, () => exportState)
     };
     EventHandler<TaskCompletionEventArgs>? taskCompleted = null;
+    EventHandler<GenericEventArgs<IScheduledTaskWorker>>? taskExecuting = null;
     var taskManager = Stub<ITaskManager>.Create((method, arguments) =>
     {
+        if (method.Name == "add_TaskExecuting") taskExecuting += (EventHandler<GenericEventArgs<IScheduledTaskWorker>>)arguments![0]!;
         // Phase 13: a queued export runs, as the host's does, until the check ends it; its end is raised as the host does.
         if (method.Name == "QueueScheduledTask" && (arguments![0] as IScheduledTask)?.Key == TraktPluginState.SyncTaskKey) traktTaskState = TaskState.Running;
         else if (method.Name == "QueueScheduledTask") exportState = TaskState.Running;
@@ -185,6 +194,11 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     {
         if (method.Name == "add_UserDataSaved") userDataSaved += (EventHandler<UserDataSaveEventArgs>)arguments![0]!;
         if (method.Name == "remove_UserDataSaved") userDataSaved -= (EventHandler<UserDataSaveEventArgs>)arguments![0]!;
+        if (method.Name == "GetUserData" && arguments is [User owner, BaseItem item] && localData.TryGetValue((owner.Id, item.Id), out var state))
+        {
+            return new UserItemData { Key = item.Id.ToString("N"), Played = state.Played, PlaybackPositionTicks = state.PositionTicks };
+        }
+
         return null;
     });
     var installed = new List<LocalPlugin>();
@@ -802,11 +816,17 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert(await ImportStarted("the import has not run yet", firstImports), "With the automatic export on and no import yet, the import starts by itself");
     Assert((await ExportStatus()).GetProperty("importRunning").GetBoolean(), "The import is running");
     var importStart = DateTime.UtcNow;
+    // Before it runs (the host raises the task's start first): S02E01 is watched here, S02E02 paused here at 10 minutes.
+    localData[(world.Admin.Id, episode3.Id)] = (true, 0);
+    localData[(world.Admin.Id, episode4.Id)] = (false, 6_000_000_000);
+    taskExecuting?.Invoke(null, new GenericEventArgs<IScheduledTaskWorker>(importWorker));
     // What the plugin's import saves while it runs: one episode Trakt has a play of, one playback position (10 minutes).
     Raise(world.Admin, episode1, UserDataSaveReason.Import, played: true, playCount: 1);
     Raise(world.Admin, episode2, UserDataSaveReason.Import, played: false, position: 6_000_000_000);
     // A newer paused position on a title already watched here: it keeps Played (P3 4).
     Raise(world.Admin, episode3, UserDataSaveReason.Import, played: true, position: 12_000_000_000, playCount: 1);
+    // Watched on Trakt after it was paused here: the import marks it watched and keeps the old resume point (re-review P3 1).
+    Raise(world.Admin, episode4, UserDataSaveReason.Import, played: true, position: 6_000_000_000, playCount: 1);
     FinishImport(importStart, DateTime.UtcNow.AddMilliseconds(300));
     Assert((await RowWhere(row => Is(row, "S01E01", "from", "imported"))).ValueKind == JsonValueKind.Object, "The import's watch is listed: marked watched in Jellyfin (from Trakt)");
     var position = await RowWhere(row => Is(row, "S01E02", "from", "position"));
@@ -814,6 +834,10 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     var newerPosition = await RowWhere(row => Is(row, "S02E01", "from", "position"));
     Assert(newerPosition.ValueKind == JsonValueKind.Object && newerPosition.GetProperty("detail").GetInt32() == 20,
         $"A newer position imported for a title already watched reads as a playback position (20 min), not marked watched ({newerPosition})");
+    var watchedPaused = await RowWhere(row => Is(row, "S02E02", "from", "imported"));
+    Assert(watchedPaused.ValueKind == JsonValueKind.Object && (await RowWhere(row => Is(row, "S02E02", "from", "position"), 1)).ValueKind != JsonValueKind.Object,
+        $"A title paused here and watched on Trakt reads marked watched here, not its unchanged resume point ({watchedPaused})");
+    localData.Clear();
     Assert((await RowWhere(row => Is(row, "S01E01", "to", "sent"), 2)).ValueKind == JsonValueKind.Object, "The title's row to Trakt stays as it was (one row per direction)");
 
     // Sync Now: the import first, then the export; an import of more than 50 titles at once is one count row.
@@ -894,14 +918,20 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     await File.AppendAllLinesAsync(logFile, new[] { Line(collectStart.AddMilliseconds(100), "INF", "Trakt.ScheduledTasks.SyncLibraryTask", "Episodes to \"add to\" collection 3") });
     Ended(collectStart, collectStart.AddMilliseconds(300));
     Assert((await RowWhere(row => Count(row, "to", "collection", 3))).ValueKind == JsonValueKind.Object, "The run's 3 collection adds are one count row");
+    // A second run in the same second keeps its own row (re-review P3 2): 600 ms later, 5 adds.
+    var collectAgain = collectStart.AddMilliseconds(600);
+    await File.AppendAllLinesAsync(logFile, new[] { Line(collectAgain.AddMilliseconds(100), "INF", "Trakt.ScheduledTasks.SyncLibraryTask", "Episodes to \"add to\" collection 5") });
+    Ended(collectAgain, collectAgain.AddMilliseconds(300));
+    Assert((await RowWhere(row => Count(row, "to", "collection", 5))).ValueKind == JsonValueKind.Object, "A second run 600 ms after the first keeps its own count row (5 adds)");
     await host.DisposeAsync();
     host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(5), new PluginConfiguration(), Configure);
     admin = host.Client(world.Admin, true);
     await Judged();
     await Task.Delay(TimeSpan.FromSeconds(3));
     var collectRows = JsonDocument.Parse(await admin.GetStringAsync("JellyfinMod/Trakt/Export")).RootElement.GetProperty("activity")
-        .EnumerateArray().Count(row => Count(row, "to", "collection", 3));
-    Assert(collectRows == 1, $"After a restart judges the same run again its collection row is not written twice ({collectRows} rows)");
+        .EnumerateArray().Select(row => Count(row, "to", "collection", 3) ? 3 : Count(row, "to", "collection", 5) ? 5 : 0).Where(count => count > 0).ToList();
+    Assert(collectRows.Count(count => count == 3) == 1 && collectRows.Count(count => count == 5) == 1,
+        $"After a restart judges the last run again its collection row is not written twice ({string.Join(", ", collectRows)})");
     await host.DisposeAsync();
 
     Assert(!logs.Lines.Any(line => line.Contains("TraktObservationListener", StringComparison.Ordinal) &&
