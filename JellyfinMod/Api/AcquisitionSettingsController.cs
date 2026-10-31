@@ -310,8 +310,10 @@ public sealed partial class AcquisitionSettingsController(
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
         var profiles = await database.AcquisitionQualityProfiles.AsNoTracking().ToListAsync(cancellationToken);
         // Best first (user, 2026-10-19): the one order every list of profiles shows, so no list sorts on its own. By the
-        // resolution of the profile's best quality (4K, 2K, 1080p, 720p, SD), then by name.
-        return profiles.OrderByDescending(profile => QualityCatalog.BestResolution(AcquisitionConfiguration.Qualities(profile)))
+        // resolution of the profile's best quality (4K, 2K, 1080p, 720p, SD), then by name; a catch-all that spans 4K to SD
+        // (Any Quality) last (user, 2026-10-30, D181: "put any to the bottom").
+        return profiles.OrderBy(profile => QualityCatalog.SpansEveryResolution(AcquisitionConfiguration.Qualities(profile)) ? 1 : 0)
+            .ThenByDescending(profile => QualityCatalog.BestResolution(AcquisitionConfiguration.Qualities(profile)))
             .ThenBy(profile => profile.Name, StringComparer.Ordinal).Select(profile => ToDto(profile, settings.DefaultQualityProfileId, settings.PhoneProfileId)).ToArray();
     }
 
