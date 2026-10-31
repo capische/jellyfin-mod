@@ -249,7 +249,10 @@ public sealed class TraktExportService(
         // Not PlaybackFinished: the host saves every stop with it, and a rewatch stopped early keeps Played, so a finished play
         // is read from the stop itself.
         if (args.SaveReason != UserDataSaveReason.TogglePlayed || !data.Played) return;
-        if (LinkOf(args.UserId) is { PostWatchedHistory: true }) _ = activity.WatchedAsync(args.UserId, args.Item, data.LastPlayedDate is { } played ? Utc(played) : now);
+        if (LinkOf(args.UserId) is { PostWatchedHistory: true } link && link.CanSync(args.Item, library))
+        {
+            _ = activity.WatchedAsync(args.UserId, args.Item, data.LastPlayedDate is { } played ? Utc(played) : now);
+        }
     }
 
     /// <summary>A linked user starts playing with the Trakt plugin's Scrobble on: the plugin reports it to Trakt live (D134).</summary>
@@ -258,7 +261,7 @@ public sealed class TraktExportService(
         if (args.Item is not (MediaBrowser.Controller.Entities.TV.Episode or MediaBrowser.Controller.Entities.Movies.Movie)) return;
         foreach (var user in args.Users ?? [])
         {
-            if (LinkOf(user.Id) is { Linked: true, Scrobble: true }) _ = activity.PlayingAsync(user.Id, args.Item);
+            if (LinkOf(user.Id) is { Linked: true, Scrobble: true } link && link.CanSync(args.Item, library)) _ = activity.PlayingAsync(user.Id, args.Item);
         }
     }
 
@@ -268,10 +271,12 @@ public sealed class TraktExportService(
         var item = args.Item;
         if (args.PlayedToCompletion)
         {
-            // A play to its end is the watch: it waits for the export.
+            // A play to its end is the watch: it waits for the export when the plugin posts the account's watched history; a
+            // live row of a play the plugin scrobbled ends either way (Codex review of the additions, P3 3).
             foreach (var user in args.Users ?? [])
             {
-                if (LinkOf(user.Id) is { PostWatchedHistory: true }) _ = activity.WatchedAsync(user.Id, item, DateTime.UtcNow);
+                if (LinkOf(user.Id) is not { } link || !link.CanSync(item, library)) continue;
+                _ = link.PostWatchedHistory ? activity.WatchedAsync(user.Id, item, DateTime.UtcNow) : activity.FinishedLiveAsync(user.Id, item);
             }
 
             return;

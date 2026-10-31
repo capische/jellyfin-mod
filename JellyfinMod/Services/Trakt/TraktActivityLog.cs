@@ -42,7 +42,25 @@ public sealed class TraktActivityLog(IServiceScopeFactory scopes, ILibraryManage
             row.At = DateTime.UtcNow;
         });
 
-    /// <summary>What one run of the Trakt plugin's import saved here: per title, or one count row past the burst limit.</summary>
+    /// <summary>
+    /// A live play the Trakt plugin scrobbled to its end while its watched history is not posted: the play row ends as
+    /// scrobbled, since no export will send it. Only a row still playing changes.
+    /// </summary>
+    public Task FinishedLiveAsync(Guid userId, BaseItem item) =>
+        WriteAsync(async database =>
+        {
+            var row = await database.TraktActivity.FirstOrDefaultAsync(entry => entry.UserId == userId && entry.ItemId == item.Id && entry.Direction == "to").ConfigureAwait(false);
+            if (row is null || row.State != "playing") return;
+            row.State = "scrobbled";
+            row.Detail = null;
+            row.At = DateTime.UtcNow;
+        });
+
+    /// <summary>
+    /// What one run of the Trakt plugin's import saved here: per title, or one count row past the burst limit. A save that
+    /// leaves a resume point is a playback position (Trakt's paused list), even on a title already watched; one without is a
+    /// watch (Codex review of the additions, P3 4).
+    /// </summary>
     public Task ImportedAsync(IReadOnlyList<(Guid UserId, Guid ItemId, bool Played, long PositionTicks, DateTime At)> saves) =>
         WriteAsync(async database =>
         {
@@ -62,8 +80,10 @@ public sealed class TraktActivityLog(IServiceScopeFactory scopes, ILibraryManage
                 foreach (var save in distinct)
                 {
                     if (library.GetItemById(save.ItemId) is not { } item) continue;
-                    await SetAsync(database, group.Key, item, "from", save.Played ? "imported" : "position",
-                        save.Played ? null : (int)TimeSpan.FromTicks(save.PositionTicks).TotalMinutes, save.At).ConfigureAwait(false);
+                    var position = save.PositionTicks > 0;
+                    if (!position && !save.Played) continue;
+                    await SetAsync(database, group.Key, item, "from", position ? "position" : "imported",
+                        position ? (int)TimeSpan.FromTicks(save.PositionTicks).TotalMinutes : null, save.At).ConfigureAwait(false);
                 }
             }
         });
@@ -93,18 +113,19 @@ public sealed class TraktActivityLog(IServiceScopeFactory scopes, ILibraryManage
                 }
             }
 
-            // The count lines are what the plugin meant to send, logged before it sent: only a clean run delivered them.
+            // The count lines are what the plugin meant to send, logged before it sent: only a clean run delivered them. One row
+            // per run and kind: a run judged again (after a restart) finds its row by its start (Codex review of the additions, P2 2).
             var user = userIds.FirstOrDefault();
             if (user == Guid.Empty || !clean) return;
-            if (episodesSent > BurstLimit)
+            async Task CountAsync(string state, int count)
             {
-                database.TraktActivity.Add(new TraktActivityEntry { UserId = user, Direction = "to", State = "summary", Detail = episodesSent, Title = string.Empty, At = started });
+                if (await database.TraktActivity.AnyAsync(entry => entry.UserId == user && entry.Direction == "to" && entry.State == state && entry.ItemId == null &&
+                    entry.At >= started.AddSeconds(-1) && entry.At <= started.AddSeconds(1)).ConfigureAwait(false)) return;
+                database.TraktActivity.Add(new TraktActivityEntry { UserId = user, Direction = "to", State = state, Detail = count, Title = string.Empty, At = started });
             }
 
-            if (collected > 0)
-            {
-                database.TraktActivity.Add(new TraktActivityEntry { UserId = user, Direction = "to", State = "collection", Detail = collected, Title = string.Empty, At = started });
-            }
+            if (episodesSent > BurstLimit) await CountAsync("summary", episodesSent.Value).ConfigureAwait(false);
+            if (collected > 0) await CountAsync("collection", collected.Value).ConfigureAwait(false);
         });
 
     /// <summary>The newest rows, at most <paramref name="count"/>.</summary>
