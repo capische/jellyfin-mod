@@ -99,13 +99,16 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     var episode1 = MakeEpisode(season1, 1);
     var episode2 = MakeEpisode(season1, 2);
     var episode3 = MakeEpisode(season2, 1);
+    // The Trakt plugin sends only a series with an id of its own (its CanSync): the fixture's TVDB id.
+    series.SetProviderId(MetadataProvider.Tvdb, "990100");
+    var episode4 = MakeEpisode(season2, 2);
     var burst = Enumerable.Range(0, 300).Select(n => new Movie { Id = Guid.NewGuid(), Name = $"JellyfinMod Burst {n}" }).ToArray();
     // The gate: an item whose lookup by the listener can be held, so that what is raised meanwhile is read as one batch.
     var gate = new Movie { Id = Guid.NewGuid(), Name = "JellyfinMod Trakt Gate" };
     var gone = new Movie { Id = Guid.NewGuid(), Name = "JellyfinMod Trakt Gone" };
     var marker = new Movie { Id = Guid.NewGuid(), Name = "JellyfinMod Trakt Marker" };
     // Read by the listener's own thread while the test adds and removes items.
-    var items = new ConcurrentDictionary<Guid, BaseItem>(new BaseItem[] { movie, otherMovie, series, season1, season2, episode1, episode2, episode3, gate, gone, marker }
+    var items = new ConcurrentDictionary<Guid, BaseItem>(new BaseItem[] { movie, otherMovie, series, season1, season2, episode1, episode2, episode3, episode4, gate, gone, marker }
         .Concat(burst).Select(item => KeyValuePair.Create(item.Id, item)));
     SemaphoreSlim? gateHold = null;
     var gateEntered = new SemaphoreSlim(0);
@@ -741,6 +744,28 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     var stopped = await RowWhere(row => Is(row, "S02E01", "to", "stopped"));
     Assert(stopped.ValueKind == JsonValueKind.Object && stopped.GetProperty("detail").GetInt32() == 30, $"Stopped before its end it reads where it stopped: 30 % ({stopped})");
 
+    // What the Trakt plugin never sends is never listed (its CanSync, Codex review of the additions, P2 1): a title in the
+    // account's excluded locations, played, played to its end or marked watched; a movie without an IMDb or TMDB id.
+    linkedAdmin.LocationsExcluded = [Path.Combine(media, "tv")];
+    playbackStart!(null, new PlaybackProgressEventArgs { Users = [world.Admin], Item = episode4 });
+    playbackStopped!(null, new PlaybackStopEventArgs { Users = [world.Admin], Item = episode4, PlaybackPositionTicks = episode4.RunTimeTicks, PlayedToCompletion = true });
+    Raise(world.Admin, episode4, UserDataSaveReason.TogglePlayed, played: true, playCount: 1);
+    Raise(world.Admin, otherMovie, UserDataSaveReason.TogglePlayed, played: true, playCount: 1);
+    await Task.Delay(1500);
+    Assert((await RowWhere(row => row.TryGetProperty("code", out var code) && code.GetString() == "S02E02" ||
+            row.GetProperty("title").GetString() == otherMovie.Name, 2)).ValueKind != JsonValueKind.Object,
+        "A title in the account's excluded locations, and a movie without an IMDb or TMDB id, are not listed: the Trakt plugin sends neither");
+    linkedAdmin.LocationsExcluded = null;
+
+    // Post watched history off, Scrobble on: a live play to its end ends as scrobbled, not watching now (P3 3).
+    linkedAdmin.PostWatchedHistory = false;
+    playbackStart!(null, new PlaybackProgressEventArgs { Users = [world.Admin], Item = episode4 });
+    Assert((await RowWhere(row => Is(row, "S02E02", "to", "playing"))).ValueKind == JsonValueKind.Object, "Outside the excluded locations the play is listed: watching now");
+    playbackStopped!(null, new PlaybackStopEventArgs { Users = [world.Admin], Item = episode4, PlaybackPositionTicks = episode4.RunTimeTicks, PlayedToCompletion = true });
+    Assert((await RowWhere(row => Is(row, "S02E02", "to", "scrobbled"))).ValueKind == JsonValueKind.Object,
+        "With the account's watched history not posted, a live play to its end reads scrobbled, not watching now");
+    linkedAdmin.PostWatchedHistory = true;
+
     var anyStart = logs.Lines.Count(line => line.Contains("starts the Trakt plugin's export (", StringComparison.Ordinal));
     await Task.Delay(TimeSpan.FromSeconds(35));
     Assert(logs.Lines.Count(line => line.Contains("starts the Trakt plugin's export (", StringComparison.Ordinal)) == anyStart,
@@ -780,10 +805,15 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     // What the plugin's import saves while it runs: one episode Trakt has a play of, one playback position (10 minutes).
     Raise(world.Admin, episode1, UserDataSaveReason.Import, played: true, playCount: 1);
     Raise(world.Admin, episode2, UserDataSaveReason.Import, played: false, position: 6_000_000_000);
+    // A newer paused position on a title already watched here: it keeps Played (P3 4).
+    Raise(world.Admin, episode3, UserDataSaveReason.Import, played: true, position: 12_000_000_000, playCount: 1);
     FinishImport(importStart, DateTime.UtcNow.AddMilliseconds(300));
     Assert((await RowWhere(row => Is(row, "S01E01", "from", "imported"))).ValueKind == JsonValueKind.Object, "The import's watch is listed: marked watched in Jellyfin (from Trakt)");
     var position = await RowWhere(row => Is(row, "S01E02", "from", "position"));
     Assert(position.ValueKind == JsonValueKind.Object && position.GetProperty("detail").GetInt32() == 10, $"The import's playback position is listed: 10 min ({position})");
+    var newerPosition = await RowWhere(row => Is(row, "S02E01", "from", "position"));
+    Assert(newerPosition.ValueKind == JsonValueKind.Object && newerPosition.GetProperty("detail").GetInt32() == 20,
+        $"A newer position imported for a title already watched reads as a playback position (20 min), not marked watched ({newerPosition})");
     Assert((await RowWhere(row => Is(row, "S01E01", "to", "sent"), 2)).ValueKind == JsonValueKind.Object, "The title's row to Trakt stays as it was (one row per direction)");
 
     // Sync Now: the import first, then the export; an import of more than 50 titles at once is one count row.
@@ -855,6 +885,23 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert(afterRestart.EnumerateArray().Any(row => row.TryGetProperty("code", out var code) && code.GetString() == "S01E01" &&
             row.GetProperty("direction").GetString() == "to" && row.GetProperty("state").GetString() == "sent"),
         $"The Trakt activity is in the plugin's database and survives a restart of the host ({afterRestart.GetArrayLength()} rows)");
+
+    // A run's count rows are written once (Codex review of the additions, P2 2): with a linked account on Trakt 33, a run adds
+    // 3 titles to the collection; after another restart the host judges that run, its last, again.
+    installed.Clear();
+    installed.Add(TraktWith(new[] { linkedAdmin }));
+    var collectStart = DateTime.UtcNow;
+    await File.AppendAllLinesAsync(logFile, new[] { Line(collectStart.AddMilliseconds(100), "INF", "Trakt.ScheduledTasks.SyncLibraryTask", "Episodes to \"add to\" collection 3") });
+    Ended(collectStart, collectStart.AddMilliseconds(300));
+    Assert((await RowWhere(row => Count(row, "to", "collection", 3))).ValueKind == JsonValueKind.Object, "The run's 3 collection adds are one count row");
+    await host.DisposeAsync();
+    host = await PluginHost.StartAsync(world, dbPath, time, logs, TimeSpan.FromSeconds(5), new PluginConfiguration(), Configure);
+    admin = host.Client(world.Admin, true);
+    await Judged();
+    await Task.Delay(TimeSpan.FromSeconds(3));
+    var collectRows = JsonDocument.Parse(await admin.GetStringAsync("JellyfinMod/Trakt/Export")).RootElement.GetProperty("activity")
+        .EnumerateArray().Count(row => Count(row, "to", "collection", 3));
+    Assert(collectRows == 1, $"After a restart judges the same run again its collection row is not written twice ({collectRows} rows)");
     await host.DisposeAsync();
 
     Assert(!logs.Lines.Any(line => line.Contains("TraktObservationListener", StringComparison.Ordinal) &&
@@ -892,6 +939,7 @@ public sealed class FakeTraktUser
     public bool SynchronizeCollections { get; set; } = true;
     public bool SkipUnwatchedImportFromTrakt { get; set; } = true;
     public bool Scrobble { get; set; } = true;
+    public string[]? LocationsExcluded { get; set; }
 }
 
 /// <summary>A changed shape: the destructive switch as a string.</summary>
