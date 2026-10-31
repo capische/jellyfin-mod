@@ -1,6 +1,11 @@
 using System.Collections;
 using System.Reflection;
 using MediaBrowser.Common.Plugins;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
+using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Logging;
@@ -31,8 +36,32 @@ public sealed record TraktPluginInfo(bool Installed, string? Version);
 /// movie Trakt has no play for.
 /// </param>
 /// <param name="Scrobble">The plugin's "scrobble" switch: it reports plays to Trakt live (Activity's "watching now").</param>
+/// <param name="LocationsExcluded">The folders the plugin never sends for this user (its "excluded locations").</param>
 public sealed record TraktLink(Guid UserId, bool Linked, bool ReconnectNeeded, DateTime? TokenExpiresAt,
-    bool PostWatchedHistory, bool PostUnwatchedHistory, bool SynchronizeCollections, bool ImportsUnwatched = false, bool Scrobble = false);
+    bool PostWatchedHistory, bool PostUnwatchedHistory, bool SynchronizeCollections, bool ImportsUnwatched = false, bool Scrobble = false,
+    IReadOnlyList<string>? LocationsExcluded = null)
+{
+    /// <summary>
+    /// Whether the Trakt plugin sends this item for this user at all: its own <c>TraktApi.CanSync</c> at v33 (a real file,
+    /// outside the user's excluded locations, a movie with an IMDb or TMDB id, an episode with a number or ids whose series has
+    /// an id). Activity lists only what the plugin would send (Codex review of the additions, P2 1).
+    /// </summary>
+    /// <param name="item">The episode or movie.</param>
+    /// <param name="library">The host's library, to find an episode's series.</param>
+    public bool CanSync(BaseItem item, ILibraryManager library)
+    {
+        // IsVirtualItem is what LocationType.Virtual reads (and a missing episode is virtual), without the file-system lookup
+        // LocationType makes for a real item.
+        if (item.Path is null || item.IsVirtualItem) return false;
+        if (LocationsExcluded is { } excluded && excluded.Any(folder => !string.IsNullOrEmpty(folder) && item.Path.Contains(folder, StringComparison.OrdinalIgnoreCase))) return false;
+        if (item is Movie movie) return movie.HasProviderId(MetadataProvider.Imdb) || movie.HasProviderId(MetadataProvider.Tmdb);
+        return item is Episode episode && library.GetItemById(episode.SeriesId) is Series series &&
+            (episode.IndexNumber.HasValue || HasTvIds(episode)) && HasTvIds(series);
+    }
+
+    private static bool HasTvIds(BaseItem item) => item.HasProviderId(MetadataProvider.Imdb) || item.HasProviderId(MetadataProvider.Tmdb) ||
+        item.HasProviderId(MetadataProvider.Tvdb) || item.HasProviderId(MetadataProvider.TvRage);
+}
 
 /// <summary>
 /// Reads the host's own plugin list and scheduled tasks for the stock Trakt plugin, and (Phase 13, user decision Q2) the
@@ -190,7 +219,8 @@ public sealed class TraktPluginState(IPluginManager plugins, ITaskManager tasks,
                     : expires.Kind == DateTimeKind.Utc ? expires : DateTime.SpecifyKind(expires, DateTimeKind.Local).ToUniversalTime();
                 // Scrobble only feeds Activity's live rows, so a plugin without it reads off rather than unknown.
                 var scrobble = TryRead(user, "Scrobble", out bool live) && live;
-                links.Add(new TraktLink(id, hasAccess, !hasAccess, expiresAt, postWatched, postUnwatched, collections, !skipUnwatched, scrobble));
+                var excluded = TryRead(user, "LocationsExcluded", out string[]? folders) ? folders : null;
+                links.Add(new TraktLink(id, hasAccess, !hasAccess, expiresAt, postWatched, postUnwatched, collections, !skipUnwatched, scrobble, excluded));
             }
 
             return links;
