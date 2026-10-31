@@ -61,9 +61,10 @@ internal static class PresetScenarios
                 profiles[FourK].GetProperty("isDefault").GetBoolean() && Name(profiles[FourK]) == "4K" &&
                 profiles.Values.All(profile => profile.GetProperty("presetId").AsGuid() == profile.GetProperty("id").AsGuid()),
                 "The 4K preset with fallback is the default profile, and every preset profile names its preset");
-            // The one order every list of profiles shows (user, 2026-10-19): best first by the resolution of the best quality, then name.
+            // The one order every list of profiles shows (user, 2026-10-19): best first by the resolution of the best quality, then name;
+            // the catch-all Any Quality last (user, 2026-10-30, D181).
             var listed = (await ReadAsync(await admin.GetAsync("/JellyfinMod/Settings/QualityProfiles"), 200, "Profiles read")).EnumerateArray().Select(Name).ToArray();
-            Assert(listed.SequenceEqual(["4K", "Any Quality", "2K", "1080p", "720p", "SD"]), "Profiles list best first: " + string.Join(", ", listed));
+            Assert(listed.SequenceEqual(["4K", "2K", "1080p", "720p", "SD", "Any Quality"]), "Profiles list best first, Any Quality last: " + string.Join(", ", listed));
             var fourK = profiles[FourK];
             Assert(Strings(fourK.GetProperty("qualities")).SequenceEqual(["remux-2160p", "bluray-2160p", "webdl-2160p", "webrip-2160p", "hdtv-2160p",
                     "bluray-1440p", "webdl-1440p", "webrip-1440p", "remux-1080p", "bluray-1080p", "webdl-1080p", "webrip-1080p", "hdtv-1080p",
@@ -97,7 +98,7 @@ internal static class PresetScenarios
             Assert(presets.Length == QualityPresets.All.Count && presets.All(preset => preset.GetProperty("added").GetBoolean() &&
                     preset.GetProperty("description").GetString()!.Length > 20) &&
                 presets.Single(preset => preset.GetProperty("isDefaultPreset").GetBoolean()).GetProperty("id").AsGuid() == FourK &&
-                presets.Select(Name).SequenceEqual(["4K", "2K", "1080p", "720p", "Any Quality", "SD"]),
+                presets.Select(Name).SequenceEqual(["4K", "2K", "1080p", "720p", "SD", "Any Quality"]),
                 "Presets carry a description, the default mark and whether each is already a profile");
 
             // Adding again changes nothing.

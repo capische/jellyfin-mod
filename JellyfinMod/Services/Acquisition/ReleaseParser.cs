@@ -24,6 +24,13 @@ public static class QualityCatalog
         qualities.Count > 0 && All.FirstOrDefault(quality => quality.Id == qualities[0]).Resolution is { } resolution &&
         int.TryParse(resolution.TrimEnd('p'), out var pixels) ? pixels : 0;
 
+    /// <summary>
+    /// Whether a profile spans every resolution, from 2160p down to SD (576p or 480p), like the Any Quality preset: the catch-all
+    /// lists after every other profile (user, 2026-10-30, D181: "put any to the bottom").
+    /// </summary>
+    public static bool SpansEveryResolution(IReadOnlyList<string> qualities) =>
+        BestResolution(qualities) == 2160 && qualities.Any(id => id.EndsWith("-576p", StringComparison.Ordinal) || id.EndsWith("-480p", StringComparison.Ordinal));
+
     /// <summary>Returns the identifier for a parsed source and resolution, or null when either is unknown.</summary>
     public static string? Identify(string? source, string? resolution) =>
         source is null || resolution is null ? null : $"{source}-{resolution}";

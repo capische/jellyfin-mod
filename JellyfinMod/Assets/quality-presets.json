@@ -103,6 +103,30 @@
       "minimumSeeders": 2
     },
     {
+      "id": "369cc96e-aade-4abe-a2f5-ec6768b79568",
+      "name": "SD",
+      "description": "480p / 576p only. DVD rips and old TV.",
+      "default": false,
+      "qualities": [
+        "bluray-576p",
+        "webdl-576p",
+        "webrip-576p",
+        "hdtv-576p",
+        "dvd-576p",
+        "bluray-480p",
+        "webdl-480p",
+        "webrip-480p",
+        "hdtv-480p",
+        "dvd-480p"
+      ],
+      "minimumBytesPerHour": null,
+      "maximumBytesPerHour": 500000000,
+      "cutoff": "bluray-576p",
+      "upgradeAllowed": false,
+      "upgradeMode": "replace",
+      "minimumSeeders": 2
+    },
+    {
       "id": "8afa2b3f-ebf0-40fd-a42b-bba6cebe1bde",
       "name": "Any Quality",
       "description": "Best available of anything. Good for hard-to-find titles.",
@@ -139,30 +163,6 @@
       "minimumBytesPerHour": null,
       "maximumBytesPerHour": null,
       "cutoff": "remux-2160p",
-      "upgradeAllowed": false,
-      "upgradeMode": "replace",
-      "minimumSeeders": 2
-    },
-    {
-      "id": "369cc96e-aade-4abe-a2f5-ec6768b79568",
-      "name": "SD",
-      "description": "480p / 576p only. DVD rips and old TV.",
-      "default": false,
-      "qualities": [
-        "bluray-576p",
-        "webdl-576p",
-        "webrip-576p",
-        "hdtv-576p",
-        "dvd-576p",
-        "bluray-480p",
-        "webdl-480p",
-        "webrip-480p",
-        "hdtv-480p",
-        "dvd-480p"
-      ],
-      "minimumBytesPerHour": null,
-      "maximumBytesPerHour": 500000000,
-      "cutoff": "bluray-576p",
       "upgradeAllowed": false,
       "upgradeMode": "replace",
       "minimumSeeders": 2
