@@ -580,7 +580,7 @@ public sealed class GrabService(
     /// Why automation would no longer make this automatic grab, or null while it still would: automation on, the target
     /// monitored and still without a file (or still holding the one an upgrade replaces), and the switch for its kind of grab
     /// still on: episode upgrades for an episode upgrade or extra version, reacquisition for a reclaimed title (final review 2,
-    /// finding 1). A copy for phones is still wanted while its switch is on and the title (each claimed episode, for a pack)
+    /// finding 1). A copy for phones is still wanted while its switch is on and the title (any claimed episode, for a pack)
     /// holds files and still none at 1080p or below (Codex review of Phase 12, P1); it never needs the episode upgrades switch,
     /// since it replaces nothing.
     /// </summary>
@@ -603,9 +603,8 @@ public sealed class GrabService(
                 return entry.State == FileState.OnDisk &&
                     await JellyfinMod.Services.Automation.PhoneCopies.MissingAsync(database, entry.Id, null, library, cancellationToken).ConfigureAwait(false)
                     ? null : "no_longer_wanted";
-            foreach (var target in targets.Where(value => value.Monitored && value.State == FileState.OnDisk))
-                if (await JellyfinMod.Services.Automation.PhoneCopies.MissingAsync(database, entry.Id, target.Id, library, cancellationToken)
-                        .ConfigureAwait(false))
+            foreach (var target in targets)
+                if (await WantsPhoneCopyAsync(entry.Id, target, cancellationToken).ConfigureAwait(false))
                     return null;
             return "no_longer_wanted";
         }
@@ -630,6 +629,30 @@ public sealed class GrabService(
         if (episode is not null && (upgrade || operation.Intent == GrabIntents.AddVersion) && !settings.EpisodeUpgradesEnabled)
             return "episode_upgrades_disabled";
         return state == FileState.Reclaimed && !settings.ReacquireReclaimed ? "reacquire_disabled" : null;
+    }
+
+    /// <summary>Whether an episode still wants automation's copy for phones: monitored, holding files, and none at 1080p or below.</summary>
+    private async Task<bool> WantsPhoneCopyAsync(Guid entryId, Episode episode, CancellationToken cancellationToken) =>
+        episode.Monitored && episode.State == FileState.OnDisk &&
+        await JellyfinMod.Services.Automation.PhoneCopies.MissingAsync(database, entryId, episode.Id, library, cancellationToken)
+            .ConfigureAwait(false);
+
+    /// <summary>
+    /// Drops the claims of a pack for phones whose episode stopped wanting the copy during the hold (unmonitored, its file gone,
+    /// or a copy for phones held by now), so no import is made for them; the episodes still wanting it go ahead (Codex re-review
+    /// of Phase 12, P2). Saved with the caller's changes.
+    /// </summary>
+    private async Task DropUnwantedPhoneClaimsAsync(GrabOperation operation, Guid entryId, CancellationToken cancellationToken)
+    {
+        if (!IsPhoneCopyAdd(operation) || !ReleaseScopes.IsPack(operation.Scope)) return;
+        var claims = await database.GrabClaims.Where(claim => claim.GrabId == operation.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var ids = claims.Select(claim => claim.EpisodeId).ToList();
+        var episodes = await database.Episodes.AsNoTracking().Where(value => ids.Contains(value.Id))
+            .ToDictionaryAsync(value => value.Id, cancellationToken).ConfigureAwait(false);
+        foreach (var claim in claims)
+            if (!episodes.TryGetValue(claim.EpisodeId, out var episode) ||
+                !await WantsPhoneCopyAsync(entryId, episode, cancellationToken).ConfigureAwait(false))
+                database.GrabClaims.Remove(claim);
     }
 
     /// <summary>Serializes every grab's final admission and insert in this process (Codex round 2 P2).</summary>
@@ -749,6 +772,7 @@ public sealed class GrabService(
                 return;
             }
 
+            await DropUnwantedPhoneClaimsAsync(operation, current!.Id, cancellationToken).ConfigureAwait(false);
             operation.State = GrabStates.Submitting;
             operation.SubmittedAt = operation.UpdatedAt = Now;
             await database.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);

@@ -44,9 +44,12 @@ public sealed class AutomationRunAlreadyActiveException : InvalidOperationExcept
     }
 }
 
-/// <summary>One searchable target of a run.</summary>
+/// <summary>
+/// One searchable target of a run. <paramref name="Then"/> is searched in the same run when this one finds nothing to grab: the
+/// best copy's upgrade behind a copy for phones, so neither can keep the other from being searched (Codex re-review of Phase 12).
+/// </summary>
 internal sealed record AutomationTarget(Guid TargetId, Entry Entry, Episode? Episode, AcquisitionQualityProfile Profile, bool Inherited,
-    UpgradeAssessment? Upgrade, bool PhoneCopy = false, bool PhoneCopyRemoved = false)
+    UpgradeAssessment? Upgrade, bool PhoneCopy = false, bool PhoneCopyRemoved = false, AutomationTarget? Then = null)
 {
     public bool IsUpgrade => Upgrade is { Eligible: true };
 
@@ -157,7 +160,8 @@ public sealed class AutomationRunner(
             var today = now.Date;
             var grabsToday = await database.GrabOperations.CountAsync(grab => grab.Automatic && grab.CreatedAt >= today, cancellationToken)
                 .ConfigureAwait(false);
-            foreach (var target in due)
+            foreach (var scheduled in due)
+            for (var target = scheduled; target is not null;)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 // Turning automation off stops the run before the next target, not after the batch.
@@ -197,6 +201,8 @@ public sealed class AutomationRunner(
                     using var scope = scopes.CreateScope();
                     scope.ServiceProvider.GetRequiredService<GrabDispatcher>().Schedule(created.Id, created.HoldUntil);
                 }
+
+                target = target.Then is { } next && FoundNothing.Contains(outcome) ? next : null;
             }
 
             run = await database.AutomationRuns.SingleAsync(value => value.Id == run.Id, cancellationToken).ConfigureAwait(false);
@@ -270,6 +276,10 @@ public sealed class AutomationRunner(
         var state = episode?.State ?? entry.State;
         return target.OnDisk ? state == FileState.OnDisk : state != FileState.OnDisk;
     }
+
+    /// <summary>The outcomes of a search that found nothing to grab, after which a target's <c>Then</c> is searched.</summary>
+    private static readonly HashSet<string> FoundNothing = [AutomationReasons.NoEligibleCandidate, AutomationReasons.Blocklisted,
+        AutomationReasons.BelowMinimumScore, AutomationReasons.BelowMinimumSeeders];
 
     /// <summary>Checks budgets, searches, picks and grabs for one target, recording exactly one decision.</summary>
     private async Task<(string Outcome, GrabOperation? Created)> ProcessAsync(AutomationRun run, AutomationTarget target,
@@ -695,13 +705,16 @@ public sealed class AutomationRunner(
             var assessment = UpgradeAssessment.For(profile, held, episode is not null, settings.EpisodeUpgradesEnabled);
             // Also get a 1080p copy for phones (Phase 12 M36): a title whose files are all above 1080p is searched with the quality
             // profile for phones and the release added beside them. A multi-episode file is never given a single-episode version.
-            // The missing copy comes before an upgrade, so an upgrade whose release never appears cannot keep it from being
-            // searched (Codex review of Phase 12, P2); once the copy is held, the upgrade is the target again.
+            // The missing copy is searched first and an eligible upgrade right after it in the same run when no release fits the
+            // copy, so neither an upgrade whose release never appears nor a copy no release fits keeps the other from being
+            // searched (Codex review and re-review of Phase 12, P2); once the copy is held, the upgrade is the target alone.
             var phoneMissing = settings.FetchPhoneCopies && phoneProfile is not null && !held.Any(version => version.MultiEpisode) &&
                 await PhoneCopies.MissingAsync(database, entry.Id, episode?.Id, library, cancellationToken).ConfigureAwait(false);
             var removed = phoneMissing && await PhoneCopies.RemovedAsync(database, entry.Id, episode?.Id, cancellationToken).ConfigureAwait(false);
-            if (phoneMissing && !removed) return new AutomationTarget(targetId, entry, episode, phoneProfile!, false, null, PhoneCopy: true);
-            if (assessment.Eligible) return new AutomationTarget(targetId, entry, episode, profile, inherited, assessment);
+            var upgrade = assessment.Eligible ? new AutomationTarget(targetId, entry, episode, profile, inherited, assessment) : null;
+            if (phoneMissing && !removed)
+                return new AutomationTarget(targetId, entry, episode, phoneProfile!, false, null, PhoneCopy: true, Then: upgrade);
+            if (upgrade is not null) return upgrade;
             return phoneMissing ? new AutomationTarget(targetId, entry, episode, phoneProfile!, false, null, PhoneCopyRemoved: true) : null;
         }
 
