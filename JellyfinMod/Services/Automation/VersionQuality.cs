@@ -64,6 +64,17 @@ public static class VersionQuality
         return "480p";
     }
 
+    /// <summary>
+    /// Like <see cref="NativeResolution"/>, but a picture wider than 1920 or taller than 1088 lines that is not 4K is
+    /// <c>1440p</c> (2K): which copy a phone plays tells 2K from 1080p (D114; Codex review of Phase 12, P2), while retention and
+    /// import keep the coarse tiers, 2K with 1080p (P4.FU9). 1088 lines allows 1080p encodes padded to a multiple of 16.
+    /// </summary>
+    public static string? FineNativeResolution(int? width, int? height)
+    {
+        var coarse = NativeResolution(width, height);
+        return coarse == "1080p" && ((width ?? 0) > 1920 || (height ?? 0) > 1088) ? "1440p" : coarse;
+    }
+
     /// <summary>Ranks a native video size the same way as a parsed resolution.</summary>
     public static int NativeRank(int? width, int? height) => RankOf(NativeResolution(width, height));
 

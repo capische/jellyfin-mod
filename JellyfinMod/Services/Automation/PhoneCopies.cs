@@ -1,5 +1,6 @@
 using JellyfinMod.Api.Contracts;
 using JellyfinMod.Data;
+using JellyfinMod.Services.Acquisition;
 using MediaBrowser.Controller.Library;
 using Microsoft.EntityFrameworkCore;
 
@@ -24,15 +25,18 @@ public static class PhoneCopies
 
     /// <summary>
     /// Marks the phone copy among a title's versions, as listed (the plugin's default first): only with two or more files, the
-    /// best one at 1080p or below, SDR before HDR at the same tier, the first listed on a tie.
+    /// best one at 1080p or below, SDR before HDR at the same resolution, then the larger file, the first listed on a tie.
     /// </summary>
     public static IReadOnlyList<VersionDto> Mark(IReadOnlyList<VersionDto> versions)
     {
         if (versions.Count < 2) return versions;
         var phone = versions.Select((version, index) => (version, index))
             .Where(item => Fits(item.version.Resolution))
-            .OrderByDescending(item => VersionQuality.RankOf(item.version.Resolution))
+            // The web's rule for which file a phone starts (pickCopy): more lines (576p above 480p), SDR first, the larger file,
+            // then the order listed (Codex review of Phase 12, P2).
+            .OrderByDescending(item => VersionQuality.OrderOf(item.version.Resolution))
             .ThenBy(item => HighRange(item.version.VideoRange) ? 1 : 0)
+            .ThenByDescending(item => item.version.SizeBytes ?? 0)
             .ThenBy(item => item.index)
             .Select(item => item.version).FirstOrDefault();
         return phone is null ? versions : versions.Select(version => ReferenceEquals(version, phone) ? version with { PhoneCopy = true } : version).ToArray();
@@ -59,12 +63,27 @@ public static class PhoneCopies
     /// </summary>
     public static async Task<bool> RemovedAsync(ModDbContext database, Guid entryId, Guid? episodeId, CancellationToken cancellationToken)
     {
-        var paths = await database.RetentionOperations.AsNoTracking()
+        var removed = await database.RetentionOperations.AsNoTracking()
             .Where(operation => operation.EntryId == entryId && operation.EpisodeId == episodeId &&
                 operation.State == RetentionOperationStates.Completed &&
                 (operation.Provenance == RetentionProvenances.Retention || operation.Provenance == RetentionProvenances.VersionRemoved))
-            .Select(operation => operation.MediaPath).ToListAsync(cancellationToken).ConfigureAwait(false);
-        return paths.Any(path => Fits(VersionQuality.Parse(path).Resolution));
+            .Select(operation => new { operation.MediaPath, operation.PhysicalIdentity }).ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (removed.Any(operation => Fits(VersionQuality.Parse(operation.MediaPath).Resolution))) return true;
+        // A file whose name says nothing (a lower episode version is named without its resolution, so it never becomes Jellyfin's
+        // default) is read from the release it was imported from, while the import linked that very file (Codex review of
+        // Phase 12, P2).
+        var unnamed = removed.Where(operation => VersionQuality.Parse(operation.MediaPath).Resolution is null)
+            .Select(operation => operation.MediaPath).ToList();
+        if (unnamed.Count == 0) return false;
+        var imports = await database.ImportOperations.AsNoTracking()
+            .Where(operation => operation.EntryId == entryId && operation.EpisodeId == episodeId && operation.State == ImportStates.Completed &&
+                operation.DestinationPath != null && unnamed.Contains(operation.DestinationPath))
+            .Select(operation => new { operation.DestinationPath, operation.DestinationPhysicalIdentity, operation.ReleaseTitle })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return removed.Any(operation => imports.Any(import => import.DestinationPath == operation.MediaPath &&
+            (string.IsNullOrEmpty(operation.PhysicalIdentity) || import.DestinationPhysicalIdentity is null ||
+                import.DestinationPhysicalIdentity == operation.PhysicalIdentity) &&
+            Fits(ReleaseParser.Parse(import.ReleaseTitle).Resolution)));
     }
 
     private static string? ResolutionOf(HeldVersion version, ILibraryManager? library)
@@ -73,7 +92,7 @@ public static class PhoneCopies
         try
         {
             return library.GetItemById(version.JellyfinItemId) is MediaBrowser.Controller.Entities.Video video
-                ? VersionQuality.NativeResolution(video.Width, video.Height)
+                ? VersionQuality.FineNativeResolution(video.Width, video.Height)
                 : null;
         }
         catch (Exception error) when (error is not OutOfMemoryException)
