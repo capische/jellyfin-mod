@@ -57,11 +57,12 @@ public sealed class TraktActivityLog(IServiceScopeFactory scopes, ILibraryManage
         });
 
     /// <summary>
-    /// What one run of the Trakt plugin's import saved here: per title, or one count row past the burst limit. A save that
-    /// leaves a resume point is a playback position (Trakt's paused list), even on a title already watched; one without is a
-    /// watch (Codex review of the additions, P3 4).
+    /// What one run of the Trakt plugin's import saved here: per title, or one count row past the burst limit. Read against
+    /// the title's state before the import (Codex re-review of the additions, P3 1): a save that marked it watched is a
+    /// watch; one that only moved its resume point is a playback position (Trakt's paused list). When one save does both, it
+    /// reads as the watch.
     /// </summary>
-    public Task ImportedAsync(IReadOnlyList<(Guid UserId, Guid ItemId, bool Played, long PositionTicks, DateTime At)> saves) =>
+    public Task ImportedAsync(IReadOnlyList<(Guid UserId, Guid ItemId, bool Played, long PositionTicks, bool WasPlayed, long WasPositionTicks, DateTime At)> saves) =>
         WriteAsync(async database =>
         {
             foreach (var group in saves.GroupBy(save => save.UserId))
@@ -71,7 +72,7 @@ public sealed class TraktActivityLog(IServiceScopeFactory scopes, ILibraryManage
                 {
                     database.TraktActivity.Add(new TraktActivityEntry
                     {
-                        UserId = group.Key, Direction = "from", State = "summary", Detail = distinct.Count(save => save.Played),
+                        UserId = group.Key, Direction = "from", State = "summary", Detail = distinct.Count(save => save.Played && !save.WasPlayed),
                         Kind = "episode", Title = string.Empty, At = distinct.Max(save => save.At)
                     });
                     continue;
@@ -80,10 +81,11 @@ public sealed class TraktActivityLog(IServiceScopeFactory scopes, ILibraryManage
                 foreach (var save in distinct)
                 {
                     if (library.GetItemById(save.ItemId) is not { } item) continue;
-                    var position = save.PositionTicks > 0;
-                    if (!position && !save.Played) continue;
-                    await SetAsync(database, group.Key, item, "from", position ? "position" : "imported",
-                        position ? (int)TimeSpan.FromTicks(save.PositionTicks).TotalMinutes : null, save.At).ConfigureAwait(false);
+                    var watched = save.Played && !save.WasPlayed;
+                    var moved = save.PositionTicks > 0 && save.PositionTicks != save.WasPositionTicks;
+                    if (!watched && !moved) continue;
+                    await SetAsync(database, group.Key, item, "from", watched ? "imported" : "position",
+                        watched ? null : (int)TimeSpan.FromTicks(save.PositionTicks).TotalMinutes, save.At).ConfigureAwait(false);
                 }
             }
         });
@@ -114,13 +116,14 @@ public sealed class TraktActivityLog(IServiceScopeFactory scopes, ILibraryManage
             }
 
             // The count lines are what the plugin meant to send, logged before it sent: only a clean run delivered them. One row
-            // per run and kind: a run judged again (after a restart) finds its row by its start (Codex review of the additions, P2 2).
+            // per run and kind: a run judged again (after a restart) finds its row by its exact start, so a second run within the
+            // same second keeps its own (Codex review of the additions, P2 2, and its re-review, P3 2).
             var user = userIds.FirstOrDefault();
             if (user == Guid.Empty || !clean) return;
             async Task CountAsync(string state, int count)
             {
                 if (await database.TraktActivity.AnyAsync(entry => entry.UserId == user && entry.Direction == "to" && entry.State == state && entry.ItemId == null &&
-                    entry.At >= started.AddSeconds(-1) && entry.At <= started.AddSeconds(1)).ConfigureAwait(false)) return;
+                    entry.At == started).ConfigureAwait(false)) return;
                 database.TraktActivity.Add(new TraktActivityEntry { UserId = user, Direction = "to", State = state, Detail = count, Title = string.Empty, At = started });
             }
 
