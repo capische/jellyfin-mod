@@ -66,13 +66,20 @@ public static class VersionQuality
 
     /// <summary>
     /// Like <see cref="NativeResolution"/>, but a picture wider than 1920 or taller than 1088 lines that is not 4K is
-    /// <c>1440p</c> (2K): which copy a phone plays tells 2K from 1080p (D114; Codex review of Phase 12, P2), while retention and
-    /// import keep the coarse tiers, 2K with 1080p (P4.FU9). 1088 lines allows 1080p encodes padded to a multiple of 16.
+    /// <c>1440p</c> (2K), and one in the lowest tier at least 540 lines tall is <c>576p</c>, as <see cref="OrderOf(int?, int?)"/>
+    /// orders it: which copy a phone or a Play picks tells 2K from 1080p and PAL from NTSC, the same as the player reads the size
+    /// (D114; Codex review and re-review of Phase 12, P2), while retention and import keep the coarse tiers, 2K with 1080p and
+    /// 576p with 480p (P4.FU9). 1088 lines allows 1080p encodes padded to a multiple of 16.
     /// </summary>
     public static string? FineNativeResolution(int? width, int? height)
     {
         var coarse = NativeResolution(width, height);
-        return coarse == "1080p" && ((width ?? 0) > 1920 || (height ?? 0) > 1088) ? "1440p" : coarse;
+        return coarse switch
+        {
+            "1080p" when (width ?? 0) > 1920 || (height ?? 0) > 1088 => "1440p",
+            "480p" when (height ?? 0) >= 540 => "576p",
+            _ => coarse
+        };
     }
 
     /// <summary>Ranks a native video size the same way as a parsed resolution.</summary>
