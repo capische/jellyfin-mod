@@ -34,15 +34,18 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
     /// <summary>Gets a value indicating whether Jellyfin's TMDb connection was found and matches this build.</summary>
     public bool Available => _binding.Value is not null;
 
-    /// <summary>Fetches a movie or series with its certifications, as <see cref="TmdbClient.GetDetailsAsync"/> does.</summary>
-    internal async Task<TmdbMetadata> GetDetailsAsync(string mediaType, int id, CancellationToken cancellationToken)
+    /// <summary>
+    /// Fetches a movie or series with its certifications, cast, the crew Jellyfin keeps and a series' creators, as
+    /// <see cref="TmdbClient.GetTitleAsync"/> does. The manager reads both with their credits.
+    /// </summary>
+    internal async Task<TmdbTitle> GetTitleAsync(string mediaType, int id, CancellationToken cancellationToken)
     {
         var binding = Require();
         if (mediaType == "movie")
         {
             var movie = await CallAsync($"movie/{id}", token => binding.GetMovie(id, Language, null, null, token), cancellationToken)
                 ?? throw NotFound($"movie/{id}");
-            return Movie(movie);
+            return new TmdbTitle(Movie(movie), Crew(movie.Credits?.Crew), []);
         }
 
         var series = await CallAsync($"tv/{id}", token => binding.GetSeries(id, Language, null, null, token), cancellationToken)
@@ -51,8 +54,15 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
         var result = Series(series);
         if (result.Seasons.Any(season => season.Number < 0) || result.Seasons.DistinctBy(season => season.Number).Count() != result.Seasons.Length)
             throw new TmdbException("TMDB returned conflicting season identities.", HttpStatusCode.BadGateway);
-        return result;
+        var creators = (series.CreatedBy ?? []).Where(person => person is not null && !string.IsNullOrWhiteSpace(person.Name))
+            .Select(person => person.Name!.Trim()).ToArray();
+        return new TmdbTitle(result, Crew(series.Credits?.Crew), creators);
     }
+
+    /// <summary>The crew Jellyfin keeps of a title's credits, as the plugin's own requests read it.</summary>
+    private static IReadOnlyList<TmdbCrewCredit> Crew(IEnumerable<TMDbLib.Objects.General.Crew?>? crew) =>
+        EpisodeCredits.From([], (crew ?? []).OfType<TMDbLib.Objects.General.Crew>()
+            .Select(person => (person.Id, person.Name, person.Department, person.Job, person.ProfilePath))).Crew;
 
     /// <summary>Searches TMDB. There are no further pages: the manager returns the first one only.</summary>
     internal async Task<TmdbPage> SearchAsync(string query, string mediaType, int page, CancellationToken cancellationToken)
@@ -102,7 +112,7 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
     /// <returns>The series' season count and the first season's episode count.</returns>
     internal async Task<(int Seasons, int Episodes)> ProbeAsync(CancellationToken cancellationToken)
     {
-        var series = await GetDetailsAsync("series", ProbeSeriesId, cancellationToken);
+        var series = (await GetTitleAsync("series", ProbeSeriesId, cancellationToken)).Metadata;
         if (series.TmdbId != ProbeSeriesId || string.IsNullOrWhiteSpace(series.Title))
             throw new TmdbException("TMDB returned incomplete metadata.", HttpStatusCode.BadGateway);
         var episodes = new ConcurrentBag<Episode>();
@@ -156,7 +166,10 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
         (movie.Genres ?? []).Select(genre => genre.Name).OfType<string>().ToArray(),
         (movie.Releases?.Countries ?? []).Where(country => country.Iso_3166_1 is not null && !string.IsNullOrEmpty(country.Certification))
             .Select(country => new TmdbCertification(country.Iso_3166_1!, country.Certification!)).Distinct().ToArray(),
-        [], movie.OriginalTitle);
+        [], movie.OriginalTitle,
+        // The manager reads a movie with its credits; its cast is kept as a series' is (TM2: the search card's lead actors).
+        Cast: EpisodeCredits.Cast((movie.Credits?.Cast ?? []).Where(person => person is not null).Select(Credit)),
+        Popularity: movie.Popularity);
 
     private static TmdbMetadata Series(TvShow series)
     {
@@ -171,19 +184,23 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
                 season.AirDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), season.PosterPath, season.Overview)).ToArray(),
             series.OriginalName,
             // The manager reads a series with its credits; its regular cast is kept as the plugin's own requests keep it (P1.FU15).
-            Cast: EpisodeCredits.Cast((series.Credits?.Cast ?? []).Where(person => person is not null).Select(Credit)));
+            Cast: EpisodeCredits.Cast((series.Credits?.Cast ?? []).Where(person => person is not null).Select(Credit)),
+            Popularity: series.Popularity);
     }
 
     private static TmdbCastCredit Credit(TMDbLib.Objects.TvShows.Cast person) =>
         new(person.Id, person.Name ?? string.Empty, person.Character, person.ProfilePath, person.Order);
 
+    private static TmdbCastCredit Credit(TMDbLib.Objects.Movies.Cast person) =>
+        new(person.Id, person.Name ?? string.Empty, person.Character, person.ProfilePath, person.Order);
+
     private static TmdbMetadata Found(SearchMovie item) => new(
         "movie", item.Id, item.Title ?? string.Empty, Day(item.ReleaseDate), item.Overview, item.PosterPath, item.BackdropPath,
-        null, null, item.Adult, item.VoteAverage, null, [], [], [], item.OriginalTitle);
+        null, null, item.Adult, item.VoteAverage, null, [], [], [], item.OriginalTitle, Popularity: item.Popularity);
 
     private static TmdbMetadata Found(SearchTv item) => new(
         "series", item.Id, item.Name ?? string.Empty, Day(item.FirstAirDate), item.Overview, item.PosterPath, item.BackdropPath,
-        null, null, false, item.VoteAverage, null, [], [], [], item.OriginalName);
+        null, null, false, item.VoteAverage, null, [], [], [], item.OriginalName, Popularity: item.Popularity);
 
     /// <summary>A TMDB date as the plugin's own requests read it: that day, at midnight UTC.</summary>
     private static DateTime? Day(DateTime? value) => value is { } date ? DateTime.SpecifyKind(date.Date, DateTimeKind.Utc) : null;

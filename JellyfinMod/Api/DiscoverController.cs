@@ -93,4 +93,45 @@ public sealed class DiscoverController(ModDbContext database, DatabaseInitialize
             return Problem(statusCode: (int)error.StatusCode, title: error.Message);
         }
     }
+
+    /// <summary>
+    /// A TMDB title for its page before it is added (TM2): the movie or series with its cast, crew and creators, and with
+    /// <paramref name="season"/> that season's episodes with their guest stars and crew. Read-only; nothing is stored.
+    /// </summary>
+    /// <remarks>
+    /// The search's rules apply: someone who may add no title of this kind, or who reads only tagged titles, gets nothing, and a
+    /// title whose rating or adult flag the user may not see is not found.
+    /// </remarks>
+    [HttpGet("Title")]
+    public async Task<ActionResult<DiscoverTitleResult>> Title([FromQuery] string type, [FromQuery] int tmdbId,
+        [FromQuery] int? season = null, CancellationToken cancellationToken = default)
+    {
+        if (!readiness.IsReady) return StatusCode(503);
+        var user = access.GetUser(User);
+        if (user is null) return Unauthorized();
+        if (type is not ("movie" or "series") || tmdbId <= 0 || season is < 0 || (season.HasValue && type != "series")) return BadRequest();
+        if (access.GetLibraries(user, type).Count == 0 ||
+            user.GetPreference(Jellyfin.Database.Implementations.Enums.PreferenceKind.AllowedTags).Length > 0) return NotFound();
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(20));
+        try
+        {
+            var title = await tmdb.GetTitleAsync(type, tmdbId, timeout.Token);
+            if (!access.CanReadMetadata(user, title.Metadata)) return NotFound();
+            if (season is not { } number) return new DiscoverTitleResult(title.Metadata, title.Crew, title.Creators, null);
+            if (title.Metadata.Seasons.All(candidate => candidate.Number != number)) return NotFound();
+            var episodes = await tmdb.GetSeasonAsync(tmdbId, number, timeout.Token);
+            // The episodes' ratings ride on the series, as on a series in the library (P1.FU14).
+            return new DiscoverTitleResult(title.Metadata.WithEpisodeRatings(episodes), title.Crew, title.Creators,
+                episodes.Select(episode => new EpisodeDto(episode)).ToArray());
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return Problem(statusCode: 504, title: "TMDB did not answer in time. Please try again.");
+        }
+        catch (TmdbException error)
+        {
+            return Problem(statusCode: (int)error.StatusCode, title: error.Message);
+        }
+    }
 }

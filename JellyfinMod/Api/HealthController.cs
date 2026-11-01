@@ -147,6 +147,8 @@ public class HealthController : ControllerBase
         // History events about one file carry that file's binding (0.1.0.0 detail page design fix, 2026-10-07).
         "history.files",
         "discover.skipped",
+        // The page of a TMDB title that is not in the library: GET /Discover/Title (TM2).
+        "discover.title",
         "reconciliation.conflicts",
         "reconciliation.orphans",
         "entries.libraryBusy",
