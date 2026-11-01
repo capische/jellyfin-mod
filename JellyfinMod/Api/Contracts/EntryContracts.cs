@@ -193,6 +193,15 @@ public sealed record DiscoveryResult([property: JsonPropertyName("items")] IRead
     [property: JsonPropertyName("nextPage")] int? NextPage,
     [property: JsonPropertyName("skipped")] int Skipped = 0);
 
+/// <summary>
+/// A TMDB title for its page before it is added (TM2): its metadata (with its cast and, for a season, its episodes' ratings), the
+/// crew Jellyfin keeps, a series' creators, and the season's episodes when one was asked for (unsaved rows: no entry, no file).
+/// </summary>
+public sealed record DiscoverTitleResult([property: JsonPropertyName("metadata")] TmdbMetadata Metadata,
+    [property: JsonPropertyName("crew")] IReadOnlyList<TmdbCrewCredit> Crew,
+    [property: JsonPropertyName("creators")] IReadOnlyList<string> Creators,
+    [property: JsonPropertyName("episodes"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<EpisodeDto>? Episodes);
+
 /// <summary>Only these fields may be supplied when adding a title.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed class CreateEntryRequest

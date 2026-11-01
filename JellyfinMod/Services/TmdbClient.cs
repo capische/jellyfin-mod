@@ -42,7 +42,7 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             if (viaJellyfin is not null)
             {
                 source = JellyfinSource;
-                await viaJellyfin.GetDetailsAsync("series", JellyfinTmdb.ProbeSeriesId, cancellationToken).ConfigureAwait(false);
+                await viaJellyfin.GetTitleAsync("series", JellyfinTmdb.ProbeSeriesId, cancellationToken).ConfigureAwait(false);
                 return ("ok", "TMDB answered through Jellyfin's built-in TMDb connection.", source);
             }
 
@@ -85,14 +85,21 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
     }
 
     /// <summary>Fetches a movie or series and its regional content certifications.</summary>
-    public async Task<TmdbMetadata> GetDetailsAsync(string mediaType, int id, CancellationToken cancellationToken)
+    public async Task<TmdbMetadata> GetDetailsAsync(string mediaType, int id, CancellationToken cancellationToken) =>
+        (await GetTitleAsync(mediaType, id, cancellationToken)).Metadata;
+
+    /// <summary>
+    /// Fetches a movie or series with its certifications, its cast and the crew Jellyfin keeps, and a series' creators: what the
+    /// page for a TMDB title that is not in the library shows (TM2). One request, the same one <see cref="GetDetailsAsync"/> makes.
+    /// </summary>
+    public async Task<TmdbTitle> GetTitleAsync(string mediaType, int id, CancellationToken cancellationToken)
     {
         var path = MediaPath(mediaType);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(id);
         var (credential, viaJellyfin) = await SourceAsync(cancellationToken);
-        var result = viaJellyfin is not null ? await viaJellyfin.GetDetailsAsync(mediaType, id, cancellationToken)
+        var result = viaJellyfin is not null ? await viaJellyfin.GetTitleAsync(mediaType, id, cancellationToken)
             : await DetailsOverHttpAsync(path, mediaType, id, credential!, cancellationToken);
-        if (result.TmdbId != id || string.IsNullOrWhiteSpace(result.Title))
+        if (result.Metadata.TmdbId != id || string.IsNullOrWhiteSpace(result.Metadata.Title))
         {
             throw new TmdbException("TMDB returned incomplete metadata.", HttpStatusCode.BadGateway);
         }
@@ -100,11 +107,12 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
         return result;
     }
 
-    private async Task<TmdbMetadata> DetailsOverHttpAsync(string path, string mediaType, int id, Credential credential,
+    private async Task<TmdbTitle> DetailsOverHttpAsync(string path, string mediaType, int id, Credential credential,
         CancellationToken cancellationToken)
     {
-        // A series also brings its regular cast (P1.FU15), in the same request.
-        using var json = await GetAsync($"{path}/{id}?append_to_response=external_ids,{(mediaType == "movie" ? "release_dates" : "content_ratings,credits")}",
+        // A series also brings its regular cast (P1.FU15), and a movie its cast (TM2: the search card's two lead actors), in
+        // the same request.
+        using var json = await GetAsync($"{path}/{id}?append_to_response=external_ids,{(mediaType == "movie" ? "release_dates,credits" : "content_ratings,credits")}",
             credential, cancellationToken);
         if (mediaType == "series")
         {
@@ -115,7 +123,33 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
                 throw new TmdbException("TMDB returned conflicting season identities.", HttpStatusCode.BadGateway);
         }
 
-        return Parse(json.RootElement, mediaType);
+        var root = json.RootElement;
+        root.TryGetProperty("credits", out var credits);
+        var crew = EpisodeCredits.From([], Array(credits, "crew").Select(person => (Number(person, "id") ?? 0, Text(person, "name"),
+            Text(person, "department"), Text(person, "job"), Text(person, "profile_path")))).Crew;
+        var creators = Array(root, "created_by").Select(person => Text(person, "name")).OfType<string>()
+            .Where(name => name.Trim().Length > 0).Select(name => name.Trim()).ToArray();
+        return new TmdbTitle(Parse(root, mediaType), crew, creators);
+    }
+
+    /// <summary>
+    /// Fetches one season's episodes, with their guest stars and crew, for the page of a series that is not in the library (TM2).
+    /// Nothing is stored: the episodes are the plugin's own rows, unsaved.
+    /// </summary>
+    public async Task<IReadOnlyList<Episode>> GetSeasonAsync(int seriesId, int seasonNumber, CancellationToken cancellationToken)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(seriesId);
+        ArgumentOutOfRangeException.ThrowIfNegative(seasonNumber);
+        var episodes = new ConcurrentBag<Episode>();
+        var (credential, viaJellyfin) = await SourceAsync(cancellationToken);
+        if (viaJellyfin is not null) await viaJellyfin.ReadSeasonAsync(seriesId, seasonNumber, episodes, cancellationToken);
+        else
+        {
+            using var json = await GetAsync($"tv/{seriesId}/season/{seasonNumber}", credential!, cancellationToken);
+            ReadSeason(json.RootElement, seasonNumber, episodes);
+        }
+
+        return Checked(episodes);
     }
 
     /// <summary>Fetches one remote search page. Permission checks and exclusions happen before exposing it.</summary>
@@ -340,7 +374,9 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
                 Text(s, "overview"))).ToArray(),
             Text(item, mediaType == "movie" ? "original_title" : "original_name"), Cast: cast,
             // The vote count beside the score, from the same response (P9.R4).
-            VoteCount: Number(item, "vote_count") is { } votes && votes > 0 ? votes : null);
+            VoteCount: Number(item, "vote_count") is { } votes && votes > 0 ? votes : null,
+            // How the search page ranks movies and shows together (TM2).
+            Popularity: Decimal(item, "popularity"));
     }
 
     private static TmdbCastCredit CastCredit(JsonElement person) => new(Number(person, "id") ?? 0, Text(person, "name") ?? string.Empty,
@@ -376,7 +412,8 @@ public sealed record TmdbMetadata(
     [property: JsonPropertyName("originalTitle")] string? OriginalTitle = null,
     [property: JsonPropertyName("episodeRatings")] IReadOnlyDictionary<int, double>? EpisodeRatings = null,
     [property: JsonPropertyName("cast")] IReadOnlyList<TmdbCastCredit>? Cast = null,
-    [property: JsonPropertyName("voteCount")] int? VoteCount = null)
+    [property: JsonPropertyName("voteCount")] int? VoteCount = null,
+    [property: JsonPropertyName("popularity")] double? Popularity = null)
 {
     /// <summary>
     /// The series with TMDB's rating of each listed episode, by TMDB episode id (P1.FU14): an episode Jellyfin has no item
@@ -391,6 +428,15 @@ public sealed record TmdbMetadata(
         Cast = Cast ?? []
     };
 }
+
+/// <summary>
+/// A TMDB title as the page for a title that is not in the library shows it (TM2): its metadata (with its cast), the crew
+/// Jellyfin keeps (directors, writers, producers) and a series' creators.
+/// </summary>
+public sealed record TmdbTitle(
+    [property: JsonPropertyName("metadata")] TmdbMetadata Metadata,
+    [property: JsonPropertyName("crew")] IReadOnlyList<TmdbCrewCredit> Crew,
+    [property: JsonPropertyName("creators")] IReadOnlyList<string> Creators);
 
 /// <summary>A person TMDB credits as cast (P1.FU15): a series' regular, or an episode's guest star.</summary>
 public sealed record TmdbCastCredit(
