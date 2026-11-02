@@ -74,9 +74,9 @@ public sealed class DiscoverController(ModDbContext database, DatabaseInitialize
                 {
                     // Search indexes may retain a removed title; it must not discard other suggestions.
                 }
-                catch (Exception error) when (error is TmdbException or HttpRequestException ||
-                    error is OperationCanceledException && !token.IsCancellationRequested)
+                catch (Exception error) when (error is not OperationCanceledException || !token.IsCancellationRequested)
                 {
+                    // Any failure of one title's details (TMDB, the network, the plugin's own store) skips that title only.
                     Interlocked.Increment(ref skipped);
                 }
             });

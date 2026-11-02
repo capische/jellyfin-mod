@@ -267,7 +267,30 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
     /// <summary>
     /// Where a call goes: the saved token or key when there is one, else Jellyfin's TMDb connection (P1.FU13), else nowhere.
     /// </summary>
-    private async Task<(Credential? Credential, JellyfinTmdb? Jellyfin)> SourceAsync(CancellationToken cancellationToken)
+    private Task<(Credential? Credential, JellyfinTmdb? Jellyfin)> SourceAsync(CancellationToken cancellationToken)
+    {
+        // Read once and kept a few seconds: a search's detail calls run in parallel, and each reading the settings row and the
+        // secret store at once made SQLite answer "database is locked" and failed the whole page (TM2, bravo 2026-11-01).
+        lock (_sourceLock)
+        {
+            if (_source is null || _source.IsFaulted || _source.IsCanceled || DateTime.UtcNow - _sourceReadAt > SourceLifetime)
+            {
+                _source = ReadSourceAsync(cancellationToken);
+                _sourceReadAt = DateTime.UtcNow;
+            }
+
+            return _source;
+        }
+    }
+
+    /// <summary>How long a read of the TMDB source is reused: long enough for one search, short enough for a settings change.</summary>
+    private static readonly TimeSpan SourceLifetime = TimeSpan.FromSeconds(10);
+
+    private readonly object _sourceLock = new();
+    private Task<(Credential? Credential, JellyfinTmdb? Jellyfin)>? _source;
+    private DateTime _sourceReadAt;
+
+    private async Task<(Credential? Credential, JellyfinTmdb? Jellyfin)> ReadSourceAsync(CancellationToken cancellationToken)
     {
         var config = configuration();
         // Saved credentials live in the secret store; a value on the configuration object is used as given.
