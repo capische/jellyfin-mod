@@ -141,7 +141,8 @@ public sealed class JellyfinNativeTitleSource(ILibraryManager library, MediaStor
                     copies.Select(item => item.Id).ToHashSet(), episodes, mounts, versionSets) with
                 {
                     SkippedEpisodes = skipped,
-                    PlaceholderEpisodes = placeholders
+                    PlaceholderEpisodes = placeholders,
+                    HoldsNothing = copies.All(Placeholders.PlaceholderStub.HoldsNothing)
                 },
                 false, null);
         }

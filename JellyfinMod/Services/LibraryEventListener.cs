@@ -141,6 +141,9 @@ public sealed class LibraryEventListener(
                     // (P4.FU11, P4.FU12). It reads Jellyfin and the plugin's database only, never the download client.
                     var reconciled = await scope.ServiceProvider.GetRequiredService<JellyfinItemReconciliationRunner>()
                         .ReconcileAsync(itemId, cancellationToken).ConfigureAwait(false);
+                    // A removed title's item that Jellyfin's refresh saved back goes again, or it stays until the next scan (tm2.u1).
+                    if (scope.ServiceProvider.GetService<Placeholders.PlaceholderService>() is { } placeholders)
+                        await placeholders.DropEmptyTitleAsync(itemId, cancellationToken).ConfigureAwait(false);
                     if (reconciled.Changed.Count > 0) scope.ServiceProvider.GetService<Import.ImportMonitor>()?.WakeLocal();
                     // A real file that just gained a binding (a copy, another tool's import), or that Jellyfin took for a further
                     // version of the title's placeholder item (it is then no binding at all), leaves the title's placeholder beside

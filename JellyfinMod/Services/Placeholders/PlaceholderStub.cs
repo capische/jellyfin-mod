@@ -89,6 +89,18 @@ public static class PlaceholderStub
         return buffer.AsSpan().SequenceEqual(expected);
     }
 
+    /// <summary>
+    /// Whether an item Jellyfin holds has nothing behind it: a media stub whose file is gone, or a series whose folder is gone. An
+    /// item of a removed title is like this when Jellyfin's metadata refresh, running as the title was removed, saves it back
+    /// (tm2.u1). Real media never counts: a video that is no stub is not asked about.
+    /// </summary>
+    public static bool HoldsNothing(MediaBrowser.Controller.Entities.BaseItem? item) => item switch
+    {
+        MediaBrowser.Controller.Entities.Movies.Movie { IsPlaceHolder: true } movie => HasStubExtension(movie.Path) && !File.Exists(movie.Path),
+        MediaBrowser.Controller.Entities.TV.Series series => !string.IsNullOrEmpty(series.Path) && !Directory.Exists(series.Path),
+        _ => false
+    };
+
     /// <summary>Forgets what is known about a path (it was written or removed).</summary>
     public static void Forget(string path) => Seen.TryRemove(path, out _);
 

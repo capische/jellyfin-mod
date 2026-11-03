@@ -52,7 +52,8 @@ internal static class BackfillIntegration
 
         var goodSeries = new Series { Id = Guid.NewGuid(), Name = "Backfilled series", Path = "/media/series" };
         goodSeries.ProviderIds["Tmdb"] = "7000";
-        var badSeries = new Series { Id = Guid.NewGuid(), Name = "Bad episode metadata", Path = "/media/bad" };
+        // A series with no playable episode must have its folder, or it holds nothing and is not backfilled (tm2.u1).
+        var badSeries = new Series { Id = Guid.NewGuid(), Name = "Bad episode metadata", Path = Directory.CreateDirectory(Path.Combine(folder, "bad")).FullName };
         badSeries.ProviderIds["Tmdb"] = "7001";
         var groupedCopy = new Series { Id = Guid.NewGuid(), Name = "Backfilled series copy", Path = "/media/series-copy" };
         groupedCopy.ProviderIds["Tmdb"] = "7000";

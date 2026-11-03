@@ -807,6 +807,11 @@ public sealed class ReconciliationService(
         var created = entry is null;
         // A series made only of the plugin's placeholders whose entry is gone (removed from the catalog while Jellyfin still lists
         // its placeholders for a moment): it is not a title the library holds, so it is never backfilled as one (P1.FU26).
+        // Nor is a stub whose file is gone or a series whose folder is gone: what Jellyfin's refresh saves back after a title was
+        // removed from the catalog (tm2.u1). A real file found later is a new item, and this does not stop it.
+        if (entry is null && snapshot.HoldsNothing &&
+            !snapshot.Representations.Any(representation => snapshot.HasPlayableEpisode(representation.JellyfinItemId)))
+            return new(ReconciliationOutcome.Unchanged, null, 0, "Nothing behind the item; not backfilled.");
         if (entry is null && snapshot.MediaType == "series" && snapshot.PlaceholderEpisodes > 0 &&
             !snapshot.Representations.Any(representation => snapshot.HasPlayableEpisode(representation.JellyfinItemId)))
             return new(ReconciliationOutcome.Unchanged, null, 0, "Only JellyfinMod placeholders; not backfilled.");
@@ -1801,6 +1806,9 @@ public sealed record NativeTitleSnapshot(string MediaType, int? TmdbId, Guid Tar
 
     /// <summary>How many of the series' episodes are the plugin's placeholders, which are never matched (P1.FU24, P1.FU26).</summary>
     public int PlaceholderEpisodes { get; init; }
+
+    /// <summary>Whether every copy of the title has nothing behind it, its stub or its folder gone (tm2.u1).</summary>
+    public bool HoldsNothing { get; init; }
 
     /// <summary>Returns true when a series copy has at least one playable episode, numbered or not.</summary>
     public bool HasPlayableEpisode(Guid seriesItemId) =>
