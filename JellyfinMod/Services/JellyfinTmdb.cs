@@ -169,7 +169,8 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
         [], movie.OriginalTitle,
         // The manager reads a movie with its credits; its cast is kept as a series' is (TM2: the search card's lead actors).
         Cast: EpisodeCredits.Cast((movie.Credits?.Cast ?? []).Where(person => person is not null).Select(Credit)),
-        Popularity: movie.Popularity);
+        // How the search page ranks movies and shows together (TM2, D253), as the plugin's own requests read it.
+        VoteCount: Votes(movie.VoteCount));
 
     private static TmdbMetadata Series(TvShow series)
     {
@@ -185,7 +186,7 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
             series.OriginalName,
             // The manager reads a series with its credits; its regular cast is kept as the plugin's own requests keep it (P1.FU15).
             Cast: EpisodeCredits.Cast((series.Credits?.Cast ?? []).Where(person => person is not null).Select(Credit)),
-            Popularity: series.Popularity);
+            VoteCount: Votes(series.VoteCount));
     }
 
     private static TmdbCastCredit Credit(TMDbLib.Objects.TvShows.Cast person) =>
@@ -196,11 +197,13 @@ public sealed class JellyfinTmdb(IServiceProvider services, ILogger<JellyfinTmdb
 
     private static TmdbMetadata Found(SearchMovie item) => new(
         "movie", item.Id, item.Title ?? string.Empty, Day(item.ReleaseDate), item.Overview, item.PosterPath, item.BackdropPath,
-        null, null, item.Adult, item.VoteAverage, null, [], [], [], item.OriginalTitle, Popularity: item.Popularity);
+        null, null, item.Adult, item.VoteAverage, null, [], [], [], item.OriginalTitle, VoteCount: Votes(item.VoteCount));
 
     private static TmdbMetadata Found(SearchTv item) => new(
         "series", item.Id, item.Name ?? string.Empty, Day(item.FirstAirDate), item.Overview, item.PosterPath, item.BackdropPath,
-        null, null, false, item.VoteAverage, null, [], [], [], item.OriginalName, Popularity: item.Popularity);
+        null, null, false, item.VoteAverage, null, [], [], [], item.OriginalName, VoteCount: Votes(item.VoteCount));
+
+    private static int? Votes(int count) => count > 0 ? count : null;
 
     /// <summary>A TMDB date as the plugin's own requests read it: that day, at midnight UTC.</summary>
     private static DateTime? Day(DateTime? value) => value is { } date ? DateTime.SpecifyKind(date.Date, DateTimeKind.Utc) : null;

@@ -1680,14 +1680,30 @@ internal static class ApiSmoke
             var metadata = root.GetProperty("metadata");
             Assert(movie.IsSuccessStatusCode && metadata.GetProperty("title").GetString() == "Browse Movie" &&
                 metadata.GetProperty("runtimeMinutes").GetInt32() == 101 && metadata.GetProperty("communityRating").GetDouble() == 7.25 &&
-                metadata.GetProperty("popularity").GetDouble() == 33.5 && metadata.GetProperty("certifications")[0].GetProperty("rating").GetString() == "R" &&
+                metadata.GetProperty("voteCount").GetInt32() == 12 && metadata.GetProperty("certifications")[0].GetProperty("rating").GetString() == "R" &&
                 metadata.GetProperty("cast").GetArrayLength() == 2 && metadata.GetProperty("cast")[0].GetProperty("character").GetString() == "Hero" &&
                 root.GetProperty("crew").EnumerateArray().Select(person => person.GetProperty("name").GetString()).SequenceEqual(["A Director", "A Writer"]) &&
                 root.GetProperty("creators").GetArrayLength() == 0 && !root.TryGetProperty("episodes", out _),
-                "Discover/Title reads a movie with its rating, certification, popularity, cast and the crew Jellyfin keeps: " + body);
+                "Discover/Title reads a movie with its rating, votes, certification, cast and the crew Jellyfin keeps: " + body);
             Assert(http.Requests.Count == 1 && http.Requests.Single() == "/3/movie/88500?append_to_response=external_ids,release_dates,credits",
                 "A movie's page is one TMDB request: " + string.Join(" | ", http.Requests));
         }
+
+        // D253: the search page orders by TMDB's votes; a search result carries them from its details, with a title of none left out.
+        const string NoVotes = """{"id":88540,"title":"Browse Unvoted","vote_count":0}""";
+        var titles = http.Response;
+        http.Response = uri => uri.AbsolutePath == "/3/search/movie" ? Json("""{"results":[{"id":88500,"title":"Browse Movie"},{"id":88540,"title":"Browse Unvoted"}],"total_pages":1}""")
+            : uri.AbsolutePath == "/3/movie/88540" ? Json(NoVotes) : titles!(uri);
+        using (var found = await client.GetAsync("/JellyfinMod/Discover/Search?q=browse&type=movie"))
+        {
+            var body = await found.Content.ReadAsStringAsync();
+            using var json = JsonDocument.Parse(body);
+            var items = json.RootElement.GetProperty("items").EnumerateArray().ToArray();
+            Assert(found.IsSuccessStatusCode && items.Length == 2 && items[0].GetProperty("voteCount").GetInt32() == 12 &&
+                (!items[1].TryGetProperty("voteCount", out var none) || none.ValueKind == JsonValueKind.Null) && !body.Contains("popularity", StringComparison.Ordinal),
+                "Discover/Search carries each title's votes, none for a title without any, and no longer popularity: " + body);
+        }
+        http.Response = titles;
 
         http.Requests.Clear();
         using (var series = await client.GetAsync("/JellyfinMod/Discover/Title?type=series&tmdbId=88510"))
