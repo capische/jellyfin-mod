@@ -15,7 +15,7 @@ namespace JellyfinMod.Services.Placeholders;
 /// note back on a placeholder's overview after a metadata refresh replaced it (<see cref="PlaceholderItems.Note"/>, P1.FU31),
 /// or takes it off any other item. Done off Jellyfin's event thread.
 /// </summary>
-public sealed class PlaceholderItemListener(ILibraryManager library,
+public sealed class PlaceholderItemListener(ILibraryManager library, ReconciliationLibraryLock libraryLock,
     ILogger<PlaceholderItemListener> logger, IUserDataManager? userData = null, IUserManager? users = null) : IHostedService
 {
     private readonly Channel<Guid> queue = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions { SingleReader = true });
@@ -124,8 +124,12 @@ public sealed class PlaceholderItemListener(ILibraryManager library,
                         }
 
                         // Saving fires this listener again, which then finds the overview right and queues nothing.
-                        if (PlaceholderItems.ApplyNote(item))
-                            await item.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+                        if (PlaceholderItems.NoteChange(item, out _))
+                            await UnderLibraryLeaseAsync(id, async current =>
+                            {
+                                if (PlaceholderItems.ApplyNote(current))
+                                    await current.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+                            }, cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
                     {
@@ -136,6 +140,27 @@ public sealed class PlaceholderItemListener(ILibraryManager library,
         }
         catch (OperationCanceledException)
         {
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="save"/> on the item read afresh, holding the lease of every library it is in: a removal holds that lease
+    /// while it deletes the item, so a save either lands before the delete or finds the item gone, and never brings a removed title's
+    /// item back (tm2.u2).
+    /// </summary>
+    private async Task UnderLibraryLeaseAsync(Guid id, Func<BaseItem, Task> save, CancellationToken cancellationToken)
+    {
+        if (library.GetItemById(id) is not { } item) return;
+        var leases = new List<IAsyncDisposable>();
+        try
+        {
+            foreach (var libraryId in library.GetCollectionFolders(item).Select(folder => folder.Id).Distinct().Order())
+                leases.Add(await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false));
+            if (leases.Count > 0 && library.GetItemById(id) is { } current) await save(current).ConfigureAwait(false);
+        }
+        finally
+        {
+            for (var index = leases.Count - 1; index >= 0; index--) await leases[index].DisposeAsync().ConfigureAwait(false);
         }
     }
 }
