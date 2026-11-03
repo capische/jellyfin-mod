@@ -1331,6 +1331,7 @@ internal static class ApiSmoke
         await VerifyEpisodeConflictsAsync(client, dbPath, user, otherUser, tvLibrary, nativeById);
         await VerifyReclaimedVisibilityAsync(client, dbPath, user, libraryFolder.Id);
         await VerifyDiscoveryBudgetAsync(client, http, user);
+        await VerifyDiscoverTitleAsync(client, http, user, dbPath);
         await VerifyContractHygieneAsync(client, dbPath, user, libraryFolder.Id, tvLibrary.Id);
         await VerifyBoundCopyPreferenceAsync(client, dbPath, libraryFolder, secondLibrary, raceLibrary, nativeById);
         // P1.FU24 (user, 2026-10-15: "should be enabled by default"): every TV library lists its placeholder switch on, with no
@@ -1622,6 +1623,128 @@ internal static class ApiSmoke
         }
 
         http.BeforeResponse = null;
+        http.Response = null;
+    }
+
+    /// <summary>
+    /// TM2: the browse page's read of a TMDB title over real HTTP. A movie brings its cast, crew and certification in one
+    /// request; a series its creators and seasons, and with a season that season's episodes with guest stars, crew and ratings;
+    /// the search's access rules apply and nothing is stored.
+    /// </summary>
+    private static async Task VerifyDiscoverTitleAsync(HttpClient client, BoundaryHttpFactory http, User user, string dbPath)
+    {
+        client.DefaultRequestHeaders.Remove("X-Smoke-Role");
+        const string Movie = """
+            {"id":88500,"title":"Browse Movie","overview":"A movie.","release_date":"2021-03-04","runtime":101,"poster_path":"/m.jpg",
+             "backdrop_path":"/b.jpg","vote_average":7.25,"vote_count":12,"popularity":33.5,"genres":[{"name":"Crime"}],
+             "release_dates":{"results":[{"iso_3166_1":"US","release_dates":[{"certification":"R"}]}]},
+             "credits":{"cast":[{"id":1,"name":"Lead One","character":"Hero","order":0,"profile_path":"/1.jpg"},{"id":2,"name":"Lead Two","character":"Foe","order":1}],
+                        "crew":[{"id":3,"name":"A Director","department":"Directing","job":"Director"},{"id":4,"name":"A Writer","department":"Writing","job":"Writer"},{"id":5,"name":"An Editor","department":"Editing","job":"Editor"}]}}
+            """;
+        const string Series = """
+            {"id":88510,"name":"Browse Show","overview":"A show.","first_air_date":"2020-01-02","poster_path":"/s.jpg","vote_average":8.5,"popularity":99.5,
+             "genres":[{"name":"Drama"}],"created_by":[{"name":"A Creator"},{"name":" "}],
+             "content_ratings":{"results":[{"iso_3166_1":"US","rating":"TV-MA"}]},
+             "seasons":[{"season_number":0,"name":"Specials","episode_count":1},{"season_number":1,"name":"Season 1","episode_count":2,"air_date":"2020-01-02","poster_path":"/s1.jpg","overview":"First."}],
+             "credits":{"cast":[{"id":6,"name":"Regular","character":"Lead","order":0}],"crew":[]}}
+            """;
+        const string Season = """
+            {"season_number":1,"episodes":[
+             {"id":88511,"season_number":1,"episode_number":1,"name":"Pilot","overview":"One.","air_date":"2020-01-02","runtime":50,"still_path":"/e1.jpg","vote_average":7.5,
+              "guest_stars":[{"id":7,"name":"Guest","character":"Visitor","order":0}],"crew":[{"id":8,"name":"Ep Director","department":"Directing","job":"Director"}]},
+             {"id":88512,"season_number":1,"episode_number":2,"name":"Second","air_date":"2020-01-09","vote_average":0,"guest_stars":[],"crew":[]}]}
+            """;
+        const string Adult = """{"id":88520,"title":"Adult Movie","adult":true}""";
+        http.Status = HttpStatusCode.OK;
+        http.Requests.Clear();
+        http.Response = uri =>
+        {
+            var path = uri.AbsolutePath;
+            if (path == "/3/movie/88500") return Json(Movie);
+            if (path == "/3/tv/88510") return Json(Series);
+            if (path == "/3/tv/88510/season/1") return Json(Season);
+            if (path == "/3/movie/88520") return Json(Adult);
+            if (path == "/3/movie/88530") return new HttpResponseMessage(HttpStatusCode.InternalServerError);
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        };
+        await using var counted = new ModDbContext(dbPath);
+        var entriesBefore = await counted.Entries.CountAsync();
+
+        foreach (var bad in new[] { "type=book&tmdbId=1", "type=movie&tmdbId=0", "type=series&tmdbId=88510&season=-1", "type=movie&tmdbId=88500&season=1" })
+            Assert((await client.GetAsync("/JellyfinMod/Discover/Title?" + bad)).StatusCode == HttpStatusCode.BadRequest, "Discover/Title refuses " + bad);
+        Assert(http.Requests.IsEmpty, "A refused Discover/Title asks TMDB nothing");
+
+        using (var movie = await client.GetAsync("/JellyfinMod/Discover/Title?type=movie&tmdbId=88500"))
+        {
+            var body = await movie.Content.ReadAsStringAsync();
+            using var json = JsonDocument.Parse(body);
+            var root = json.RootElement;
+            var metadata = root.GetProperty("metadata");
+            Assert(movie.IsSuccessStatusCode && metadata.GetProperty("title").GetString() == "Browse Movie" &&
+                metadata.GetProperty("runtimeMinutes").GetInt32() == 101 && metadata.GetProperty("communityRating").GetDouble() == 7.25 &&
+                metadata.GetProperty("popularity").GetDouble() == 33.5 && metadata.GetProperty("certifications")[0].GetProperty("rating").GetString() == "R" &&
+                metadata.GetProperty("cast").GetArrayLength() == 2 && metadata.GetProperty("cast")[0].GetProperty("character").GetString() == "Hero" &&
+                root.GetProperty("crew").EnumerateArray().Select(person => person.GetProperty("name").GetString()).SequenceEqual(["A Director", "A Writer"]) &&
+                root.GetProperty("creators").GetArrayLength() == 0 && !root.TryGetProperty("episodes", out _),
+                "Discover/Title reads a movie with its rating, certification, popularity, cast and the crew Jellyfin keeps: " + body);
+            Assert(http.Requests.Count == 1 && http.Requests.Single() == "/3/movie/88500?append_to_response=external_ids,release_dates,credits",
+                "A movie's page is one TMDB request: " + string.Join(" | ", http.Requests));
+        }
+
+        http.Requests.Clear();
+        using (var series = await client.GetAsync("/JellyfinMod/Discover/Title?type=series&tmdbId=88510"))
+        {
+            var body = await series.Content.ReadAsStringAsync();
+            using var json = JsonDocument.Parse(body);
+            var root = json.RootElement;
+            Assert(series.IsSuccessStatusCode && root.GetProperty("creators").EnumerateArray().Select(name => name.GetString()).SequenceEqual(["A Creator"]) &&
+                root.GetProperty("metadata").GetProperty("seasons").GetArrayLength() == 2 && root.GetProperty("metadata").GetProperty("cast").GetArrayLength() == 1 &&
+                !root.TryGetProperty("episodes", out _) && http.Requests.Count == 1,
+                "Discover/Title reads a series with its creators, seasons and cast, without its episodes, in one request: " + body);
+        }
+
+        using (var season = await client.GetAsync("/JellyfinMod/Discover/Title?type=series&tmdbId=88510&season=1"))
+        {
+            var body = await season.Content.ReadAsStringAsync();
+            using var json = JsonDocument.Parse(body);
+            var root = json.RootElement;
+            var episodes = root.GetProperty("episodes").EnumerateArray().OrderBy(episode => episode.GetProperty("episodeNumber").GetInt32()).ToArray();
+            var credits = episodes[0].GetProperty("credits");
+            Assert(season.IsSuccessStatusCode && episodes.Length == 2 && episodes[0].GetProperty("title").GetString() == "Pilot" &&
+                credits.GetProperty("guestStars")[0].GetProperty("name").GetString() == "Guest" &&
+                credits.GetProperty("crew")[0].GetProperty("name").GetString() == "Ep Director" &&
+                root.GetProperty("metadata").GetProperty("episodeRatings").GetProperty("88511").GetDouble() == 7.5,
+                "Discover/Title reads a season's episodes with guest stars, crew and ratings: " + body);
+        }
+
+        Assert((await client.GetAsync("/JellyfinMod/Discover/Title?type=series&tmdbId=88510&season=9")).StatusCode == HttpStatusCode.NotFound,
+            "A season the series does not have is not found");
+        Assert((await client.GetAsync("/JellyfinMod/Discover/Title?type=movie&tmdbId=88599")).StatusCode == HttpStatusCode.NotFound,
+            "A title TMDB does not know is not found");
+        Assert((await client.GetAsync("/JellyfinMod/Discover/Title?type=movie&tmdbId=88520")).StatusCode == HttpStatusCode.NotFound,
+            "An adult title is not found, as in the search");
+        Assert((int)(await client.GetAsync("/JellyfinMod/Discover/Title?type=movie&tmdbId=88530")).StatusCode >= 500,
+            "A failing TMDB answers an error, not an empty page");
+
+        http.Requests.Clear();
+        user.SetPreference(PreferenceKind.AllowedTags, ["kids"]);
+        Assert((await client.GetAsync("/JellyfinMod/Discover/Title?type=movie&tmdbId=88500")).StatusCode == HttpStatusCode.NotFound && http.Requests.IsEmpty,
+            "A user who reads only tagged titles gets nothing and asks TMDB nothing, as in the search");
+        user.SetPreference(PreferenceKind.AllowedTags, []);
+        var maxScore = user.MaxParentalRatingScore;
+        user.MaxParentalRatingScore = 1;
+        Assert((await client.GetAsync("/JellyfinMod/Discover/Title?type=movie&tmdbId=88500")).StatusCode == HttpStatusCode.NotFound,
+            "A title above the user's parental rating is not found, as in the search");
+        user.MaxParentalRatingScore = maxScore;
+
+        using (var health = await client.GetAsync("/JellyfinMod/Health"))
+            Assert((await health.Content.ReadAsStringAsync()).Contains("\"discover.title\"", StringComparison.Ordinal), "Health advertises discover.title");
+        using (var anonymous = new HttpClient { BaseAddress = client.BaseAddress, Timeout = TimeSpan.FromSeconds(60) })
+            Assert((await anonymous.GetAsync("/JellyfinMod/Discover/Title?type=movie&tmdbId=88500")).StatusCode == HttpStatusCode.Unauthorized,
+                "An anonymous Discover/Title is rejected");
+        Assert(await counted.Entries.CountAsync() == entriesBefore, "Reading a TMDB title stores nothing");
+
+        http.Requests.Clear();
         http.Response = null;
     }
 
