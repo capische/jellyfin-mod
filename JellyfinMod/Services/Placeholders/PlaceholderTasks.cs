@@ -16,7 +16,7 @@ namespace JellyfinMod.Services.Placeholders;
 /// Also refreshes Jellyfin's cached user data of an item that took a placeholder's place, or a placeholder that took a file's
 /// place, once its first refresh has re-attached the data (<see cref="PlaceholderUserData"/>, P1.FU25 follow-up).
 /// </summary>
-public sealed class PlaceholderItemListener(ILibraryManager library, IServiceScopeFactory scopeFactory,
+public sealed class PlaceholderItemListener(ILibraryManager library, IServiceScopeFactory scopeFactory, ReconciliationLibraryLock libraryLock,
     ILogger<PlaceholderItemListener> logger, IUserDataManager? userData = null, IUserManager? users = null) : IHostedService
 {
     private readonly Channel<Guid> queue = Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions { SingleReader = true });
@@ -113,9 +113,10 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
                     try
                     {
                         if (library.GetItemById(id) is not { } item) continue;
-                        await service.StampAsync(item, cancellationToken).ConfigureAwait(false);
+                        if (item is Video { IsPlaceHolder: true } && PlaceholderStub.HasStubExtension(item.Path))
+                            await UnderLibraryLeaseAsync(id, current => service.StampAsync(current, cancellationToken), cancellationToken).ConfigureAwait(false);
                         // The first refresh has re-attached the user data by now (the pause above): put it in Jellyfin's cache.
-                        if (item.DateLastRefreshed != DateTime.MinValue && fresh.TryRemove(id, out _) && userData is not null && users is not null)
+                        if (library.GetItemById(id) is not null && item.DateLastRefreshed != DateTime.MinValue && fresh.TryRemove(id, out _) && userData is not null && users is not null)
                             PlaceholderUserData.Resave(userData, users, item, logger);
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
@@ -127,6 +128,27 @@ public sealed class PlaceholderItemListener(ILibraryManager library, IServiceSco
         }
         catch (OperationCanceledException)
         {
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="save"/> on the item read afresh, holding the lease of every library it is in: a removal holds that lease
+    /// while it deletes the item, so a save either lands before the delete or finds the item gone, and never brings a removed title's
+    /// item back (tm2.u2).
+    /// </summary>
+    private async Task UnderLibraryLeaseAsync(Guid id, Func<BaseItem, Task> save, CancellationToken cancellationToken)
+    {
+        if (library.GetItemById(id) is not { } item) return;
+        var leases = new List<IAsyncDisposable>();
+        try
+        {
+            foreach (var libraryId in library.GetCollectionFolders(item).Select(folder => folder.Id).Distinct().Order())
+                leases.Add(await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false));
+            if (leases.Count > 0 && library.GetItemById(id) is { } current) await save(current).ConfigureAwait(false);
+        }
+        finally
+        {
+            for (var index = leases.Count - 1; index >= 0; index--) await leases[index].DisposeAsync().ConfigureAwait(false);
         }
     }
 }

@@ -652,30 +652,6 @@ public sealed class PlaceholderService(
     }
 
     /// <summary>
-    /// Removes the Jellyfin item of a title with no entry and nothing behind it (<see cref="PlaceholderStub.HoldsNothing"/>), which is
-    /// what Jellyfin's metadata refresh leaves when it saves an item back after the title was removed (tm2.u1). It does what the next
-    /// scan would do, sooner: no file is touched, and it needs the library's folder to be there, so a disk that is away changes nothing.
-    /// </summary>
-    public async Task DropEmptyTitleAsync(Guid itemId, CancellationToken cancellationToken)
-    {
-        if (library.GetItemById(itemId) is not { } item || !PlaceholderStub.HoldsNothing(item)) return;
-        foreach (var folder in library.GetCollectionFolders(item).OfType<CollectionFolder>())
-        {
-            await using var lease = await libraryLock.AcquireAsync(folder.Id, cancellationToken).ConfigureAwait(false);
-            // Afresh under the lease: Add again writes the stub back under it.
-            if (library.GetItemById(itemId) is not { } current || !PlaceholderStub.HoldsNothing(current)) return;
-            var path = current.Path;
-            if (!SeriesFolders.LibraryRoots(library, files, folder.Id).Any(root => path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))) continue;
-            var mediaType = current is Movie ? "movie" : "series";
-            var tmdbId = current.ProviderIds.GetValueOrDefault("Tmdb");
-            var entries = await database.Entries.AsNoTracking().Where(entry => entry.TargetLibraryId == folder.Id && entry.MediaType == mediaType)
-                .Select(entry => entry.TmdbId).ToListAsync(cancellationToken).ConfigureAwait(false);
-            if (entries.Any(id => id.ToString(System.Globalization.CultureInfo.InvariantCulture) == tmdbId)) continue;
-            DropItems(folder.Id, current is Movie ? [path] : [], current is Movie ? [] : [path]);
-        }
-    }
-
-    /// <summary>
     /// The retention half for a movie (P1.FU26): after a reclaim unlinked the movie's last file <paramref name="mediaPath"/> and
     /// recorded it, writes the movie's stub in that same folder (named after the folder), so the movie stays a Jellyfin item with
     /// its user data re-attached by key. Only in a movie library with placeholders on, in a folder inside one of its folders

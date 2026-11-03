@@ -807,8 +807,8 @@ public sealed class ReconciliationService(
         var created = entry is null;
         // A series made only of the plugin's placeholders whose entry is gone (removed from the catalog while Jellyfin still lists
         // its placeholders for a moment): it is not a title the library holds, so it is never backfilled as one (P1.FU26).
-        // Nor is a stub whose file is gone or a series whose folder is gone: what Jellyfin's refresh saves back after a title was
-        // removed from the catalog (tm2.u1). A real file found later is a new item, and this does not stop it.
+        // Nor is a stub whose file is gone or a series whose folder is gone: a removed title's leftover must not become an entry
+        // (tm2.u1). This only declines to create: real media on a disk that is away is found when it returns.
         if (entry is null && snapshot.HoldsNothing &&
             !snapshot.Representations.Any(representation => snapshot.HasPlayableEpisode(representation.JellyfinItemId)))
             return new(ReconciliationOutcome.Unchanged, null, 0, "Nothing behind the item; not backfilled.");

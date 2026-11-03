@@ -90,9 +90,9 @@ public static class PlaceholderStub
     }
 
     /// <summary>
-    /// Whether an item Jellyfin holds has nothing behind it: a media stub whose file is gone, or a series whose folder is gone. An
-    /// item of a removed title is like this when Jellyfin's metadata refresh, running as the title was removed, saves it back
-    /// (tm2.u1). Real media never counts: a video that is no stub is not asked about.
+    /// Whether an item Jellyfin holds has nothing behind it: a media stub whose file is gone, or a series whose folder is gone. It may
+    /// be a removed title's leftover or real media on a disk that is away, so it only ever stops a new entry being made from the item
+    /// (tm2.u1); it is never a reason to delete anything (tm2.u2). Real media returns with its disk.
     /// </summary>
     public static bool HoldsNothing(MediaBrowser.Controller.Entities.BaseItem? item) => item switch
     {
