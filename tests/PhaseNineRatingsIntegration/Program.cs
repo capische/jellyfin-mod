@@ -184,7 +184,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     var series = new Series { Id = Guid.NewGuid(), Name = "JellyfinMod Ratings Native Series", CommunityRating = 8.082f, CriticRating = 100,
         DateLastRefreshed = DateTime.UtcNow.AddDays(-1) };
     var lonelyMovie = new Movie { Id = Guid.NewGuid(), Name = "JellyfinMod Ratings Native Movie", CommunityRating = 6.5f, CriticRating = 40,
-        DateLastRefreshed = DateTime.UtcNow.AddDays(-1) };
+        DateLastRefreshed = DateTime.UtcNow.AddDays(-30) };
     var episode = new MediaBrowser.Controller.Entities.TV.Episode { Id = Guid.NewGuid(), Name = "Episode", SeriesId = series.Id, CommunityRating = 9f };
     var hiddenMovie = new Movie { Id = Guid.NewGuid(), Name = "JellyfinMod Ratings Hidden", CommunityRating = 5f };
     var items = new Dictionary<Guid, BaseItem> { [series.Id] = series, [lonelyMovie.Id] = lonelyMovie, [episode.Id] = episode, [hiddenMovie.Id] = hiddenMovie };
@@ -341,7 +341,7 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         "A native series page reads its entry's ratings and the host's");
     item = await Get(viewer, $"JellyfinMod/Ratings/Items/{lonelyMovie.Id}");
     Assert(item.Body.GetProperty("ratings").EnumerateArray().All(rating => !rating.GetProperty("stale").GetBoolean()),
-        "The host's values refreshed a day ago are current");
+        "Without an MDBList key, the host's values refreshed thirty days ago are still current");
     Assert(item.Status == HttpStatusCode.OK && item.Body.GetProperty("entryId").ValueKind == JsonValueKind.Null &&
         BySource(item.Body.GetProperty("ratings"))["tomatoes_critic"].GetProperty("value").GetDouble() == 40,
         "A native movie with no catalog entry still shows what the host stored");
@@ -475,8 +475,11 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     time.Offset = TimeSpan.FromDays(15);
     Assert((await EntryRatings(admin, movieA))["imdb"].GetProperty("stale").GetBoolean(), "A value older than the refresh window is marked stale, never presented as current");
     var lonely = BySource((await Get(viewer, $"JellyfinMod/Ratings/Items/{lonelyMovie.Id}")).Body.GetProperty("ratings"));
-    Assert(lonely["tomatoes_critic"].GetProperty("stale").GetBoolean() && lonely["tmdb"].GetProperty("stale").GetBoolean(),
-        "The host's values are marked stale too once its last metadata refresh is older than the window (review 2026-10-07, P3 8)");
+    Assert(lonely["tomatoes_critic"].GetProperty("provider").GetString() == "host_omdb" &&
+        lonely["tmdb"].GetProperty("provider").GetString() == "host_tmdb" &&
+        lonely.Values.All(rating => !rating.GetProperty("stale").GetBoolean() &&
+            time.GetUtcNow().UtcDateTime - rating.GetProperty("fetchedAt").GetDateTime() > TimeSpan.FromDays(14)),
+        "Host OMDb and TMDB values older than the refresh window stay current with Jellyfin's metadata");
     await Run();
     Assert(boundary.Calls.Count == callsBefore + 9 && boundary.Calls.Skip(callsBefore).Distinct().Count() == 9 &&
         !(await EntryRatings(admin, movieA))["imdb"].GetProperty("stale").GetBoolean(),

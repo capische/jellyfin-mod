@@ -100,10 +100,9 @@ public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, 
             candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, row.Votes, row.Provider, at, now - at > window));
         }
 
-        // The host's values are as old as the item's last metadata refresh, and are marked stale by the same window
-        // (review 2026-10-07, P3 8).
+        // Host values are current with Jellyfin's metadata; only fetched provider values use our refresh window.
         foreach (var row in hosted)
-            candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, null, row.Provider, row.FetchedAt, now - row.FetchedAt > window));
+            candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, null, row.Provider, row.FetchedAt, false));
         var result = new List<RatingDto>();
         foreach (var source in RatingSources.Known)
         {
