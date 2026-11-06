@@ -2166,6 +2166,10 @@ namespace JellyfinMod.Data.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("Url")
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
                     b.Property<double>("Value")
                         .HasColumnType("REAL");
 

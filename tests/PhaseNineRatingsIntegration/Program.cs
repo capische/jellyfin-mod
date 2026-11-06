@@ -20,7 +20,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 // Phase 9 ratings (R2-R5, the R8 suite): a real Kestrel plugin host with authentication, authorization, MVC serialization,
-// EF migrations and SQLite, against a real HTTP boundary that answers as MDBList and as TMDB. Simulated host services:
+// EF migrations and SQLite, against a real HTTP boundary that answers as MDBList, Wikidata and TMDB. Simulated host services:
 // Jellyfin's users, library roots and item store (DispatchProxy stubs), as in every plugin suite; nothing calls a third party.
 var stopwatch = Stopwatch.StartNew();
 var folder = Path.Combine(Path.GetTempPath(), "jfmod-phase-nine-ratings-" + Guid.NewGuid().ToString("N"));
@@ -29,6 +29,7 @@ var logs = new CapturingLoggerProvider();
 try
 {
     await MigrationAsync(folder);
+    await RatingLinksIntegration.RunAsync(folder, logs);
     await RunAsync(folder, logs);
     await AutomaticAsync(folder, logs);
     Console.WriteLine($"PASS: Phase 9 ratings — migration, settings, secret, Test, fetcher, budget, breaker, claims, projection, access, automatic fetching ({stopwatch.Elapsed.TotalSeconds:F1}s)");
@@ -63,8 +64,8 @@ static async Task MigrationAsync(string folder)
         var fetchUnique = await database.Database.SqlQueryRaw<string>(
             "SELECT name AS Value FROM pragma_index_list('RatingsFetches') WHERE \"unique\" = 1").ToListAsync();
         Assert(fetchUnique.Contains("IX_RatingsFetches_MediaType_TmdbId"), "One attempt per title identity keeps the attempt log bounded");
-        Assert(!(await ColumnsAsync(database, "TitleRatings")).Contains("Url") && !(await ColumnsAsync(database, "RatingsFetches")).Contains("EntryId"),
-            "No provider link is stored, and an attempt belongs to the title, not to an entry (review 2026-10-07 round 2, P1 and P2 5)");
+        Assert((await ColumnsAsync(database, "TitleRatings")).Contains("Url") && !(await ColumnsAsync(database, "RatingsFetches")).Contains("EntryId"),
+            "D277 adds the nullable title link; an attempt still belongs to the title, not to an entry");
         Assert((await database.Database.SqlQueryRaw<string>("SELECT integrity_check AS Value FROM pragma_integrity_check").ToListAsync())
             .SequenceEqual(["ok"]), "The migrated database passes its integrity check");
         Assert(!(await database.Database.GetPendingMigrationsAsync()).Any(), "No migration is left pending");
@@ -92,21 +93,21 @@ static async Task MigrationAsync(string folder)
         await database.Database.MigrateAsync();
         var attempts = await database.RatingsFetches.AsNoTracking().OrderBy(row => row.TmdbId).ToListAsync();
         Assert(attempts.Count == 2 && attempts[0].TmdbId == 7001 && attempts[0].Outcome == "interrupted" && attempts[1].Outcome == "not_found" &&
-            (await database.TitleRatings.AsNoTracking().SingleAsync()).Value == 8.1 && !(await ColumnsAsync(database, "TitleRatings")).Contains("Url"),
-            "From the first Phase 9 shape each title keeps its latest attempt, ratings stay, and stored links are gone",
+            (await database.TitleRatings.AsNoTracking().SingleAsync()).Value == 8.1 && (await database.TitleRatings.AsNoTracking().SingleAsync()).Url == null,
+            "From the first Phase 9 shape each title keeps its latest attempt, ratings stay, and unsafe links are gone and the new Url column is empty",
             attempts.Select(row => new { row.TmdbId, row.Outcome }));
         Assert((await database.Database.SqlQueryRaw<string>("SELECT integrity_check AS Value FROM pragma_integrity_check").ToListAsync())
             .SequenceEqual(["ok"]) && (await database.Database.SqlQueryRaw<string>("SELECT 'x' AS Value FROM pragma_foreign_key_check").ToListAsync()).Count == 0,
             "The converted database passes integrity and foreign-key checks");
     }
 
-    // User decision 9 (2026-10-08): a server still on decision 6's default list takes the new one; an administrator's own list stays.
+    // D274: a server still on the previous default takes TMDB too; an administrator's own list stays.
     // "untouched" has revision 3: other ratings settings (the key, the budget) were saved, the sources never changed; every Save of
     // the settings area sends the list as shown, so only the list itself tells a choice apart. "reordered" is decision 6's five in
     // another order, and "trimmed" decision 6's list without TMDB in another order: both are choices.
     foreach (var (name, before, after) in new[]
     {
-        ("untouched", RatingsSettings.FirstDefaultSourcesJson, RatingsSettings.DefaultSourcesJson),
+        ("untouched", "[\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"trakt\"]", RatingsSettings.DefaultSourcesJson),
         ("chosen", "[\"letterboxd\",\"imdb\",\"tmdb\"]", "[\"letterboxd\",\"imdb\",\"tmdb\"]"),
         ("reordered", "[\"trakt\",\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"tmdb\"]", "[\"trakt\",\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"tmdb\"]"),
         ("trimmed", "[\"imdb\",\"trakt\",\"tomatoes_critic\"]", "[\"imdb\",\"trakt\",\"tomatoes_critic\"]")
@@ -114,15 +115,28 @@ static async Task MigrationAsync(string folder)
     {
         var path = Path.Combine(folder, $"display-defaults-{name}.db");
         await using var database = new ModDbContext(path);
-        await database.GetService<IMigrator>().MigrateAsync("20261007073736_PhaseNineRatingsIdentity");
+        await database.GetService<IMigrator>().MigrateAsync("20261029054257_TraktActivity");
         await database.Database.ExecuteSqlInterpolatedAsync($"""
             INSERT INTO RatingsSettings (Id, Enabled, ApiKeyRef, RefreshDays, DailyBudget, DefaultSources, Revision, VerifiedRevision, VerifiedAt)
             VALUES ({RatingsSettings.SingletonId}, 1, NULL, 14, 500, {before}, 3, NULL, NULL)
             """);
+        var existingEntry = Guid.NewGuid();
+        await database.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO Entries (Id, MediaType, TmdbId, Title, State, Monitored, AddedAt, TargetLibraryId, RetentionPolicy)
+            VALUES ({existingEntry}, 'movie', 1, 'Existing', 4, 1, '2026-09-01T00:00:00', {Guid.NewGuid()}, 0)
+            """);
+        await database.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO TitleRatings (Id, EntryId, Source, Provider, Value, Scale, Votes, FetchedAt)
+            VALUES ({Guid.NewGuid()}, {existingEntry}, 'tomatoes_critic', 'mdblist', 91, 'percent', 310, '2026-10-01 00:00:00')
+            """);
+        Assert(!(await ColumnsAsync(database, "TitleRatings")).Contains("Url"), "The pre-D277 database has existing ratings and no Url column");
         await database.Database.MigrateAsync();
+        var existingRating = await database.TitleRatings.AsNoTracking().SingleAsync();
+        Assert(existingRating.Value == 91 && existingRating.Votes == 310 && existingRating.Url == null,
+            "RatingLinks adds a nullable Url without losing existing scores or votes");
         var kept = (await database.RatingsSettings.AsNoTracking().SingleAsync()).DefaultSources;
         Assert(kept == after, name == "untouched"
-            ? "A server whose default sources were never changed takes the new defaults in migration PhaseNineRatingsDisplayDefaults (user decision 9)"
+            ? "A server whose default sources were never changed takes the new defaults in migration RatingLinks (D274)"
             : $"An administrator's own source list ({name}) is kept by that migration", kept);
     }
 
@@ -288,15 +302,15 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert(new[] { "ratings", "ratings.cards", "settings.ratings" }.All(name =>
         health.GetProperty("Capabilities").EnumerateArray().Any(value => value.GetString() == name)), "Health lists ratings, ratings.cards and settings.ratings");
 
-    // ---- Defaults (decisions 5 and 9): on, no key, 14 days, 500 a day, IMDb, RT critics, RT audience, Trakt (TMDB and the rest off).
+    // ---- Defaults (D274): on, no key, 14 days, 500 a day, IMDb, RT critics, RT audience, TMDB, Trakt.
     var settings = await Settings();
     Assert(settings.GetProperty("enabled").GetBoolean() && !settings.GetProperty("apiKeyConfigured").GetBoolean() &&
         settings.GetProperty("refreshDays").GetInt32() == 14 && settings.GetProperty("dailyBudget").GetInt32() == 500 &&
-        string.Join(",", settings.GetProperty("defaultSources").EnumerateArray().Select(value => value.GetString())) == "imdb,tomatoes_critic,tomatoes_audience,trakt" &&
+        string.Join(",", settings.GetProperty("defaultSources").EnumerateArray().Select(value => value.GetString())) == "imdb,tomatoes_critic,tomatoes_audience,tmdb,trakt" &&
         settings.GetProperty("availableSources").GetArrayLength() == 9 && !settings.GetProperty("verified").GetBoolean(),
-        "The ratings settings start on, without a key, every 14 days, 500 calls a day, showing IMDb, RT critics, RT audience and Trakt (user decision 9)");
+        "The ratings settings start on, without a key, every 14 days, 500 calls a day, showing IMDb, RT critics, RT audience, TMDB and Trakt (D274)");
     var defaults = (await Get(viewer, "JellyfinMod/Ratings/Defaults")).Body;
-    Assert(defaults.GetProperty("enabled").GetBoolean() && defaults.GetProperty("defaultSources").GetArrayLength() == 4 &&
+    Assert(defaults.GetProperty("enabled").GetBoolean() && defaults.GetProperty("defaultSources").GetArrayLength() == 5 &&
         !defaults.TryGetProperty("apiKeyConfigured", out _), "An ordinary user reads the default order and nothing about the key");
 
     // ---- Disposable titles through the real add path: the TMDB snapshot now carries the vote count (R4).
@@ -432,11 +446,10 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         Assert(await database.TitleRatings.AnyAsync(row => row.Source == "myanimelist" && row.Scale == "unknown") &&
             !await database.TitleRatings.AnyAsync(row => row.Value == 0), "An unknown source is stored raw and hidden; no zero is ever stored");
 
-    // ---- Provider links (review 2026-10-07, P1; round 2, P1): no link is kept or shown at all — a provider-written link can
-    // carry the key in its query, its path, its host name or double-encoded, and nothing in JellyfinMod uses one.
+    // ---- D277 preserves the original secret-leak regression: unsafe links never leave the client.
     var linked = await EntryRatings(viewer, extra[3]);
     Assert(linked["imdb"].GetProperty("value").GetDouble() == 8.1 && linked.Values.All(rating => !rating.TryGetProperty("url", out _)),
-        "A rating carries no provider link, whatever the provider sent; its value is kept", linked.Keys);
+        "Unsafe provider links are dropped while rating values are kept", linked.Keys);
     Assert(bodies.All(body => !body.Contains(Key, StringComparison.Ordinal)), "No answer so far carries the key the provider echoed");
 
     // Within the window nothing is called again.

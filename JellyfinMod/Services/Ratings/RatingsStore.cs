@@ -97,7 +97,8 @@ public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, 
         foreach (var row in stored.Where(row => RatingSources.IsKnown(row.Source) && row.Scale != RatingSources.Unknown))
         {
             var at = DateTime.SpecifyKind(row.FetchedAt, DateTimeKind.Utc);
-            candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, row.Votes, row.Provider, at, now - at > window));
+            candidates.Add(new RatingDto(row.Source, row.Value, row.Scale, row.Votes, row.Provider, at, now - at > window,
+                RatingLinks.Rebuild(row.Source, row.Url)));
         }
 
         // Host values are current with Jellyfin's metadata; only fetched provider values use our refresh window.
