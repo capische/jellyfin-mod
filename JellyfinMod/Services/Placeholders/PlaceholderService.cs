@@ -297,7 +297,8 @@ public sealed class PlaceholderService(
                 }
             }
 
-            var reported = ReportOnce(libraryId, changed, done.Select(write => write.Path));
+            lease ??= await libraryLock.AcquireAsync(libraryId, cancellationToken).ConfigureAwait(false);
+            var reported = await ReportOnceAsync(libraryId, changed, done.Select(write => write.Path), cancellationToken).ConfigureAwait(false);
             await StampAsync(libraryId, cancellationToken).ConfigureAwait(false);
             if (done.Count > 0 || removals.Count > 0)
                 logger.LogInformation("JellyfinMod placeholders in library {Library}: wrote {Written}, removed {Removed}, {Failed} failed, {Pending} left for the next run; asked Jellyfin to look at {Folders} folder(s) once",
@@ -377,28 +378,27 @@ public sealed class PlaceholderService(
     }
 
     /// <summary>
-    /// Asks Jellyfin to look at the folders a run changed, once each and only the outermost (a season folder inside a reported
-    /// series folder is left out): Jellyfin's file monitor waits its library monitor delay, merges folders that sit side by side
-    /// into one look at their parent, and refreshes each item found once. Returns how many folders were reported.
+    /// Discovers the run's changes in one batch under the library lease, and reports only the outermost changed folders to the
+    /// library monitor as a fallback (a season inside a reported series is left out). Returns how many folders were reported.
     /// </summary>
-    private int ReportOnce(Guid libraryId, IEnumerable<string> folders, IEnumerable<string> writtenFiles)
+    private async Task<int> ReportOnceAsync(Guid libraryId, IEnumerable<string> folders, IEnumerable<string> writtenFiles,
+        CancellationToken cancellationToken)
     {
         var sorted = folders.Select(Path.TrimEndingDirectorySeparator).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
         var outermost = new List<string>();
         foreach (var folder in sorted)
             if (!outermost.Any(parent => folder.StartsWith(parent + "/", StringComparison.Ordinal))) outermost.Add(folder);
-        // And at once (P4.FU12): Jellyfin picks the changed folders and the files written in them up now, not after its library
-        // monitor delay (a library folder it holds no item for is made by its discovery); the report below stays as the fallback.
-        // The discovery never faults and nothing here waits for it.
-        // The clients are told once Jellyfin holds them (P4.FU12), at once and not with Jellyfin's own 30 s batch.
-        if (outermost.Count > 0 && discovery is not null)
+        foreach (var folder in outermost) Report(folder);
+        // Complete discovery under the sync's library lease, once for the batch, without watcher events or the monitor delay.
+        // Include the files: a newly created series reports the library root, which discovery alone cannot place as a title.
+        // A running native scan picks up the changes itself; do not start a competing folder validation.
+        if (outermost.Count > 0 && discovery is not null && !ScanRunning())
         {
             var files = writtenFiles.ToArray();
-            _ = discovery.DiscoverAsync(libraryId, outermost.Concat(files).ToArray())
-                .ContinueWith(_ => notifications?.NotifyAdded(libraryId, files, outermost), TaskScheduler.Default);
+            await discovery.DiscoverAsync(libraryId, outermost.Concat(files).ToArray(), cancellationToken).ConfigureAwait(false);
+            notifications?.NotifyAdded(libraryId, files, outermost);
         }
 
-        foreach (var folder in outermost) Report(folder);
         return outermost.Count;
     }
 

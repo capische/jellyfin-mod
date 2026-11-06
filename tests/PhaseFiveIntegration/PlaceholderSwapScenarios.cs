@@ -317,15 +317,46 @@ internal static class PlaceholderSwapScenarios
                 Directory.EnumerateFileSystemEntries(movieFolder).Count() == 1 &&
                 !Directory.EnumerateDirectories(world.Movies.Location, "*tmdbid-653*").Any(),
                 "A sync writes the movie's marked placeholder, alone in its new folder, and nothing for the unreleased movie");
-            var showSync = await placeholders.SyncAsync(world.Tv.Id, default);
+            // No watcher events and no manual scan: the batch must await discovery while still holding its library lease.
+            var autoScan = world.Native.AutoScan;
+            var discovery = world.Native.Discovery;
+            var held = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var showAsked = world.Native.DiscoveryRequests.Count;
+            var discoveryCalls = world.Native.DiscoveryCalls;
+            world.Native.AutoScan = false;
+            world.Native.Discovery = true;
+            world.Native.DiscoveryHold = held.Task;
+            PlaceholderPlan showSync;
+            var syncing = placeholders.SyncEntryAsync(world.Tv.Id, ids["fileless"], default);
+            try
+            {
+                await WaitAsync(() => Task.FromResult<bool?>(world.Native.DiscoveryRequests.Count > showAsked ? true : null),
+                    "The new series batch requests discovery");
+                await using var competing = await host.Service<ReconciliationLibraryLock>().TryAcquireAsync(world.Tv.Id, TimeSpan.FromMilliseconds(20), default);
+                Assert(!syncing.IsCompleted && competing is null && !world.Native.Items.Any(item => item.Path == showFolder),
+                    "Sync waits for discovery under the library lease before the new series exists in Jellyfin");
+            }
+            finally
+            {
+                held.TrySetResult();
+                showSync = await syncing;
+                world.Native.DiscoveryHold = null;
+                world.Native.AutoScan = autoScan;
+                world.Native.Discovery = discovery;
+            }
+
             Assert(PlaceholderStub.IsStubFile(ShowStub(1)) && PlaceholderStub.IsStubFile(ShowStub(2)) && !File.Exists(ShowStub(3)) &&
-                showSync.Writes.Count(write => write.EntryId == ids["fileless"]) == 2,
-                "A series with nothing on disk gets its own folder in the library with a placeholder for each aired episode only: " +
+                showSync.Writes.Count(write => write.EntryId == ids["fileless"]) == 2 &&
+                world.Native.Items.OfType<MediaBrowser.Controller.Entities.TV.Series>().Any(item => item.Path == showFolder) &&
+                new[] { ShowStub(1), ShowStub(2) }.All(path => world.Native.Items.OfType<MediaBrowser.Controller.Entities.TV.Episode>()
+                    .Any(item => item.Path == path && item.IsPlaceHolder)) &&
+                world.Native.DiscoveryRequests.Count == showAsked + 3 && world.Native.DiscoveryCalls == discoveryCalls + 1,
+                "A new series and its aired placeholder episodes become Jellyfin items in one batch without watcher events or a library scan: " +
                 JsonSerializer.Serialize(showSync.Writes.Where(write => write.EntryId == ids["fileless"])));
         }
 
+        await PlaceholderNextUpScenarios.RunAsync(admin, world, ShowStub(1));
         world.Native.Scan(movieFolder);
-        world.Native.Scan(showFolder);
         var stubItem = world.Native.Items.OfType<MediaBrowser.Controller.Entities.Movies.Movie>().Single(item => item.Path == movieStub);
         Assert(stubItem.IsPlaceHolder, "Jellyfin holds the movie's placeholder as a placeholder movie");
         await tick();

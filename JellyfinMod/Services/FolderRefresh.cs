@@ -115,8 +115,9 @@ public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSyste
                 {
                     try
                     {
-                        await DiscoverLibraryAsync(group.Key, group.SelectMany(request => request.Paths).Distinct(StringComparer.Ordinal).ToArray(),
-                            cancellationToken).ConfigureAwait(false);
+                        if (!library.IsScanRunning)
+                            await DiscoverLibraryAsync(group.Key, group.SelectMany(request => request.Paths).Distinct(StringComparer.Ordinal).ToArray(),
+                                cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
                     {

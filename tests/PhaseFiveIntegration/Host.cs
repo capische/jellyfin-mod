@@ -18,6 +18,7 @@ using JellyfinMod.Services.Import;
 using JellyfinMod.Services.Placeholders;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Controller.Configuration;
+using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
@@ -55,15 +56,13 @@ internal sealed class SimulatedDiscovery(NativeWorld world) : IMediaDiscovery
     // The simulated discovery is done when it returns.
     public Task IdleAsync(Guid libraryId) => Task.CompletedTask;
 
-    public Task DiscoverAsync(Guid libraryId, IReadOnlyCollection<string> paths, CancellationToken cancellationToken = default)
+    public async Task DiscoverAsync(Guid libraryId, IReadOnlyCollection<string> paths, CancellationToken cancellationToken = default)
     {
+        Interlocked.Increment(ref world.DiscoveryCalls);
+        foreach (var path in paths) world.DiscoveryRequests.Enqueue(path);
+        if (world.DiscoveryHold is { } hold) await hold.WaitAsync(cancellationToken);
         foreach (var path in paths)
-        {
-            world.DiscoveryRequests.Enqueue(path);
             if (world.Discovery ?? world.AutoScan) world.Scan(path);
-        }
-
-        return Task.CompletedTask;
     }
 }
 
@@ -121,6 +120,10 @@ internal sealed partial class NativeWorld
 
     /// <summary>Whether a discovery request looks at the path: null follows <see cref="AutoScan"/> (the watcher and the discovery act together).</summary>
     public bool? Discovery { get; set; }
+
+    public Task? DiscoveryHold { get; set; }
+
+    public int DiscoveryCalls;
 
     /// <summary>Whether Jellyfin reports a library scan running (<c>ILibraryManager.IsScanRunning</c>; the backfill gives way, P1.FU27).</summary>
     public bool ScanRunning { get; set; }
@@ -595,7 +598,9 @@ internal sealed class PluginHost : IAsyncDisposable
         });
         builder.WebHost.UseKestrel().UseUrls("http://127.0.0.1:0");
         builder.Logging.ClearProviders().AddProvider(logs).SetMinimumLevel(LogLevel.Debug);
-        builder.Services.AddControllers().AddApplicationPart(typeof(QueueController).Assembly).AddJsonOptions(options =>
+        builder.Services.AddControllers(options => options.Filters.AddService<JellyfinMod.Api.Filters.PlaceholderFilter>())
+            .AddApplicationPart(typeof(QueueController).Assembly)
+            .AddApplicationPart(typeof(TvShowsController).Assembly).AddJsonOptions(options =>
         {
             // Match the pinned Jellyfin host's serializer defaults; plugin DTOs name their own properties.
             var defaults = Jellyfin.Extensions.Json.JsonDefaults.PascalCaseOptions;
@@ -628,6 +633,8 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Services.AddSingleton<IHostedService, DeleteRepair>();
         builder.Services.AddSingleton(world.Native.MediaSources);
         builder.Services.AddSingleton(userData);
+        builder.Services.AddSingleton(Stub<IDtoService>.Create((_, _) => null));
+        builder.Services.AddTransient<JellyfinMod.Api.Filters.PlaceholderFilter>();
         builder.Services.AddSingleton(sessions);
         builder.Services.AddSingleton(localization);
         builder.Services.AddTransient(_ => new LibraryAccess(users, world.Native.Library, localization));
