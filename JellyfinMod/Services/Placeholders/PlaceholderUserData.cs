@@ -55,6 +55,59 @@ public static class PlaceholderUserData
         }
     }
 
+    /// <summary>
+    /// Merges every user's data before a version is removed (D279). Read stored rows, but save through the served item so
+    /// Jellyfin's cache is updated too. A failed user never stops another user's copy or the requested removal.
+    /// </summary>
+    public static void CopyTo(IUserDataManager userData, IReadOnlyCollection<Jellyfin.Database.Implementations.Entities.User> users,
+        ILibraryManager library, BaseItem source,
+        BaseItem remaining, bool sameContent, ILogger logger)
+    {
+        foreach (var user in users)
+        {
+            try
+            {
+                var old = userData.GetUserData(user, source)
+                    ?? throw new InvalidOperationException("Jellyfin returned no source user data record.");
+                var served = library.GetItemById(remaining.Id);
+                // RetrieveItem bypasses Jellyfin's item cache and loads this user's current stored rows.
+                var fresh = library.RetrieveItem(remaining.Id)
+                    ?? throw new InvalidOperationException("The survivor is no longer available.");
+                var current = userData.GetUserData(user, fresh)
+                    ?? throw new InvalidOperationException("Jellyfin returned no survivor user data record.");
+                // No timestamp exists for a rating: keep an existing survivor rating rather than replacing it.
+                var position = current.PlaybackPositionTicks;
+                if ((current.LastPlayedDate is null && (old.LastPlayedDate.HasValue || current.PlaybackPositionTicks == 0) ||
+                        old.LastPlayedDate > current.LastPlayedDate) &&
+                    (old.PlaybackPositionTicks == 0 || sameContent ||
+                        fresh.RunTimeTicks is > 0 && old.PlaybackPositionTicks <= fresh.RunTimeTicks))
+                    position = old.PlaybackPositionTicks;
+                var merged = new UserItemData
+                {
+                    Key = current.Key,
+                    Played = old.Played || current.Played,
+                    PlayCount = Math.Max(old.PlayCount, current.PlayCount),
+                    LastPlayedDate = current.LastPlayedDate is null || old.LastPlayedDate > current.LastPlayedDate
+                        ? old.LastPlayedDate : current.LastPlayedDate,
+                    IsFavorite = old.IsFavorite || current.IsFavorite,
+                    Rating = current.Rating ?? old.Rating,
+                    PlaybackPositionTicks = position,
+                    AudioStreamIndex = current.AudioStreamIndex,
+                    SubtitleStreamIndex = current.SubtitleStreamIndex
+                };
+                if (merged.Played == current.Played && merged.PlayCount == current.PlayCount &&
+                    merged.LastPlayedDate == current.LastPlayedDate && merged.IsFavorite == current.IsFavorite &&
+                    merged.Rating == current.Rating && merged.PlaybackPositionTicks == current.PlaybackPositionTicks) continue;
+                SaveQuietly(userData, user, served ?? fresh, merged, CancellationToken.None);
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                logger.LogWarning("JellyfinMod could not keep user data for user {User} from item {OldItem} on {RemainingItem}: {Error}",
+                    user.Id, source.Id, remaining.Id, error.Message);
+            }
+        }
+    }
+
     /// <summary>Whether a new item is one whose user data Jellyfin may re-attach from a removed item: a movie or an episode.</summary>
     public static bool IsCandidate(BaseItem item) => item is Movie or Episode && item.Path is { Length: > 0 };
 

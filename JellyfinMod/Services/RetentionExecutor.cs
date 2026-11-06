@@ -24,7 +24,9 @@ public sealed class RetentionExecutor(
     RetentionLiveCheck liveCheck,
     ILibraryMonitor? libraryMonitor = null,
     LibraryNotifications? notifications = null,
-    MediaBrowser.Controller.Library.IMediaSourceManager? mediaSources = null)
+    MediaBrowser.Controller.Library.IMediaSourceManager? mediaSources = null,
+    IUserDataManager? userData = null,
+    IUserManager? users = null)
 {
     /// <summary>Revalidates and reclaims one binding selected by the shared retention preview.</summary>
     public async Task<RetentionExecutionResult> ReclaimAsync(Guid bindingId, CancellationToken cancellationToken)
@@ -223,6 +225,7 @@ public sealed class RetentionExecutor(
         // Read again under the locks: nothing below may act on a binding another writer changed meanwhile.
         target = await LoadVersionAsync(entryId, bindingId, cancellationToken).ConfigureAwait(false);
         if (target is null) return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
+        await KeepVersionUserDataAsync(target, bindingId).ConfigureAwait(false);
         var (reason, observed) = await CheckRemovableAsync(target, cancellationToken).ConfigureAwait(false);
         if (reason is not null) return RetentionExecutionResult.NotStarted(bindingId, reason);
         var policy = await database.RetentionPolicySnapshots.AsNoTracking()
@@ -299,6 +302,7 @@ public sealed class RetentionExecutor(
             return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.MediaIdentityChanged);
         if (await IdentityUnverifiedAsync(bindingId, cancellationToken).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.IdentityUnverified);
+        await KeepVersionUserDataAsync(target, bindingId).ConfigureAwait(false);
         var (reason, observed) = await CheckRemovableAsync(target, cancellationToken).ConfigureAwait(false);
         if (reason is not null) return RetentionExecutionResult.NotStarted(bindingId, reason);
         if (!await ImportedFilePresentAsync(successorImportId, entryId, episodeId, cancellationToken).ConfigureAwait(false) ||
@@ -668,6 +672,8 @@ public sealed class RetentionExecutor(
                     null, cancellationToken).ConfigureAwait(false);
         }
 
+        foreach (var operation in operations) await KeepVersionUserDataAsync(operation).ConfigureAwait(false);
+
         cancellationToken.ThrowIfCancellationRequested();
         var livePolicy = await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
         if (!livePolicy.Enabled)
@@ -1033,6 +1039,93 @@ public sealed class RetentionExecutor(
         return cleaned;
     }
 
+    /// <summary>Preserves an explicit removal's data before its destructive safeguards run.</summary>
+    private async Task KeepVersionUserDataAsync(RemovableVersion target, Guid bindingId)
+    {
+        try
+        {
+            if (target.Path is null || !files.TryInspect(target.Path, out var observed)) return;
+            await KeepVersionUserDataAsync(new RetentionOperation
+            {
+                BindingId = bindingId, EntryId = target.EntryId, EpisodeId = target.EpisodeId,
+                JellyfinItemId = target.ItemId, MediaPath = observed.CanonicalPath, PhysicalIdentity = observed.PhysicalIdentity
+            }).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogWarning("JellyfinMod could not keep user data before removing item {Item}: {Error}", target.ItemId, error.Message);
+        }
+    }
+
+    /// <summary>Copies to every surviving file of this movie or episode, including the item Jellyfin may promote (D279).</summary>
+    private async Task KeepVersionUserDataAsync(RetentionOperation operation)
+    {
+        try
+        {
+            // A copy bound by number only may be another episode: its data is not passed on (the removal itself goes ahead).
+            if (operation.EpisodeId.HasValue && await database.EpisodeBindings.AsNoTracking().AnyAsync(binding =>
+                    binding.Id == operation.BindingId && binding.IdentityUnverified, CancellationToken.None).ConfigureAwait(false))
+            {
+                logger.LogWarning("JellyfinMod did not keep user data from item {Item}: its episode identity is unverified",
+                    operation.JellyfinItemId);
+                return;
+            }
+            var siblings = operation.EpisodeId is { } episodeId
+                ? await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == episodeId &&
+                        binding.Id != operation.BindingId && binding.MediaPath != null && binding.MediaPath != operation.MediaPath)
+                    .Select(binding => new { ItemId = binding.JellyfinItemId, Path = binding.MediaPath!,
+                        SeriesId = binding.SeriesItemId, binding.IdentityUnverified })
+                    .ToArrayAsync(CancellationToken.None).ConfigureAwait(false)
+                : await database.EntryBindings.AsNoTracking().Where(binding => binding.EntryId == operation.EntryId &&
+                        binding.Id != operation.BindingId && binding.MediaPath != null && binding.MediaPath != operation.MediaPath)
+                    .Select(binding => new { ItemId = binding.JellyfinItemId, Path = binding.MediaPath!,
+                        SeriesId = Guid.Empty, IdentityUnverified = false })
+                    .ToArrayAsync(CancellationToken.None).ConfigureAwait(false);
+            if (siblings.Length == 0) return;
+            if (userData is null || users is null)
+                throw new InvalidOperationException("Jellyfin user data services are unavailable.");
+            var source = library.RetrieveItem(operation.JellyfinItemId);
+            if (source?.Path is not { Length: > 0 } sourcePath ||
+                !files.TryResolveForDeletion(sourcePath, out var sourceCanonical) ||
+                !string.Equals(sourceCanonical, operation.MediaPath, StringComparison.Ordinal))
+                throw new InvalidOperationException("The removed item's stored user data is unavailable or its path changed.");
+            var owners = users.GetUsers().ToArray();
+            foreach (var sibling in siblings)
+            {
+                try
+                {
+                    if (sibling.IdentityUnverified)
+                        throw new InvalidOperationException("The survivor's episode identity is unverified.");
+                    if (sibling.ItemId == source.Id || !files.TryInspect(sibling.Path, out var observed) ||
+                        string.Equals(observed.CanonicalPath, operation.MediaPath, StringComparison.Ordinal)) continue;
+                    var remaining = library.RetrieveItem(sibling.ItemId);
+                    if (remaining is not Video { IsPlaceHolder: false } ||
+                        !string.Equals(remaining.Path, sibling.Path, StringComparison.Ordinal))
+                        throw new InvalidOperationException("The survivor is no longer a non-placeholder video at its recorded path.");
+                    // Reconciliation verified the binding: local movie alternates need not carry provider ids,
+                    // and a verified episode's native numbering need not match the tracked display position.
+                    var matches = operation.EpisodeId.HasValue
+                        ? remaining is MediaBrowser.Controller.Entities.TV.Episode nativeEpisode &&
+                            sibling.SeriesId != Guid.Empty && nativeEpisode.SeriesId == sibling.SeriesId
+                        : remaining is MediaBrowser.Controller.Entities.Movies.Movie;
+                    if (!matches) throw new InvalidOperationException("The survivor no longer matches the tracked movie or episode.");
+                    Placeholders.PlaceholderUserData.CopyTo(userData, owners, library, source, remaining,
+                        observed.PhysicalIdentity == operation.PhysicalIdentity, logger);
+                }
+                catch (Exception error) when (error is not OutOfMemoryException)
+                {
+                    logger.LogWarning("JellyfinMod could not keep user data from item {OldItem} on {RemainingItem}: {Error}",
+                        source.Id, sibling.ItemId, error.Message);
+                }
+            }
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            logger.LogWarning("JellyfinMod could not keep user data before removing item {Item}: {Error}",
+                operation.JellyfinItemId, error.Message);
+        }
+    }
+
     /// <summary>
     /// Removes the native item of an unlinked file, file deletion off. True when nothing is left to do: the item is gone,
     /// or the cleanup is obsolete because the file is back at its path or another binding owns the item (a title reacquired
@@ -1076,6 +1169,8 @@ public sealed class RetentionExecutor(
 
             var (rating, tags) = (native.CustomRating ?? native.OfficialRating, native.Tags);
             var parentId = native.ParentId;
+            // Also covers recovery after an unlink, before deleting the still-readable native user data.
+            await KeepVersionUserDataAsync(operation).ConfigureAwait(false);
             library.DeleteItem(native, new DeleteOptions
             {
                 DeleteFileLocation = false,
