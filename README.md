@@ -263,6 +263,15 @@ provider down, ratings are simply absent. Contract: `../jellyfin-web/docs/jellyf
 evidence: `PHASE9.md`. The suite is `tests/PhaseNineRatingsIntegration` (set `RATINGS_DB_COPY` to also migrate a copy of a
 real database).
 
+Clickable ratings (D274/D277): ratings in `GET /JellyfinMod/Ratings/Items/{id}` and entry responses may carry an optional
+`url`, omitted when unknown. Only rebuilt title-page URLs on the source's fixed host are stored, never raw provider links.
+During background refresh, missing Rotten Tomatoes, Metacritic and Letterboxd links are looked up together in Wikidata by
+IMDb id. Those calls share the ratings daily budget, one-call-per-second pace and circuit breaker; reads do no lookups.
+Roger Ebert links are used only when MDBList supplies an accepted review URL. IMDb, TMDB and Trakt links are built by the web.
+Migration `20261106131408_RatingLinks` adds the nullable column and restores TMDB to the exact old default source list;
+custom lists stay as saved. As before, an administrator who deliberately saved exactly the old default is indistinguishable
+from an unchanged default. Personal display preferences are owned by the web and are untouched.
+
 ## Database and local validation
 
 Startup applies pending EF migrations at `Plugin.Instance.DataPath/jellyfinmod.db`. A database

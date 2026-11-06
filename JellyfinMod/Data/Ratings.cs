@@ -9,10 +9,9 @@ public class RatingsSettings
     public static Guid SingletonId { get; } = Guid.Parse("4c1f7a3e-9b2d-4e60-8a15-2f9d0c7b6e31");
 
     /// <summary>
-    /// The default sources shown, in order (user decision 9, 2026-10-08: IMDb, Rotten Tomatoes critics and audience, Trakt; every
-    /// other source off). It replaced decision 6's list, which also had TMDB.
+    /// The default sources shown, in order (D274): IMDb, Rotten Tomatoes critics and audience, TMDB and Trakt.
     /// </summary>
-    public const string DefaultSourcesJson = "[\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"trakt\"]";
+    public const string DefaultSourcesJson = FirstDefaultSourcesJson;
 
     /// <summary>Decision 6's default (2026-10-07), which migration <c>PhaseNineRatingsDisplayDefaults</c> replaces where it was never changed.</summary>
     public const string FirstDefaultSourcesJson = "[\"imdb\",\"tomatoes_critic\",\"tomatoes_audience\",\"tmdb\",\"trakt\"]";
@@ -30,7 +29,7 @@ public class RatingsSettings
     /// <summary>Gets or sets how many days a title's ratings stay current before they are fetched again.</summary>
     public int RefreshDays { get; set; } = 14;
 
-    /// <summary>Gets or sets the most MDBList calls made per UTC day, manual refreshes and Tests included.</summary>
+    /// <summary>Gets or sets the most ratings HTTP calls per UTC day, MDBList and Wikidata, manual refreshes and Tests included.</summary>
     public int DailyBudget { get; set; } = 500;
 
     /// <summary>Gets or sets the administrator's default source order as a JSON array of source names.</summary>
@@ -73,7 +72,7 @@ public class RatingsProviderState
     /// <summary>Gets or sets the UTC day <see cref="BudgetUsed"/> counts.</summary>
     public DateTime? BudgetDay { get; set; }
 
-    /// <summary>Gets or sets the MDBList calls made on <see cref="BudgetDay"/>.</summary>
+    /// <summary>Gets or sets the ratings HTTP calls made on <see cref="BudgetDay"/>.</summary>
     public int BudgetUsed { get; set; }
 
     /// <summary>Gets or sets when the last scheduled or manual run started.</summary>
@@ -123,8 +122,9 @@ public class TitleRating
     /// <summary>Gets or sets when it was fetched.</summary>
     public DateTime FetchedAt { get; set; }
 
-    // No provider link is kept (review 2026-10-07 round 2, P1): a link the provider writes can carry anything, the key
-    // included, in its path or host, and nothing in JellyfinMod shows one.
+    /// <summary>Gets or sets the title-page URL rebuilt by the source allowlist (D277), never a raw provider URL.</summary>
+    [MaxLength(512)]
+    public string? Url { get; set; }
 }
 
 /// <summary>

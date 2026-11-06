@@ -38,6 +38,9 @@ internal sealed class Boundary : IAsyncDisposable
 
     public int WrongKeyCalls;
 
+    public ConcurrentQueue<(string Imdb, string UserAgent, DateTime At)> WikidataCalls { get; } = new();
+    public string WikidataMode { get; set; } = "links";
+
     /// <summary>A second key accepted while a test replaces the key under a running fetch.</summary>
     public string? AlsoAccept { get; set; }
 
@@ -146,6 +149,26 @@ internal sealed class Boundary : IAsyncDisposable
                 case "otherid": return Results.Json(MdbList(id + 1, kind, true));
                 // A provider echoing the caller's key in its links (review 2026-10-07, P1, and round 2: in a path, a host name and
                 // double-encoded): no link is kept at all, whatever it holds.
+                case "links":
+                    return Results.Json(new { ids = new { tmdb = id }, ratings = new object[]
+                    {
+                        new { source = "tomatoes", value = 91, url = "https://rottentomatoes.com/m/the_matrix/" },
+                        new { source = "popcorn", value = 88, url = "https://www.rottentomatoes.com/m/the_matrix" },
+                        new { source = "metacritic", value = 74, url = "https://metacritic.com/movie/the-matrix" },
+                        new { source = "metacriticuser", value = 8.4, url = "https://www.metacritic.com/movie/the-matrix/" },
+                        new { source = "letterboxd", value = 4.1, url = "https://letterboxd.com/film/the-matrix/" },
+                        new { source = "rogerebert", value = 3.5, url = "https://www.rogerebert.com/reviews/the-matrix-1999" }
+                    }});
+                case "badlinks":
+                    return Results.Json(new { ids = new { tmdb = id }, ratings = new object[]
+                    {
+                        new { source = "tomatoes", value = 91, url = "https://rottentomatoes.com.evil.example/m/the_matrix" },
+                        new { source = "popcorn", value = 88, url = "https://www.rottentomatoes.com/m/the_matrix?key=private" },
+                        new { source = "metacritic", value = 74, url = "https://www.metacritic.com/movie/%74he-matrix/" },
+                        new { source = "metacriticuser", value = 8.4, url = "https://www.metacritic.com/movie/the-matrix/#reviews" },
+                        new { source = "letterboxd", value = 4.1, url = $"https://letterboxd.com/film/{key}/" },
+                        new { source = "rogerebert", value = 3.5, url = "https://www.rogerebert.com/reviews/../about" }
+                    }});
                 case "keyurl":
                     return Results.Json(new
                     {
@@ -186,10 +209,33 @@ internal sealed class Boundary : IAsyncDisposable
                 default: return Results.Json(MdbList(id, kind, true));
             }
         });
+        app.MapGet("/sparql", (HttpContext context) =>
+        {
+            var boundary = self!;
+            var query = context.Request.Query["query"].ToString();
+            var imdb = System.Text.RegularExpressions.Regex.Match(query, "tt[0-9]+").Value;
+            boundary.WikidataCalls.Enqueue((imdb, context.Request.Headers.UserAgent.ToString(), DateTime.UtcNow));
+            if (boundary.WikidataMode == "fail") return Results.Text("unavailable", statusCode: 503);
+            if (boundary.WikidataMode == "ratelimited")
+            {
+                context.Response.Headers.RetryAfter = "172800";
+                return Results.Text("slow down", statusCode: 429);
+            }
+            if (boundary.WikidataMode == "malformed") return Results.Text("{}", "application/json");
+            if (boundary.WikidataMode == "missing") return Results.Json(new { results = new { bindings = Array.Empty<object>() } });
+            var foreign = boundary.WikidataMode == "foreign";
+            return Results.Json(new { head = new { vars = new[] { "item", "rt", "mc", "lb" } }, results = new { bindings = new[] { new
+            {
+                item = new { type = "uri", value = "http://www.wikidata.org/entity/Q83495" },
+                rt = new { type = "literal", value = foreign ? "https://evil.example/matrix" : boundary.WikidataMode == "keypath" ? "m/" + boundary.ExpectedKey : "m/matrix" },
+                mc = new { type = "literal", value = foreign ? "movie/%2fmatrix" : boundary.WikidataMode == "keypath" ? "movie/" + boundary.ExpectedKey : "movie/the-matrix" },
+                lb = new { type = "literal", value = foreign ? "../matrix" : boundary.WikidataMode == "keypath" ? boundary.ExpectedKey : "the-matrix" }
+            } } } });
+        });
         app.MapGet("/3/movie/{id:int}", (int id) => Results.Json(new
         {
             id, title = $"JellyfinMod Ratings Movie {id}", release_date = "2026-01-02", overview = "A disposable fixture.",
-            vote_average = 7.8, vote_count = 1234, genres = Array.Empty<object>(), external_ids = new { imdb_id = $"tt{id}" },
+            vote_average = 7.8, vote_count = 1234, genres = Array.Empty<object>(), external_ids = new { imdb_id = id == 9601 ? "tt0133093" : $"tt{id}" },
             release_dates = new { results = Array.Empty<object>() }, adult = false
         }));
         // A series whose TMDB answer carries no score, like a title the native backfill created.

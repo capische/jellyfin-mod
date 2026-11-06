@@ -15,8 +15,8 @@ public sealed record RatingsEndpoint(Uri BaseAddress)
 }
 
 /// <summary>One rating as MDBList reported it, already mapped to a source and scale.</summary>
-/// <remarks>The provider's own link for the source is never read or kept (review 2026-10-07 round 2, P1).</remarks>
-public sealed record FetchedRating(string Source, string Scale, double Value, int? Votes);
+/// <remarks>Only an allowlisted, rebuilt title link may leave this client (D277).</remarks>
+public sealed record FetchedRating(string Source, string Scale, double Value, int? Votes, string? Url = null);
 
 /// <summary>What one MDBList call produced. Never carries the key, the request URL or a response body.</summary>
 /// <param name="Outcome">A <see cref="RatingsOutcomes"/> code.</param>
@@ -66,13 +66,13 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
             if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
                 return Done(RatingsOutcomes.Unauthorized, status);
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
-                return new MdbListResult(RatingsOutcomes.RateLimited, [], RetryAfter(response), status);
+                return new MdbListResult(RatingsOutcomes.RateLimited, [], RetryAfter(response, clock.GetUtcNow().UtcDateTime), status);
             if (response.StatusCode == HttpStatusCode.NotFound) return Done(RatingsOutcomes.NotFound, status);
             if (!response.IsSuccessStatusCode) return Done(RatingsOutcomes.Failed, status);
 
             await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
             using var document = await JsonDocument.ParseAsync(stream, cancellationToken: timeout.Token).ConfigureAwait(false);
-            return Parse(document.RootElement, tmdbId, status);
+            return Parse(document.RootElement, tmdbId, status, apiKey);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -91,7 +91,7 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
 
     private static MdbListResult Done(string outcome, int? status) => new(outcome, [], null, status);
 
-    private static MdbListResult Parse(JsonElement root, int tmdbId, int status)
+    private static MdbListResult Parse(JsonElement root, int tmdbId, int status, string apiKey)
     {
         if (root.ValueKind != JsonValueKind.Object) return Done(RatingsOutcomes.Malformed, status);
         if (!root.TryGetProperty("ratings", out var ratings) || ratings.ValueKind != JsonValueKind.Array)
@@ -121,7 +121,11 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
                 return Done(RatingsOutcomes.Malformed, status);
             var source = name.GetString();
             if (RatingSources.FromMdbList(source, value, votes) is not { } mapped) continue;
-            result.Add(new FetchedRating(mapped.Source, mapped.Scale, mapped.Value, votes is > 0 ? votes : null));
+            var rawUrl = item.TryGetProperty("url", out var url) && url.ValueKind == JsonValueKind.String ? url.GetString() : null;
+            // Even a title-shaped path must not echo the credential. Escaped characters are rejected by the allowlist.
+            var safeUrl = rawUrl is not null && !rawUrl.Contains(apiKey, StringComparison.OrdinalIgnoreCase)
+                ? RatingLinks.Rebuild(mapped.Source, rawUrl) : null;
+            result.Add(new FetchedRating(mapped.Source, mapped.Scale, mapped.Value, votes is > 0 ? votes : null, safeUrl));
         }
 
         // One value per source; MDBList has been seen to repeat a source.
@@ -165,9 +169,8 @@ public sealed class MdbListClient(IHttpClientFactory clients, Func<PluginConfigu
     /// Retry-After never hides a reset days away (review 2026-10-07, P2 6). Null when neither says. A long delay is kept as
     /// given, however far away, and one past the last representable moment saturates to it (round 2, P3 7).
     /// </summary>
-    private DateTime? RetryAfter(HttpResponseMessage response)
+    internal static DateTime? RetryAfter(HttpResponseMessage response, DateTime now)
     {
-        var now = clock.GetUtcNow().UtcDateTime;
         DateTime? latest = null;
         void Consider(DateTime candidate) => latest = latest is { } known && known >= candidate ? known : candidate;
         // A delay in seconds is read from the header's own text, digit by digit, so a number too large for .NET's parser (which

@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging;
 namespace JellyfinMod.Services.Ratings;
 
 /// <summary>The fetcher's timing bounds; integration hosts shorten them.</summary>
-/// <param name="MinInterval">The least time between two MDBList calls.</param>
+/// <param name="MinInterval">The least time between ratings HTTP calls, including Wikidata.</param>
 /// <param name="FailureRetry">How long a title whose last attempt failed waits before it is due again.</param>
 /// <param name="BreakerFailures">Consecutive transient failures that open the breaker.</param>
 /// <param name="BreakerOpen">How long that breaker stays open.</param>
@@ -70,8 +70,8 @@ public sealed class RatingsRunGate
 /// The MDBList credential and its settings, held still: the ratings settings save takes it, and the fetcher holds it from its
 /// last look at the settings, the key and the provider state, through the call, to recording what the call meant
 /// (review 2026-10-07 round 2, P2 2-4). So once a save has returned, no call starts with what it replaced, and an answer to
-/// a replaced key is always recorded before the replacement, which then clears it. A save waits at most for one call
-/// already out (bounded by <see cref="MdbListClient.Timeout"/>).
+/// a replaced key is always recorded before the replacement, which then clears it. A save waits for the MDBList call
+/// (bounded by <see cref="MdbListClient.Timeout"/>), then at most one pacing interval and the 5 s Wikidata lookup.
 /// </summary>
 public sealed class RatingsCredentialGate
 {
@@ -110,6 +110,7 @@ public sealed class RatingsCredentialGate
 public sealed class RatingsRefreshRunner(
     ModDbContext database,
     MdbListClient client,
+    WikidataRatingsClient wikidata,
     AcquisitionSecretStore secrets,
     RatingsRunGate gate,
     RatingsCredentialGate credential,
@@ -390,6 +391,29 @@ public sealed class RatingsRefreshRunner(
 
         gate.LastCallAt = DateTime.UtcNow;
         var result = await client.FetchAsync(current.Key!, title.MediaType, title.TmdbId, cancellationToken).ConfigureAwait(false);
+        var observed = result;
+        if (result.Outcome == RatingsOutcomes.Ok && result.Ratings.Any(RatingLinks.NeedsLookup) &&
+            BudgetUsed(current.State, Now) < current.Settings.DailyBudget)
+        {
+            var imdbId = await database.Entries.AsNoTracking()
+                .Where(row => row.MediaType == title.MediaType && row.TmdbId == title.TmdbId && row.ImdbId != null)
+                .Select(row => row.ImdbId).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            if (WikidataRatingsClient.IsImdbId(imdbId))
+            {
+                await PaceAsync(cancellationToken).ConfigureAwait(false);
+                Spend(current.State);
+                if (!await SaveBoundedAsync(cancellationToken).ConfigureAwait(false)) return (null, RatingsOutcomes.DatabaseBusy);
+                gate.LastCallAt = DateTime.UtcNow;
+                var lookup = await wikidata.FetchAsync(imdbId!, cancellationToken).ConfigureAwait(false);
+                // Lookup failures never discard scores; they do feed the existing breaker without a preceding reset.
+                observed = new MdbListResult(lookup.Outcome, [], lookup.RetryAfter, null);
+                result = result with { Ratings = result.Ratings.Select(rating =>
+                {
+                    var url = rating.Url ?? lookup.Links.GetValueOrDefault(rating.Source);
+                    return rating with { Url = url is not null && !url.Contains(current.Key!, StringComparison.OrdinalIgnoreCase) ? url : null };
+                }).ToArray() };
+            }
+        }
         var error = result.Outcome == RatingsOutcomes.Ok ? null : result.Status is { } status ? $"HTTP {status}" : result.Outcome;
         // The recording is bounded too, so the gate a settings save waits on is held for the call's limit plus at most
         // DatabaseLimit (review round 3, P2 1). It is one save: all of it or nothing. When the database stays busy past the
@@ -403,7 +427,7 @@ public sealed class RatingsRefreshRunner(
                 // title's attempt and, for an answer with ratings, the values of every entry that still holds the title.
                 database.ChangeTracker.Clear();
                 var state = await RatingsStore.GetStateAsync(database, limit.Token).ConfigureAwait(false);
-                Observe(state, result);
+                Observe(state, observed);
                 var recorded = await database.RatingsFetches.SingleAsync(row => row.MediaType == title.MediaType && row.TmdbId == title.TmdbId,
                     limit.Token).ConfigureAwait(false);
                 (recorded.Outcome, recorded.Error) = (result.Outcome, error);
@@ -449,7 +473,7 @@ public sealed class RatingsRefreshRunner(
             database.TitleRatings.AddRange(ratings.Select(rating => new TitleRating
             {
                 EntryId = id, Source = rating.Source, Provider = RatingSources.ProviderMdbList, Value = rating.Value, Scale = rating.Scale,
-                Votes = rating.Votes, FetchedAt = at
+                Votes = rating.Votes, FetchedAt = at, Url = RatingLinks.Rebuild(rating.Source, rating.Url)
             }));
         }
     }
@@ -568,7 +592,7 @@ public sealed class RatingsRefreshRunner(
                 database.TitleRatings.AddRange(source.Select(row => new TitleRating
                 {
                     EntryId = id, Source = row.Source, Provider = row.Provider, Value = row.Value, Scale = row.Scale, Votes = row.Votes,
-                    FetchedAt = row.FetchedAt
+                    FetchedAt = row.FetchedAt, Url = RatingLinks.Rebuild(row.Source, row.Url)
                 }));
             }
 

@@ -23,6 +23,7 @@ public static class RatingsServices
         services.AddTransient(provider => new MdbListClient(provider.GetRequiredService<IHttpClientFactory>(), configuration,
             provider.GetRequiredService<ILogger<MdbListClient>>(), provider.GetRequiredService<TimeProvider>(),
             provider.GetService<RatingsEndpoint>()));
+        services.AddTransient<WikidataRatingsClient>();
         services.AddTransient<RatingsRefreshRunner>();
     }
 
