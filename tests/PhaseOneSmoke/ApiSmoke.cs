@@ -51,6 +51,9 @@ internal static class ApiSmoke
             "GetLinkedAlternateVersions" => Array.Empty<MediaBrowser.Controller.Entities.Video>(),
             "GetUserRootFolder" => root,
             "GetItemById" or "RetrieveItem" when args?[0] is Guid id => nativeById.GetValueOrDefault(id),
+            "GetItemList" when args?[0] is InternalItemsQuery { SeriesPresentationUniqueKey: "next-up-smoke", IsPlaceHolder: false } =>
+                nativeById.Values.Where(item => item is MediaBrowser.Controller.Entities.TV.Episode
+                    { SeriesPresentationUniqueKey: "next-up-smoke", IsPlaceHolder: false }).ToList(),
             "GetVirtualFolders" => new[] { libraryFolder, secondLibrary, raceLibrary, tvLibrary, secondTvLibrary }
                 .Select(folder => new VirtualFolderInfo { ItemId = folder.Id.ToString(), Name = folder.Id.ToString("N"),
                     CollectionType = folder.CollectionType == Jellyfin.Data.Enums.CollectionType.tvshows
@@ -70,7 +73,9 @@ internal static class ApiSmoke
         var builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions { ContentRootPath = folder, ApplicationName = typeof(EntriesController).Assembly.FullName });
         builder.WebHost.UseKestrel().UseUrls("http://127.0.0.1:0");
         builder.Logging.ClearProviders().AddConsole().SetMinimumLevel(LogLevel.Warning);
-        builder.Services.AddControllers().AddApplicationPart(typeof(EntriesController).Assembly).AddJsonOptions(options =>
+        builder.Services.AddControllers(options => options.Filters.AddService<JellyfinMod.Api.Filters.PlaceholderFilter>())
+            .AddApplicationPart(typeof(EntriesController).Assembly)
+            .AddApplicationPart(typeof(TvShowsController).Assembly).AddJsonOptions(options =>
         {
             // Match the pinned Jellyfin host's native DTO contract, including its converters.
             var defaults = Jellyfin.Extensions.Json.JsonDefaults.PascalCaseOptions;
@@ -86,6 +91,8 @@ internal static class ApiSmoke
         builder.Services.AddSingleton(new LibraryWriteBudget(TimeSpan.FromMilliseconds(500)));
         builder.Services.AddSingleton<RetentionExecutionGate>();
         builder.Services.AddSingleton(library);
+        builder.Services.AddSingleton(users);
+        builder.Services.AddTransient<JellyfinMod.Api.Filters.PlaceholderFilter>();
         builder.Services.AddTransient(_ => new LibraryAccess(users, library, localization));
         builder.Services.AddSingleton<UnixFileInspector>();
         builder.Services.AddSingleton(TimeProvider.System);
@@ -169,6 +176,7 @@ internal static class ApiSmoke
         using var client = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(60) };
         Assert((await client.GetAsync("/JellyfinMod/Entries")).StatusCode == HttpStatusCode.Unauthorized, "Anonymous list is rejected by middleware");
         client.DefaultRequestHeaders.Add("X-Smoke-User", user.Id.ToString());
+        await PlaceholderNextUpScenarios.RunAsync(client, nativeById);
         Assert((await client.GetAsync($"/JellyfinMod/Entries?mediaType=movie&targetLibraryId={tvLibrary.Id}")).StatusCode == HttpStatusCode.NotFound,
             "Entries list rejects a library incompatible with the supplied media type");
         Assert((await client.GetAsync($"/JellyfinMod/Entries?targetLibraryId={Guid.NewGuid()}")).StatusCode == HttpStatusCode.NotFound,
