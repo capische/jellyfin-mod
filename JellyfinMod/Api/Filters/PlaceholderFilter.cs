@@ -30,7 +30,8 @@ namespace JellyfinMod.Api.Filters;
 /// Jellyfin answers it.</para>
 /// <list type="table">
 /// <item><term><c>GET /Shows/NextUp</c></term><description>a stub episode's slot holds that series' next real episode after the
-/// gap, or is left out when none follows (P1.FU28, see <see cref="ShapeNextUp"/>).</description></item>
+/// gap, or is left out when none follows, unless <c>jfmodPlaceholders=true</c> keeps the actual next episode for display
+/// (P1.FU28, see <see cref="ShapeNextUp"/>).</description></item>
 /// <item><term><c>GET /UserItems/Resume</c></term><description>stub items are left out (a stub cannot be resumed; it can only
 /// carry a position from the file it stands in for).</description></item>
 /// <item><term><c>GET /Shows/{id}/Episodes</c> with <c>startItemId</c></term><description>stubs after the start item are left out
@@ -149,7 +150,8 @@ public sealed class PlaceholderFilter(
                 var arguments = context.HttpContext.Items.TryGetValue(ArgumentsKey, out var stored)
                     ? stored as IReadOnlyDictionary<string, object?>
                     : null;
-                if (kind == Kind.NextUp && result.Value is QueryResult<BaseItemDto> page && arguments is not null)
+                if (kind == Kind.NextUp && result.Value is QueryResult<BaseItemDto> page && arguments is not null
+                    && !string.Equals(context.HttpContext.Request.Query["jfmodPlaceholders"], "true", StringComparison.OrdinalIgnoreCase))
                     result.Value = ShapeNextUp(page, arguments, context.HttpContext.User);
                 else if (kind == Kind.Latest && result.Value is IEnumerable<BaseItemDto> latest)
                     result.Value = latest.Where(item => item.IsPlaceHolder != true || !IsStub(item.Id)).ToArray();
