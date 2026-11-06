@@ -128,6 +128,18 @@ internal sealed partial class NativeWorld
     /// <summary>Every user data save through the user data manager: user, item, and the data saved (the watched restore, P1.FU27).</summary>
     public ConcurrentQueue<(Guid UserId, Guid ItemId, UserItemData Data)> SavedUserData { get; } = new();
 
+    /// <summary>Per-user records for scenarios that need distinct native state; other items keep the completed fixture default.</summary>
+    public ConcurrentDictionary<(Guid UserId, Guid ItemId), UserItemData> UserData { get; } = new();
+
+    /// <summary>Observes or fails a user data save before it is stored.</summary>
+    public Action<Guid, Guid>? UserDataSaving { get; set; }
+
+    /// <summary>Models stored item snapshots separately from Jellyfin's cached item instance.</summary>
+    public Func<BaseItem, BaseItem>? ItemRetrieved { get; set; }
+
+    /// <summary>Models user data loaded on a particular item snapshot.</summary>
+    public Func<Guid, BaseItem, UserItemData?>? UserDataReading { get; set; }
+
     /// <summary>
     /// The TMDB id Jellyfin's metadata gives a scanned episode file, or null for one it only numbers (season and series packs:
     /// a file bound by its number alone is not verified as that episode).
@@ -288,6 +300,8 @@ internal sealed partial class NativeWorld
             Id = NewItemId(file, owner.GetType()), Name = Path.GetFileNameWithoutExtension(file), Path = file,
             DateCreated = DateTime.UtcNow, DateLastRefreshed = RefreshedAt(file), OwnerId = owner.Id, PrimaryVersionId = owner.Id
         };
+        // MovieResolver resolves the alternate as a file in a mixed folder and reads its own filename's id tag.
+        if (TmdbPattern().Match(Path.GetFileName(file)) is { Success: true } match) source.ProviderIds["Tmdb"] = match.Groups[1].Value;
         owner.LocalAlternateVersions = [.. owner.LocalAlternateVersions, file];
         _items[source.Id] = source;
         // The owning item is what Jellyfin saves and reports; the media source has no place of its own in a library.
@@ -473,7 +487,8 @@ internal sealed partial class NativeWorld
             case "RetrieveItem":
                 var id = (Guid)arguments![0]!;
                 if (FailingRead?.Invoke(id) == true) throw new InvalidOperationException("injected: the item could not be read");
-                return Libraries.FirstOrDefault(library => library.Id == id) as BaseItem ?? _items.GetValueOrDefault(id);
+                var found = Libraries.FirstOrDefault(library => library.Id == id) as BaseItem ?? _items.GetValueOrDefault(id);
+                return method.Name == "RetrieveItem" && found is not null && ItemRetrieved is { } retrieve ? retrieve(found) : found;
             case "GetItemList": return Query((InternalItemsQuery)arguments![0]!);
             case "GetCount": return Query((InternalItemsQuery)arguments![0]!).Count;
             case "GetCollectionFolders":
@@ -550,10 +565,14 @@ internal sealed class PluginHost : IAsyncDisposable
         var userData = Stub<IUserDataManager>.Create((method, args) =>
         {
             if (method.Name == "GetUserData" && args?[1] is BaseItem item)
-                return new UserItemData { Key = item.Id.ToString("N"), Played = true, LastPlayedDate = time.GetUtcNow().UtcDateTime };
+                return world.Native.UserDataReading?.Invoke(((User)args[0]!).Id, item) ??
+                    (world.Native.UserData.TryGetValue((((User)args[0]!).Id, item.Id), out var stored) ? stored
+                    : new UserItemData { Key = item.Id.ToString("N"), Played = true, LastPlayedDate = time.GetUtcNow().UtcDateTime });
             // A save is recorded and stored on the item, as Jellyfin stores a user data row for it (the watched restore, P1.FU27).
             if (method.Name == "SaveUserData" && args is [User saver, BaseItem saved, UserItemData data, ..])
             {
+                world.Native.UserDataSaving?.Invoke(saver.Id, saved.Id);
+                if (world.Native.UserData.ContainsKey((saver.Id, saved.Id))) world.Native.UserData[(saver.Id, saved.Id)] = data;
                 world.Native.SavedUserData.Enqueue((saver.Id, saved.Id, data));
                 saved.UserData = [.. saved.UserData ?? [], new UserData { ItemId = saved.Id, UserId = saver.Id, CustomDataKey = data.Key ?? saved.Id.ToString("N"),
                     Played = data.Played, LastPlayedDate = data.LastPlayedDate, Item = null!, User = null! }];

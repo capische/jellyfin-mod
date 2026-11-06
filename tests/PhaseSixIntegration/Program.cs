@@ -1610,8 +1610,11 @@ internal static class Phase6
         var unplayable = await ReplacementWaitsAsync(swapImport.Id, "successor_unavailable", "The replacement waits for the new file to play");
         Assert((await SwapFilesAsync()).Length == 5 && File.Exists(swapOld),
             $"While the new file has no video stream every held file stays (P1 4): {unplayable.ReplaceDetail}");
+        var userDataKeep = UserDataKeepScenario.Seed(world, host, swapOld, swapImport.DestinationPath!);
         Assert(world.Native.Probe(swapImport.DestinationPath!), "Jellyfin's probe finds the new file's video");
         var swapDone = await ReplacementEndsAsync(swapImport.Id, "The movie's replacement ends");
+        userDataKeep.Verify();
+        world.Native.UserDataSaving = null;
         var swapLeft = await SwapFilesAsync();
         Assert(swapDone.ReplaceState == ReplaceStates.Done &&
             swapLeft.SequenceEqual(["Swap Movie (2020) [tmdbid-489] - 1080p BluRay.mkv", Path.GetFileName(swapLate)]) &&
@@ -2278,6 +2281,10 @@ internal static class Phase6
         await ReadAsync(await admin.DeleteAsync($"/JellyfinMod/Entries/{ids["mrepl"]}/Versions/{keptVersion}/Keep"), 200, "The file's Keep is lifted");
         Assert((await SetAutomationSwitchAsync("episodeUpgradesEnabled", switchesBefore["episodeUpgradesEnabled"]!.GetValue<bool>())).IsSuccessStatusCode,
             "The Replace switch is put back after the race");
+
+        await UserDataKeepScenario.RemoveDefaultAsync(world, host, admin, dbPath, ids["mrepl"], logs);
+        await UserDataKeepScenario.RemoveEpisodeAsync(world, host, admin, dbPath, ids["s1e2"]);
+        Console.WriteLine("PASS: D279 multi-user data survives Replace and movie/episode default-version removal; newer data, resume bounds, same content and failed copies");
 
         // ---- Settings survive a restart; the whole run wrote no media_missing.
         await host.DisposeAsync();
