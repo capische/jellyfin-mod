@@ -371,6 +371,25 @@ public sealed class AcquisitionSettingsRequest
     public int? Revision { get; set; }
 }
 
+/// <summary>
+/// What a key field's Test may send (ds.t9): a key (and for Prowlarr an address) typed but not saved. It is tested as given and
+/// never stored; a test without it tests the saved values, so callers that send no body keep working.
+/// </summary>
+public sealed class KeyTestRequest
+{
+    /// <summary>Gets or sets the typed key or token, or null to test the saved one.</summary>
+    [JsonPropertyName("apiKey"), MaxLength(4096)]
+    public string? ApiKey { get; set; }
+
+    /// <summary>Gets or sets the typed address (Prowlarr only), or null to test the saved one.</summary>
+    [JsonPropertyName("baseUrl"), MaxLength(2048)]
+    public string? BaseUrl { get; set; }
+
+    /// <summary>The typed key, trimmed, or null when none was typed.</summary>
+    [JsonIgnore]
+    public string? TypedKey => string.IsNullOrWhiteSpace(ApiKey) ? null : ApiKey.Trim();
+}
+
 /// <summary>A bounded, credential-free connection test result.</summary>
 public sealed record ConnectionTestDto(
     [property: JsonPropertyName("ok")] bool Ok,

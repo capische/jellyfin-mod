@@ -63,15 +63,20 @@ public sealed class ProwlarrSync(
         indexer.ManagedBy == IndexerOwners.Prowlarr && string.Equals(indexer.ProwlarrDefinitionName, "1337x", StringComparison.OrdinalIgnoreCase)
             ? SlowSetupHowTo : null;
 
-    /// <summary>Checks the source answers, accepts the key and has enabled torrent indexers. Changes nothing.</summary>
-    public async Task<(string Code, string Message, string? Version)> TestAsync(ProwlarrSource source, CancellationToken cancellationToken)
+    /// <summary>
+    /// Checks the source answers, accepts the key and has enabled torrent indexers. Changes nothing. With
+    /// <paramref name="typedKey"/>, that key is sent instead of the saved one (a key field's Test, ds.t9); the caller passes a
+    /// source that is not tracked when it tests a typed address.
+    /// </summary>
+    public async Task<(string Code, string Message, string? Version)> TestAsync(ProwlarrSource source, CancellationToken cancellationToken,
+        string? typedKey = null)
     {
         try
         {
-            using var status = await GetAsync(source, "api/v1/system/status", cancellationToken).ConfigureAwait(false);
+            using var status = await GetAsync(source, "api/v1/system/status", cancellationToken, typedKey: typedKey).ConfigureAwait(false);
             var version = status.RootElement.TryGetProperty("version", out var value) ? value.GetString() : null;
-            using var _ = await GetAsync(source, "api/v1/health", cancellationToken).ConfigureAwait(false);
-            var indexers = await ReadIndexersAsync(source, cancellationToken).ConfigureAwait(false);
+            using var _ = await GetAsync(source, "api/v1/health", cancellationToken, typedKey: typedKey).ConfigureAwait(false);
+            var indexers = await ReadIndexersAsync(source, cancellationToken, typedKey).ConfigureAwait(false);
             var torrents = indexers.Count(indexer => indexer.Protocol == "torrent" && indexer.Enable);
             return torrents == 0
                 ? ("no_torrent_indexers", "Prowlarr answered, but has no enabled torrent indexer to import.", version)
@@ -311,9 +316,10 @@ public sealed class ProwlarrSync(
         }
     }
 
-    private async Task<IReadOnlyList<RemoteIndexer>> ReadIndexersAsync(ProwlarrSource source, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<RemoteIndexer>> ReadIndexersAsync(ProwlarrSource source, CancellationToken cancellationToken,
+        string? typedKey = null)
     {
-        using var document = await GetAsync(source, "api/v1/indexer", cancellationToken).ConfigureAwait(false);
+        using var document = await GetAsync(source, "api/v1/indexer", cancellationToken, typedKey: typedKey).ConfigureAwait(false);
         if (document.RootElement.ValueKind != JsonValueKind.Array)
             throw new ProwlarrException("prowlarr_schema", "Prowlarr's indexer list was not a list.");
         var host = new Uri(source.BaseUrl).IdnHost.ToLowerInvariant();
@@ -427,9 +433,10 @@ public sealed class ProwlarrSync(
     private static string? Text(JsonElement item, string property) =>
         item.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String && value.GetString() is { Length: > 0 } text ? text : null;
 
-    private async Task<JsonDocument> GetAsync(ProwlarrSource source, string path, CancellationToken cancellationToken, int? maxBytes = null)
+    private async Task<JsonDocument> GetAsync(ProwlarrSource source, string path, CancellationToken cancellationToken, int? maxBytes = null,
+        string? typedKey = null)
     {
-        var key = await secrets.GetAsync(source.ApiKeySecretRef, cancellationToken).ConfigureAwait(false);
+        var key = typedKey ?? await secrets.GetAsync(source.ApiKeySecretRef, cancellationToken).ConfigureAwait(false);
         if (key is null) throw new ProwlarrException("unauthorized", "No Prowlarr API key is saved.");
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(Timeout);

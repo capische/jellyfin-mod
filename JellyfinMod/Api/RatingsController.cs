@@ -101,17 +101,25 @@ public sealed class RatingsController(
         return dto;
     }
 
-    /// <summary>Makes one real MDBList call for a fixed well-known title and answers a code and a sentence.</summary>
+    /// <summary>
+    /// Makes one real MDBList call for a fixed well-known title and answers a code and a sentence. A body with <c>apiKey</c>
+    /// tests that typed key instead of the saved one, and keeps nothing of it (ds.t9).
+    /// </summary>
     [HttpPost("Settings/Ratings/Test"), Authorize(Policy = Policies.RequiresElevation)]
-    public async Task<ActionResult<RatingsTestDto>> Test(CancellationToken cancellationToken)
+    public async Task<ActionResult<RatingsTestDto>> Test(
+        [FromBody(EmptyBodyBehavior = Microsoft.AspNetCore.Mvc.ModelBinding.EmptyBodyBehavior.Allow)] KeyTestRequest? request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
-        var result = await runner.TestAsync(cancellationToken);
-        // A key Test has just verified starts a full run in the background at once (user decision 8).
-        if (result.Outcome == RatingsOutcomes.Ok) automatic.RunAll(RatingsPassKinds.Setup);
+        var typed = request?.TypedKey;
+        var result = await runner.TestAsync(typed, cancellationToken);
+        // A saved key Test has just verified starts a full run in the background at once (user decision 8); a typed one starts
+        // nothing until it is saved.
+        if (result.Outcome == RatingsOutcomes.Ok && typed is null) automatic.RunAll(RatingsPassKinds.Setup);
         var sources = result.Ratings.Select(rating => rating.Source).Where(RatingSources.IsKnown).ToArray();
         return new RatingsTestDto(result.Outcome == RatingsOutcomes.Ok, result.Outcome, result.Outcome switch
         {
+            RatingsOutcomes.Ok when typed is not null => "MDBList accepted this key. Save it to start fetching ratings.",
+            RatingsOutcomes.Unauthorized when typed is not null => "MDBList refused this key. Check it was copied completely.",
             RatingsOutcomes.Ok => sources.Length > 0 ? "MDBList accepted the key and returned ratings." : "MDBList accepted the key but returned no ratings for the test title.",
             RatingsOutcomes.NotConfigured => "No MDBList key is saved yet.",
             RatingsOutcomes.Unauthorized => "MDBList refused the key. Check it was copied completely.",

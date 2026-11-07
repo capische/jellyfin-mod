@@ -263,19 +263,33 @@ public sealed class RatingsRefreshRunner(
     /// budget like any other call (review 2026-10-07, P2 3). A refused key may be tried: that is what Test is for. It is checked,
     /// called and recorded under the credential gate, so the key it tested is still the saved one when it is marked verified.
     /// </summary>
-    public async Task<MdbListResult> TestAsync(CancellationToken cancellationToken)
+    public Task<MdbListResult> TestAsync(CancellationToken cancellationToken) => TestAsync(null, cancellationToken);
+
+    /// <summary>
+    /// The Test of a key field (ds.t9): with <paramref name="typedKey"/>, that key is tested as typed and nothing about it is
+    /// kept: the call counts in the budget like any other, but its answer neither verifies the saved key nor opens a breaker,
+    /// sets a blocker or starts fetching. Without it, the saved key is tested as before.
+    /// </summary>
+    public async Task<MdbListResult> TestAsync(string? typedKey, CancellationToken cancellationToken)
     {
         using var lease = await gate.AcquireAsync(cancellationToken).ConfigureAwait(false);
         await PaceAsync(cancellationToken).ConfigureAwait(false);
         using var held = await credential.AcquireAsync(cancellationToken).ConfigureAwait(false);
         using var bounded = BoundDatabase();
         var current = await CurrentAsync(cancellationToken).ConfigureAwait(false);
-        if (current.Key is null) return new MdbListResult(RatingsOutcomes.NotConfigured, [], null, null);
+        var key = typedKey ?? current.Key;
+        if (key is null) return new MdbListResult(RatingsOutcomes.NotConfigured, [], null, null);
         if (TestRefusal(current.Settings, current.State, Now) is { } refusal) return new MdbListResult(refusal, [], null, null);
         Spend(current.State);
         if (!await SaveBoundedAsync(cancellationToken).ConfigureAwait(false)) return new MdbListResult(RatingsOutcomes.DatabaseBusy, [], null, null);
         gate.LastCallAt = DateTime.UtcNow;
-        var result = await client.FetchAsync(current.Key, "movie", MdbListClient.TestTmdbId, cancellationToken).ConfigureAwait(false);
+        var result = await client.FetchAsync(key, "movie", MdbListClient.TestTmdbId, cancellationToken).ConfigureAwait(false);
+        if (typedKey is not null)
+        {
+            logger.LogInformation("Ratings Test of a typed key: {Outcome} (HTTP {Status})", result.Outcome, result.Status);
+            return result;
+        }
+
         Observe(current.State, result);
         if (result.Outcome == RatingsOutcomes.Ok)
         {

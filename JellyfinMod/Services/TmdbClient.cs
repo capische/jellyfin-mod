@@ -33,11 +33,24 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
     /// it checks Jellyfin's TMDb connection instead, with one read of a well-known series (P1.FU13).
     /// </summary>
     /// <returns>A stable code, a sentence and the source tested; never the credential or a raw exception.</returns>
-    public async Task<(string Code, string Message, string? Source)> TestAsync(CancellationToken cancellationToken)
+    public Task<(string Code, string Message, string? Source)> TestAsync(CancellationToken cancellationToken) => TestAsync(null, cancellationToken);
+
+    /// <summary>
+    /// The Test of the token field (ds.t9): with <paramref name="typedToken"/>, that read access token is checked as typed,
+    /// never stored; without it, the saved credential (or Jellyfin's connection) is checked as before.
+    /// </summary>
+    public async Task<(string Code, string Message, string? Source)> TestAsync(string? typedToken, CancellationToken cancellationToken)
     {
         string? source = null;
         try
         {
+            if (typedToken is not null)
+            {
+                source = TokenSource;
+                using var typed = await GetAsync("configuration", new Credential(typedToken, string.Empty), cancellationToken).ConfigureAwait(false);
+                return ("ok", "TMDB accepted this token. Save it to use it for discovery.", source);
+            }
+
             var (credential, viaJellyfin) = await SourceAsync(cancellationToken).ConfigureAwait(false);
             if (viaJellyfin is not null)
             {
@@ -55,6 +68,7 @@ public sealed class TmdbClient(IHttpClientFactory clients, Func<PluginConfigurat
             return (failure.Code, failure.Code switch
             {
                 "not_configured" => "No TMDB token is saved, and Jellyfin's built-in TMDb connection is unavailable.",
+                "unauthorized" when typedToken is not null => "TMDB refused this token. Check it was copied completely.",
                 "unauthorized" => "TMDB rejected the token. Check it was copied completely.",
                 "timeout" => "TMDB did not answer in time.",
                 "unreachable" => "TMDB could not be reached from this server.",

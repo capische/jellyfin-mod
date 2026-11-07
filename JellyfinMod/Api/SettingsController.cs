@@ -79,8 +79,10 @@ public sealed class SettingsController(
     /// the current revision. With <c>source=jellyfin</c> it checks Jellyfin's connection whatever is saved and records nothing
     /// (P1.FU13 live diagnostic).
     /// </summary>
+    /// <remarks>A body with <c>apiKey</c> tests that typed token instead, and records nothing (ds.t9).</remarks>
     [HttpPost("Settings/Discovery/Test")]
-    public async Task<ActionResult<ConnectionTestDto>> TestDiscovery([FromQuery] string? source, CancellationToken cancellationToken)
+    public async Task<ActionResult<ConnectionTestDto>> TestDiscovery([FromQuery] string? source,
+        [FromBody(EmptyBodyBehavior = Microsoft.AspNetCore.Mvc.ModelBinding.EmptyBodyBehavior.Allow)] KeyTestRequest? request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
         if (source is not (null or TmdbClient.JellyfinSource)) return Invalid("invalid_source");
@@ -88,6 +90,12 @@ public sealed class SettingsController(
         {
             var (probeCode, probeMessage) = await tmdb.TestJellyfinAsync(cancellationToken);
             return new ConnectionTestDto(probeCode == "ok", probeCode, probeMessage, null, null, TmdbClient.JellyfinSource);
+        }
+
+        if (request?.TypedKey is { } typed)
+        {
+            var (typedCode, typedMessage, typedSource) = await tmdb.TestAsync(typed, cancellationToken);
+            return new ConnectionTestDto(typedCode == "ok", typedCode, typedMessage, null, null, typedSource);
         }
 
         var settings = await AcquisitionConfiguration.GetSettingsAsync(database, cancellationToken);
