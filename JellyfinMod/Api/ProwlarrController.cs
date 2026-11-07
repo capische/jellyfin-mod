@@ -60,7 +60,11 @@ public sealed class ProwlarrController(
         return StatusCode(201, await ToDtoAsync(source, cancellationToken));
     }
 
-    /// <summary>Changes the source; replacing the key rotates it for every synced indexer at once.</summary>
+    /// <summary>
+    /// Changes the source; replacing the key rotates it for every synced indexer at once. An address that names another
+    /// Prowlarr (<see cref="SameProwlarr"/>) is a new source (the user, 2026-11-07): the indexers synced from the old one go in
+    /// the same save, and the new one is synced at once.
+    /// </summary>
     [HttpPatch("{id:guid}")]
     public async Task<ActionResult<ProwlarrSourceDto>> Patch(Guid id, ProwlarrSourceRequest request, CancellationToken cancellationToken)
     {
@@ -72,63 +76,75 @@ public sealed class ProwlarrController(
         if (source is null) return NotFound();
         if (request.Revision != source.Revision)
             return Conflict(Problem("revision_conflict", "This configuration changed since it was loaded. Reload and try again."));
+        var newBase = request.BaseUrl.Trim().TrimEnd('/');
+        var another = !SameProwlarr(source.BaseUrl, newBase);
+        if (another && await SyncedIndexersInUseAsync(id, cancellationToken)) return InUse();
         var previous = source.ApiKeySecretRef;
-        var previousBase = source.BaseUrl;
         if (!string.IsNullOrWhiteSpace(request.Name)) source.Name = request.Name.Trim();
-        source.BaseUrl = request.BaseUrl.Trim().TrimEnd('/');
+        source.BaseUrl = newBase;
         source.Enabled = request.Enabled;
         source.SyncIntervalMinutes = request.SyncIntervalMinutes;
         if (request.ApiKey.Action == "replace") source.ApiKeySecretRef = await secrets.AddAsync(request.ApiKey.Value!, cancellationToken);
         source.Revision++;
-        var moved = !string.Equals(previousBase, source.BaseUrl, StringComparison.Ordinal);
-        if (moved) await MoveSyncedIndexersAsync(source, previousBase, cancellationToken);
+        if (another)
+        {
+            // Nothing of the old Prowlarr is carried over: its indexers, its sync state and its empty-answer count. A search or
+            // sync that read the old rows meanwhile is refused (source_changed), so no request reaches the old host again.
+            await RemoveSyncedIndexersAsync(id, cancellationToken);
+            (source.LastSyncAt, source.LastSyncOutcome, source.LastError) = (null, null, null);
+            (source.ConsecutiveEmptySyncs, source.LastEmptySyncAt) = (0, null);
+        }
+
         if (await SaveAsync(cancellationToken) is { } conflict) return conflict;
         if (previous != source.ApiKeySecretRef) await secrets.RemoveAsync(previous, CancellationToken.None);
         cache.Invalidate();
-        // Re-verify at the new address now rather than at the next scheduled sync; its outcome is on the source.
-        if (moved && source.Enabled) await sync.SyncByIdAsync(source.Id, cancellationToken);
+        // Sync the new Prowlarr now, whether or not the schedule is on; a failed sync is fail-closed and leaves its code on the source.
+        if (another) await sync.SyncByIdAsync(source.Id, cancellationToken);
         database.ChangeTracker.Clear();
         source = await database.ProwlarrSources.SingleAsync(value => value.Id == id, cancellationToken);
         return await ToDtoAsync(source, cancellationToken);
     }
 
     /// <summary>
-    /// Points every synced indexer at the source's new address in the same save that moves the source, so no search,
-    /// <c>t=caps</c> or download ever goes to the old host with the source's key (REVIEW-2026-09-24 S9-R3). The
-    /// feeds must prove themselves again at the new address.
+    /// Whether two addresses name the same Prowlarr: the same scheme, host (any case), port (the default one written or not)
+    /// and path, a trailing slash ignored. Anything else is another Prowlarr, even the same one moved to a new host.
     /// </summary>
-    private async Task MoveSyncedIndexersAsync(ProwlarrSource source, string previousBase, CancellationToken cancellationToken)
+    private static bool SameProwlarr(string stored, string requested)
     {
-        var oldHost = new Uri(previousBase).Host;
-        var newBase = new Uri(source.BaseUrl.TrimEnd('/') + "/");
-        var rows = await database.AcquisitionIndexers.Where(indexer => indexer.ProwlarrSourceId == source.Id).ToListAsync(cancellationToken);
-        foreach (var row in rows)
-        {
-            if (row.ProwlarrIndexerId is { } prowlarrId) row.BaseUrl = new Uri(newBase, $"{prowlarrId}/api").ToString();
-            var hosts = row.DownloadHosts.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(host => string.Equals(host, oldHost, StringComparison.OrdinalIgnoreCase) ? newBase.Host : host)
-                .Distinct(StringComparer.OrdinalIgnoreCase);
-            row.DownloadHosts = string.Join(',', hosts);
-            row.Revision++;
-            row.VerifiedRevision = null;
-            row.CapabilitiesJson = null;
-            row.CapabilitiesFetchedAt = null;
-        }
+        if (!Uri.TryCreate(stored.TrimEnd('/'), UriKind.Absolute, out var before) || !Uri.TryCreate(requested.TrimEnd('/'), UriKind.Absolute, out var after))
+            return string.Equals(stored.TrimEnd('/'), requested.TrimEnd('/'), StringComparison.Ordinal);
+        return string.Equals(before.Scheme, after.Scheme, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(before.IdnHost, after.IdnHost, StringComparison.OrdinalIgnoreCase) && before.Port == after.Port &&
+            string.Equals(before.AbsolutePath.TrimEnd('/'), after.AbsolutePath.TrimEnd('/'), StringComparison.Ordinal);
     }
 
-    /// <summary>Removes the source and its synced indexers, unless a grab through one is still active.</summary>
+    private async Task<bool> SyncedIndexersInUseAsync(Guid sourceId, CancellationToken cancellationToken)
+    {
+        var synced = await database.AcquisitionIndexers.Where(indexer => indexer.ProwlarrSourceId == sourceId).Select(indexer => indexer.Id)
+            .ToListAsync(cancellationToken);
+        return await database.GrabOperations.AnyAsync(grab => synced.Contains(grab.IndexerId) && grab.ActiveHash != null, cancellationToken);
+    }
+
+    /// <summary>Marks the source's synced indexers for removal; grabs through them keep their recorded indexer name.</summary>
+    private async Task RemoveSyncedIndexersAsync(Guid sourceId, CancellationToken cancellationToken) =>
+        database.AcquisitionIndexers.RemoveRange(await database.AcquisitionIndexers.Where(indexer => indexer.ProwlarrSourceId == sourceId)
+            .ToListAsync(cancellationToken));
+
+    private ConflictObjectResult InUse() =>
+        Conflict(Problem("prowlarr_indexer_in_use", "Grabs through a synced indexer are still active; resolve them first."));
+
+    /// <summary>
+    /// Disconnects: removes the source, its synced indexers and its key, unless a grab through one is still active. Indexers
+    /// added by hand stay; the settings form calls it when the address and the key are both cleared (the user, 2026-11-07).
+    /// </summary>
     [HttpDelete("{id:guid}")]
     public async Task<IActionResult> Delete(Guid id, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
         var source = await database.ProwlarrSources.SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
         if (source is null) return NotFound();
-        var synced = await database.AcquisitionIndexers.Where(indexer => indexer.ProwlarrSourceId == id).Select(indexer => indexer.Id)
-            .ToListAsync(cancellationToken);
-        if (await database.GrabOperations.AnyAsync(grab => synced.Contains(grab.IndexerId) && grab.ActiveHash != null, cancellationToken))
-            return Conflict(Problem("prowlarr_indexer_in_use", "Grabs through a synced indexer are still active; resolve them first."));
-        database.AcquisitionIndexers.RemoveRange(await database.AcquisitionIndexers.Where(indexer => indexer.ProwlarrSourceId == id)
-            .ToListAsync(cancellationToken));
+        if (await SyncedIndexersInUseAsync(id, cancellationToken)) return InUse();
+        await RemoveSyncedIndexersAsync(id, cancellationToken);
         database.ProwlarrSources.Remove(source);
         await database.SaveChangesAsync(cancellationToken);
         await secrets.RemoveAsync(source.ApiKeySecretRef, CancellationToken.None);

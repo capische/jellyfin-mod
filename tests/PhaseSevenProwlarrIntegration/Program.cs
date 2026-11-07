@@ -308,57 +308,115 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         Assert(test.GetProperty("ok").GetBoolean() && torznab.Indexers["alpha"].Queries.Last().Contains("apikey=" + rotated, StringComparison.Ordinal),
             "The next request through a synced indexer uses the rotated key");
 
-        // ---- S9-R3: Prowlarr moves host. The synced feeds follow in the same save and are re-verified at the new
-        //      address; the old boundary receives nothing more, not even with the new key.
-        await using (var moved = new ProwlarrBoundary(torznab, "127.0.0.2"))
+        // ---- ds.t9 (the user, 2026-11-07): an address that names another Prowlarr is a new source. The indexers synced from
+        //      the old one go in the same save, the new one is synced at once, nothing is matched across the two by Prowlarr's
+        //      indexer id, and the old host receives nothing more. A refused save removes nothing.
+        async Task<JsonElement> Source() => (await Read(admin.GetAsync("/JellyfinMod/Settings/Prowlarr"), 200, "Sources")).EnumerateArray().Single();
+        Task<HttpResponseMessage> MoveTo(string address, int revision, object? apiKey = null) =>
+            admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new { name = "Prowlarr", baseUrl = address, apiKey = apiKey ?? new { action = "unchanged" }, revision });
+        string?[] SyncedIds(JsonElement[] all) => all.Where(row => row.GetProperty("managedBy").GetString() == "prowlarr").Select(row => row.GetProperty("id").GetString())
+            .OrderBy(value => value, StringComparer.Ordinal).ToArray();
+        string?[] SyncedNames(JsonElement[] all) => all.Where(row => row.GetProperty("managedBy").GetString() == "prowlarr").Select(row => row.GetProperty("name").GetString())
+            .OrderBy(value => value, StringComparer.Ordinal).ToArray();
+        bool HasManual(JsonElement[] all) => all.Count(row => row.GetProperty("managedBy").GetString() == "manual") == 1;
+        async Task<Guid> AddGrab(Guid indexerId, string indexerName, bool active)
         {
-            await moved.StartAsync();
-            moved.ApiKey = prowlarr.ApiKey;
-            foreach (var pair in prowlarr.Indexers) moved.Indexers[pair.Key] = (JsonObject)pair.Value.DeepClone();
-            foreach (var pair in prowlarr.Feeds) moved.Feeds[pair.Key] = pair.Value;
-            var oldRequests = prowlarr.Requests;
-            source = (await Read(admin.GetAsync("/JellyfinMod/Settings/Prowlarr"), 200, "Sources")).EnumerateArray().Single();
-            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
+            await using var database = new ModDbContext(dbPath);
+            var grab = new GrabOperation
             {
-                name = "Prowlarr", baseUrl = moved.Address.ToString(), apiKey = new { action = "unchanged" }, revision = source.GetProperty("revision").GetInt32()
-            }), 200, "Administrator moves the source to a new host");
-            alpha = Synced(await Indexers(), 1);
-            Assert(alpha.GetProperty("baseUrl").GetString() == new Uri(moved.Address, "/1/api").ToString() &&
-                alpha.GetProperty("downloadHosts").EnumerateArray().Select(value => value.GetString()).SequenceEqual(["127.0.0.2", "alpha.example"]) &&
-                alpha.GetProperty("verified").GetBoolean() && Synced(await Indexers(), 2).GetProperty("baseUrl").GetString()!.StartsWith(moved.Address.ToString(), StringComparison.Ordinal),
-                "S9-R3: the synced feeds and the download allow-list name the new host at once, re-verified there");
-            test = await Read(admin.PostAsync($"/JellyfinMod/Settings/Indexers/{alphaId}/Test", null), 200, "Synced indexer test after the move");
-            Assert(test.GetProperty("ok").GetBoolean() && moved.FeedRequests > 0, "S9-R3: t=caps reaches the new host");
-            Assert(prowlarr.Requests == oldRequests, "S9-R3: the old host receives nothing after the move");
-            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
-            {
-                name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "unchanged" }, revision = source.GetProperty("revision").GetInt32()
-            }), 200, "Administrator moves the source back");
-            Assert(Synced(await Indexers(), 1).GetProperty("baseUrl").GetString() == new Uri(prowlarr.Address, "/1/api").ToString() &&
-                Synced(await Indexers(), 1).GetProperty("verified").GetBoolean(), "Moving back re-points and re-verifies the feeds");
+                RequestedBy = world.Admin.Id, IdempotencyKey = "ds-t9-" + Guid.NewGuid().ToString("N"), RequestFingerprint = "ds-t9", SearchId = Guid.NewGuid(),
+                ReleaseId = "ds-t9", IndexerId = indexerId, IndexerName = indexerName, SourceGuid = "ds-t9", RawTitle = "JellyfinMod.Ds.T9.2020.1080p.WEB-DL-GRP",
+                ActiveHash = active ? Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(20)) : null, State = active ? GrabStates.Accepted : GrabStates.Failed
+            };
+            database.GrabOperations.Add(grab);
+            await database.SaveChangesAsync();
+            return grab.Id;
+        }
 
-            // Whole-review P1 c3bf1: a search read Alpha's feed address, then the source moved with a new key. Resolving
-            // that search's endpoint must not pair the old address with the new key.
-            AcquisitionIndexer staleAlpha;
+        async Task ResolveGrab(Guid grabId)
+        {
+            await using var database = new ModDbContext(dbPath);
+            await database.GrabOperations.Where(row => row.Id == grabId).ExecuteUpdateAsync(setters => setters.SetProperty(row => row.ActiveHash, (string?)null)
+                .SetProperty(row => row.State, GrabStates.Failed));
+        }
+
+        async Task<string?> GrabIndexerName(Guid grabId)
+        {
+            await using var database = new ModDbContext(dbPath);
+            return (await database.GrabOperations.AsNoTracking().SingleOrDefaultAsync(row => row.Id == grabId))?.IndexerName;
+        }
+
+        await using (var other = new ProwlarrBoundary(torznab, "127.0.0.2"))
+        {
+            await other.StartAsync();
+            other.ApiKey = prowlarr.ApiKey;
+            torznab.Indexers["beta"].ApiKey = prowlarr.ApiKey;
+            // Another Prowlarr whose indexer 1 is a different indexer from the first one's indexer 1.
+            other.Indexers[1] = new() { ["id"] = 1, ["name"] = "Delta", ["protocol"] = "torrent", ["enable"] = true, ["priority"] = 15 };
+            other.Feeds[1] = "alpha";
+            other.Indexers[4] = new() { ["id"] = 4, ["name"] = "Epsilon", ["protocol"] = "torrent", ["enable"] = true, ["priority"] = 40 };
+            other.Feeds[4] = "beta";
+            var beforeMove = await Indexers();
+            var oldIds = SyncedIds(beforeMove);
+            Assert(oldIds.Length == 2 && SyncedNames(beforeMove).SequenceEqual(["Alpha (Prowlarr)", "Beta"]), "ds.t9: two indexers are synced from the first Prowlarr");
+
+            source = await Source();
+            var revision = source.GetProperty("revision").GetInt32();
+            await Expect(Read(MoveTo(other.Address.ToString(), revision - 1), 409, "ds.t9: a move with a stale revision is refused"), "revision_conflict");
+            Assert(SyncedIds(await Indexers()).SequenceEqual(oldIds) && (await Source()).GetProperty("baseUrl").GetString() == prowlarr.Address.ToString().TrimEnd('/'),
+                "ds.t9: a refused save removes no synced indexer and keeps the address");
+
+            var activeGrab = await AddGrab(alphaId, "Alpha (Prowlarr)", active: true);
+            await Expect(Read(MoveTo(other.Address.ToString(), revision), 409, "ds.t9: a move while a grab through a synced indexer is active is refused"),
+                "prowlarr_indexer_in_use");
+            Assert(SyncedIds(await Indexers()).SequenceEqual(oldIds) && (await Source()).GetProperty("revision").GetInt32() == revision,
+                "ds.t9: the refused move changed nothing");
+            await ResolveGrab(activeGrab);
+
+            var oldRequests = prowlarr.Requests;
+            source = await Read(MoveTo(other.Address.ToString(), revision), 200, "ds.t9: administrator points the source at another Prowlarr");
+            var after = await Indexers();
+            Assert(SyncedNames(after).SequenceEqual(["Delta", "Epsilon"]) && !SyncedIds(after).Intersect(oldIds).Any() && HasManual(after),
+                "ds.t9: the old Prowlarr's indexers are gone, the new one's are synced at once as new rows, and the manual indexer stays: " +
+                string.Join(", ", SyncedNames(after)));
+            var delta = Synced(after, 1);
+            Assert(delta.GetProperty("baseUrl").GetString() == new Uri(other.Address, "/1/api").ToString() && delta.GetProperty("priority").GetInt32() == 15 &&
+                delta.GetProperty("downloadHosts").EnumerateArray().Select(value => value.GetString()).SequenceEqual(["127.0.0.2"]) &&
+                delta.GetProperty("verified").GetBoolean() && delta.GetProperty("dailyQueryBudget").GetInt32() != 7 &&
+                delta.GetProperty("slowSetupHowTo").ValueKind == JsonValueKind.Null,
+                "ds.t9: indexer 1 of the new Prowlarr is its own Delta, verified there, with nothing carried over from the old indexer 1 (no budget, no 1337x mark)");
+            Assert(Synced(after, 4).GetProperty("verified").GetBoolean(), "ds.t9: the new Prowlarr's other indexer is verified too");
+            Assert(source.GetProperty("indexerCount").GetInt32() == 2 && source.GetProperty("lastSyncOutcome").GetString() == "ok",
+                "ds.t9: the saved source answers the new sync's outcome and count");
+            test = await Read(admin.PostAsync($"/JellyfinMod/Settings/Indexers/{delta.GetProperty("id").GetString()}/Test", null), 200, "Synced indexer test after the move");
+            Assert(test.GetProperty("ok").GetBoolean() && other.FeedRequests > 0, "ds.t9: t=caps reaches the new Prowlarr");
+            Assert(prowlarr.Requests == oldRequests, "ds.t9: the old Prowlarr receives nothing during or after the move");
+            Assert(await GrabIndexerName(activeGrab) == "Alpha (Prowlarr)", "ds.t9: a grab through a removed indexer stays, with its recorded indexer name");
+
+            // The same Prowlarr written another way (scheme case, trailing slash) is no new source: its rows stay as they are.
+            var deltaId = delta.GetProperty("id").GetString();
+            source = await Read(MoveTo($"HTTP://{other.Address.Authority}/", source.GetProperty("revision").GetInt32()), 200, "ds.t9: the same address, spelt another way");
+            Assert(Synced(await Indexers(), 1).GetProperty("id").GetString() == deltaId && Synced(await Indexers(), 1).GetProperty("verified").GetBoolean(),
+                "ds.t9: the same scheme, host, port and path keep the synced indexers");
+
+            // Fail-closed: the save that moves the source removes the old rows; the new Prowlarr refusing the sync adds none and
+            // leaves its code on the source. A search that read a row before the move is refused (whole-review P1 c3bf1).
+            AcquisitionIndexer staleDelta;
             await using (var database = new ModDbContext(dbPath))
-                staleAlpha = await database.AcquisitionIndexers.AsNoTracking().SingleAsync(row => row.Id == alphaId);
-            var movedKey = "prowlarr-" + Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
-            secrets.Add(movedKey);
-            moved.ApiKey = movedKey;
-            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
-            {
-                name = "Prowlarr", baseUrl = moved.Address.ToString(), apiKey = new { action = "replace", value = movedKey },
-                revision = source.GetProperty("revision").GetInt32()
-            }), 200, "Administrator moves the source with a new key");
+                staleDelta = await database.AcquisitionIndexers.AsNoTracking().SingleAsync(row => row.ProwlarrIndexerId == 1);
+            prowlarr.Fault = "401";
+            source = await Read(MoveTo(prowlarr.Address.ToString(), source.GetProperty("revision").GetInt32()), 200, "ds.t9: a move to a Prowlarr that refuses the key");
+            prowlarr.Fault = null;
+            after = await Indexers();
+            Assert(SyncedIds(after).Length == 0 && HasManual(after) && source.GetProperty("indexerCount").GetInt32() == 0 &&
+                source.GetProperty("lastSyncOutcome").GetString() == "unauthorized",
+                $"ds.t9: the save removed the old rows; the refused sync added none and left its code ({source.GetProperty("lastSyncOutcome")})");
             string? refusal = null;
-            string? pairedHost = null;
             using (var scope = host.Service<IServiceScopeFactory>().CreateScope())
             {
                 try
                 {
-                    var endpoint = await scope.ServiceProvider.GetRequiredService<JellyfinMod.Services.Acquisition.AcquisitionConfiguration>()
-                        .EndpointAsync(staleAlpha, default);
-                    pairedHost = endpoint.BaseUrl.Host + (endpoint.ApiKey == movedKey ? " with the new key" : " with another key");
+                    await scope.ServiceProvider.GetRequiredService<JellyfinMod.Services.Acquisition.AcquisitionConfiguration>().EndpointAsync(staleDelta, default);
                 }
                 catch (JellyfinMod.Services.Acquisition.TorznabException failure)
                 {
@@ -366,39 +424,32 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
                 }
             }
 
-            Assert(refusal == "source_changed",
-                $"A feed address read before a move is never paired with the moved source's key (whole-review P1 c3bf1): {refusal ?? pairedHost}");
-            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
-            {
-                name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "replace", value = rotated },
-                revision = source.GetProperty("revision").GetInt32()
-            }), 200, "Administrator moves the source back with its key");
-            Assert(Synced(await Indexers(), 1).GetProperty("verified").GetBoolean(), "Back at the old host, the feeds verify again");
+            Assert(refusal == "source_changed", $"A feed read before a move is never paired with the moved source's key (whole-review P1 c3bf1): {refusal ?? "paired"}");
+            sync = await Read(admin.PostAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}/Sync", null), 200, "ds.t9: Sync Now once the key is accepted");
+            Assert(sync.GetProperty("code").GetString() == "ok" && SyncedNames(await Indexers()).SequenceEqual(["Alpha (Prowlarr)", "Beta"]),
+                "ds.t9: Sync Now imports the first Prowlarr's indexers again");
 
-            // A sync that read the source before a move must not write the old feed addresses back over it.
-            moved.ApiKey = rotated;
+            // A sync that read the source before a move must not write the old Prowlarr's indexers back over it.
             await using (var staleContext = new ModDbContext(dbPath))
             {
                 using var syncScope = host.Service<IServiceScopeFactory>().CreateScope();
-                var staleSync = ActivatorUtilities.CreateInstance<JellyfinMod.Services.Acquisition.ProwlarrSync>(syncScope.ServiceProvider,
-                    staleContext);
+                var staleSync = ActivatorUtilities.CreateInstance<JellyfinMod.Services.Acquisition.ProwlarrSync>(syncScope.ServiceProvider, staleContext);
                 var staleSource = await staleContext.ProwlarrSources.SingleAsync(row => row.Id == sourceId);
-                source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
-                {
-                    name = "Prowlarr", baseUrl = moved.Address.ToString(), apiKey = new { action = "unchanged" },
-                    revision = source.GetProperty("revision").GetInt32()
-                }), 200, "Administrator moves the source while a sync is in flight");
+                source = await Read(MoveTo(other.Address.ToString(), (await Source()).GetProperty("revision").GetInt32()), 200,
+                    "ds.t9: administrator moves the source while a sync is in flight");
                 var staleOutcome = await staleSync.SyncAsync(staleSource, default);
-                var alphaAfter = Synced(await Indexers(), 1).GetProperty("baseUrl").GetString();
-                Assert(staleOutcome.Code == "source_changed" && alphaAfter == new Uri(moved.Address, "/1/api").ToString(),
-                    $"An in-flight sync never restores the old feed addresses after a move (whole-review P1 c3bf1): {staleOutcome.Code}, {alphaAfter}");
+                after = await Indexers();
+                Assert(staleOutcome.Code == "source_changed" && SyncedNames(after).SequenceEqual(["Delta", "Epsilon"]) &&
+                    after.Where(row => row.GetProperty("managedBy").GetString() == "prowlarr")
+                        .All(row => row.GetProperty("baseUrl").GetString()!.StartsWith(other.Address.ToString(), StringComparison.Ordinal)),
+                    $"An in-flight sync never restores the old Prowlarr's indexers after a move (whole-review P1 c3bf1): {staleOutcome.Code}");
             }
 
-            source = await Read(admin.PatchAsJsonAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}", new
-            {
-                name = "Prowlarr", baseUrl = prowlarr.Address.ToString(), apiKey = new { action = "unchanged" },
-                revision = source.GetProperty("revision").GetInt32()
-            }), 200, "Administrator moves the source back again");
+            source = await Read(MoveTo(prowlarr.Address.ToString(), source.GetProperty("revision").GetInt32()), 200, "ds.t9: administrator moves the source back");
+            after = await Indexers();
+            Assert(SyncedNames(after).SequenceEqual(["Alpha (Prowlarr)", "Beta"]) && Synced(after, 1).GetProperty("verified").GetBoolean(),
+                "ds.t9: back at the first Prowlarr, its indexers are synced and verified again");
+            alphaId = Synced(after, 1).GetProperty("id").AsGuid();
         }
 
         // ---- S9-R1: the scheduled task honours the source's own interval.
@@ -508,12 +559,23 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs, List<str
         Assert(sync.GetProperty("removed").GetInt32() == 1 && !(await Indexers()).Any(row => row.GetProperty("prowlarrIndexerId").ValueKind == JsonValueKind.Number &&
             row.GetProperty("prowlarrIndexerId").GetInt32() == 1), "After 30 days a removed indexer is deleted");
 
-        // ---- Removing the source removes its synced indexers and its key; the manual indexer stays.
-        Assert((await admin.DeleteAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}")).StatusCode == HttpStatusCode.NoContent, "Administrator removes the source");
+        // ---- Disconnecting (ds.t9: the settings form's Save with the address and the key both cleared) removes the source, its
+        //      synced indexers and its key, never while a grab through one is active; the manual indexer and grab history stay.
+        var synced2 = Synced(await Indexers(), 2);
+        var historyGrab = await AddGrab(synced2.GetProperty("id").AsGuid(), synced2.GetProperty("name").GetString()!, active: false);
+        var liveGrab = await AddGrab(synced2.GetProperty("id").AsGuid(), synced2.GetProperty("name").GetString()!, active: true);
+        await Expect(Read(admin.DeleteAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}"), 409, "ds.t9: a disconnect while a grab is active is refused"),
+            "prowlarr_indexer_in_use");
+        Assert((await Indexers()).Any(row => row.GetProperty("managedBy").GetString() == "prowlarr"), "ds.t9: the refused disconnect removed nothing");
+        await ResolveGrab(liveGrab);
+        Assert((await admin.DeleteAsync($"/JellyfinMod/Settings/Prowlarr/{sourceId}")).StatusCode == HttpStatusCode.NoContent, "Administrator disconnects the source");
         rows = await Indexers();
         Assert(rows.Length == 1 && rows[0].GetProperty("managedBy").GetString() == "manual" &&
-            !File.ReadAllText(Path.Combine(folder, "acquisition-secrets.json")).Contains(rotated, StringComparison.Ordinal),
-            "Its synced indexers and its key go with it; the manual indexer stays");
+            !File.ReadAllText(Path.Combine(folder, "acquisition-secrets.json")).Contains(rotated, StringComparison.Ordinal) &&
+            (await Read(admin.GetAsync("/JellyfinMod/Settings/Prowlarr"), 200, "Sources")).GetArrayLength() == 0,
+            "Its source, synced indexers and key go with it; the manual indexer stays");
+        Assert(await GrabIndexerName(historyGrab) == "Beta" && await GrabIndexerName(liveGrab) == "Beta",
+            "ds.t9: grab history through a removed indexer stays, with its recorded indexer name");
         // ---- Whole-review P1 4: a redirect never carries the key anywhere. Prowlarr behind a proxy that redirects (here to
         // another path; to another host in the finding) is refused, and the redirected request is never sent.
         var movedSource = await Read(admin.PostAsJsonAsync("/JellyfinMod/Settings/Prowlarr", new
