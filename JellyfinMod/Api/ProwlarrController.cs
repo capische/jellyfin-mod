@@ -136,14 +136,51 @@ public sealed class ProwlarrController(
         return NoContent();
     }
 
-    /// <summary>Reads system status, health and the indexer list without changing anything.</summary>
+    /// <summary>
+    /// Reads system status, health and the indexer list without changing anything. A body may carry the address and key typed
+    /// in the form but not saved (ds.t9): each is used in place of the saved one, and nothing is stored. Without a source yet
+    /// (<c>POST Test</c>), both must be typed.
+    /// </summary>
     [HttpPost("{id:guid}/Test")]
-    public async Task<ActionResult<ConnectionTestDto>> Test(Guid id, CancellationToken cancellationToken)
+    [HttpPost("Test")]
+    public async Task<ActionResult<ConnectionTestDto>> Test(Guid? id,
+        [FromBody(EmptyBodyBehavior = Microsoft.AspNetCore.Mvc.ModelBinding.EmptyBodyBehavior.Allow)] KeyTestRequest? request, CancellationToken cancellationToken)
     {
         if (!readiness.IsReady) return StatusCode(503);
-        var source = await database.ProwlarrSources.AsNoTracking().SingleOrDefaultAsync(value => value.Id == id, cancellationToken);
+        var source = id is { } sourceId
+            ? await database.ProwlarrSources.AsNoTracking().SingleOrDefaultAsync(value => value.Id == sourceId, cancellationToken)
+            : new ProwlarrSource { Name = DefaultName, BaseUrl = string.Empty };
         if (source is null) return NotFound();
-        var (code, message, version) = await sync.TestAsync(source, cancellationToken);
+        var typedKey = request?.TypedKey;
+        if (typedKey is { Length: > 256 }) return Invalid("invalid_secret_change");
+        var typedAddress = string.IsNullOrWhiteSpace(request?.BaseUrl) ? null : request.BaseUrl.Trim().TrimEnd('/');
+        if (typedAddress is not null && !string.Equals(typedAddress, source.BaseUrl, StringComparison.Ordinal))
+        {
+            if (!Uri.TryCreate(typedAddress, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||
+                !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
+                return Invalid("invalid_prowlarr_url");
+            source.BaseUrl = typedAddress;
+        }
+        else
+        {
+            typedAddress = null;
+        }
+
+        if (id is null && (typedAddress is null || typedKey is null))
+            return Invalid("prowlarr_test_incomplete");
+        var (code, message, version) = await sync.TestAsync(source, cancellationToken, typedKey);
+        // Typed values get words that say what to do next; the saved ones keep the sync's own sentence.
+        if (typedKey is not null || typedAddress is not null)
+        {
+            message = code switch
+            {
+                "ok" => message.Replace("Prowlarr answered and has", typedKey is null ? "Prowlarr answered at this address and has" : "Prowlarr accepted this key and has",
+                    StringComparison.Ordinal) + " Save it to sync with it.",
+                "unauthorized" when typedKey is not null => "Prowlarr refused this key. Copy it again from its General settings.",
+                _ => message
+            };
+        }
+
         return new ConnectionTestDto(code == "ok", code, message, version, null);
     }
 
@@ -270,6 +307,7 @@ public sealed class ProwlarrController(
     private BadRequestObjectResult Invalid(string code) =>
         BadRequest(new ProblemDetails { Status = 400, Type = code, Title = code == "invalid_prowlarr_url"
             ? "Enter the Prowlarr address, for example http://host:9696, without credentials."
+            : code == "prowlarr_test_incomplete" ? "Type the Prowlarr address and its API key to test them."
             : "The configuration is not valid." });
 
     private static ProblemDetails Problem(string code, string title) => new() { Status = 409, Type = code, Title = title };
