@@ -539,6 +539,31 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     Assert((await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{Guid.NewGuid()}/Ratings/Refresh")).Status == HttpStatusCode.NotFound,
         "Refreshing an unknown entry is 404");
 
+    // ---- The fetching flag (ds.t16): a native page and a file-less page read again while a fetch of their title waits or runs.
+    async Task<(bool Item, bool Entry)> Fetching() => (
+        (await Get(viewer, $"JellyfinMod/Ratings/Items/{series.Id}")).Body.GetProperty("fetching").GetBoolean(),
+        (await Get(viewer, $"JellyfinMod/Entries/{seriesS}")).Body.GetProperty("ratingsFetching").GetBoolean());
+    Assert(await Fetching() == (false, false), "With nothing waiting for the title, neither answer says it is fetching");
+    var seriesAttempt = await Attempt(9201, "series");
+    boundary.HoldTitle = 9201;
+    Assert((await Send(admin, HttpMethod.Post, $"JellyfinMod/Entries/{seriesS}/Ratings/Refresh")).Status == HttpStatusCode.Accepted,
+        "A refresh of the native series' title is queued");
+    Assert(await Fetching() == (true, true), "While the refresh waits, the native item's ratings and the entry's detail say fetching");
+    await boundary.Held.Task.WaitAsync(TimeSpan.FromSeconds(30));
+    Assert(await Fetching() == (true, true), "While its call is out, both still say fetching");
+    boundary.Release.TrySetResult();
+    await WaitFor(async () => await Fetching() == (false, false), "the flag clears once the refresh has answered");
+    boundary.ResetHold();
+    Assert(BySource((await Get(viewer, $"JellyfinMod/Ratings/Items/{series.Id}")).Body.GetProperty("ratings"))["imdb"].GetProperty("provider").GetString() == "mdblist",
+        "The answer that clears the flag carries the fetched values");
+    // The title is due again as it was, so the runs below see the same titles.
+    await using (var database = new ModDbContext(dbPath))
+    {
+        var attempt = await database.RatingsFetches.SingleAsync(row => row.MediaType == "series" && row.TmdbId == 9201);
+        (attempt.AttemptedAt, attempt.Manual) = (seriesAttempt.AttemptedAt, seriesAttempt.Manual);
+        await database.SaveChangesAsync();
+    }
+
     // ---- Structure (review 2026-10-07, P2 5): a wrong-shaped item makes the answer malformed and keeps every stored value.
     async Task<string> RefreshAndWait(Guid entry, int tmdb)
     {
@@ -1137,6 +1162,8 @@ static async Task AutomaticAsync(string root, CapturingLoggerProvider logs)
         await Task.Delay(15);
     }
 
+    async Task<bool> Fetching(Guid entry) => (await Send(HttpMethod.Get, $"JellyfinMod/Entries/{entry}")).Body.GetProperty("ratingsFetching").GetBoolean();
+    Assert(!await Fetching(first[2]), "Without a key an arrival waiting for its pass is not fetching: nothing will fetch it (ds.t16)");
     await Settle();
     var status = await Status();
     Assert(boundary.Calls.IsEmpty && status.GetProperty("lastRun").ValueKind == JsonValueKind.Null && status.GetProperty("running").ValueKind == JsonValueKind.Null,
@@ -1172,13 +1199,23 @@ static async Task AutomaticAsync(string root, CapturingLoggerProvider logs)
     var arrivalsBefore = Arrivals();
     var added = Stopwatch.StartNew();
     var addWatch = Stopwatch.StartNew();
+    boundary.HoldTitle = 9304;
     var fresh = await Add(9304, world.Movies.Id);
     var addSeconds = addWatch.Elapsed.TotalSeconds;
+    // The fetching flag (ds.t16): set while the arrival waits for its pass and while its call is out, clear once it answered.
+    var waitingFlag = await Fetching(fresh);
+    await boundary.Held.Task.WaitAsync(TimeSpan.FromSeconds(30));
+    var runningFlag = await Fetching(fresh);
+    boundary.Release.TrySetResult();
+    Assert(waitingFlag && runningFlag, "A new entry's detail says its ratings are fetching while its arrival waits and while its call is out",
+        new { waitingFlag, runningFlag });
     await WaitFor(async () => boundary.CallsFor("movie", 9304) == 1 && await HasMdbList(fresh), "the new title's ratings");
     var arrivedSeconds = added.Elapsed.TotalSeconds;
     Assert(arrivedSeconds < 6 && addSeconds < 2 && Arrivals() == arrivalsBefore + 1,
         "A title added to the catalog has its ratings within seconds (one arrivals pass), and the add itself did not wait for MDBList",
         new { arrivedSeconds, addSeconds });
+    boundary.ResetHold();
+    await WaitFor(async () => !await Fetching(fresh), "the flag clears after the pass");
     Console.WriteLine($"evidence - add answered in {addSeconds:F2}s; the title's ratings were stored {arrivedSeconds:F2}s after the add began");
     // The same title added to another library joins what its title already has: no call.
     var twin = await Add(9304, world.Movies2.Id);
@@ -1210,6 +1247,7 @@ static async Task AutomaticAsync(string root, CapturingLoggerProvider logs)
     }
 
     var behindBreaker = await Add(9306, world.Movies.Id);
+    Assert(!await Fetching(behindBreaker), "With the breaker open an arrival is not fetching");
     await Settle();
     Assert(boundary.CallsFor("movie", 9306) == 0, "With the breaker open an arriving title makes no call");
     time.Offset += TimeSpan.FromHours(2);

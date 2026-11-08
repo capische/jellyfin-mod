@@ -1254,6 +1254,7 @@ public sealed class EntriesController(
             evaluations.Values.Where(evaluation => readableTargets.Contains(evaluation.TargetId))), isAdmin);
         var readableHistory = await ReadableHistoryAsync(user, history, episodes, readableEpisodes, entry.MediaType == "series",
             cancellationToken).ConfigureAwait(false);
+        var ratingsSettings = ratings is null ? null : await ratings.ReadSettingsAsync(cancellationToken).ConfigureAwait(false);
         return new EntryDetail(new EntryDto(entry, projections.GetValueOrDefault(entry.Id))
             { PlaceholderItemId = titleItem, PlayableItemId = playable.TryGetValue(entry.Id, out var playableTitle) ? playableTitle : null }, readableHistory,
             episodeDtos, entryRetention,
@@ -1267,8 +1268,8 @@ public sealed class EntriesController(
             EpisodeListLoaded = entry.MediaType != "series" || episodes.Any(episode => !episode.IsPositionIdentity) ||
                 history.Any(record => record.EventType == SeriesMetadataRefresher.EpisodeListEvent),
             // Display only (user decision 7): read from SQLite and the host's item, never fetched here (P9.R5).
-            Ratings = ratings is null ? [] : await ratings.ForEntryAsync(entry, await ratings.ReadSettingsAsync(cancellationToken).ConfigureAwait(false),
-                cancellationToken).ConfigureAwait(false)
+            Ratings = ratingsSettings is null ? [] : await ratings!.ForEntryAsync(entry, ratingsSettings, cancellationToken).ConfigureAwait(false),
+            RatingsFetching = ratingsSettings is not null && await ratings!.FetchingAsync(entry, ratingsSettings, cancellationToken).ConfigureAwait(false)
         };
     }
 }

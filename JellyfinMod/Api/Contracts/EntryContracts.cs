@@ -186,6 +186,10 @@ public sealed record EntryDetail([property: JsonPropertyName("entry")] EntryDto 
     /// <summary>Gets the title's ratings, one per source in its own scale; empty while ratings are off (P9.R5).</summary>
     [JsonPropertyName("ratings")]
     public IReadOnlyList<RatingDto> Ratings { get; init; } = [];
+
+    /// <summary>Gets whether a fetch of the title's ratings is waiting or under way, so the page reads again soon (ds.t16).</summary>
+    [JsonPropertyName("ratingsFetching")]
+    public bool RatingsFetching { get; init; }
 }
 
 /// <summary>Filtered remote page with an explicit continuation, not a misleading remote total.</summary>
