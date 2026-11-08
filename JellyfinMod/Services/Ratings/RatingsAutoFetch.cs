@@ -31,8 +31,8 @@ public static class RatingsPassKinds
 /// next one. Each pass goes through <see cref="RatingsRefreshRunner.RunAutomaticAsync"/>, so the claim, the budget, the
 /// breaker, the blocker and the credential gate apply exactly as they do to the daily run.
 /// </summary>
-public sealed class RatingsAutoFetch(IServiceScopeFactory scopes, DatabaseInitializer readiness, RatingsOptions options, ILogger<RatingsAutoFetch> logger)
-    : BackgroundService
+public sealed class RatingsAutoFetch(IServiceScopeFactory scopes, DatabaseInitializer readiness, RatingsOptions options, ILogger<RatingsAutoFetch> logger,
+    TimeProvider? clock = null) : BackgroundService
 {
     /// <summary>Arrived entries kept by id at most; beyond this the pass still takes every title never attempted.</summary>
     private const int ArrivalLimit = 10000;
@@ -40,6 +40,8 @@ public sealed class RatingsAutoFetch(IServiceScopeFactory scopes, DatabaseInitia
     private readonly Channel<bool> _wake = Channel.CreateBounded<bool>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
     private readonly object _lock = new();
     private readonly HashSet<Guid> _arrived = [];
+    private readonly HashSet<Guid> _running = [];
+    private DateTime _runningSince;
     private bool _arrivals;
     private string? _full;
     private long _firstArrival;
@@ -60,6 +62,19 @@ public sealed class RatingsAutoFetch(IServiceScopeFactory scopes, DatabaseInitia
         }
 
         _wake.Writer.TryWrite(true);
+    }
+
+    /// <summary>
+    /// Whether an entry's title waits for a pass (<c>Pending</c>), or the pass under way took it (<c>RunningSince</c>, the pass's
+    /// start on the runner's clock: a fetch attempted since then has answered for it). Both empty when no pass is about it (ds.t16).
+    /// </summary>
+    public (bool Pending, DateTime? RunningSince) Fetching(Guid entryId)
+    {
+        lock (_lock)
+        {
+            if (_arrived.Contains(entryId)) return (true, null);
+            return _running.Contains(entryId) ? (false, _runningSince) : (false, null);
+        }
     }
 
     /// <summary>Asks for a full run at once (<see cref="RatingsPassKinds.Setup"/> or <see cref="RatingsPassKinds.Startup"/>).</summary>
@@ -90,11 +105,20 @@ public sealed class RatingsAutoFetch(IServiceScopeFactory scopes, DatabaseInitia
                     kind = _full ?? (_arrivals ? RatingsPassKinds.Arrivals : null);
                     arrived = _full is null && _arrivals ? _arrived.ToArray() : null;
                     (_full, _arrivals) = (null, false);
+                    // A full run takes the arrivals with it, so they are its titles as much as an arrivals pass's.
+                    _running.UnionWith(_arrived);
+                    _runningSince = (clock ?? TimeProvider.System).GetUtcNow().UtcDateTime;
                     _arrived.Clear();
                 }
 
-                if (kind is null) continue;
-                await PassAsync(kind, arrived, stoppingToken).ConfigureAwait(false);
+                try
+                {
+                    if (kind is not null) await PassAsync(kind, arrived, stoppingToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    lock (_lock) _running.Clear();
+                }
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

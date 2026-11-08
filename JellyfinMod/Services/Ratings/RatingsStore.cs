@@ -10,7 +10,8 @@ namespace JellyfinMod.Services.Ratings;
 /// Reads and projects ratings (P9.R5): SQLite and the host's in-memory items only, never a provider call. One value per
 /// source, by the precedence of plan decision 5; unknown raw sources are never exposed.
 /// </summary>
-public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, TimeProvider clock)
+public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, TimeProvider clock,
+    RatingsAutoFetch? automatic = null, RatingsRefreshQueue? manual = null, AcquisitionSecretStore? secrets = null)
 {
     /// <summary>Gets the settings row, creating it with the defaults on first use.</summary>
     public static async Task<RatingsSettings> GetSettingsAsync(ModDbContext database, CancellationToken cancellationToken)
@@ -83,6 +84,28 @@ public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, 
         var stored = entry is null ? [] : await database.TitleRatings.AsNoTracking().Where(row => row.EntryId == entry.Id)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         return Project(entry, stored, host.Read(item), settings);
+    }
+
+    /// <summary>
+    /// Whether a fetch for the entry's title is waiting or under way (ds.t16): an arrival not yet fetched, the pass that took it
+    /// until its call has answered, or a manual refresh still queued. A fetch that may not start now (ratings off, no key, a
+    /// blocker, an open breaker, a spent budget) is not one, so the page does not wait for it. Display only: no call is made.
+    /// </summary>
+    public async Task<bool> FetchingAsync(Entry? entry, RatingsSettings settings, CancellationToken cancellationToken)
+    {
+        if (entry is null || entry.TmdbId <= 0 || !settings.Enabled || secrets is null) return false;
+        var queued = manual?.Contains(entry.Id) == true;
+        var (pending, since) = automatic?.Fetching(entry.Id) ?? (false, null);
+        if (!queued && !pending && since is null) return false;
+        var state = await database.RatingsProviderStates.AsNoTracking().SingleOrDefaultAsync(row => row.Id == RatingsProviderState.SingletonId,
+            cancellationToken).ConfigureAwait(false) ?? new RatingsProviderState();
+        var now = clock.GetUtcNow().UtcDateTime;
+        if (RatingsRefreshRunner.Refusal(settings, state, await secrets.HasAsync(settings.ApiKeyRef, cancellationToken).ConfigureAwait(false), now)
+            is not null) return false;
+        if (queued || pending) return true;
+        var attempt = await database.RatingsFetches.AsNoTracking()
+            .SingleOrDefaultAsync(row => row.MediaType == entry.MediaType && row.TmdbId == entry.TmdbId, cancellationToken).ConfigureAwait(false);
+        return attempt is null || attempt.Outcome == RatingsOutcomes.Pending || attempt.AttemptedAt < since;
     }
 
     /// <summary>Merges the snapshot, stored and host values into one value per known source, in the complete display order.</summary>

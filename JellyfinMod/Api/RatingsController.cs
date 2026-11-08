@@ -179,7 +179,8 @@ public sealed class RatingsController(
             .OrderBy(entry => entry.Id).ToListAsync(cancellationToken);
         var entry = candidates.FirstOrDefault(candidate => access.CanRead(user, candidate));
         var settings = await ratings.ReadSettingsAsync(cancellationToken);
-        return new ItemRatingsDto(entry?.Id, await ratings.ForNativeAsync(entry, item, settings, cancellationToken));
+        return new ItemRatingsDto(entry?.Id, await ratings.ForNativeAsync(entry, item, settings, cancellationToken),
+            await ratings.FetchingAsync(entry, settings, cancellationToken));
     }
 
     /// <summary>Queues one title's refresh inside the budget (202); 409 with a code when fetching cannot happen now.</summary>

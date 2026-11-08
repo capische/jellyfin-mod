@@ -16,7 +16,8 @@ public sealed record RatingDto(
 /// <summary>A native item's ratings, for its detail page (P9.R5).</summary>
 public sealed record ItemRatingsDto(
     [property: JsonPropertyName("entryId"), JsonIgnore(Condition = JsonIgnoreCondition.Never)] Guid? EntryId,
-    [property: JsonPropertyName("ratings")] IReadOnlyList<RatingDto> Ratings);
+    [property: JsonPropertyName("ratings")] IReadOnlyList<RatingDto> Ratings,
+    [property: JsonPropertyName("fetching")] bool Fetching = false);
 
 /// <summary>What every signed-in user may know about ratings: whether they are on and the administrator's default order.</summary>
 public sealed record RatingsDefaultsDto(

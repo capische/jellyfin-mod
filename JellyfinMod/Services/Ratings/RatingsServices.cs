@@ -63,6 +63,12 @@ public sealed class RatingsRefreshQueue
         }
     }
 
+    /// <summary>Whether this entry's refresh is waiting or running (it leaves when the fetcher is done with it).</summary>
+    public bool Contains(Guid entryId)
+    {
+        lock (_lock) return _queued.Contains(entryId);
+    }
+
     internal ChannelReader<Guid> Reader => _channel.Reader;
 
     internal void Done(Guid entryId)
