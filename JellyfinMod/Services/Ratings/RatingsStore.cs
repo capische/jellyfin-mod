@@ -11,7 +11,8 @@ namespace JellyfinMod.Services.Ratings;
 /// source, by the precedence of plan decision 5; unknown raw sources are never exposed.
 /// </summary>
 public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, TimeProvider clock,
-    RatingsAutoFetch? automatic = null, RatingsRefreshQueue? manual = null, AcquisitionSecretStore? secrets = null)
+    RatingsAutoFetch? automatic = null, RatingsRefreshQueue? manual = null, AcquisitionSecretStore? secrets = null,
+    RatingsRunGate? runs = null)
 {
     /// <summary>Gets the settings row, creating it with the defaults on first use.</summary>
     public static async Task<RatingsSettings> GetSettingsAsync(ModDbContext database, CancellationToken cancellationToken)
@@ -88,21 +89,25 @@ public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, 
 
     /// <summary>
     /// Whether a fetch for the entry's title is waiting or under way (ds.t16): an arrival not yet fetched, the pass that took it
-    /// until its call has answered, or a manual refresh still queued. A fetch that may not start now (ratings off, no key, a
-    /// blocker, an open breaker, a spent budget) is not one, so the page does not wait for it. Display only: no call is made.
+    /// until its call has answered, a title any run (daily, full, arrivals) still has to fetch, or a manual refresh still queued.
+    /// A fetch that may not start now (ratings off, no key, a blocker, an open breaker, a spent budget) is not one, so the page
+    /// does not wait for it; a call already made is, until its answer is recorded. Display only: no call is made.
     /// </summary>
     public async Task<bool> FetchingAsync(Entry? entry, RatingsSettings settings, CancellationToken cancellationToken)
     {
         if (entry is null || entry.TmdbId <= 0 || !settings.Enabled || secrets is null) return false;
+        var (waiting, calling) = runs?.Fetching(entry.MediaType, entry.TmdbId) ?? (false, false);
+        // Its own spend may have been the last of the budget: a call made is answered whatever may start after it.
+        if (calling) return true;
         var queued = manual?.Contains(entry.Id) == true;
         var (pending, since) = automatic?.Fetching(entry.Id) ?? (false, null);
-        if (!queued && !pending && since is null) return false;
+        if (!queued && !waiting && !pending && since is null) return false;
         var state = await database.RatingsProviderStates.AsNoTracking().SingleOrDefaultAsync(row => row.Id == RatingsProviderState.SingletonId,
             cancellationToken).ConfigureAwait(false) ?? new RatingsProviderState();
         var now = clock.GetUtcNow().UtcDateTime;
         if (RatingsRefreshRunner.Refusal(settings, state, await secrets.HasAsync(settings.ApiKeyRef, cancellationToken).ConfigureAwait(false), now)
             is not null) return false;
-        if (queued || pending) return true;
+        if (queued || waiting || pending) return true;
         var attempt = await database.RatingsFetches.AsNoTracking()
             .SingleOrDefaultAsync(row => row.MediaType == entry.MediaType && row.TmdbId == entry.TmdbId, cancellationToken).ConfigureAwait(false);
         return attempt is null || attempt.Outcome == RatingsOutcomes.Pending || attempt.AttemptedAt < since;

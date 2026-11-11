@@ -614,10 +614,25 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
     // A run under way: turning ratings off, or lowering the budget, stops it; no call starts once the save has returned.
     foreach (var change in new[] { "off", "budget" })
     {
+        // The budget case leaves room for exactly the one call it holds (Codex review of ds.t16, P2 4-5).
+        if (change == "budget")
+            Assert((await Patch(new { revision = (await Settings()).GetProperty("revision").GetInt32(),
+                dailyBudget = (await Status()).GetProperty("budget").GetProperty("used").GetInt32() + 1 })).Status == HttpStatusCode.OK,
+                "The budget leaves room for one more call today");
         boundary.HoldAny = true;
         callsBefore = boundary.Calls.Count;
         var running = Run();
         await boundary.Held.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        Guid? heldEntry = null;
+        if (change == "budget")
+        {
+            var heldTmdb = int.Parse(boundary.Calls.Last().Split(':')[1], System.Globalization.CultureInfo.InvariantCulture);
+            await using (var database = new ModDbContext(dbPath))
+                heldEntry = await database.Entries.AsNoTracking().Where(row => row.TmdbId == heldTmdb).Select(row => row.Id).FirstAsync();
+            Assert((await Get(admin, $"JellyfinMod/Entries/{heldEntry}")).Body.GetProperty("ratingsFetching").GetBoolean(),
+                "While the daily run's call that spent the last of the budget is out, its title's detail says fetching");
+        }
+
         revision = (await Settings()).GetProperty("revision").GetInt32();
         var used = (await Status()).GetProperty("budget").GetProperty("used").GetInt32();
         var changed = await SaveWhileHeld(change == "off" ? new { revision, enabled = (bool?)false, dailyBudget = (int?)null } :
@@ -625,6 +640,9 @@ static async Task RunAsync(string folder, CapturingLoggerProvider logs)
         var callsAtSave = boundary.Calls.Count;
         await running;
         boundary.ResetHold();
+        if (heldEntry is { } answered)
+            Assert(!(await Get(admin, $"JellyfinMod/Entries/{answered}")).Body.GetProperty("ratingsFetching").GetBoolean(),
+                "Once the run has recorded that answer, the title is no longer fetching");
         var stop = (await Status()).GetProperty("lastRun").GetProperty("stopReason").GetString();
         Assert(changed.Status == HttpStatusCode.OK && callsAtSave == callsBefore + 1 && boundary.Calls.Count == callsBefore + 1 &&
             stop == (change == "off" ? "ratings_disabled" : "budget_spent"),
