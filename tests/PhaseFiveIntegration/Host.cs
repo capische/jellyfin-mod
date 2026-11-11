@@ -619,7 +619,7 @@ internal sealed class PluginHost : IAsyncDisposable
         builder.Logging.ClearProviders().AddProvider(logs).SetMinimumLevel(LogLevel.Debug);
         builder.Services.AddControllers(options => options.Filters.AddService<JellyfinMod.Api.Filters.PlaceholderFilter>())
             .AddApplicationPart(typeof(QueueController).Assembly)
-            .AddApplicationPart(typeof(TvShowsController).Assembly).AddJsonOptions(options =>
+            .AddApplicationPart(typeof(PluginHost).Assembly).AddJsonOptions(options =>
         {
             // Match the pinned Jellyfin host's serializer defaults; plugin DTOs name their own properties.
             var defaults = Jellyfin.Extensions.Json.JsonDefaults.PascalCaseOptions;
