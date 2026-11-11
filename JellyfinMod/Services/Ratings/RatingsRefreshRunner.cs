@@ -48,6 +48,49 @@ public sealed class RatingsRunGate
     /// <summary>Gets or sets the pass in progress, or null when none is (set only while the gate is held).</summary>
     public RatingsActivity? Activity { get; set; }
 
+    private readonly object _titles = new();
+    private HashSet<(string MediaType, int TmdbId)> _waiting = [];
+    private (string MediaType, int TmdbId)? _calling;
+
+    /// <summary>
+    /// Whether the run under way still has this title to fetch (<c>Waiting</c>), or has called for it and not yet recorded the
+    /// answer (<c>Calling</c>), by title identity, so every library's entry of it counts (ds.t16). Every kind of run: the daily
+    /// run, a full or arrivals pass, a manual refresh (which only calls).
+    /// </summary>
+    public (bool Waiting, bool Calling) Fetching(string mediaType, int tmdbId)
+    {
+        lock (_titles) return (_waiting.Contains((mediaType, tmdbId)), _calling == (mediaType, tmdbId));
+    }
+
+    /// <summary>Sets the titles the run under way is still to fetch.</summary>
+    internal void Waiting(IEnumerable<(string MediaType, int TmdbId)> titles)
+    {
+        var set = titles.ToHashSet();
+        lock (_titles) _waiting = set;
+    }
+
+    /// <summary>One of the run's titles is done with, fetched or not.</summary>
+    internal void Answered((string MediaType, int TmdbId) title)
+    {
+        lock (_titles) _waiting.Remove(title);
+    }
+
+    /// <summary>A call for this title is made; dispose the result once its answer is recorded.</summary>
+    internal IDisposable Calling((string MediaType, int TmdbId) title)
+    {
+        lock (_titles) _calling = title;
+        return new Call(this, title);
+    }
+
+    private sealed class Call(RatingsRunGate owner, (string MediaType, int TmdbId) title) : IDisposable
+    {
+        public void Dispose()
+        {
+            lock (owner._titles)
+                if (owner._calling == title) owner._calling = null;
+        }
+    }
+
     /// <summary>Waits for the gate; dispose the result to release it.</summary>
     public async Task<IDisposable> AcquireAsync(CancellationToken cancellationToken)
     {
@@ -212,11 +255,13 @@ public sealed class RatingsRefreshRunner(
         int fetched = 0, failed = 0;
         try
         {
+            if (stop is null) gate.Waiting(due.Select(title => (title.MediaType, title.TmdbId)));
             for (var index = 0; stop is null && index < due.Count; index++)
             {
                 gate.Activity = new RatingsActivity(kind, startedAt, due.Count - index);
                 cancellationToken.ThrowIfCancellationRequested();
                 var (outcome, refusal) = await FetchAsync(due[index], false, cancellationToken).ConfigureAwait(false);
+                gate.Answered((due[index].MediaType, due[index].TmdbId));
                 if (refusal is not null)
                 {
                     stop = refusal;
@@ -232,6 +277,7 @@ public sealed class RatingsRefreshRunner(
         finally
         {
             gate.Activity = null;
+            gate.Waiting([]);
         }
 
         database.ChangeTracker.Clear();
@@ -403,6 +449,8 @@ public sealed class RatingsRefreshRunner(
         Spend(current.State);
         if (!await SaveBoundedAsync(cancellationToken).ConfigureAwait(false)) return (null, RatingsOutcomes.DatabaseBusy);
 
+        // Fetching until the answer is recorded, also when this call spent the last of the budget (ds.t16).
+        using var call = gate.Calling((title.MediaType, title.TmdbId));
         gate.LastCallAt = DateTime.UtcNow;
         var result = await client.FetchAsync(current.Key!, title.MediaType, title.TmdbId, cancellationToken).ConfigureAwait(false);
         var observed = result;
