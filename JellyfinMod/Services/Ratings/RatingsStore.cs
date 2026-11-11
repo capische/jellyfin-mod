@@ -105,8 +105,9 @@ public sealed class RatingsStore(ModDbContext database, HostRatingsReader host, 
         var state = await database.RatingsProviderStates.AsNoTracking().SingleOrDefaultAsync(row => row.Id == RatingsProviderState.SingletonId,
             cancellationToken).ConfigureAwait(false) ?? new RatingsProviderState();
         var now = clock.GetUtcNow().UtcDateTime;
+        // A call may have started, and spent the last of the budget, while these were read: the gate is read again after them.
         if (RatingsRefreshRunner.Refusal(settings, state, await secrets.HasAsync(settings.ApiKeyRef, cancellationToken).ConfigureAwait(false), now)
-            is not null) return false;
+            is not null) return runs?.Fetching(entry.MediaType, entry.TmdbId).Calling == true;
         if (queued || waiting || pending) return true;
         var attempt = await database.RatingsFetches.AsNoTracking()
             .SingleOrDefaultAsync(row => row.MediaType == entry.MediaType && row.TmdbId == entry.TmdbId, cancellationToken).ConfigureAwait(false);
