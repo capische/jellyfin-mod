@@ -242,6 +242,8 @@ public sealed class RetentionExecutor(
         // data is on the copies that stay (D279).
         if (!await KeepVersionUserDataAsync(operation).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.UserDataNotKept);
+        // Playback needs no library lease, so a session that started during the copy is read again here.
+        if (PlayingReason(target.ItemId) is { } playing) return RetentionExecutionResult.NotStarted(bindingId, playing);
         database.RetentionOperations.Add(operation);
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
@@ -340,6 +342,8 @@ public sealed class RetentionExecutor(
         // user's data is on the copies that stay (D279).
         if (!await KeepVersionUserDataAsync(operation).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.UserDataNotKept);
+        // Playback needs no library lease, so a session that started during the copy is read again here.
+        if (PlayingReason(target.ItemId) is { } playing) return RetentionExecutionResult.NotStarted(bindingId, playing);
         database.RetentionOperations.Add(operation);
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
@@ -553,14 +557,18 @@ public sealed class RetentionExecutor(
         // A file another binding shares (an overlapping library, a hardlinked copy bound elsewhere) is not this version alone.
         var sharing = await CurrentBindingSetAsync(observed.CanonicalPath, cancellationToken).ConfigureAwait(false);
         if (sharing.Count != 1) return (RetentionPreviewReasons.SharedPathNotAllEligible, observed);
-        switch (liveCheck.IsFilePlaying(target.ItemId))
-        {
-            case null: return (RetentionPreviewReasons.ActiveSessionUnknown, observed);
-            case true: return (RetentionPreviewReasons.ActiveSession, observed);
-        }
+        if (PlayingReason(target.ItemId) is { } playing) return (playing, observed);
 
         return (null, observed);
     }
+
+    /// <summary>Why a file that is playing, or may be, cannot be removed now; null when no session plays it.</summary>
+    private string? PlayingReason(Guid itemId) => liveCheck.IsFilePlaying(itemId) switch
+    {
+        null => RetentionPreviewReasons.ActiveSessionUnknown,
+        true => RetentionPreviewReasons.ActiveSession,
+        false => null
+    };
 
     /// <summary>Inspects and resolves operations left prepared or unlinked by an interrupted process.</summary>
     public async Task<IReadOnlyList<RetentionExecutionResult>> RecoverAsync(CancellationToken cancellationToken)
@@ -694,15 +702,19 @@ public sealed class RetentionExecutor(
                         RetentionExecutionReasons.IdentityUnverified, null, cancellationToken).ConfigureAwait(false);
 
         // Stored observations can miss a favourite, unwatched or resume event, and a session can be
-        // playing another version. Re-read live Jellyfin state for every affected target last.
-        foreach (var operation in operations)
+        // playing another version. Re-read live Jellyfin state for every affected target, here and again right before the unlink.
+        async Task<string?> LiveBlockAsync()
         {
-            var liveReason = await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken, requireCompletion: !replacement)
-                .ConfigureAwait(false);
-            if (liveReason is not null)
-                return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
-                    liveReason, null, cancellationToken).ConfigureAwait(false);
+            foreach (var operation in operations)
+                if (await liveCheck.BlockReasonAsync(operation, livePolicy, cancellationToken, requireCompletion: !replacement)
+                        .ConfigureAwait(false) is { } liveReason)
+                    return liveReason;
+            return null;
         }
+
+        if (await LiveBlockAsync().ConfigureAwait(false) is { } blocked)
+            return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                blocked, null, cancellationToken).ConfigureAwait(false);
 
         // An upgrade replaces the old version only while its successor is still there: bound, on disk and playable.
         // Remove this version or anything else may have taken it since the upgrade checked (review P1-3).
@@ -732,6 +744,10 @@ public sealed class RetentionExecutor(
             if (!await KeepVersionUserDataAsync(operation).ConfigureAwait(false))
                 return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
                     RetentionExecutionReasons.UserDataNotKept, null, cancellationToken).ConfigureAwait(false);
+        // Playback, a favourite or a resume point need no library lease, so one that began during the copy is read again here.
+        if (await LiveBlockAsync().ConfigureAwait(false) is { } blockedLate)
+            return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                blockedLate, null, cancellationToken).ConfigureAwait(false);
 
         // The last point at which cancellation is honoured; everything after the unlink must finish.
         cancellationToken.ThrowIfCancellationRequested();
@@ -1093,8 +1109,13 @@ public sealed class RetentionExecutor(
                 try
                 {
                     // A survivor bound by number only may be another episode: nothing is copied to it, as from such a copy.
-                    if (sibling.IdentityUnverified || sibling.ItemId == source.Id || !files.TryInspect(sibling.Path, out var observed) ||
-                        string.Equals(observed.CanonicalPath, operation.MediaPath, StringComparison.Ordinal)) continue;
+                    if (sibling.IdentityUnverified || sibling.ItemId == source.Id) continue;
+                    // A survivor proven gone is none; one that cannot be read may still be, so it fails the copy.
+                    var presence = files.Probe(sibling.Path);
+                    if (presence == PathPresence.Absent) continue;
+                    if (presence != PathPresence.Present || !files.TryInspect(sibling.Path, out var observed))
+                        throw new InvalidOperationException("The survivor's file cannot be read.");
+                    if (string.Equals(observed.CanonicalPath, operation.MediaPath, StringComparison.Ordinal)) continue;
                     var remaining = library.RetrieveItem(sibling.ItemId);
                     if (remaining is not Video { IsPlaceHolder: false } ||
                         !string.Equals(remaining.Path, sibling.Path, StringComparison.Ordinal))
