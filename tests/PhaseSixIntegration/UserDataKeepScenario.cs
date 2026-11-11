@@ -139,7 +139,8 @@ internal sealed class UserDataKeepScenario(World world, PluginHost host, BaseIte
             world.Native.UserDataReading = null;
         }
 
-        // The third copy remains: failing one user's copy must warn, still copy the other user, and honour the removal.
+        // The third copy remains: failing one user's copy must warn, still copy the other user, and keep the version until a
+        // later attempt copies everyone (Codex review of ds.t7, P1).
         EntryBinding last;
         await using (var database = new ModDbContext(dbPath))
             last = await database.EntryBindings.AsNoTracking().SingleAsync(value => value.EntryId == entryId && value.Id != survivor.Id);
@@ -159,9 +160,15 @@ internal sealed class UserDataKeepScenario(World world, PluginHost host, BaseIte
         };
         try
         {
-            using var response = await admin.PostAsync($"/JellyfinMod/Entries/{entryId}/Versions/{survivor.Id}/Remove", null);
-            Check(response.IsSuccessStatusCode && !File.Exists(survivor.MediaPath) && File.Exists(last.MediaPath),
-                "A failed user copy does not block the requested removal or remove the survivor");
+            using var refused = await admin.PostAsync($"/JellyfinMod/Entries/{entryId}/Versions/{survivor.Id}/Remove", null);
+            var refusal = await refused.Content.ReadAsStringAsync();
+            Check((int)refused.StatusCode == 409 && refusal.Contains("user_data_not_kept", StringComparison.Ordinal) &&
+                File.Exists(survivor.MediaPath) && File.Exists(last.MediaPath) &&
+                world.Native.Items.Any(item => item.Id == survivor.JellyfinItemId),
+                "A failed user copy refuses the removal and keeps the version and its item: " + refusal);
+            await using (var database = new ModDbContext(dbPath))
+                Check(!await database.RetentionOperations.AnyAsync(value => value.BindingId == survivor.Id),
+                    "A refused removal records no operation");
             var kept = host.Service<IUserDataManager>().GetUserData(world.Ordinary,
                 world.Native.Items.Single(item => item.Id == last.JellyfinItemId))!;
             Check(kept.Played && kept.IsFavorite && kept.PlayCount == 9 && kept.LastPlayedDate == PlayedAt.AddDays(2) &&
@@ -173,6 +180,16 @@ internal sealed class UserDataKeepScenario(World world, PluginHost host, BaseIte
         finally
         {
             world.Native.UserDataSaving = null;
+        }
+
+        // Once the write works again the same removal copies the failed user too and goes ahead.
+        using (var response = await admin.PostAsync($"/JellyfinMod/Entries/{entryId}/Versions/{survivor.Id}/Remove", null))
+        {
+            Check(response.IsSuccessStatusCode && !File.Exists(survivor.MediaPath) && File.Exists(last.MediaPath),
+                "The retried removal removes the version and keeps the survivor: " + await response.Content.ReadAsStringAsync());
+            var retried = host.Service<IUserDataManager>().GetUserData(world.Admin,
+                world.Native.Items.Single(item => item.Id == last.JellyfinItemId))!;
+            Check(retried.Played && retried.IsFavorite, "The retry puts the failed user's data on the survivor");
         }
 
         // A second name for the very same content keeps resume even when the new item's runtime is not known yet.

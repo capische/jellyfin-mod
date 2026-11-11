@@ -57,12 +57,15 @@ public static class PlaceholderUserData
 
     /// <summary>
     /// Merges every user's data before a version is removed (D279). Read stored rows, but save through the served item so
-    /// Jellyfin's cache is updated too. A failed user never stops another user's copy or the requested removal.
+    /// Jellyfin's cache is updated too. A failed user never stops another user's copy, but it makes the result false, and the
+    /// caller then keeps the removed version (or its native item) until a later attempt copies everything.
     /// </summary>
-    public static void CopyTo(IUserDataManager userData, IReadOnlyCollection<Jellyfin.Database.Implementations.Entities.User> users,
+    /// <returns>Whether every user's data is on <paramref name="remaining"/>.</returns>
+    public static bool CopyTo(IUserDataManager userData, IReadOnlyCollection<Jellyfin.Database.Implementations.Entities.User> users,
         ILibraryManager library, BaseItem source,
         BaseItem remaining, bool sameContent, ILogger logger)
     {
+        var kept = true;
         foreach (var user in users)
         {
             try
@@ -102,10 +105,13 @@ public static class PlaceholderUserData
             }
             catch (Exception error) when (error is not OutOfMemoryException)
             {
+                kept = false;
                 logger.LogWarning("JellyfinMod could not keep user data for user {User} from item {OldItem} on {RemainingItem}: {Error}",
                     user.Id, source.Id, remaining.Id, error.Message);
             }
         }
+
+        return kept;
     }
 
     /// <summary>Whether a new item is one whose user data Jellyfin may re-attach from a removed item: a movie or an episode.</summary>
