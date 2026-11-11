@@ -225,7 +225,6 @@ public sealed class RetentionExecutor(
         // Read again under the locks: nothing below may act on a binding another writer changed meanwhile.
         target = await LoadVersionAsync(entryId, bindingId, cancellationToken).ConfigureAwait(false);
         if (target is null) return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.BindingUnavailable);
-        await KeepVersionUserDataAsync(target, bindingId).ConfigureAwait(false);
         var (reason, observed) = await CheckRemovableAsync(target, cancellationToken).ConfigureAwait(false);
         if (reason is not null) return RetentionExecutionResult.NotStarted(bindingId, reason);
         var policy = await database.RetentionPolicySnapshots.AsNoTracking()
@@ -239,6 +238,10 @@ public sealed class RetentionExecutor(
             Reason = RetentionProvenances.VersionRemoved, PreparedAt = clock.GetUtcNow().UtcDateTime,
             Provenance = RetentionProvenances.VersionRemoved
         };
+        // Only once every check has passed, so a refused removal changes nothing; and nothing is removed unless every user's
+        // data is on the copies that stay (D279).
+        if (!await KeepVersionUserDataAsync(operation).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.UserDataNotKept);
         database.RetentionOperations.Add(operation);
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
@@ -302,7 +305,6 @@ public sealed class RetentionExecutor(
             return RetentionExecutionResult.NotStarted(bindingId, RetentionPreviewReasons.MediaIdentityChanged);
         if (await IdentityUnverifiedAsync(bindingId, cancellationToken).ConfigureAwait(false))
             return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.IdentityUnverified);
-        await KeepVersionUserDataAsync(target, bindingId).ConfigureAwait(false);
         var (reason, observed) = await CheckRemovableAsync(target, cancellationToken).ConfigureAwait(false);
         if (reason is not null) return RetentionExecutionResult.NotStarted(bindingId, reason);
         if (!await ImportedFilePresentAsync(successorImportId, entryId, episodeId, cancellationToken).ConfigureAwait(false) ||
@@ -334,6 +336,10 @@ public sealed class RetentionExecutor(
             Reason = RetentionProvenances.PackReplaced, PreparedAt = clock.GetUtcNow().UtcDateTime,
             Provenance = RetentionProvenances.PackReplaced
         };
+        // Only once every check has passed, so a refused replacement changes nothing; and nothing is removed unless every
+        // user's data is on the copies that stay (D279).
+        if (!await KeepVersionUserDataAsync(operation).ConfigureAwait(false))
+            return RetentionExecutionResult.NotStarted(bindingId, RetentionExecutionReasons.UserDataNotKept);
         database.RetentionOperations.Add(operation);
         await database.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
@@ -672,8 +678,6 @@ public sealed class RetentionExecutor(
                     null, cancellationToken).ConfigureAwait(false);
         }
 
-        foreach (var operation in operations) await KeepVersionUserDataAsync(operation).ConfigureAwait(false);
-
         cancellationToken.ThrowIfCancellationRequested();
         var livePolicy = await policyService.SyncAsync(configuration.Current, cancellationToken).ConfigureAwait(false);
         if (!livePolicy.Enabled)
@@ -721,6 +725,13 @@ public sealed class RetentionExecutor(
                 cancellationToken).ConfigureAwait(false) is { } retained)
             return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
                 RetentionExecutionReasons.RetainedDownload, new IOException(retained), cancellationToken).ConfigureAwait(false);
+
+        // After every safeguard, so a blocked action changes nothing; and the file stays unless every user's data is on the
+        // copies that stay (D279).
+        foreach (var operation in operations)
+            if (!await KeepVersionUserDataAsync(operation).ConfigureAwait(false))
+                return await FinishAsync(operations, requestedBindingId, RetentionOperationStates.Blocked,
+                    RetentionExecutionReasons.UserDataNotKept, null, cancellationToken).ConfigureAwait(false);
 
         // The last point at which cancellation is honoured; everything after the unlink must finish.
         cancellationToken.ThrowIfCancellationRequested();
@@ -1039,26 +1050,12 @@ public sealed class RetentionExecutor(
         return cleaned;
     }
 
-    /// <summary>Preserves an explicit removal's data before its destructive safeguards run.</summary>
-    private async Task KeepVersionUserDataAsync(RemovableVersion target, Guid bindingId)
-    {
-        try
-        {
-            if (target.Path is null || !files.TryInspect(target.Path, out var observed)) return;
-            await KeepVersionUserDataAsync(new RetentionOperation
-            {
-                BindingId = bindingId, EntryId = target.EntryId, EpisodeId = target.EpisodeId,
-                JellyfinItemId = target.ItemId, MediaPath = observed.CanonicalPath, PhysicalIdentity = observed.PhysicalIdentity
-            }).ConfigureAwait(false);
-        }
-        catch (Exception error) when (error is not OutOfMemoryException)
-        {
-            logger.LogWarning("JellyfinMod could not keep user data before removing item {Item}: {Error}", target.ItemId, error.Message);
-        }
-    }
-
-    /// <summary>Copies to every surviving file of this movie or episode, including the item Jellyfin may promote (D279).</summary>
-    private async Task KeepVersionUserDataAsync(RetentionOperation operation)
+    /// <summary>
+    /// Copies to every surviving file of this movie or episode, including the item Jellyfin may promote (D279). False when any
+    /// user's data could not be put on a survivor: the caller then removes nothing, so the data stays on the version (or the
+    /// native item) that holds it, and a later attempt copies it again.
+    /// </summary>
+    private async Task<bool> KeepVersionUserDataAsync(RetentionOperation operation)
     {
         try
         {
@@ -1068,7 +1065,7 @@ public sealed class RetentionExecutor(
             {
                 logger.LogWarning("JellyfinMod did not keep user data from item {Item}: its episode identity is unverified",
                     operation.JellyfinItemId);
-                return;
+                return true;
             }
             var siblings = operation.EpisodeId is { } episodeId
                 ? await database.EpisodeBindings.AsNoTracking().Where(binding => binding.EpisodeId == episodeId &&
@@ -1081,7 +1078,7 @@ public sealed class RetentionExecutor(
                     .Select(binding => new { ItemId = binding.JellyfinItemId, Path = binding.MediaPath!,
                         SeriesId = Guid.Empty, IdentityUnverified = false })
                     .ToArrayAsync(CancellationToken.None).ConfigureAwait(false);
-            if (siblings.Length == 0) return;
+            if (siblings.Length == 0) return true;
             if (userData is null || users is null)
                 throw new InvalidOperationException("Jellyfin user data services are unavailable.");
             var source = library.RetrieveItem(operation.JellyfinItemId);
@@ -1090,13 +1087,13 @@ public sealed class RetentionExecutor(
                 !string.Equals(sourceCanonical, operation.MediaPath, StringComparison.Ordinal))
                 throw new InvalidOperationException("The removed item's stored user data is unavailable or its path changed.");
             var owners = users.GetUsers().ToArray();
+            var kept = true;
             foreach (var sibling in siblings)
             {
                 try
                 {
-                    if (sibling.IdentityUnverified)
-                        throw new InvalidOperationException("The survivor's episode identity is unverified.");
-                    if (sibling.ItemId == source.Id || !files.TryInspect(sibling.Path, out var observed) ||
+                    // A survivor bound by number only may be another episode: nothing is copied to it, as from such a copy.
+                    if (sibling.IdentityUnverified || sibling.ItemId == source.Id || !files.TryInspect(sibling.Path, out var observed) ||
                         string.Equals(observed.CanonicalPath, operation.MediaPath, StringComparison.Ordinal)) continue;
                     var remaining = library.RetrieveItem(sibling.ItemId);
                     if (remaining is not Video { IsPlaceHolder: false } ||
@@ -1109,20 +1106,24 @@ public sealed class RetentionExecutor(
                             sibling.SeriesId != Guid.Empty && nativeEpisode.SeriesId == sibling.SeriesId
                         : remaining is MediaBrowser.Controller.Entities.Movies.Movie;
                     if (!matches) throw new InvalidOperationException("The survivor no longer matches the tracked movie or episode.");
-                    Placeholders.PlaceholderUserData.CopyTo(userData, owners, library, source, remaining,
+                    kept &= Placeholders.PlaceholderUserData.CopyTo(userData, owners, library, source, remaining,
                         observed.PhysicalIdentity == operation.PhysicalIdentity, logger);
                 }
                 catch (Exception error) when (error is not OutOfMemoryException)
                 {
+                    kept = false;
                     logger.LogWarning("JellyfinMod could not keep user data from item {OldItem} on {RemainingItem}: {Error}",
                         source.Id, sibling.ItemId, error.Message);
                 }
             }
+
+            return kept;
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
             logger.LogWarning("JellyfinMod could not keep user data before removing item {Item}: {Error}",
                 operation.JellyfinItemId, error.Message);
+            return false;
         }
     }
 
@@ -1169,8 +1170,14 @@ public sealed class RetentionExecutor(
 
             var (rating, tags) = (native.CustomRating ?? native.OfficialRating, native.Tags);
             var parentId = native.ParentId;
-            // Also covers recovery after an unlink, before deleting the still-readable native user data.
-            await KeepVersionUserDataAsync(operation).ConfigureAwait(false);
+            // Also covers recovery after an unlink. The native item holds the user data still: it stays, and the operation keeps a
+            // retryable failure, until every user's data is on the copies that stay (D279).
+            if (!await KeepVersionUserDataAsync(operation).ConfigureAwait(false))
+            {
+                operation.Error = Bound("Not every user's data could be kept on the copy that stays, so the native item that holds it is left until it can.");
+                return false;
+            }
+
             library.DeleteItem(native, new DeleteOptions
             {
                 DeleteFileLocation = false,
@@ -1448,6 +1455,9 @@ internal static class RetentionExecutionReasons
     public const string OperationOpen = "operation_open";
     public const string MediaIdentityUnverified = "media_identity_unverified";
     public const string SuccessorUnavailable = "successor_unavailable";
+
+    /// <summary>Not every user's data could be put on the copies that stay (D279); nothing was removed.</summary>
+    public const string UserDataNotKept = "user_data_not_kept";
 
     /// <summary>A pack replacement was stopped before its unlink; it is prepared again with every check.</summary>
     public const string ReplacementInterrupted = "replacement_interrupted";
