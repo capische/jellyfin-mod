@@ -26,6 +26,8 @@ public interface IMediaDiscovery
     /// <summary>
     /// Completes once every discovery of the library asked for before this call is over, so a removal that follows cannot be
     /// overtaken by a discovery still making items for what it removes (P4.FU12: Remove Placeholders during the first sync).
+    /// A discovery asked for before this call and put off until a library scan ends is dropped (the library monitor still
+    /// picks its paths up).
     /// </summary>
     Task IdleAsync(Guid libraryId);
 }
@@ -46,13 +48,16 @@ public interface IMediaDiscovery
 /// </summary>
 public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSystem, ILogger<FolderRefresh> logger) : IMediaDiscovery, IHostedService
 {
-    private sealed record Request(Guid LibraryId, IReadOnlyCollection<string> Paths, TaskCompletionSource Done);
+    private sealed record Request(Guid LibraryId, IReadOnlyCollection<string> Paths, TaskCompletionSource Done, int Generation);
 
     /// <summary>How long after a request the batch is taken, so the files of one moment (a pack's) are one look.</summary>
     public static readonly TimeSpan Window = TimeSpan.FromMilliseconds(150);
 
     private readonly Channel<Request> queue = Channel.CreateUnbounded<Request>(new UnboundedChannelOptions { SingleReader = true });
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Request, byte> open = new();
+    // Each library's removal generation, raised by IdleAsync: a discovery put off past a scan is asked for again only while the
+    // generation it was asked in still holds, under this lock, so it is either open before a removal's wait or never asked.
+    private readonly Dictionary<Guid, int> generations = [];
     private CancellationTokenSource? stopping;
     private Task? worker;
 
@@ -61,7 +66,8 @@ public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSyste
     {
         if (paths.Count == 0) return Task.CompletedTask;
         var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var request = new Request(libraryId, paths.ToArray(), done);
+        Request request;
+        lock (generations) request = new Request(libraryId, paths.ToArray(), done, generations.GetValueOrDefault(libraryId));
         open[request] = 0;
         _ = done.Task.ContinueWith(_ => open.TryRemove(request, out var _), TaskScheduler.Default);
         if (!queue.Writer.TryWrite(request)) done.TrySetResult();
@@ -69,8 +75,11 @@ public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSyste
     }
 
     /// <inheritdoc />
-    public Task IdleAsync(Guid libraryId) =>
-        Task.WhenAll(open.Keys.Where(request => request.LibraryId == libraryId).Select(request => request.Done.Task));
+    public Task IdleAsync(Guid libraryId)
+    {
+        lock (generations) generations[libraryId] = generations.GetValueOrDefault(libraryId) + 1;
+        return Task.WhenAll(open.Keys.Where(request => request.LibraryId == libraryId).Select(request => request.Done.Task));
+    }
 
     /// <inheritdoc />
     public Task StartAsync(CancellationToken cancellationToken)
@@ -119,7 +128,8 @@ public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSyste
                         // A running native scan may have read these folders already, and a validation now would compete with it:
                         // the paths are discovered once it ends. Nobody waits for that, since a caller may hold the library
                         // lease the scan's own post-scan reconciliation needs.
-                        if (library.IsScanRunning) DiscoverAfterScan(group.Key, paths, cancellationToken);
+                        if (library.IsScanRunning)
+                            foreach (var request in group) DiscoverAfterScan(request, cancellationToken);
                         else await DiscoverLibraryAsync(group.Key, paths, cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
@@ -139,15 +149,22 @@ public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSyste
         }
     }
 
-    /// <summary>Asks for the paths again once the running scan has ended (polled every 2 s, for at most an hour).</summary>
-    private void DiscoverAfterScan(Guid libraryId, IReadOnlyCollection<string> paths, CancellationToken cancellationToken) =>
+    /// <summary>
+    /// Asks for a request's paths again once the running scan has ended (polled every 2 s, for at most an hour), unless a removal
+    /// waited for the library's discoveries since it was asked for.
+    /// </summary>
+    private void DiscoverAfterScan(Request deferred, CancellationToken cancellationToken) =>
         _ = Task.Run(async () =>
         {
             try
             {
                 for (var waited = 0; waited < 1800 && library.IsScanRunning; waited++)
                     await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
-                await DiscoverAsync(libraryId, paths, cancellationToken).ConfigureAwait(false);
+                Task? again = null;
+                lock (generations)
+                    if (generations.GetValueOrDefault(deferred.LibraryId) == deferred.Generation)
+                        again = DiscoverAsync(deferred.LibraryId, deferred.Paths, cancellationToken);
+                if (again is not null) await again.ConfigureAwait(false);
             }
             catch (Exception error) when (error is not OutOfMemoryException)
             {
