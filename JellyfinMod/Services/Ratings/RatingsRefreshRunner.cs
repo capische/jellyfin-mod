@@ -446,11 +446,12 @@ public sealed class RatingsRefreshRunner(
         }
 
         (attempt.AttemptedAt, attempt.Outcome, attempt.Error, attempt.Manual) = (Now, RatingsOutcomes.Pending, null, manual);
+        // Fetching until the answer is recorded, also when this call spends the last of the budget (ds.t16): published before
+        // the spend is, so a reader that sees the budget spent also sees the call.
+        using var call = gate.Calling((title.MediaType, title.TmdbId));
         Spend(current.State);
         if (!await SaveBoundedAsync(cancellationToken).ConfigureAwait(false)) return (null, RatingsOutcomes.DatabaseBusy);
 
-        // Fetching until the answer is recorded, also when this call spent the last of the budget (ds.t16).
-        using var call = gate.Calling((title.MediaType, title.TmdbId));
         gate.LastCallAt = DateTime.UtcNow;
         var result = await client.FetchAsync(current.Key!, title.MediaType, title.TmdbId, cancellationToken).ConfigureAwait(false);
         var observed = result;
