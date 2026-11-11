@@ -113,11 +113,14 @@ public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSyste
                 while (queue.Reader.TryRead(out var request)) batch.Add(request);
                 foreach (var group in batch.GroupBy(request => request.LibraryId))
                 {
+                    var paths = group.SelectMany(request => request.Paths).Distinct(StringComparer.Ordinal).ToArray();
                     try
                     {
-                        if (!library.IsScanRunning)
-                            await DiscoverLibraryAsync(group.Key, group.SelectMany(request => request.Paths).Distinct(StringComparer.Ordinal).ToArray(),
-                                cancellationToken).ConfigureAwait(false);
+                        // A running native scan may have read these folders already, and a validation now would compete with it:
+                        // the paths are discovered once it ends. Nobody waits for that, since a caller may hold the library
+                        // lease the scan's own post-scan reconciliation needs.
+                        if (library.IsScanRunning) DiscoverAfterScan(group.Key, paths, cancellationToken);
+                        else await DiscoverLibraryAsync(group.Key, paths, cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception error) when (error is not OperationCanceledException and not OutOfMemoryException)
                     {
@@ -135,6 +138,22 @@ public sealed class FolderRefresh(ILibraryManager library, IFileSystem fileSyste
         {
         }
     }
+
+    /// <summary>Asks for the paths again once the running scan has ended (polled every 2 s, for at most an hour).</summary>
+    private void DiscoverAfterScan(Guid libraryId, IReadOnlyCollection<string> paths, CancellationToken cancellationToken) =>
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                for (var waited = 0; waited < 1800 && library.IsScanRunning; waited++)
+                    await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+                await DiscoverAsync(libraryId, paths, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is not OutOfMemoryException)
+            {
+                // Stopping, or the scan state unreadable: the library monitor still picks the paths up.
+            }
+        }, CancellationToken.None);
 
     private async Task DiscoverLibraryAsync(Guid libraryId, IReadOnlyList<string> paths, CancellationToken cancellationToken)
     {

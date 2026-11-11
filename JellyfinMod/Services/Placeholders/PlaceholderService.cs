@@ -391,12 +391,13 @@ public sealed class PlaceholderService(
         foreach (var folder in outermost) Report(folder);
         // Complete discovery under the sync's library lease, once for the batch, without watcher events or the monitor delay.
         // Include the files: a newly created series reports the library root, which discovery alone cannot place as a title.
-        // A running native scan picks up the changes itself; do not start a competing folder validation.
-        if (outermost.Count > 0 && discovery is not null && !ScanRunning())
+        // During a native scan the discovery waits for its end and this run does not: Jellyfin tells the clients itself.
+        if (outermost.Count > 0 && discovery is not null)
         {
             var files = writtenFiles.ToArray();
+            var scanning = ScanRunning();
             await discovery.DiscoverAsync(libraryId, outermost.Concat(files).ToArray(), cancellationToken).ConfigureAwait(false);
-            notifications?.NotifyAdded(libraryId, files, outermost);
+            if (!scanning) notifications?.NotifyAdded(libraryId, files, outermost);
         }
 
         return outermost.Count;
